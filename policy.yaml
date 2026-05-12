@@ -1,0 +1,169 @@
+# Aggressive preset — minimum always-on, heavy trigger gating.
+# Default for messaging channels (Telegram, Slack, Discord, etc.).
+# Expected typical savings: ~8,000 tok per message vs. current behavior.
+
+name: aggressive
+description: >
+  Minimum always-on; everything else trigger-gated. Best for short conversational
+  channels. The model can call `expand_tools(category=...)` if it needs something
+  that wasn't loaded.
+
+# Tools loaded on every message in this mode, regardless of content.
+# Anything in the user's platform_toolsets ceiling but NOT listed here AND
+# NOT named under any trigger below is considered "unknown" and kept on
+# (safe fallback for plugin-provided tools).
+always_on:
+  # Implicit recall — needed for any message that references prior state
+  - memory
+  - session_search
+
+  # Meta tools — discovery, planning, asking for help
+  - clarify
+  - skill_view
+  - skills_list
+  - todo
+
+  # Universal cheap tools
+  - web_search
+  - read_file
+  - search_files
+  - process
+
+  # Gateway essentials — ignored on CLI by the plugin
+  - send_message
+
+  # Always-on meta-tool the plugin itself adds
+  - expand_tools
+
+# Triggered tool groups. Each group fires when ANY of its signals match.
+# When a group fires, all listed tools are added to the active set.
+# Multiple groups can fire on the same message (additive).
+triggers:
+
+  # File modifications — read is always-on, write is gated
+  - name: file_write
+    tools: [write_file, patch]
+    keywords:
+      - '\b(write|create|save|update|edit|editing|modify|patch|append|fix|change|delete|rewrite)\b'
+      - '\.(md|py|js|ts|tsx|jsx|json|yaml|yml|toml|sh|html|css|sql|txt)\b'  # filename-with-extension
+      - '/\S+\.\S+'        # path with extension
+      - '~/\S+'            # home-relative path
+    exclude_keywords:
+      - '\b(should we|would we|could we|might|maybe|eventually|later|future)\b'
+      - '\b(what do you think|talk through|approach|strategy|idea|thinking about)\b'
+      - '\b(not asking you to|don[''’]t|do not)\b.*\b(write|edit|change|patch|save|commit)\b'
+      - '^\s*>'
+      - '```'
+
+  # Shell — heavy tool, only loads when shell-y intent appears
+  - name: shell
+    tools: [terminal]
+    keywords:
+      - '\b(run|install|execute|shell|terminal|build|deploy|test the|tests pass)\b'
+      - '\b(brew|npm|yarn|pnpm|pip|pipx|uv|cargo|go|make|cmake|docker|kubectl|gh|git)\b'
+      - '\$\s*\w+'         # shell prompt symbol
+
+  # Python script with tool calls — for batch / processing intent
+  - name: code_execution
+    tools: [execute_code]
+    keywords:
+      - '\b(for each|loop (over|through)|process all|filter|aggregate|map over)\b'
+      - '\b(N pages|N files|fetch all|all of them|batch|in bulk)\b'
+      - '\bwrite a (python|simple) script\b'
+
+  # Subagent delegation — explicit worker/spawn intent
+  - name: delegation
+    tools: [delegate_task]
+    keywords:
+      - '\b(delegate|sub-?agents?|spawn|orchestrat(e|or))\b'
+      - '\b(use|run|spin up|ask)\b.{0,40}\b(Claude Code|CC|worker|sub-?agent)\b'
+      - '\b(in parallel|simultaneously|concurrent(ly)?)\b.{0,80}\b(do|run|work on|build|research|implement|fix)\b'
+    exclude_keywords:
+      - '\b(should we|would we|could we|might|maybe|eventually|later|future)\b'
+      - '\b(idea|approach|strategy|thinking about|talk through|discussion)\b'
+      - '\b(not yet|not now|don[''’]t delegate|do not delegate)\b'
+
+  # Skill authoring — explicit capture intent
+  - name: skills_authoring
+    tools: [skill_manage]
+    keywords:
+      - '\bsave (this|that|it) as a skill\b'
+      - '\b(capture|create|make|new|update|fix|patch|edit) (a |the )?skill\b'
+      - '\bturn (this|that) into a skill\b'
+
+  # Web content extraction — URL or scrape intent
+  - name: web_extract
+    tools: [web_extract]
+    keywords:
+      - 'https?://\S+'                              # any URL
+      - '\b(scrape|crawl|fetch from|extract from|content of)\b'
+      - '\b(read|grab|pull) (the|this) (page|article|post|url)\b'
+
+  # Vision — primarily attachment-driven
+  - name: vision
+    tools: [vision_analyze]
+    has_attachment: image                            # primary signal — image present in event
+    keywords:
+      - '\b(this (image|picture|photo|screenshot|diagram))\b'
+      - '\bwhat(s| is)? (in|on) this\b'
+
+  # Image generation
+  - name: image_gen
+    tools: [image_generate]
+    keywords:
+      - '\b(draw|illustrate|paint|sketch)\b'
+      - '\b(generate|create|make) (an? )?(image|picture|photo|illustration|drawing|artwork)\b'
+      - '\b(image|picture) of\b'
+
+  # Text-to-speech
+  - name: tts
+    tools: [text_to_speech]
+    keywords:
+      - '\b(read (this )?(aloud|out loud)|say this|speak (this|it)|read it out|TTS|out loud)\b'
+      - '\bvoice (over|this)\b'
+
+  # Browser automation — entire 12-tool family loads on signal
+  - name: browser
+    tools:
+      - browser_navigate
+      - browser_snapshot
+      - browser_click
+      - browser_type
+      - browser_scroll
+      - browser_back
+      - browser_press
+      - browser_get_images
+      - browser_vision
+      - browser_console
+      - browser_cdp
+      - browser_dialog
+    keywords:
+      - '\b(browse|navigate to|open .* in (a |the )?browser|browser automation)\b'
+      - '\b(fill (out|in)|click on|select|hover|scroll)\b.*\b(form|page|button|link|element)\b'
+      - '\bweb scrap'
+      - '\bautomate.*browser\b'
+
+  # Cronjob — scheduling intent
+  - name: cronjob
+    tools: [cronjob]
+    keywords:
+      - '\b(schedule|recurring|repeating)\b.*\b(task|job|check|run|send|reminder|notify|report)\b'
+      - '\bremind me\b.*\b(every|daily|weekly|at|tomorrow|on monday|on tuesday|on wednesday|on thursday|on friday|on saturday|on sunday)\b'
+      - '\bnotify me\b.*\b(daily|weekly|every|when|at)\b'
+      - '\bset (a |an )?(alarm|reminder|timer)\b'
+      - '\bcron(job)?\b.*\b(create|add|schedule|run|edit|remove|pause|resume)\b'
+    exclude_keywords:
+      - '\b(should we|would we|could we|might|maybe|eventually|later|future)\b'
+      - '\b(how does|how do|what is|explain|talk through|approach)\b.*\b(cron|schedule|scheduled|reminder)\b'
+      - '\b(I|we)\b.*\b(every day|daily|weekly)\b'
+
+  # Home Assistant — smart home control
+  - name: homeassistant
+    tools: [ha_list_entities, ha_get_state, ha_list_services, ha_call_service]
+    keywords:
+      - '\b(turn (on|off)|switch (on|off)|toggle)\b.*\b(lights?|lamp|fan|outlet|plug|tv|switch|alarm)\b'
+      - '\b(temperature|thermostat|climate)\b'
+      - '\b(garage|door|gate|window|blinds)\b.*\b(open|close|lock|unlock)\b'
+      - '\bhome assistant\b'
+      - '\bHA\b'
+      - '\b(dim|brighten) (the )?lights?\b'

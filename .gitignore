@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# Analyzer outputs (regenerated each run)
+reports/*.md
+reports/*.json
+
+# Editor cruft
+.vscode/
+.idea/
+*.swp

@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent: dynamic-tools daily analysis (00:00 and 12:00 local time).
+
+  Install:
+    cp scripts/com.dalemugford.hermes.dynamic-tools-analyzer.plist \
+       ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) \
+       ~/Library/LaunchAgents/com.dalemugford.hermes.dynamic-tools-analyzer.plist
+
+  Verify scheduled:
+    launchctl print gui/$(id -u)/com.dalemugford.hermes.dynamic-tools-analyzer \
+       | grep -E "state|next run"
+
+  Run once on demand:
+    launchctl kickstart gui/$(id -u)/com.dalemugford.hermes.dynamic-tools-analyzer
+
+  Uninstall:
+    launchctl bootout gui/$(id -u) \
+       ~/Library/LaunchAgents/com.dalemugford.hermes.dynamic-tools-analyzer.plist
+    rm ~/Library/LaunchAgents/com.dalemugford.hermes.dynamic-tools-analyzer.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.dalemugford.hermes.dynamic-tools-analyzer</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/macmini/.hermes/plugins/dynamic-tools/scripts/daily-analysis.sh</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Hour</key>
+      <integer>0</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+    <dict>
+      <key>Hour</key>
+      <integer>12</integer>
+      <key>Minute</key>
+      <integer>0</integer>
+    </dict>
+  </array>
+
+  <!-- If the Mac is asleep or off at the scheduled time, run as soon as it
+       wakes up. Without this, missed runs are silently skipped. -->
+  <key>RunAtLoad</key>
+  <false/>
+
+  <!-- launchd captures stdout/stderr to these files. The script itself
+       also writes a structured summary to state/dynamic-tools/cron-logs/. -->
+  <key>StandardOutPath</key>
+  <string>/Users/macmini/.hermes/state/dynamic-tools/cron-logs/launchd.stdout</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/macmini/.hermes/state/dynamic-tools/cron-logs/launchd.stderr</string>
+
+  <!-- Ensure HERMES_HOME is set for the script in case it inherits a sparse
+       environment. -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HERMES_HOME</key>
+    <string>/Users/macmini/.hermes</string>
+    <key>PATH</key>
+    <string>/usr/local/bin:/usr/bin:/bin:/opt/homebrew/bin</string>
+  </dict>
+</dict>
+</plist>
