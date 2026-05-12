@@ -445,12 +445,33 @@ def _agent_platform_from_context(event: Any = None, kwargs: dict[str, Any] | Non
     """
     kwargs = kwargs or {}
     session_key = str(os.environ.get("HERMES_SESSION_KEY") or "")
-    agent = str(_CONFIG.get("agent") or os.environ.get("HERMES_PROFILE") or "").strip().lower()
     platform = ""
 
+    # Agent resolution precedence (highest to lowest):
+    #   1. explicit _CONFIG['agent']
+    #   2. HERMES_HOME-derived profile name (authoritative when running
+    #      as `hermes -p <name> gateway`; Hermes' own session_key uses
+    #      'main' or other placeholders in profile contexts, so we must
+    #      win against parts[1] below).
+    #   3. HERMES_PROFILE env var (rarely set in practice)
+    #   4. session_key parts[1]
+    #   5. 'default'
+    agent = str(_CONFIG.get("agent") or "").strip().lower()
+    if not agent:
+        home = os.environ.get("HERMES_HOME", "").rstrip("/")
+        if home:
+            parent_dir, name = os.path.split(home)
+            if os.path.basename(parent_dir) == "profiles" and name:
+                agent = name.strip().lower()
+    if not agent:
+        agent = os.environ.get("HERMES_PROFILE", "").strip().lower()
+
+    # Session key still parsed for platform regardless of how agent was
+    # resolved. Agent only filled in here if still empty.
     parts = session_key.split(":")
     if len(parts) >= 3 and parts[0] == "agent":
-        agent = agent or parts[1].strip().lower()
+        if not agent:
+            agent = parts[1].strip().lower()
         platform = parts[2].strip().lower()
 
     for key in ("platform", "source", "transport"):
@@ -469,16 +490,6 @@ def _agent_platform_from_context(event: Any = None, kwargs: dict[str, Any] | Non
             if name:
                 platform = name
                 break
-
-    # Hermes profile-scoped gateways set HERMES_HOME=<root>/profiles/<name>/
-    # but don't export a separate HERMES_PROFILE. Recover the profile name
-    # from the path so per-agent telemetry stays labeled correctly.
-    if not agent:
-        home = os.environ.get("HERMES_HOME", "").rstrip("/")
-        if home:
-            parent_dir, name = os.path.split(home)
-            if os.path.basename(parent_dir) == "profiles" and name:
-                agent = name.strip().lower()
 
     agent = agent or "default"
     platform = platform or "unknown"
