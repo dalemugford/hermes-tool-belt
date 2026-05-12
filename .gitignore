@@ -6,9 +6,8 @@ __pycache__/
 # macOS
 .DS_Store
 
-# Analyzer outputs (regenerated each run)
-reports/*.md
-reports/*.json
+# Analyzer outputs (regenerated each run; per-profile subdirs)
+reports/
 
 # Editor cruft
 .vscode/

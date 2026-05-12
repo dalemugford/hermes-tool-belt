@@ -470,6 +470,16 @@ def _agent_platform_from_context(event: Any = None, kwargs: dict[str, Any] | Non
                 platform = name
                 break
 
+    # Hermes profile-scoped gateways set HERMES_HOME=<root>/profiles/<name>/
+    # but don't export a separate HERMES_PROFILE. Recover the profile name
+    # from the path so per-agent telemetry stays labeled correctly.
+    if not agent:
+        home = os.environ.get("HERMES_HOME", "").rstrip("/")
+        if home:
+            parent_dir, name = os.path.split(home)
+            if os.path.basename(parent_dir) == "profiles" and name:
+                agent = name.strip().lower()
+
     agent = agent or "default"
     platform = platform or "unknown"
     return agent, platform, f"{agent}:{platform}"
