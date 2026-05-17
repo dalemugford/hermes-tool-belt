@@ -99,8 +99,13 @@ _CONFIG: dict[str, Any] = {
 
 _ORIGINAL_BUILD_API_KWARGS: Any = None
 _PATCHED = False
-_STICKY_BY_SCOPE: dict[str, dict[str, dict[str, Any]]] = {}
-_TURN_BY_SCOPE: dict[str, int] = {}
+# Ephemeral sticky-residency state, keyed by sticky_key (a session-scoped
+# opaque token derived from session_id — NOT the coarse policy scope).
+# One entry per session; cleared on on_session_end.
+_STICKY_BY_KEY: dict[str, dict[str, dict[str, Any]]] = {}
+# Turn counter keyed by policy_scope (agent:platform) for telemetry only.
+# NOT used for sticky residency decisions.
+_POLICY_TURN_BY_SCOPE: dict[str, int] = {}
 # Per-session ring of recent user-message texts for lookback prediction.
 # Keyed by session_id. Cleared on on_session_end.
 _PRIOR_MESSAGES_BY_SESSION: dict[str, list[str]] = {}
@@ -299,11 +304,24 @@ def _sticky_allowed_categories() -> set[str]:
     return {str(item).strip() for item in raw if str(item).strip()}
 
 
-def _decay_sticky(scope: str) -> None:
-    """Decrement sticky entries once per inbound gateway turn for a scope."""
-    if not _sticky_enabled() or not scope:
+def _sticky_key_for_session(session_id: str) -> str:
+    """Derive a privacy-safe sticky-residency key from a session ID.
+
+    The key is opaque (sha1 hex prefix) so no raw session/chat identifiers
+    appear in logs. Returns empty string when session_id is empty, which
+    causes all sticky helpers to no-op safely.
+    """
+    if not session_id:
+        return ""
+    digest = hashlib.sha1(session_id.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"stk:{digest}"
+
+
+def _decay_sticky(sticky_key: str) -> None:
+    """Decrement sticky entries once per inbound gateway turn for a sticky key."""
+    if not _sticky_enabled() or not sticky_key:
         return
-    entries = _STICKY_BY_SCOPE.get(scope)
+    entries = _STICKY_BY_KEY.get(sticky_key)
     if not entries:
         return
     for category in list(entries.keys()):
@@ -315,14 +333,14 @@ def _decay_sticky(scope: str) -> None:
         if entry.get("remaining_turns", 0) <= 0:
             entries.pop(category, None)
     if not entries:
-        _STICKY_BY_SCOPE.pop(scope, None)
+        _STICKY_BY_KEY.pop(sticky_key, None)
 
 
-def _live_sticky(scope: str) -> tuple[list[str], list[str], dict[str, int]]:
+def _live_sticky(sticky_key: str) -> tuple[list[str], list[str], dict[str, int]]:
     """Return (tools, categories, remaining_turns) for active sticky entries."""
-    if not _sticky_enabled() or not scope:
+    if not _sticky_enabled() or not sticky_key:
         return [], [], {}
-    entries = _STICKY_BY_SCOPE.get(scope) or {}
+    entries = _STICKY_BY_KEY.get(sticky_key) or {}
     tools: set[str] = set()
     categories: list[str] = []
     remaining: dict[str, int] = {}
@@ -335,30 +353,34 @@ def _live_sticky(scope: str) -> tuple[list[str], list[str], dict[str, int]]:
     return sorted(tools), sorted(categories), remaining
 
 
-def _refresh_sticky(scope: str, category: str, tools: list[str]) -> dict[str, Any]:
-    """Refresh in-memory sticky residency after successful expand_tools."""
-    if not _sticky_enabled() or not scope or not category or not tools:
+def _refresh_sticky(sticky_key: str, category: str, tools: list[str], *, policy_scope: str = "") -> dict[str, Any]:
+    """Refresh in-memory sticky residency after successful expand_tools.
+
+    sticky_key is the session-scoped opaque key (from _sticky_key_for_session).
+    policy_scope (agent:platform) is used only for the turn-counter telemetry
+    field; it is never stored as the residency index.
+    """
+    if not _sticky_enabled() or not sticky_key or not category or not tools:
         return {"enabled": False}
 
     allowed_categories = _sticky_allowed_categories()
     if allowed_categories and category not in allowed_categories:
         return {"enabled": True, "refreshed": False, "reason": "category_not_sticky"}
 
-    entries = _STICKY_BY_SCOPE.setdefault(scope, {})
+    entries = _STICKY_BY_KEY.setdefault(sticky_key, {})
     state = _PREDICTION_CV.get()
     entries[category] = {
         "tools": set(str(t) for t in tools if str(t)),
         "remaining_turns": _sticky_ttl_turns(),
         "updated_at": time.time(),
-        "expanded_at_turn": _TURN_BY_SCOPE.get(scope, 0),
+        "expanded_at_turn": _POLICY_TURN_BY_SCOPE.get(policy_scope, 0),
         "prediction_id": str((state or {}).get("prediction_id", "")),
     }
 
-    sticky_tools, categories, remaining = _live_sticky(scope)
+    sticky_tools, categories, remaining = _live_sticky(sticky_key)
     return {
         "enabled": True,
         "refreshed": True,
-        "scope": scope,
         "category": category,
         "sticky_tools": sticky_tools,
         "sticky_categories": categories,
@@ -366,14 +388,19 @@ def _refresh_sticky(scope: str, category: str, tools: list[str]) -> dict[str, An
     }
 
 
-def _sticky_expansion_for_tool(scope: str, tool: str) -> dict[str, Any]:
-    """Return sticky expansion metadata if ``tool`` came from a live expansion."""
-    if not _sticky_enabled() or not scope or not tool:
+def _sticky_expansion_for_tool(sticky_key: str, policy_scope: str, tool: str) -> dict[str, Any]:
+    """Return sticky expansion metadata if ``tool`` came from a live expansion.
+
+    sticky_key is the session-scoped residency index.
+    policy_scope (agent:platform) is used only to look up the turn counter
+    for the turns_until_used telemetry field.
+    """
+    if not _sticky_enabled() or not sticky_key or not tool:
         return {}
 
     base_tool = _base_tool_name(tool)
-    entries = _STICKY_BY_SCOPE.get(scope) or {}
-    current_turn = _TURN_BY_SCOPE.get(scope, 0)
+    entries = _STICKY_BY_KEY.get(sticky_key) or {}
+    current_turn = _POLICY_TURN_BY_SCOPE.get(policy_scope, 0)
     for category, entry in entries.items():
         try:
             remaining_turns = int(entry.get("remaining_turns", 0))
@@ -435,44 +462,127 @@ def _platform_name(value: Any) -> str:
     return ""
 
 
+def _profile_agent_name() -> str:
+    """Derive the agent identity from profile/config context.
+
+    Precedence mirrors :func:`_agent_platform_from_context` but stops at
+    the agent slot. Returns ``""`` when no real profile identity is
+    discoverable — callers MUST NOT substitute ``"default"`` for blank
+    telemetry rows (it would conflate true-out-of-band calls with
+    profile-less environments).
+    """
+    agent = str(_CONFIG.get("agent") or "").strip().lower()
+    if agent:
+        return agent
+    home = os.environ.get("HERMES_HOME", "").rstrip("/")
+    if home:
+        parent_dir, name = os.path.split(home)
+        if os.path.basename(parent_dir) == "profiles" and name:
+            return name.strip().lower()
+    return os.environ.get("HERMES_PROFILE", "").strip().lower()
+
+
+def _platform_from_session_key(session_key: Any) -> str:
+    """Return the platform segment of a canonical Hermes session key.
+
+    Hermes' :func:`gateway.session.build_session_key` produces:
+        ``agent:main:{platform}:{chat_type}[:...]``
+    Position 1 is the *literal* string ``"main"`` — NOT a per-profile
+    agent name (that lived in our imagination, not in the gateway).
+    Position 2 is the platform.
+
+    Returns ``""`` for anything that doesn't match the canonical shape
+    (AIAgent's uuid/timestamp ``session_id``, blank inputs, anything
+    without a ``"main"`` second segment).
+    """
+    if not isinstance(session_key, str) or not session_key:
+        return ""
+    parts = session_key.split(":")
+    if len(parts) >= 3 and parts[0] == "agent" and parts[1] == "main":
+        return parts[2].strip().lower()
+    return ""
+
+
+def _parse_session_key_scope(session_key: Any) -> tuple[str, str, str]:
+    """Resolve ``(agent, platform, scope)`` from a canonical session key.
+
+    Platform comes from the session key itself; agent comes from profile
+    context (see :func:`_profile_agent_name`). Both must be non-empty for
+    a populated result — otherwise returns ``("", "", "")`` so callers
+    leave the row blank rather than synthesizing a misleading scope.
+
+    The previous implementation read the agent from ``parts[1]``, which
+    is always the literal ``"main"`` — that produced spurious
+    ``main:telegram`` attribution for every profile.
+    """
+    platform = _platform_from_session_key(session_key)
+    if not platform:
+        return "", "", ""
+    agent = _profile_agent_name()
+    if not agent:
+        return "", "", ""
+    return agent, platform, f"{agent}:{platform}"
+
+
+def _canonical_session_key(
+    event: Any = None,
+    session_store: Any = None,
+    kwargs: dict[str, Any] | None = None,
+) -> str:
+    """Resolve the canonical Hermes session key for telemetry.
+
+    Hermes' gateway is the source of truth for session identity. When
+    ``session_store`` is reachable we ask it to build the key from
+    ``event.source`` — that's the exact value the gateway itself uses to
+    route the message. Falling back to ``HERMES_SESSION_KEY`` covers
+    paths where ``session_store`` isn't handed in but the env var is set
+    by the dispatch loop.
+
+    Avoids inventing a session id from ``chat_id`` or other partial
+    SessionSource fields — those would diverge from Hermes' own bookkeeping
+    and break joins against gateway logs.
+    """
+    if session_store is not None and event is not None:
+        try:
+            source = getattr(event, "source", None)
+            generator = getattr(session_store, "_generate_session_key", None)
+            if source is not None and callable(generator):
+                key = generator(source)
+                if isinstance(key, str) and key:
+                    return key
+        except Exception:
+            pass
+    env_key = os.environ.get("HERMES_SESSION_KEY") or ""
+    if env_key:
+        return env_key
+    if kwargs:
+        for cand in ("session_key", "session_id"):
+            val = kwargs.get(cand)
+            if isinstance(val, str) and val:
+                return val
+    val = getattr(event, "session_id", None) if event is not None else None
+    if isinstance(val, str) and val:
+        return val
+    return ""
+
+
 def _agent_platform_from_context(event: Any = None, kwargs: dict[str, Any] | None = None) -> tuple[str, str, str]:
     """Return ``(agent, platform, scope)`` for per-agent/platform learning.
 
-    Scope is ``{agent}:{platform}``. Hermes gateway sessions expose this
-    shape in ``HERMES_SESSION_KEY``, e.g. ``agent:bernard:telegram:dm:<chat>``
-    (positions 1 and 2 are the agent and platform; further segments are
-    chat-identifying detail we intentionally don't use).
+    Scope is ``{agent}:{platform}``. Agent identity comes from profile
+    context (explicit config, HERMES_HOME profile dir, HERMES_PROFILE);
+    platform comes from the canonical session key's platform segment, then
+    from kwargs/event hints. Hermes' own ``HERMES_SESSION_KEY`` is shaped
+    ``agent:main:{platform}:{chat_type}[:...]`` — position 1 is the
+    literal ``"main"``, never the per-profile agent name, so we don't
+    consult it for agent resolution. Falls through to ``default:unknown``
+    only when nothing real is discoverable.
     """
     kwargs = kwargs or {}
     session_key = str(os.environ.get("HERMES_SESSION_KEY") or "")
-    platform = ""
 
-    # Agent resolution precedence (highest to lowest):
-    #   1. explicit _CONFIG['agent']
-    #   2. HERMES_HOME-derived profile name (authoritative when running
-    #      as `hermes -p <name> gateway`; Hermes' own session_key uses
-    #      'main' or other placeholders in profile contexts, so we must
-    #      win against parts[1] below).
-    #   3. HERMES_PROFILE env var (rarely set in practice)
-    #   4. session_key parts[1]
-    #   5. 'default'
-    agent = str(_CONFIG.get("agent") or "").strip().lower()
-    if not agent:
-        home = os.environ.get("HERMES_HOME", "").rstrip("/")
-        if home:
-            parent_dir, name = os.path.split(home)
-            if os.path.basename(parent_dir) == "profiles" and name:
-                agent = name.strip().lower()
-    if not agent:
-        agent = os.environ.get("HERMES_PROFILE", "").strip().lower()
-
-    # Session key still parsed for platform regardless of how agent was
-    # resolved. Agent only filled in here if still empty.
-    parts = session_key.split(":")
-    if len(parts) >= 3 and parts[0] == "agent":
-        if not agent:
-            agent = parts[1].strip().lower()
-        platform = parts[2].strip().lower()
+    agent = _profile_agent_name()
+    platform = _platform_from_session_key(session_key)
 
     for key in ("platform", "source", "transport"):
         name = _platform_name(kwargs.get(key))
@@ -751,9 +861,12 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         message = _message_text_from_event(event)
         attachments = _attachments_from_event(event)
         agent, platform, scope = _agent_platform_from_context(event, kwargs)
-        _TURN_BY_SCOPE[scope] = _TURN_BY_SCOPE.get(scope, 0) + 1
+        _POLICY_TURN_BY_SCOPE[scope] = _POLICY_TURN_BY_SCOPE.get(scope, 0) + 1
         channel = scope
-        session_id = getattr(event, "session_id", None) or kwargs.get("session_id") or ""
+        session_id = _canonical_session_key(event, session_store, kwargs)
+        # Narrow sticky-residency key: session-scoped, opaque. Distinct from the
+        # coarse policy scope (agent:platform) used for telemetry/learned policy.
+        sticky_key = _sticky_key_for_session(str(session_id))
 
         lookback_turns = _predictor_lookback_turns()
         prior_messages = _lookback_prior_messages(str(session_id), lookback_turns)
@@ -767,8 +880,8 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         known = _all_known_tool_names(preset)
         always_on_tools = list(preset.always_on) if isinstance(preset.always_on, list) else []
         trigger_tools = _trigger_tools_by_group(preset, prediction.triggers_fired)
-        _decay_sticky(scope)
-        sticky_tools, sticky_categories, sticky_remaining = _live_sticky(scope)
+        _decay_sticky(sticky_key)
+        sticky_tools, sticky_categories, sticky_remaining = _live_sticky(sticky_key)
         allowed_tool_names = prediction.allowed_tool_names
         if allowed_tool_names != WILDCARD_ALWAYS_ON and allowed_tool_names is not None:
             allowed_tool_names = sorted(set(allowed_tool_names) | set(sticky_tools))
@@ -791,6 +904,7 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             "agent": agent,
             "platform": platform,
             "scope": scope,
+            "sticky_key": sticky_key,
             "session_id": session_id,
             "message_hash": logger_io.hash_message(message),
             "message_preview": logger_io.message_preview(message),
@@ -819,6 +933,42 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
 
 # ─── Hook: post_tool_call ──────────────────────────────────────────────────
 
+def _recover_attribution_without_state(
+    session_id: Any,
+    kwargs: dict[str, Any],
+) -> tuple[str, str, str]:
+    """Best-effort ``(agent, platform, scope)`` for out-of-band tool calls.
+
+    Used when the contextvar has no per-turn state — typically background
+    tools fired outside a gateway-dispatched message loop. Resolution:
+
+      · Agent — from profile/config context only
+        (:func:`_profile_agent_name`). The canonical session key's
+        position 1 is always the literal ``"main"`` and must never be
+        used as the agent identity.
+      · Platform — from the passed ``session_id`` if it carries the
+        canonical shape, else from ``HERMES_SESSION_KEY`` in env, else
+        from kwargs hints (platform/source/transport).
+
+    Returns ``("", "", "")`` when either slot can't be filled with real
+    data — preserves blank attribution for legitimately untrackable rows
+    rather than synthesizing ``default:unknown``.
+    """
+    platform = _platform_from_session_key(session_id)
+    if not platform:
+        platform = _platform_from_session_key(os.environ.get("HERMES_SESSION_KEY") or "")
+    if not platform and kwargs:
+        for key in ("platform", "source", "transport"):
+            name = _platform_name(kwargs.get(key))
+            if name:
+                platform = name
+                break
+    agent = _profile_agent_name()
+    if agent and platform:
+        return agent, platform, f"{agent}:{platform}"
+    return "", "", ""
+
+
 def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **kwargs) -> None:
     if not _CONFIG["enabled"] or not _CONFIG.get("log", True):
         return None
@@ -832,10 +982,18 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
             cut_tools = set(state.get("cut_tools") or []) if state else set()
             expanded = set(state.get("expansions") or set()) if state else set()
             pending_expansion = dict(state.get("pending_expansion") or {}) if state else {}
+            if state:
+                attribution_agent = str(state.get("agent", ""))
+                attribution_platform = str(state.get("platform", ""))
+                attribution_scope = str(state.get("scope", ""))
+            else:
+                attribution_agent, attribution_platform, attribution_scope = (
+                    _recover_attribution_without_state(session_id, kwargs)
+                )
             extra = {
-                "agent": str(state.get("agent", "")) if state else "",
-                "platform": str(state.get("platform", "")) if state else "",
-                "scope": str(state.get("scope", "")) if state else "",
+                "agent": attribution_agent,
+                "platform": attribution_platform,
+                "scope": attribution_scope,
                 "was_initially_available": tool in initial_allowed,
                 "was_cut": tool in cut_tools,
                 "was_expanded": tool in expanded,
@@ -850,7 +1008,11 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                     extra["expand_resolved_tools"] = pending_expansion.get("resolved_tools", [])
                     extra["expand_tools_added"] = pending_expansion.get("tools_added", [])
                 if not expand_use and state:
-                    expand_use = _sticky_expansion_for_tool(str(state.get("scope", "")), tool)
+                    expand_use = _sticky_expansion_for_tool(
+                        str(state.get("sticky_key", "")),
+                        str(state.get("scope", "")),
+                        tool,
+                    )
                 if expand_use:
                     extra["expand_tools_used"] = True
                     extra["expanded_tool"] = expand_use.get("expanded_tool", tool)
@@ -884,17 +1046,49 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
 # ─── Hook: on_session_end ──────────────────────────────────────────────────
 
 def _on_session_end(session_id=None, **kwargs) -> None:
-    """Reset the prediction context. The contextvar is task-scoped so it
-    auto-cleans, but we explicitly clear here to keep state hygiene clean
-    if the same task processes another message."""
+    """Clear all per-session state when a session ends.
+
+    The contextvar is task-scoped so it auto-cleans, but we explicitly
+    clear here to keep state hygiene clean if the same task processes
+    another message. Sticky residency and lookback history are keyed by
+    session so they must be evicted here to prevent cross-session bleed.
+
+    Hermes invokes this hook with ``session_id`` set to the AIAgent's
+    uuid/timestamp identifier — NOT the canonical gateway session key
+    that pre_gateway_dispatch uses to index our per-session state. We
+    therefore prefer the canonical key, which is still discoverable
+    in-process via either a ``session_key`` kwarg (if Hermes ever passes
+    one) or the ``HERMES_SESSION_KEY`` env var the gateway sets for the
+    active dispatch. We evict under both shapes so legacy rows written
+    under the uuid form (pre-fix) also get cleaned up.
+    """
     if not _CONFIG["enabled"]:
         return None
     try:
         _PREDICTION_CV.set(None)
     except Exception:
         pass
+
+    eviction_ids: list[str] = []
+    canonical_key = ""
+    if isinstance(kwargs.get("session_key"), str) and kwargs["session_key"]:
+        canonical_key = str(kwargs["session_key"])
+    if not canonical_key:
+        env_key = os.environ.get("HERMES_SESSION_KEY") or ""
+        if env_key:
+            canonical_key = env_key
+    if canonical_key:
+        eviction_ids.append(canonical_key)
     if session_id:
-        _PRIOR_MESSAGES_BY_SESSION.pop(str(session_id), None)
+        sid = str(session_id)
+        if sid and sid not in eviction_ids:
+            eviction_ids.append(sid)
+
+    for sid in eviction_ids:
+        sticky_key = _sticky_key_for_session(sid)
+        if sticky_key:
+            _STICKY_BY_KEY.pop(sticky_key, None)
+        _PRIOR_MESSAGES_BY_SESSION.pop(sid, None)
     return None
 
 

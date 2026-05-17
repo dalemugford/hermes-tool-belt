@@ -383,24 +383,34 @@ def _ngrams(tokens: list[str], n: int) -> list[str]:
     return [" ".join(tokens[i : i + n]) for i in range(len(tokens) - n + 1)]
 
 
-def _load_preset_excludes(plugin_dir: Path) -> dict[str, list[re.Pattern[str]]]:
+def _load_preset_excludes(
+    plugin_dir: Path,
+) -> tuple[dict[str, list[re.Pattern[str]]], str]:
     """Load compiled exclude_keywords per trigger group from policy.yaml.
 
-    Used to filter out dampener candidates that an existing pattern already
-    vetoes — no point suggesting something already covered. Returns
-    ``{trigger_name: [compiled_pattern, ...]}``. Missing file → empty dict.
+    Returns ``(excludes_by_trigger, status)`` where ``status`` is one of:
+
+      ``"ok"``           — policy.yaml parsed and excludes compiled
+      ``"no_yaml"``      — PyYAML not importable in this Python runtime
+      ``"no_policy"``    — policy.yaml file missing under ``plugin_dir``
+      ``"parse_error"``  — YAML present but failed to parse
+
+    The status lets the caller surface a clear degraded-mode message
+    instead of silently reporting "existing_exclude_keyword_count: 0",
+    which previously made an empty result look like a real policy state
+    on a runtime that simply lacked PyYAML.
     """
     try:
         import yaml  # type: ignore[import-untyped]
     except Exception:
-        return {}
+        return {}, "no_yaml"
     path = plugin_dir / "policy.yaml"
     if not path.exists():
-        return {}
+        return {}, "no_policy"
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
-        return {}
+        return {}, "parse_error"
     out: dict[str, list[re.Pattern[str]]] = {}
     for entry in data.get("triggers", []) or []:
         if not isinstance(entry, dict):
@@ -417,7 +427,26 @@ def _load_preset_excludes(plugin_dir: Path) -> dict[str, list[re.Pattern[str]]]:
                 continue
         if name and patterns:
             out[name] = patterns
-    return out
+    return out, "ok"
+
+
+_EXCLUDES_STATUS_MESSAGE = {
+    "no_yaml": (
+        "PyYAML is not installed in this Python runtime — policy.yaml "
+        "exclude_keywords are NOT being applied to dampener candidates. "
+        "Counts shown as 'existing_exclude_keyword_count: 0' reflect the "
+        "missing loader, not an empty policy. Install pyyaml or run the "
+        "analyzer under the Hermes venv to restore filtering."
+    ),
+    "no_policy": (
+        "policy.yaml not found alongside analyze.py — dampener candidates "
+        "will not be deduplicated against existing exclude_keywords."
+    ),
+    "parse_error": (
+        "policy.yaml failed to parse — dampener candidates will not be "
+        "deduplicated against existing exclude_keywords this run."
+    ),
+}
 
 
 def _is_already_covered(ngram: str, existing_patterns: list[re.Pattern[str]]) -> bool:
@@ -614,7 +643,12 @@ def dampener_candidates(stats: dict[str, ScopeStats], args: argparse.Namespace) 
     if not getattr(args, "suggest_dampeners", False):
         return []
     plugin_dir = Path(__file__).resolve().parent
-    existing_by_trigger = _load_preset_excludes(plugin_dir)
+    existing_by_trigger, excludes_status = _load_preset_excludes(plugin_dir)
+    if excludes_status != "ok":
+        warning = _EXCLUDES_STATUS_MESSAGE.get(
+            excludes_status, f"preset excludes unavailable: {excludes_status}"
+        )
+        print(f"warning: dynamic-tools analyzer: {warning}", file=sys.stderr)
     rows: list[dict[str, Any]] = []
     for scope, stat in stats.items():
         for trigger, fp_previews in stat.trigger_fp_previews.items():
@@ -640,6 +674,7 @@ def dampener_candidates(stats: dict[str, ScopeStats], args: argparse.Namespace) 
                 "fp_previews_mined": len(fp_previews),
                 "tp_previews_mined": len(tp_previews),
                 "existing_exclude_keyword_count": len(existing),
+                "preset_excludes_status": excludes_status,
                 "candidates": candidates,
             })
     return rows
@@ -1080,12 +1115,23 @@ def markdown_report(
             "called. Review and paste high-precision candidates into the "
             "preset's `exclude_keywords` list."
         )
+        statuses = {row.get("preset_excludes_status", "ok") for row in dampeners}
+        degraded = sorted(s for s in statuses if s and s != "ok")
+        if degraded:
+            for status in degraded:
+                note = _EXCLUDES_STATUS_MESSAGE.get(
+                    status, f"preset excludes unavailable: {status}"
+                )
+                lines.append("")
+                lines.append(f"> ⚠ Degraded mode (`{status}`): {note}")
         lines.append("")
         for row in dampeners:
+            status = row.get("preset_excludes_status", "ok")
+            status_suffix = "" if status == "ok" else f", excludes_status={status}"
             lines.append(
                 f"### {row['scope']} / `{row['trigger']}` "
                 f"(FP={row['fp_previews_mined']}, TP={row['tp_previews_mined']}, "
-                f"existing excludes={row['existing_exclude_keyword_count']})"
+                f"existing excludes={row['existing_exclude_keyword_count']}{status_suffix})"
             )
             lines.append("")
             for cand in row.get("candidates", []):

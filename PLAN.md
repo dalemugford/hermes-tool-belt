@@ -29,7 +29,7 @@
 The plugin now manipulates tools through:
 1. **Static preset YAML** (`presets/aggressive.yaml`) — hard-coded always_on and triggers
 2. **Manual config overrides** (`always_on_extra`, `always_off`) — requires editing config.yaml
-3. **Temporary sticky** (`_STICKY_BY_SCOPE`) — in-memory only, TTL-based, resets every session
+3. **Temporary sticky** (`_STICKY_BY_KEY`) — in-memory only, TTL-based, session-scoped, resets on session end
 4. **Learned state** (`learned.json`) — persistent per-scope overlays, applied only when `learned_mode` permits it
 5. **Analyzer recommendations** (`analyze.py`) — deterministic telemetry pass that emits markdown reports and optional `learned_recommendations.json`
 

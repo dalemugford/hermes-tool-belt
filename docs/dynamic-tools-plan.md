@@ -1,0 +1,140 @@
+# Dynamic Tool Loading — Plan & Categorization
+
+A Hermes plugin that narrows the set of tool definitions sent to the model on each gateway message based on detected intent, while strictly respecting the user's existing per-platform `platform_toolsets` config as a hard ceiling.
+
+Companion docs:
+- [context-injection.md](context-injection.md) — full prompt-build architecture
+- [prompt-compressor-plan.md](prompt-compressor-plan.md) — abandoned predecessor; lessons-learned
+
+## Goal
+
+**Stop paying token cost for tools the model wasn't going to use this turn.** Bias toward "off until proven needed." Imperceptible in daily use — savings come from tools that wouldn't have fired anyway. Bigger savings unlocks the budget for context-stuffing improvements (auto-briefing, recall) downstream.
+
+## Architecture (one-paragraph recap)
+
+A plugin registers a `pre_gateway_dispatch` hook and an always-on `expand_tools` meta-tool. The hook reads the inbound message, runs Pass A (deterministic regex/keyword classifier with lightweight dampeners for high-risk triggers), and stashes the result in a `contextvars.ContextVar`. A monkey-patch on `AIAgent._build_api_kwargs` ([hermes-agent/run_agent.py:8126](../hermes-agent/run_agent.py)) reads the contextvar and filters `kwargs["tools"]` per API call (not per agent lifetime — Hermes caches AIAgent instances per session for up to 1h, so per-call narrowing is the correct layer). If no prediction is set (CLI / cron paths / subagents), it passes through unchanged. The model sees only the narrowed list. If it tries to use a missing tool, it can call `expand_tools(category="…")` to widen the contextvar's expansion set; the next API call within the same turn ships with those tools added.
+
+The full patch surface is documented separately at [dynamic-tools-hermes-surface.md](dynamic-tools-hermes-surface.md) — read this before any Hermes upgrade.
+
+## Layering rules — the plugin works *within* the user's ceiling
+
+```
+1. _get_platform_tools(config, channel)              # user's declared ceiling
+        ↓
+2. predicted = predictor(message_text, attachments)  # always_on + triggered groups
+        ↓
+3. final = (always_on ∪ predicted) ∩ user_ceiling    # never re-enables what user disabled
+```
+
+Practical consequence: Spotify off Telegram in your config → never considered, no work done. The plugin only narrows. It cannot override user intent.
+
+Tools in the user's ceiling that aren't mentioned anywhere in our preset are treated as **always-on** by default (safe fallback for unknown plugin tools) — see "Open questions" below if we want to flip this.
+
+## Cost-aware categorization
+
+Token costs are from a real Bernard session ([sessions/20260505_220853_0846494c.jsonl](../sessions/)) — each tool's cost as part of the API request payload (description + parameter schema + JSON wrapper).
+
+### Always-on candidates — universal AND cheap
+
+| Tool | Cost (tok) | Why always-on |
+|---|---:|---|
+| `memory` | 506 | Implicit recall is needed for nearly any message |
+| `session_search` | 523 | "you saved a file yesterday" — no keyword signal possible |
+| `clarify` | 313 | Any ambiguous request can resolve via clarification |
+| `skill_view` | 216 | Skills load on demand from any topic |
+| `skills_list` | ~80 | Meta — discovering what skills exist |
+| `todo` | 337 | Planning meta-tool, used in any multi-step work |
+| `web_search` | 202 | Reached for constantly, hard to predict |
+| `read_file` | 240 | Reading is implicit — "show me…", "what's in…" |
+| `search_files` | 446 | Search by name/content is reached for in any code context |
+| `process` | 329 | Polls background work — needed even when `terminal` is gated |
+| `send_message` | 380 | Gateway-essential cross-platform messaging |
+| `expand_tools` (new) | ~80 | Always present — model's recourse when a tool was gated |
+
+**Always-on subtotal: ~3,650 tok** (vs. current ~12,500 tok)
+
+### Triggerable — universal but expensive, OR clearly single-purpose
+
+| Tool | Cost | Trigger group | Notes |
+|---|---:|---|---|
+| `terminal` | 1,128 | shell | Cost makes it triggerable even though widely used |
+| `delegate_task` | 1,555 | delegation | Your point: planning sessions don't need it; load when "in parallel"/"big task" signals appear |
+| `execute_code` | 689 | code_execution | Loops and batch processing only |
+| `skill_manage` | 715 | skills_authoring | Authoring is explicit ("save this as a skill") |
+| `write_file` | ~250 | file_write | Cheap, but pairs with patch — load together on write intent |
+| `patch` | 378 | file_write | Same — only relevant when modifying |
+| `web_extract` | ~370 | web_extract | URL/scrape signal |
+| `vision_analyze` | 207 | vision | Has-attachment signal beats keywords |
+| `image_generate` | 203 | image_gen | "draw…", "generate an image of…" |
+| `text_to_speech` | ~310 | tts | "read aloud", "say this" |
+| `cronjob` | 1,227 | cronjob | "schedule…", "every day at…", "remind me to…" |
+| `browser_*` (12 tools) | ~1,800 | browser | "navigate to", "fill out", "click on" |
+
+**Trigger group ceiling: ~9,000 tok**, of which a typical message will fire 0–2 groups.
+
+### Channel-scoped — handled by Hermes' existing `platform_toolsets`
+
+`discord_*`, `discord_admin`, `feishu_*`, `spotify_*`, `yb_*`, `ha_*` are already gated by the user's per-platform config and `_DEFAULT_OFF_TOOLSETS`. The plugin doesn't need to think about these — they're either in the user's ceiling for this channel or not.
+
+## The three preset modes
+
+Three named curations of the always-on / trigger split. Switching modes is a single config flip.
+
+| Preset | Always-on | Trigger gating | When to use |
+|---|---|---|---|
+| **aggressive** | The 12 always-on candidates above | Everything else gated | Default for messaging channels (Telegram, Slack, etc.) where most messages are short and conversational |
+| **balanced** | Aggressive + `write_file`, `patch`, `terminal`, `process`, `web_extract` | Heavy/specialized tools still gated (`delegate_task`, `execute_code`, `cronjob`, `browser_*`, `image_generate`, `text_to_speech`, `vision_analyze`, `skill_manage`) | CLI sessions doing real work where shell + file edits are common |
+| **conservative** | Everything in user's `platform_toolsets` | None gated | Effectively off — kill switch / fallback |
+
+Per-channel override is supported — see preset YAML schema.
+
+Per-message expected savings:
+
+| Preset | Always-on baseline | Worst case (every trigger fires) | Typical message |
+|---|---:|---:|---:|
+| aggressive | ~3,650 tok | ~12,500 tok (back to current) | ~4,500 tok (1–2 triggers) — **~8,000 tok saved** |
+| balanced | ~5,500 tok | ~12,500 tok | ~6,500 tok (1–2 triggers) — **~6,000 tok saved** |
+| conservative | ~12,500 tok | ~12,500 tok | ~12,500 tok — 0 saved |
+
+## The trigger taxonomy
+
+See the preset YAML files for exact patterns. The summary:
+
+| Trigger group | Tools loaded | Primary signal | Sample messages |
+|---|---|---|---|
+| `file_write` | write_file, patch | action verb near write/edit/create intent, explicit path/filename; dampen planning/meta talk | "edit the README", "patch the config", "save notes to docs/foo.md" |
+| `shell` | terminal | "run/install/execute/shell/brew/npm/pip/git/build/deploy" | "run the tests", "git status", "npm install" |
+| `code_execution` | execute_code | "for each/loop/process all/filter/aggregate/run a script/N pages" | "fetch all 50 pages and summarize", "loop over the files" |
+| `delegation` | delegate_task | explicit "delegate/subagent/spawn/Claude Code" action; dampen conceptual delegation talk | "delegate this to Claude Code", "spin up a worker to review this" |
+| `skills_authoring` | skill_manage | "save as a skill/capture this/new skill/update the skill" | "save this as a skill", "make a skill that does X" |
+| `web_extract` | web_extract | URL pattern, "scrape/fetch from/extract/content of" | "scrape this page", "extract from https://..." |
+| `vision` | vision_analyze | Image attachment present (signal beats keywords) | (an image attached) "what's this?", "explain this screenshot" |
+| `image_gen` | image_generate | "draw/generate (image\|picture)/create (image\|picture)/illustration/paint" | "draw a cat", "generate an image of…" |
+| `tts` | text_to_speech | "read aloud/say this/speak this/TTS" | "read this aloud", "say it out loud" |
+| `browser` | browser_* (12 tools) | "browse to/navigate to/fill out/click on/browser automation" | "navigate to the page and click submit" |
+| `cronjob` | cronjob | scheduling action plus time/frequency; dampen habits/explanations | "remind me every weekday at 9am", "schedule a weekly report" |
+
+## Open questions for review
+
+1. **`always_on` for unknown tools.** When a plugin registers a tool we don't know about, default to always-on (safe) or off-unless-triggered (aggressive)? Currently leaning safe-default. Consequence: a plugin shipping a heavy tool stays on until we explicitly categorize it.
+
+2. **Subagent toolsets.** When `delegate_task` spawns a subagent, the subagent inherits a toolset. Should the plugin narrow subagents too, or assume the parent already chose for them? **Currently planning: do not narrow subagents.** Subagent calls are short-lived and the parent already curated.
+
+3. **Cron jobs.** Cron sessions get explicit per-job toolsets via `_resolve_cron_enabled_toolsets` ([cron/scheduler.py:44](../hermes-agent/cron/scheduler.py)). Should the plugin narrow cron toolsets based on the cron task message? **Currently planning: no — cron jobs are pre-curated.** The narrowing only applies to interactive gateway messages.
+
+4. **Sticky tools across multi-turn sessions.** If turn 1 triggered `delegate_task`, should it stay loaded for turn 2 even without a fresh trigger? In gateway mode each user message is a fresh `AIAgent`, so this would require cross-message state. **Currently planning: no stickiness.** Keep it stateless until we have data.
+
+5. **Trigger dampeners before classifiers.** Live data does not justify Pass B or a full scoring framework yet. Current plan: add `exclude_keywords` dampeners and tighter action-shaped regexes for `file_write`, `delegation`, and `cronjob`; add near-miss telemetry if needed.
+
+6. **`expand_tools` granularity.** One enum-typed tool that takes a category name, or a small set of category-specific tools (`load_browser_tools`, `load_codegen_tools`, etc.)? Single tool is cheaper at the schema level (~80 tok vs ~500 tok for a family). **Leaning: single tool.**
+
+7. **CLI sessions.** No `pre_gateway_dispatch` hook exists for CLI. Plugin defaults CLI to `conservative` (no narrowing). Is that acceptable, or do we want CLI hooked too?
+
+## Plugin location
+
+After the categorization audit, the plugin and its preset YAMLs live at:
+
+- `~/.hermes/plugins/dynamic-tools/__init__.py`
+- `~/.hermes/plugins/dynamic-tools/presets/aggressive.yaml`
+- `~/.hermes/plugins/dynamic-tools/presets/balanced.yaml`
+- `~/.hermes/plugins/dynamic-tools/presets/conservative.yaml`

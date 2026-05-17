@@ -16,8 +16,8 @@ Companion docs:
 - [CALIBRATION-PLAN.md](CALIBRATION-PLAN.md) — design for the observe → handoff → steady-state flow that makes "install, activate, done" honest (deferred)
 - [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md) — the writer-side script that closes the loop (deferred; depends on telemetry-correctness audit)
 - [TRIGGER-SCORING-PLAN.md](TRIGGER-SCORING-PLAN.md) — historical full-scoring plan; current direction is the lighter `exclude_keywords` dampener slice
-- [../../docs/context-injection.md](../../docs/context-injection.md) — full prompt-build architecture
-- [../../docs/dynamic-tools-plan.md](../../docs/dynamic-tools-plan.md) — original design doc and categorization audit
+- [docs/dynamic-tools-hermes-surface.md](docs/dynamic-tools-hermes-surface.md) — patch-point reference; read before any Hermes upgrade
+- [docs/dynamic-tools-plan.md](docs/dynamic-tools-plan.md) — original design doc and categorization audit
 
 ## Quick start
 
@@ -100,9 +100,9 @@ plugins:
    (`expand_tools(category="browser")`) when it needs something gated. The
    handler appends the category to the contextvar's `expansions` set; the
    next `_build_api_kwargs` call unions the resolved tools into the allowed
-   set. Expansions also refresh in-memory **sticky residency** for the scope
-   so a category stays available for `ttl_turns` further turns without
-   re-expanding.
+   set. Expansions also refresh in-memory **sticky residency** for the active
+   session via a private sticky key, so a category stays available for
+   `ttl_turns` further turns without re-expanding.
 
 4. **`post_tool_call` hook** logs every actual tool call alongside the
    prediction id — including whether the tool came from the initial allowed
@@ -123,7 +123,7 @@ plugins:
     always_on_extra: []
     always_off: []
 
-    # Sticky residency (in-memory only, per scope)
+    # Sticky residency (in-memory only, per active session)
     sticky:
       enabled: true
       ttl_turns: 3

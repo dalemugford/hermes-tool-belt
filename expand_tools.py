@@ -141,7 +141,12 @@ def _handle_inner(args: dict, kwargs: dict, prediction_cv, sticky_refresh_fn=Non
     sticky_event = None
     if sticky_refresh_fn is not None:
         try:
-            sticky_event = sticky_refresh_fn(str(state.get("scope", "")), category, resolved)
+            sticky_event = sticky_refresh_fn(
+                str(state.get("sticky_key", "")),
+                category,
+                resolved,
+                policy_scope=str(state.get("scope", "")),
+            )
             expand_event["sticky"] = sticky_event
             if isinstance(sticky_event, dict) and sticky_event.get("refreshed"):
                 state["sticky_tools"] = sticky_event.get("sticky_tools", [])

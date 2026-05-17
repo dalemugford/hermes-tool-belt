@@ -13,9 +13,23 @@ description: >
 # NOT named under any trigger below is considered "unknown" and kept on
 # (safe fallback for plugin-provided tools).
 always_on:
-  # Implicit recall — needed for any message that references prior state
-  - memory
+  # Implicit recall — needed for any message that references prior state.
+  # `memory` (legacy builtin) is deprecated and disabled at toolset level
+  # (config.yaml: agent.disabled_toolsets) — Mnemosyne replaces it.
   - session_search
+
+  # Mnemosyne — all 7 tools always-on during evaluation period (2026-05-16+).
+  # We need to measure whether the agent reaches for them organically;
+  # gating them defeats that. Costs ~7×388 ≈ 2700 tok/turn — significant.
+  # REVISIT 2026-06-01: run analyzer per-category metrics; gate the
+  # cold tools (likely _triple_add/_triple_query/_invalidate/_stats).
+  - mnemosyne_remember
+  - mnemosyne_recall
+  - mnemosyne_sleep
+  - mnemosyne_stats
+  - mnemosyne_invalidate
+  - mnemosyne_triple_add
+  - mnemosyne_triple_query
 
   # Meta tools — discovery, planning, asking for help
   - clarify
