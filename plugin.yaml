@@ -1,5 +1,5 @@
 name: dynamic-tools
-version: 0.1.0
+version: 2026.5.17-beta
 description: Narrow the tool definitions sent to the model on each gateway message based on detected intent. Respects the user's existing platform_toolsets ceiling. Falls back to no-narrowing on any failure.
 author: Dale Mugford
 provides_tools:
