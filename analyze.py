@@ -1422,9 +1422,10 @@ def markdown_report(
     recs: list[dict[str, Any]],
     args: argparse.Namespace,
     dampeners: list[dict[str, Any]] | None = None,
+    trigger_keywords: list[dict[str, Any]] | None = None,
 ) -> str:
     generated = time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime())
-    payload = summary_payload(stats, recs, args, dampeners)
+    payload = summary_payload(stats, recs, args, dampeners, trigger_keywords)
     totals = payload["totals"]
 
     lines = [
@@ -1594,6 +1595,57 @@ def markdown_report(
             "for more telemetry to accumulate.",
         ])
 
+    # ─── Harvest-driven sections (only present when harvest data is loaded) ───
+    harvest_recs = [r for r in (recs or []) if r.get("kind") == "harvest_tool_promotion"]
+    if harvest_recs:
+        lines.extend(["", "## Harvest-Driven Per-Tool Promotion Candidates", ""])
+        lines.append(
+            "Derived from `policy_source: harvest` rows where the historical "
+            "model called a tool that current narrowing would have cut. Each "
+            "such call is a counterfactual `expand_tools` round-trip. Action "
+            "values: `promote_always_on` (net token savings positive), "
+            "`broaden_trigger_recall` (frequent demand but per-tool carry "
+            "would lose net — fix the trigger instead), `keep_gated` (sparse)."
+        )
+        lines.append("")
+        for r in harvest_recs:
+            m = r["metrics"]
+            lines.append(
+                f"### {r['scope']} / `{r['item']}` — **{r['action']}** "
+                f"(cuts={m['harvest_was_cut']}, cut_rate={m['cut_rate']:.1%}, "
+                f"net={m['net_savings_tokens']:+,} tok)"
+            )
+            lines.append("")
+            lines.append(f"- {r['reason']}")
+            lines.append("")
+
+    if trigger_keywords:
+        lines.extend(["", "## Suggested Trigger-Keyword Candidates", ""])
+        lines.append(
+            "Mined from harvest messages where the model called a tool that "
+            "would have been cut by current narrowing. Symmetric inverse of "
+            "the dampener flow — these add coverage, dampeners remove false "
+            "fires. Review high-precision candidates before pasting into "
+            "the target trigger group's `keywords` list."
+        )
+        lines.append("")
+        for row in trigger_keywords:
+            lines.append(
+                f"### {row['scope']} / `{row['tool']}` → **{row['action']}** "
+                f"`{row['target_trigger']}` (cuts={row['cut_count']}, "
+                f"existing patterns={row['existing_keyword_pattern_count']})"
+            )
+            lines.append("")
+            for cand in row.get("candidates", []):
+                lines.append(
+                    f"- pattern `{cand['pattern']}` → regex `{cand['suggested_regex']}`  "
+                    f"(precision {cand['precision']:.2f}, "
+                    f"cut={cand['cut_count']}, noise={cand['noise_count']})"
+                )
+                for sample in cand.get("sample_previews", []):
+                    lines.append(f"    - {sample}")
+                lines.append("")
+
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -1702,7 +1754,10 @@ def main() -> int:
         stamp = time.strftime("%Y-%m-%d-%H%M%S", time.gmtime())
         report_path = reports_dir / f"{stamp}-analysis.md"
         reports_dir.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(markdown_report(stats, recs, args, dampeners), encoding="utf-8")
+        report_path.write_text(
+            markdown_report(stats, recs, args, dampeners, trigger_keywords),
+            encoding="utf-8",
+        )
         print(f"report: {report_path}", file=status_stream)
 
     return 0
