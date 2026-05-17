@@ -400,5 +400,245 @@ class AnalyzerExcludesDegradedModeTests(unittest.TestCase):
         self.assertEqual(rows[0]["preset_excludes_status"], "no_yaml")
 
 
+class TriggerFpLateBoundTpTests(unittest.TestCase):
+    """The analyzer must credit a trigger as TP when the matching tool
+    is called within a few turns of the trigger firing in the same
+    session — sticky residency carries expansions across turns, so a
+    "fired here, used three turns later" pattern is correct prediction,
+    not a false positive.
+
+    When ``session_id`` is blank (pre-fix telemetry), the analyzer must
+    fall back to same-prediction behavior to avoid cross-session leakage.
+    """
+
+    def _row_prediction(self, *, pid, sid, trigger, tools_for_trigger, ts):
+        return {
+            "ts": ts,
+            "prediction_id": pid,
+            "session_id": sid,
+            "scope": "bernard:telegram",
+            "agent": "bernard",
+            "platform": "telegram",
+            "policy_source": "preset",
+            "message_preview": f"msg-{pid}",
+            "triggers_fired": [trigger] if trigger else [],
+            "trigger_tools_by_group": {trigger: tools_for_trigger} if trigger else {},
+            "tokens_saved": 0,
+            "ceiling_tokens": 0,
+            "narrowed_tokens": 0,
+            "always_on_tools": [],
+            "cut_tools": [],
+        }
+
+    def _row_call(self, *, pid, tool):
+        return {"prediction_id": pid, "tool_name": tool}
+
+    def test_late_bound_call_within_session_window_counts_as_tp(self):
+        preds = [
+            self._row_prediction(pid="p1", sid="s1", trigger="shell",
+                                 tools_for_trigger=["terminal"], ts=1.0),
+            self._row_prediction(pid="p2", sid="s1", trigger=None,
+                                 tools_for_trigger=[], ts=2.0),
+        ]
+        calls = [self._row_call(pid="p2", tool="terminal")]
+        stats = analyze.collect_stats(preds, calls)
+        scope = stats["bernard:telegram"]
+        self.assertEqual(scope.trigger_hits["shell"], 1,
+            "tool called in next prediction (within window) must count as TP")
+        self.assertEqual(scope.trigger_false_positives.get("shell", 0), 0)
+
+    def test_call_beyond_window_counts_as_fp(self):
+        preds = [
+            self._row_prediction(pid="p1", sid="s1", trigger="shell",
+                                 tools_for_trigger=["terminal"], ts=1.0),
+            self._row_prediction(pid="p2", sid="s1", trigger=None,
+                                 tools_for_trigger=[], ts=2.0),
+            self._row_prediction(pid="p3", sid="s1", trigger=None,
+                                 tools_for_trigger=[], ts=3.0),
+            self._row_prediction(pid="p4", sid="s1", trigger=None,
+                                 tools_for_trigger=[], ts=4.0),
+            self._row_prediction(pid="p5", sid="s1", trigger=None,
+                                 tools_for_trigger=[], ts=5.0),
+        ]
+        # Window is 3 — p5 is 4 turns out, beyond the window.
+        calls = [self._row_call(pid="p5", tool="terminal")]
+        stats = analyze.collect_stats(preds, calls)
+        scope = stats["bernard:telegram"]
+        self.assertEqual(scope.trigger_false_positives.get("shell", 0), 1,
+            "tool called beyond window must remain FP")
+
+    def test_cross_session_call_does_not_leak(self):
+        preds = [
+            self._row_prediction(pid="p1", sid="s1", trigger="shell",
+                                 tools_for_trigger=["terminal"], ts=1.0),
+            # Different session — even if chronologically adjacent, must
+            # not credit s1's trigger.
+            self._row_prediction(pid="p2", sid="s2", trigger=None,
+                                 tools_for_trigger=[], ts=2.0),
+        ]
+        calls = [self._row_call(pid="p2", tool="terminal")]
+        stats = analyze.collect_stats(preds, calls)
+        scope = stats["bernard:telegram"]
+        self.assertEqual(scope.trigger_false_positives.get("shell", 0), 1,
+            "different-session tool call must not satisfy the trigger")
+
+    def test_blank_session_falls_back_to_same_prediction(self):
+        # Historical telemetry with blank session_id — analyzer must
+        # not synthesize a session and must not look ahead across
+        # adjacent rows (would cross-contaminate).
+        preds = [
+            self._row_prediction(pid="p1", sid="", trigger="shell",
+                                 tools_for_trigger=["terminal"], ts=1.0),
+            self._row_prediction(pid="p2", sid="", trigger=None,
+                                 tools_for_trigger=[], ts=2.0),
+        ]
+        calls = [self._row_call(pid="p2", tool="terminal")]
+        stats = analyze.collect_stats(preds, calls)
+        scope = stats["bernard:telegram"]
+        self.assertEqual(scope.trigger_false_positives.get("shell", 0), 1,
+            "blank session_id must fall back to same-prediction classification")
+
+
+class ExpandToolsUsedAttributionTests(unittest.TestCase):
+    """The ``expand_tools_used`` flag must only fire when expansion
+    actually provided the tool — not when the model happens to call a
+    tool that was already in the initial allowed set and is also
+    coincidentally covered by an active sticky entry.
+
+    The bug this guards against: live telemetry showed 94% of
+    ``expand_tools_used`` flags coinciding with ``was_initially_available
+    == True``, inflating analyzer promotion signal ~15×.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.profile_home = _make_profile_dir(self.tmp.name, "bernard")
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {"HERMES_HOME": self.profile_home, "HERMES_SESSION_KEY": ""},
+            clear=False,
+        )
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
+
+        self._original_config = dict(plugin._CONFIG)
+        plugin._CONFIG["enabled"] = True
+        plugin._CONFIG["log"] = True
+        plugin._CONFIG["agent"] = "bernard"
+        self.addCleanup(self._restore_config)
+
+        # Clear the sticky table so prior tests' state can't leak in.
+        plugin._STICKY_BY_KEY.clear()
+        plugin._POLICY_TURN_BY_SCOPE.clear()
+        plugin._PREDICTION_CV.set(None)
+
+    def _restore_config(self) -> None:
+        plugin._CONFIG.clear()
+        plugin._CONFIG.update(self._original_config)
+        plugin._STICKY_BY_KEY.clear()
+        plugin._POLICY_TURN_BY_SCOPE.clear()
+
+    def _seed_sticky(self, sticky_key: str, category: str, tools: list[str]) -> None:
+        """Insert a live sticky entry by hand so the test doesn't depend
+        on running a full expand_tools round-trip."""
+        plugin._STICKY_BY_KEY[sticky_key] = {
+            category: {
+                "tools": {str(t) for t in tools},
+                "remaining_turns": 3,
+                "updated_at": 0.0,
+                "expanded_at_turn": 0,
+                "prediction_id": "pred-prior",
+            }
+        }
+
+    def _set_prediction_state(self, *, initial_allowed: list[str], sticky_key: str) -> None:
+        plugin._PREDICTION_CV.set({
+            "prediction_id": "pred-current",
+            "agent": "bernard",
+            "platform": "telegram",
+            "scope": "bernard:telegram",
+            "sticky_key": sticky_key,
+            "session_id": REAL_KEY_TELEGRAM,
+            "initial_allowed_tools": initial_allowed,
+            "cut_tools": [],
+            "expansions": set(),
+            "pending_expansion": None,
+            "ceiling_tools": list(initial_allowed),
+            "unknown_kept_tools": [],
+        })
+
+    def _latest_row(self) -> dict:
+        tool_calls_path = Path(self.profile_home) / "state" / "dynamic-tools" / "tool_calls.jsonl"
+        rows = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l]
+        self.assertTrue(rows, "expected at least one tool-call row")
+        return rows[-1]
+
+    def test_already_available_tool_does_not_credit_sticky_expansion(self):
+        # The bug case: terminal is already in the initial allowed set
+        # AND covered by an active sticky entry. The flag must NOT fire.
+        sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
+        self._seed_sticky(sticky_key, "terminal", ["terminal"])
+        self._set_prediction_state(initial_allowed=["terminal", "memory"], sticky_key=sticky_key)
+
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={}, result="ok", task_id="t1",
+            session_id=REAL_KEY_TELEGRAM,
+        )
+        row = self._latest_row()
+        self.assertTrue(row.get("was_initially_available"))
+        self.assertNotEqual(row.get("expand_tools_used"), True,
+            "tool already in initial allowed set must not be credited as expansion-driven")
+
+    def test_cut_tool_with_active_sticky_credits_expansion(self):
+        # The legitimate case: terminal was cut from the initial allowed
+        # set; sticky residency from a prior expansion is what made it
+        # callable. The flag must fire.
+        sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
+        self._seed_sticky(sticky_key, "terminal", ["terminal"])
+        self._set_prediction_state(initial_allowed=["memory"], sticky_key=sticky_key)
+        # Mark the tool as cut so was_cut reflects reality (the predictor
+        # would have set this when narrowing).
+        state = plugin._PREDICTION_CV.get()
+        state["cut_tools"] = ["terminal"]
+        plugin._PREDICTION_CV.set(state)
+
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={}, result="ok", task_id="t1",
+            session_id=REAL_KEY_TELEGRAM,
+        )
+        row = self._latest_row()
+        self.assertFalse(row.get("was_initially_available"))
+        self.assertTrue(row.get("expand_tools_used"),
+            "tool cut from initial allowed set but reachable via sticky must be credited")
+        self.assertEqual(row.get("expand_category"), "terminal")
+
+    def test_pending_expansion_skipped_when_already_available(self):
+        # Same-turn expansion (pending_expansion) for a tool that was
+        # already always-on: the round-trip happened but provided
+        # nothing. after_expand_tools still records the round-trip, but
+        # expand_tools_used must stay false.
+        sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
+        self._set_prediction_state(initial_allowed=["terminal"], sticky_key=sticky_key)
+        state = plugin._PREDICTION_CV.get()
+        state["pending_expansion"] = {
+            "category": "terminal",
+            "resolved_tools": ["terminal"],
+            "tools_added": [],
+        }
+        plugin._PREDICTION_CV.set(state)
+
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={}, result="ok", task_id="t1",
+            session_id=REAL_KEY_TELEGRAM,
+        )
+        row = self._latest_row()
+        self.assertTrue(row.get("was_initially_available"))
+        self.assertTrue(row.get("after_expand_tools"),
+            "round-trip happened — should still record after_expand_tools")
+        self.assertNotEqual(row.get("expand_tools_used"), True,
+            "round-trip provided nothing new — must not be credited as expansion-driven")
+
+
 if __name__ == "__main__":
     unittest.main()

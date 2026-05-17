@@ -1001,13 +1001,25 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
             if tool == "expand_tools":
                 extra["expand_event"] = pending_expansion
             else:
-                expand_use = _pending_expansion_for_tool(pending_expansion, tool)
+                # Only credit a tool call as "expansion-driven" when the
+                # tool was NOT already in the initial allowed set. A tool
+                # the model could have called regardless gives no signal
+                # about whether the expansion was useful — it would
+                # inflate analyzer promotion signal with noise.
+                # `after_expand_tools` and the round-trip metadata still
+                # record when an expansion happened, so analyzers can
+                # account for round-trip cost even when the eventual
+                # tool call wasn't expansion-driven.
+                already_available = tool in initial_allowed
+                expand_use: dict[str, Any] = {}
+                if not already_available:
+                    expand_use = _pending_expansion_for_tool(pending_expansion, tool)
                 if pending_expansion:
                     extra["after_expand_tools"] = True
                     extra["expand_category"] = pending_expansion.get("category", "")
                     extra["expand_resolved_tools"] = pending_expansion.get("resolved_tools", [])
                     extra["expand_tools_added"] = pending_expansion.get("tools_added", [])
-                if not expand_use and state:
+                if not expand_use and state and not already_available:
                     expand_use = _sticky_expansion_for_tool(
                         str(state.get("sticky_key", "")),
                         str(state.get("scope", "")),

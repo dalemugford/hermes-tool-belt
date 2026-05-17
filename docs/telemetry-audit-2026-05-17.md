@@ -1,0 +1,249 @@
+# Telemetry Correctness Audit — 2026-05-17
+
+**Status:** First pass complete. Two of six audit items required fixes
+(landed in this commit); two are blocked on post-restart data; two are
+clean.
+
+**Scope:** All six items from the prerequisite list at the top of
+[../AUTO-APPLY-PLAN.md](../AUTO-APPLY-PLAN.md). The auto-apply layer
+remains gated until items #3, #4, and the cross-window half of #6 clear
+in a follow-up audit after clean data accumulates.
+
+---
+
+## Telemetry snapshot at audit time
+
+| Source | Predictions | Tool calls | Window | Blank session_id |
+|---|---:|---:|---|---:|
+| `~/.hermes/state/dynamic-tools/` (Bernard) | 216 | 1585 | 2026-05-12 → 05-17 (5d) | 89% |
+| `~/.hermes/profiles/sue/state/dynamic-tools/` | 78 | 939 | 2026-05-12 → 05-17 (5d) | 95% |
+| **total** | **294** | **2524** | | **~91%** |
+
+Scopes observed: `bernard:telegram` (208), `bernard:slack` (8),
+`sue:slack` (78). No Sue:cron despite cron jobs running — confirms
+"cron sessions are not narrowed" limitation in the README.
+
+**Critical caveat:** the 91% blank-session-id rate means anything that
+depends on per-session attribution (bypass cohort, session-bounded
+lookahead, expansion-event chains across turns) is operating on a
+small sliver of the data. The just-committed canonical session-key
+fix should produce clean rows on the next gateway restart.
+
+---
+
+## Item #1 — `expand_tools_used` accounting
+
+**Finding: BUG. Fixed in writer and analyzer.**
+
+`_sticky_expansion_for_tool` credited every tool call within sticky TTL
+as expansion-driven, even when the tool was already in the initial
+allowed set. The model would have called the tool regardless — the
+expansion provided nothing, but the flag fired anyway.
+
+**Magnitude on Bernard's data:**
+
+| Category | Flagged (old) | Legitimate (corrected) | Spurious % |
+|---|---:|---:|---:|
+| terminal | 167 | 14 | 92% |
+| file | 50 | 0 | 100% |
+| browser | 2 | 0 | 100% |
+| **total** | **219** | **14** | **94%** |
+
+Real expansion success rate is **14 / 56 events = 25%**, not the
+impossible 391% the old metric implied (>100% is itself a smell — that
+should have been an existing assertion).
+
+**Implication:** all `learned_recommendations.json` entries written
+under the old logic are operating on noise. The current file at
+`~/.hermes/state/dynamic-tools/learned_recommendations.json` should
+be considered void and re-generated after the fix lands AND data
+accumulates with clean session_ids.
+
+**Fix:**
+- Writer ([__init__.py:1004-1019](../__init__.py)) — skip
+  `_pending_expansion_for_tool` / `_sticky_expansion_for_tool` when
+  the tool is already in `initial_allowed`. `after_expand_tools` still
+  records the round-trip happened, so cost accounting stays honest.
+- Reader ([analyze.py:307](../analyze.py)) — same condition applied at
+  read time so historical inflated rows don't pollute fresh runs of
+  the analyzer.
+
+**Tests:** `ExpandToolsUsedAttributionTests` in
+[tests/test_session_attribution.py](../tests/test_session_attribution.py).
+
+---
+
+## Item #2 — trigger false-positive classification (late-bound uses)
+
+**Finding: BUG. Fixed in analyzer.**
+
+The classifier marked a trigger as FP if no matching tool was called
+*within the same prediction*. Sticky residency carries an expansion
+across 2-3 turns, so the model often calls the tool one or two
+predictions later — correct prediction, late-bound action, but
+classified as FP.
+
+**Magnitude (Bernard, 3-turn lookahead, scope-ordered timeline as
+session proxy since session_ids are mostly blank):**
+
+| Trigger | Same-pred TP | Window TP | FPs recovered |
+|---|---:|---:|---:|
+| file_write | 6 | 11 | +5 (29% of "FPs" were late-bound TPs) |
+| shell | 13 | 18 | +5 (56% of "FPs" were late-bound TPs) |
+| other | 2 | 2 | 0 |
+| **total** | **21** | **31** | **+10 (32%)** |
+
+The scope-ordered timeline overstates by an unknown amount due to
+cross-session leakage — two adjacent conversations on the same scope
+could share tools spuriously. The real magnitude needs to be remeasured
+on post-restart data with populated session_ids; the bug is real
+either way.
+
+**Implication:** dampener candidates are mined from the FP set. With
+~32% of FPs being misclassified, dampener-mining quality is degraded
+in proportion. The current `bernard:telegram/file_write` candidates
+(`"memory md"`, `"can you"`) may or may not survive remining under
+the corrected classification.
+
+**Fix:** [analyze.py:326-372](../analyze.py) — session-bounded
+N-turn lookahead (N=3, matches `sticky_ttl_turns` default). Gracefully
+degrades to same-prediction behavior when `session_id` is blank, so
+historical rows aren't cross-contaminated by adjacent sessions.
+
+**Tests:** `TriggerFpLateBoundTpTests` in
+[tests/test_session_attribution.py](../tests/test_session_attribution.py).
+
+---
+
+## Item #3 — `session_id` coverage
+
+**Finding: FIX SHIPPED, validation BLOCKED on restart + accumulation.**
+
+91% of current rows have blank `session_id`. The just-committed
+canonical-session-key fix (commit `1f1b7e2`) addresses this at the
+writer level, but no post-fix data exists yet because the gateway
+hasn't restarted with the new code.
+
+**Action required:**
+1. Restart the gateway (`hermes gateway restart` or both profile
+   wrappers).
+2. Wait ≥7 days for organic traffic to accumulate.
+3. Re-run this audit, asserting `session_id` is populated on ≥95% of
+   new rows.
+
+Until then, any analyzer output that depends on per-session attribution
+should be considered approximate. The dampener-mining and cohort
+analyses above are gated by this.
+
+---
+
+## Item #4 — cohort populations (bypass cohort)
+
+**Finding: BLOCKED on item #3.**
+
+Config is correct (`bypass_rate: 0.05` on `bernard:telegram` in
+`~/.hermes/config.yaml`). The bypass sampler is deterministic on
+`session_id` — with 91% blank, no cohort assignment was possible
+regardless of configuration. Zero rows currently carry
+`policy_source: bypass`.
+
+**Action required:** post-restart, confirm:
+1. New rows on `bernard:telegram` show `policy_source: bypass` on
+   ~5% of sessions (not turns — sessions).
+2. `analyze.py --format json | jq '.scopes["bernard:telegram"].cohorts'`
+   returns populated cohort comparisons.
+
+---
+
+## Item #5 — `tools_in_category` accuracy
+
+**Finding: CLEAN. No fix needed.**
+
+`expand_event.resolved_tools` is internally consistent across all
+expansion events:
+
+| Category | Events | Distinct resolved | Size range |
+|---|---:|---:|---|
+| browser | 2 | 13 | 13-13 |
+| file | 9 | 4 | 4-4 |
+| terminal | 45 | 2 | 2-2 |
+
+Terminal's small size was initially suspicious but is correct — the
+toolset is just `process` + `terminal`. Expand-cost math
+(`predictions × tools_in_category × per_tool_tokens`) is using
+accurate counts.
+
+---
+
+## Item #6 — dampener candidate sample sizes
+
+**Finding: SAMPLE TOO THIN for current data. Cross-window stability
+check DEFERRED.**
+
+Single-window output (after item #2 fix):
+
+| Scope | Trigger | FPs mined | TPs mined | Candidates | Top precision |
+|---|---|---:|---:|---:|---:|
+| bernard:telegram | file_write | 17 | 6 | 2 | 1.0 (fp=3) |
+
+**No current candidate meets the auto-apply min support threshold
+(fp ≥ 5).** Even the highest-precision candidate (`"memory md"`,
+precision=1.0) has only fp=3.
+
+Cross-window stability check (auto-apply prereq: "high-precision
+candidates consistently high-precision across non-overlapping windows")
+is not possible with a 5-day window — splitting into meaningful
+non-overlapping segments leaves too few events per segment.
+
+**Action required:**
+1. Accumulate ≥2 weeks of post-restart data.
+2. Re-run with windows split by week; assert high-precision candidates
+   appear in both halves.
+3. Promote any that survive to manual-review pasting in policy.yaml
+   (auto-apply for dampeners stays deferred until then).
+
+---
+
+## Cross-cutting observation: Sue has zero `expand_tools` events
+
+Across 78 predictions and 939 tool calls on `sue:slack`, no expansion
+fired. Three hypotheses, none investigated:
+
+1. Sue's policy already keeps everything she uses always-on (no
+   narrowing requires expansion).
+2. Predictor over-triggers on Sue's traffic shape (all needed tools
+   admitted upfront via trigger groups).
+3. `expand_tools` registration silently broken on Sue's profile.
+
+This isn't an audit item, but it's worth a separate investigation
+before treating "no expansions" as the steady-state target. If Sue's
+policy is correctly auto-handling her traffic, that's evidence the
+warm-start `policy.yaml` works for at least one non-Bernard profile —
+which is exactly what STRATEGY.md's promotion gate asks for. If it's
+hypothesis #3, we have a bigger problem.
+
+---
+
+## Auto-apply readiness
+
+The prerequisite gate from AUTO-APPLY-PLAN.md is **NOT YET CLEARED.**
+Remaining work:
+
+| Item | Status | Unblocks |
+|---|---|---|
+| #1 expand_tools_used | Fixed | Promotion signal math |
+| #2 trigger FP classification | Fixed (analyzer) | Dampener mining |
+| #3 session_id coverage | Restart + 7d wait | #4, session-bounded analysis |
+| #4 cohort populations | Blocked by #3 | Bypass cohort gate |
+| #5 tools_in_category | Clean | Net-value math |
+| #6 dampener sample sizes | Insufficient data; ≥2wk wait | Auto-apply dampeners |
+
+**Earliest realistic auto-apply implementation start:** 2026-06-01,
+contingent on a follow-up audit pass confirming items #3, #4, and the
+two-week half of #6.
+
+In the interim: the existing manual flow
+(`analyze.py --write-recommendations` → human review → paste into
+policy.yaml) remains the correct path. The cleanup of
+`learned_recommendations.json` should happen on the first
+post-restart analyzer run — its current contents are noise.

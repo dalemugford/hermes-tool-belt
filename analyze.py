@@ -304,7 +304,14 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
                 stat.tools_per_category[category].add(resolved)
             continue
 
-        if row.get("expand_tools_used") is True:
+        # Filter out the "tool was already in the initial allowed set"
+        # case at read time so historical telemetry (written before the
+        # writer-side fix) doesn't inflate expansion-success metrics.
+        # The corrected writer no longer credits these, but old rows
+        # still carry the inflated flag. ``was_initially_available`` is
+        # present on every row written since the multi-profile telemetry
+        # commit, so it's safe to consult here.
+        if row.get("expand_tools_used") is True and not row.get("was_initially_available", False):
             category = str(row.get("expand_category") or "unknown").strip() or "unknown"
             stat.used_expansion_rows += 1
             expansion_prediction_id = str(row.get("expansion_prediction_id") or "").strip()
@@ -316,10 +323,52 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
             stat.expanded_uses_by_tool[expanded_tool] += 1
             stat.turns_until_used.append(max(0, safe_int(row.get("turns_until_used"))))
 
+    # Build a session-bounded lookahead window so that sticky-carried
+    # tool calls in subsequent turns count as TPs for the trigger that
+    # fired on the earlier turn. Without this, a trigger that correctly
+    # predicted intent but where the model called the tool 1-2 turns
+    # later (sticky residency carried the expansion) is miscounted as
+    # an FP — inflating dampener-candidate FP counts by ~30% on file_write
+    # and ~50% on shell in observed telemetry.
+    #
+    # When session_id is blank (pre-fix telemetry), we fall back to
+    # same-prediction behavior to avoid cross-session leakage from
+    # scope-ordered timeline lookups. Session-aware data was added by
+    # the canonical-session-key fix; rows without it predate that.
+    WINDOW = 3  # matches the default sticky_ttl_turns
+    session_ordered_preds: dict[str, list[str]] = defaultdict(list)
+    pred_session: dict[str, str] = {}
+    for row in predictions:
+        pid = str(row.get("prediction_id") or "").strip()
+        sid = str(row.get("session_id") or "").strip()
+        if pid and sid:
+            session_ordered_preds[sid].append(pid)
+            pred_session[pid] = sid
+    pred_index_in_session: dict[str, int] = {
+        pid: i for plist in session_ordered_preds.values() for i, pid in enumerate(plist)
+    }
+
+    def _window_called(prediction_id: str) -> set[str]:
+        """Tools called in this prediction + next WINDOW predictions
+        within the same session. Falls back to same-prediction when
+        session_id is unavailable."""
+        same = prediction_tools_called.get(prediction_id, set())
+        sid = pred_session.get(prediction_id, "")
+        if not sid:
+            return same
+        plist = session_ordered_preds.get(sid, [])
+        i = pred_index_in_session.get(prediction_id, -1)
+        if i < 0:
+            return same
+        ahead: set[str] = set()
+        for q in plist[i + 1 : i + 1 + WINDOW]:
+            ahead |= prediction_tools_called.get(q, set())
+        return same | ahead
+
     for prediction_id, groups in prediction_triggers.items():
         scope = prediction_scope.get(prediction_id, "unknown")
         stat = get(scope)
-        called = prediction_tools_called.get(prediction_id, set())
+        called = _window_called(prediction_id)
         fired_groups = set(groups)
         preview = prediction_preview.get(prediction_id, "")
         for group, tools in groups.items():
