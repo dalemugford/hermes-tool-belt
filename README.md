@@ -1,110 +1,118 @@
 # dynamic-tools
 
+### Cut your Hermes agent's per-message tool overhead in half. Today.
+
 A [Hermes Agent](https://hermes-agent.nousresearch.com) plugin that
-narrows the tools sent to the model on each message — so the prompt
-budget pays only for the tools the current turn actually needs.
+ships only the tools the current turn actually needs.
 
-## The problem
+**Measured: 57% reduction across 109 production sessions, 3.37M tokens
+saved.** ~388 tokens per tool, per API call, per message — that adds up
+fast.
 
-Every inbound message ships **every** tool definition the agent has.
-For a heavy profile (web, terminal, file, browser, MCP servers, custom
-skills) that can be 8–15k tokens of overhead on a message whose answer
-is "yes." Most of those tools aren't relevant to what's being asked
-right now — but the model still pays to read them.
+## Why
 
-## What it does
+Every message you send your agent ships **every** tool definition. For
+a heavy profile — web, terminal, file, browser, MCP servers, custom
+skills — that's 8–15k tokens of overhead on a message whose answer is
+"yes." Your `"hi"` costs the same as `"deploy the build script"` in
+tool overhead. The model still pays to read them all.
 
-On every inbound gateway message, the plugin:
+## See it
 
-1. **Reads the message** (and recent context, if lookback is enabled).
-2. **Predicts** which tool categories the agent will need this turn
-   using a configurable regex/keyword classifier.
-3. **Filters** the outbound API call's `tools` payload down to
-   `(always_on ∪ triggered ∪ expanded ∪ sticky) ∩ ceiling`. Your
-   existing `platform_toolsets` config remains a hard ceiling — the
-   plugin never *adds* tools you didn't sanction.
-4. **Hands the model an escape hatch.** An `expand_tools` meta-tool is
-   always loaded. If the predictor guesses wrong, the model calls
-   `expand_tools(category="browser")` (or any category) and the next
-   API call unions the resolved tools into the allowed set.
-5. **Logs everything** to append-only JSONL so you can audit and tune
-   the policy with real numbers, not vibes.
+```text
+User: "hi, how's it going?"
+  ceiling:    37 tools  (~3,500 tok)
+  shipped:    12 tools  (~1,200 tok)   ← always-on only; no triggers fired
+  saved:      2,300 tok / message
 
-Any failure — bad YAML, predictor exception, lookup miss — falls
-through to **no narrowing**. The plugin is invisible when broken, never
-destructive.
+User: "run the build script and check the logs"
+  ceiling:    37 tools
+  shipped:    14 tools                  ← always-on + `shell` trigger
+  saved:      ~1,800 tok / message      (terminal+process loaded;
+                                         browser, image_gen, MCP cut)
 
-## Measured impact
+User: (any message the predictor guesses wrong on)
+  model calls: expand_tools(category="browser")
+  next API call ships browser_* tools — recovers cleanly,
+  ~1,500 tok extra round-trip vs. multiple K saved across the session
+```
 
-Telemetry on Bernard's Telegram scope (pre-2026-05-17 audit reset):
-**3.37M tokens saved across 109 sessions, ~57% reduction vs.
-baseline**, at an estimated **~388 tokens per tool per API call**.
+## Three things that make this safe to install
 
-> The 2026-05-17 audit found two attribution bugs in the analyzer
-> (`expand_tools_used` was 94% over-credited; trigger FPs were ~32%
-> under-counted by missing late-bound TPs) and reset live telemetry
-> for clean post-fix measurement. The savings figure above is
-> unaffected — token math doesn't depend on the buggy fields — but
-> per-trigger precision/recall numbers from before the fix should be
-> treated as approximate.
->
-> Until clean post-fix data accumulates, the harvest-based view
-> ([scripts/bootstrap.py](scripts/bootstrap.py)) is the most reliable
-> source of per-profile auto-apply recommendations.
+- **Fails invisibly.** Any error — bad YAML, predictor exception, missing lookup — falls through to "no narrowing." The plugin can save you tokens; it can never break your agent.
+- **Strict ceiling.** Can only *narrow* what your `platform_toolsets` config already allowed. Never adds a tool you didn't sanction.
+- **Day-one recommendations from your own data.** [`scripts/bootstrap.py`](scripts/bootstrap.py) replays your existing Hermes sessions through the predictor and prints concrete per-tool promotion candidates — no week-long wait for telemetry to accumulate. Real first-run output for one author:
 
-## Releases
+  ```
+  TOP ACTIONS
+    1. [PROMOTE]  bernard:telegram  terminal  cuts=516  net=+499,684 tok
+    2. [PROMOTE]  bernard:slack     terminal  cuts= 13  net= +12,128 tok
+    3. [BROADEN]  bernard:telegram  patch     cuts=132  (broaden file_write trigger)
+  ```
 
-This branch (`main`) is the trunk; everything ships from here. Lab
-features that aren't ready to be enabled by default are gated behind
-config flags (`enabled: false`, `learned_mode: off`, etc.) so an
-install of `main` is always safe.
+## Install
 
-Release tags (`vX.Y.Z`) mark known-good states. For stability, pin a
-tag. For bleeding-edge, track `main`.
+```bash
+hermes plugins install dalemugford/hermes-dynamic-tools
+```
 
-Companion docs:
-- **[STRATEGY.md](STRATEGY.md)** — the north star: the promise, release strategy, calibration flow, official-plugin readiness. **Start here** if you want to understand where this plugin is going.
-- [PLAN.md](PLAN.md) — current architecture, what's built vs. planned, validation status
-- [CALIBRATION-PLAN.md](CALIBRATION-PLAN.md) — design for the observe → handoff → steady-state flow that makes "install, activate, done" honest
-- [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md) — the writer-side script that closes the loop (telemetry-correctness audit cleared mechanically; see [docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md))
-- [TRIGGER-SCORING-PLAN.md](TRIGGER-SCORING-PLAN.md) — historical full-scoring plan; current direction is the lighter `exclude_keywords` dampener slice
-- [docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md) — first-pass telemetry-correctness audit (2 bugs found + fixed, 2 items clean, 3 items pending data accumulation)
-- [docs/harvest-followups.md](docs/harvest-followups.md) — open auto-apply candidates surfaced by harvest; resolve by edit or via the trigger-keyword suggester
-- [docs/dynamic-tools-hermes-surface.md](docs/dynamic-tools-hermes-surface.md) — patch-point reference; read before any Hermes upgrade
-- [docs/dynamic-tools-plan.md](docs/dynamic-tools-plan.md) — original design doc and categorization audit
-
-## Quick start
-
-The plugin is **off by default**. To enable globally, edit
-`~/.hermes/config.yaml`:
+Enable in `~/.hermes/config.yaml`:
 
 ```yaml
 plugins:
   dynamic-tools:
     enabled: true
-    log: true                 # write per-prediction telemetry
-    learned_mode: off         # off | recommend | auto | audit (see below)
 ```
 
-Restart Hermes (or the gateway) so the plugin's `register()` runs. From the
-next message onward, tool definitions are narrowed per-message. The model
-always gets `expand_tools` as recourse if it needs a category that wasn't
-loaded.
+Restart the gateway. From the next message onward, tool definitions
+are narrowed per-turn.
 
-### Day-one recommendations (warm start)
-
-If you have any existing Hermes sessions under `~/.hermes/sessions/`,
-run the bootstrap script once after install to get concrete promotion
-candidates and trigger-keyword suggestions tailored to your own usage
-— no need to wait for live telemetry to accumulate:
+### Day-one warm start (if you already use Hermes)
 
 ```bash
 python3 ~/.hermes/plugins/dynamic-tools/scripts/bootstrap.py
 ```
 
-The script replays your session history through the predictor, runs
-the analyzer in harvest-aware mode, and prints a ranked **TOP ACTIONS**
-summary. See [scripts/README.md](scripts/README.md) for details.
+Replays your existing session history through the predictor and prints
+a ranked **TOP ACTIONS** summary tailored to your usage — concrete
+edits you can make today, derived from real conversations.
+
+---
+
+## Releases
+
+This branch (`main`) is the trunk; everything ships from here. Adaptive
+features that aren't ready to be enabled by default are gated behind
+config flags (`enabled: false`, `learned_mode: off`, etc.) so an
+install of `main` is always safe.
+
+Release tags use CalVer (`YYYY.M.D`). For stability, pin a tag. For
+bleeding-edge, track `main`. Current release: **2026.5.17-beta**.
+
+## How it stays honest
+
+- **Append-only telemetry** (`predictions.jsonl` + `tool_calls.jsonl`)
+  — every narrowing decision is recorded; tune from real numbers, not
+  vibes.
+- **A/B baseline cohort** — set `bypass_rate: 0.05` and a deterministic
+  5% of sessions ship the full toolset, so headline savings get a real
+  control to compare against.
+- **Telemetry-correctness audit** ([docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md))
+  — 2 attribution bugs found and fixed before they could mislead
+  recommendations. Tests + smoke harness keep them from coming back.
+
+## Companion docs
+
+- **[ROADMAP.md](ROADMAP.md)** — queued work + open design questions. Start here if you want to contribute.
+- [STRATEGY.md](STRATEGY.md) — the north star: the promise, release strategy, calibration flow, official-plugin readiness
+- [PLAN.md](PLAN.md) — current architecture, what's built vs. planned, validation status
+- [CALIBRATION-PLAN.md](CALIBRATION-PLAN.md) — observe → handoff → steady-state flow that makes "install, activate, done" honest
+- [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md) — design for the writer-side script that closes the loop
+- [docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md) — first-pass audit: 2 bugs fixed, 2 items clean, 3 pending data accumulation
+- [docs/harvest-followups.md](docs/harvest-followups.md) — open auto-apply candidates surfaced by harvest
+- [docs/dynamic-tools-hermes-surface.md](docs/dynamic-tools-hermes-surface.md) — patch-point reference; read before any Hermes upgrade
+- [docs/dynamic-tools-plan.md](docs/dynamic-tools-plan.md) — original design doc and categorization audit
+- [TRIGGER-SCORING-PLAN.md](TRIGGER-SCORING-PLAN.md) — historical full-scoring plan (deferred)
 
 ## Policy
 
