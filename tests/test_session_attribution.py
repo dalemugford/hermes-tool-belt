@@ -499,6 +499,139 @@ class TriggerFpLateBoundTpTests(unittest.TestCase):
             "blank session_id must fall back to same-prediction classification")
 
 
+class TriggerKeywordSuggesterTests(unittest.TestCase):
+    """The trigger-keyword suggester mines cut-tool message previews
+    for candidate keywords that would have fired a trigger to cover the
+    tool. Symmetric inverse of dampener mining; must filter the same
+    pollution patterns (stop-words, existing-pattern overlap)."""
+
+    def _args(self, **overrides):
+        defaults = dict(
+            suggest_trigger_keywords=True,
+            dampener_min_support=2,
+            dampener_min_n=2,
+            dampener_max_n=4,
+            dampener_min_precision=0.6,
+            dampener_max_candidates=5,
+            harvest_min_cuts=2,
+            expand_round_trip_tokens=1500,
+            per_tool_tokens=388,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def _make_stats(self, *, scope="bernard:telegram", cut_previews,
+                    all_previews, was_cut_count):
+        from collections import Counter
+        stat = analyze.ScopeStats(scope=scope)
+        stat.harvest_predictions = len(all_previews)
+        stat.harvest_all_previews = list(all_previews)
+        for tool, previews in cut_previews.items():
+            stat.harvest_cut_previews[tool] = list(previews)
+            stat.harvest_was_cut[tool] = was_cut_count.get(tool, len(previews))
+        return {scope: stat}
+
+    def test_surfaces_content_words_filters_stopwords(self):
+        # 5 cut messages mentioning "deploy the app", 20 noise messages
+        # that talk about everything else. Expect "deploy the app" or
+        # subset to surface; pure stopword n-grams ("and the", "for a")
+        # must not surface even if frequent.
+        cut_msgs = [
+            "please deploy the app to staging",
+            "can you deploy the app today",
+            "deploy the app and confirm it ran",
+            "i want to deploy the app",
+            "deploy the app right now",
+        ]
+        noise = [
+            "how are you doing today",
+            "what time is the meeting and the call",
+            "for a moment let me think",
+            "and the next thing is to ask",
+        ] * 5
+        stats = self._make_stats(
+            cut_previews={"deploy_tool": cut_msgs},
+            all_previews=cut_msgs + noise,
+            was_cut_count={"deploy_tool": 5},
+        )
+        with mock.patch.object(analyze, "_load_preset_triggers",
+                               return_value=({}, "ok")):
+            rows = analyze.trigger_keyword_candidates(stats, self._args())
+        self.assertTrue(rows, "expected at least one candidate row")
+        patterns = [c["pattern"] for c in rows[0]["candidates"]]
+        self.assertTrue(any("deploy" in p for p in patterns),
+            f"expected 'deploy' in candidate patterns; got {patterns}")
+        # Stopword-only patterns must not appear
+        for p in patterns:
+            self.assertTrue(analyze._has_content_word(p),
+                f"pure-stopword pattern leaked into candidates: {p!r}")
+
+    def test_existing_trigger_group_targeted(self):
+        # When the cut tool is already listed under an existing trigger
+        # group's tools, action must be "add_keywords_to_trigger" and
+        # target_trigger must name that group.
+        cut_msgs = ["run the build script", "execute the build script",
+                    "kick off the build script", "build script again"]
+        triggers = {
+            "shell": {"tools": ["terminal"], "keyword_patterns": []},
+        }
+        stats = self._make_stats(
+            cut_previews={"terminal": cut_msgs},
+            all_previews=cut_msgs + ["random unrelated message"] * 10,
+            was_cut_count={"terminal": 4},
+        )
+        with mock.patch.object(analyze, "_load_preset_triggers",
+                               return_value=(triggers, "ok")):
+            rows = analyze.trigger_keyword_candidates(stats, self._args())
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["action"], "add_keywords_to_trigger")
+        self.assertEqual(rows[0]["target_trigger"], "shell")
+
+    def test_no_existing_trigger_suggests_new_group(self):
+        # No trigger group claims this tool — must suggest creating a
+        # new group, named by the tool's underscore prefix.
+        cut_msgs = ["please screenshot the page"] * 4
+        stats = self._make_stats(
+            cut_previews={"browser_snapshot": cut_msgs},
+            all_previews=cut_msgs + ["chat about lunch"] * 10,
+            was_cut_count={"browser_snapshot": 4},
+        )
+        with mock.patch.object(analyze, "_load_preset_triggers",
+                               return_value=({}, "ok")):
+            rows = analyze.trigger_keyword_candidates(stats, self._args())
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["action"], "create_new_trigger")
+        self.assertEqual(rows[0]["target_trigger"], "browser")
+
+    def test_existing_keyword_match_excluded(self):
+        # If an existing trigger pattern already matches a candidate
+        # n-gram, the candidate must be filtered out (no duplicate
+        # suggestions).
+        import re as _re
+        cut_msgs = ["deploy the app now"] * 4
+        triggers = {
+            "deploy": {
+                "tools": ["deploy_tool"],
+                "keyword_patterns": [_re.compile(r"deploy the", _re.IGNORECASE)],
+            },
+        }
+        stats = self._make_stats(
+            cut_previews={"deploy_tool": cut_msgs},
+            all_previews=cut_msgs + ["random"] * 10,
+            was_cut_count={"deploy_tool": 4},
+        )
+        with mock.patch.object(analyze, "_load_preset_triggers",
+                               return_value=(triggers, "ok")):
+            rows = analyze.trigger_keyword_candidates(stats, self._args())
+        # All cut messages contain "deploy the" which is already covered.
+        # Candidates list (if any) must not include "deploy the" or
+        # substrings that the existing pattern matches.
+        if rows:
+            for c in rows[0]["candidates"]:
+                self.assertFalse(triggers["deploy"]["keyword_patterns"][0].search(c["pattern"]),
+                    f"existing-pattern overlap leaked: {c['pattern']!r}")
+
+
 class HarvestRecommendationTests(unittest.TestCase):
     """The analyzer's harvest-aware recommendation generator should
     surface per-tool promotion candidates from was_cut signal, with

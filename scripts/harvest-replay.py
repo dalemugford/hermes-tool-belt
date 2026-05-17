@@ -139,11 +139,47 @@ def parse_session(session_file: Path) -> HarvestedSession | None:
     )
 
 
+import re as _re
+
+
+# Hermes wraps user messages with system-injected framing — quote/reply
+# context, thread context summaries, speaker attribution. The mining
+# flows (dampener and trigger-keyword) operate on message previews; if
+# the framing eats the 80-char preview window, candidates become noise
+# (matches on "prior messages in this thread", "you are bernard
+# working on dale" — system text, not user intent). Strip the framing
+# BEFORE preview computation so the preview captures actual content.
+_FRAMING_BLOCK = _re.compile(
+    r"^\s*\[(?:Replying to:[^\]]*|Thread context[^\]]*)\]\s*",
+    flags=_re.DOTALL,
+)
+_SPEAKER_PREFIX = _re.compile(r"^\s*\[[a-zA-Z0-9_.-]{1,40}\]\s*")
+
+
+def _strip_message_framing(text: str) -> str:
+    """Strip Hermes-injected framing prefixes from a user message.
+
+    Removes ``[Replying to: "..."]`` quote blocks, ``[Thread context — ...]``
+    context summaries, and leading ``[username]`` speaker prefixes (often
+    repeated multiple times when reply chains nest). Idempotent — calling
+    on an unframed message is a no-op.
+    """
+    if not text:
+        return text
+    prev = None
+    while text != prev:
+        prev = text
+        text = _FRAMING_BLOCK.sub("", text)
+        text = _SPEAKER_PREFIX.sub("", text)
+    return text
+
+
 def _message_text(row: dict[str, Any]) -> str:
-    """Extract user message text from the row's content field."""
+    """Extract user message text from the row's content field, with
+    Hermes' system-injected framing stripped."""
     content = row.get("content")
     if isinstance(content, str):
-        return content
+        return _strip_message_framing(content)
     if isinstance(content, list):
         # Some assistant frameworks use a content-block list. User messages
         # in Hermes are typically plain strings, but be defensive.
@@ -153,7 +189,7 @@ def _message_text(row: dict[str, Any]) -> str:
                 t = block.get("text") or block.get("content")
                 if isinstance(t, str):
                     parts.append(t)
-        return "\n".join(parts)
+        return _strip_message_framing("\n".join(parts))
     return ""
 
 

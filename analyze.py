@@ -109,6 +109,10 @@ class ScopeStats:
     # Used by the trigger-keyword suggester to mine candidate keywords
     # for adding cut tools into existing or new trigger groups.
     harvest_cut_previews: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
+    # All harvest-prediction previews for this scope — the noise denominator
+    # for keyword mining precision. Sized cap protects unbounded growth on
+    # big harvests; sampling preserves precision math accuracy.
+    harvest_all_previews: list[str] = field(default_factory=list)
 
 
 def state_dir_from_env() -> Path:
@@ -290,6 +294,9 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
             stat.learned_modes[learned_mode] += 1
         if policy_source == "harvest":
             stat.harvest_predictions += 1
+            preview = str(row.get("message_preview") or "").strip()
+            if preview and len(stat.harvest_all_previews) < 2000:
+                stat.harvest_all_previews.append(preview)
 
     for row in tool_calls:
         prediction_id = str(row.get("prediction_id") or "").strip()
@@ -522,6 +529,73 @@ _EXCLUDES_STATUS_MESSAGE = {
 }
 
 
+def _load_preset_triggers(
+    plugin_dir: Path,
+) -> tuple[dict[str, dict[str, Any]], str]:
+    """Load the full trigger structure from policy.yaml.
+
+    Returns ``({group_name: {tools: [...], keyword_patterns: [...]}}, status)``
+    with the same status enum as :func:`_load_preset_excludes`. Used by
+    the trigger-keyword suggester to:
+      · Decide which group a candidate keyword should join (the one whose
+        ``tools`` already lists the cut tool).
+      · Avoid re-suggesting keywords that an existing trigger pattern
+        already matches.
+    """
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except Exception:
+        return {}, "no_yaml"
+    path = plugin_dir / "policy.yaml"
+    if not path.exists():
+        return {}, "no_policy"
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return {}, "parse_error"
+    out: dict[str, dict[str, Any]] = {}
+    for entry in data.get("triggers", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name") or "").strip()
+        if not name:
+            continue
+        tools = [str(t) for t in (entry.get("tools") or []) if isinstance(t, str)]
+        keywords = entry.get("keywords") or []
+        patterns: list[re.Pattern[str]] = []
+        for raw in keywords:
+            if not isinstance(raw, str):
+                continue
+            try:
+                patterns.append(re.compile(raw, flags=re.IGNORECASE))
+            except re.error:
+                continue
+        out[name] = {"tools": tools, "keyword_patterns": patterns}
+    return out, "ok"
+
+
+def _trigger_group_for_tool(
+    tool: str, triggers: dict[str, dict[str, Any]],
+) -> str | None:
+    """Find the existing trigger group whose ``tools`` list includes
+    ``tool``. Returns the group name, or None when no group claims it."""
+    for name, spec in triggers.items():
+        if tool in spec.get("tools", []):
+            return name
+    return None
+
+
+def _suggested_new_trigger_name(tool: str) -> str:
+    """Heuristic group name when no existing group claims a cut tool.
+
+    Common pattern: ``browser_navigate`` / ``browser_click`` → use the
+    underscore prefix (``browser``). Falls back to the bare tool name.
+    """
+    if "_" in tool:
+        return tool.split("_", 1)[0]
+    return tool
+
+
 def _is_already_covered(ngram: str, existing_patterns: list[re.Pattern[str]]) -> bool:
     """True if any existing exclude pattern already matches this n-gram."""
     if not existing_patterns:
@@ -704,6 +778,210 @@ def category_net_value(
         "added_carry_tokens": cost,
         "net_value_tokens": saved - cost,
     }
+
+
+# Stop words to filter out as candidate keywords. An n-gram composed
+# entirely of these is too generic to be a useful trigger keyword — even
+# at precision=1.0 it would just be a coincidence of the noise sample.
+_KEYWORD_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "but", "if", "of", "to", "for", "in",
+    "on", "at", "by", "with", "from", "as", "is", "are", "was", "were",
+    "be", "been", "being", "have", "has", "had", "do", "does", "did",
+    "will", "would", "could", "should", "may", "might", "can", "this",
+    "that", "these", "those", "it", "its", "what", "when", "where",
+    "who", "why", "how", "yes", "no", "ok", "okay", "sure", "thanks",
+    "thank", "you", "your", "yours", "i", "we", "us", "our", "me", "my",
+    "him", "her", "his", "hers", "them", "they", "their", "so", "just",
+})
+
+
+def _has_content_word(ngram: str) -> bool:
+    """True if at least one token is not in the stop-word set.
+    Filters out pure-stopword n-grams like ``for a`` / ``and the``.
+    Single short tokens (<3 chars) are also treated as stop-ish."""
+    for tok in ngram.split():
+        t = tok.strip().lower()
+        if len(t) >= 3 and t not in _KEYWORD_STOPWORDS:
+            return True
+    return False
+
+
+def _suggest_keywords_for_cut_tool(
+    cut_previews: list[str],
+    noise_previews: list[str],
+    existing_patterns: list[re.Pattern[str]],
+    *,
+    min_n: int,
+    max_n: int,
+    min_support: int,
+    min_precision: float,
+    max_candidates: int,
+) -> list[dict[str, Any]]:
+    """Mine n-grams that recur in cut-tool messages but rarely elsewhere.
+
+    Mirrors :func:`_suggest_dampeners_for_trigger` with inverted semantics:
+    dampener mining wants n-grams that ONLY appear in FP messages
+    (suppress over-triggering); keyword mining wants n-grams that
+    appear in cut-tool messages but NOT in unrelated noise (surface
+    under-triggering).
+
+    Returns candidate keyword dicts ranked by precision then frequency.
+    """
+    if not cut_previews or len(cut_previews) < min_support:
+        return []
+
+    raw_candidates: list[dict[str, Any]] = []
+    cut_lower = [p.lower() for p in cut_previews]
+    noise_lower = [p.lower() for p in noise_previews]
+
+    seen: set[str] = set()
+    for preview in cut_lower:
+        tokens = _tokenize_preview(preview)
+        for n in range(min_n, max_n + 1):
+            for ngram in _ngrams(tokens, n):
+                if ngram in seen:
+                    continue
+                seen.add(ngram)
+                if not _has_content_word(ngram):
+                    continue
+                cut_count = sum(1 for p in cut_lower if ngram in p)
+                if cut_count < min_support:
+                    continue
+                noise_count = sum(1 for p in noise_lower if ngram in p)
+                precision = cut_count / max(1, cut_count + noise_count)
+                if precision < min_precision:
+                    continue
+                raw_candidates.append({
+                    "ngram": ngram,
+                    "cut_count": cut_count,
+                    "noise_count": noise_count,
+                    "precision": precision,
+                    "length": n,
+                })
+
+    # Dedupe substrings: if "open the page" survives and "open the" also
+    # survives with similar precision, prefer the longer (more specific)
+    # one. Identical-stats shorter candidates get dropped.
+    raw_candidates.sort(key=lambda c: (-c["precision"], -c["cut_count"], -c["length"]))
+    dropped: set[str] = set()
+    kept: list[dict[str, Any]] = []
+    for cand in raw_candidates:
+        if cand["ngram"] in dropped:
+            continue
+        if _is_already_covered(cand["ngram"], existing_patterns):
+            continue
+        kept.append(cand)
+        for other in raw_candidates:
+            if (other["ngram"] != cand["ngram"]
+                and other["ngram"] in cand["ngram"]
+                and other["cut_count"] <= cand["cut_count"]):
+                dropped.add(other["ngram"])
+
+    out: list[dict[str, Any]] = []
+    for cand in kept[:max_candidates]:
+        ngram = cand["ngram"]
+        samples = [p for p in cut_previews if ngram in p.lower()][:3]
+        out.append({
+            "pattern": ngram,
+            "suggested_regex": _ngram_to_regex(ngram),
+            "cut_count": cand["cut_count"],
+            "noise_count": cand["noise_count"],
+            "precision": round(cand["precision"], 4),
+            "sample_previews": samples,
+        })
+    return out
+
+
+def trigger_keyword_candidates(
+    stats: dict[str, ScopeStats], args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    """Per-(scope, tool) keyword candidates for adding to triggers.
+
+    The symmetric inversion of :func:`dampener_candidates`. Where the
+    dampener flow mines FP messages to suppress over-triggering, this
+    flow mines was_cut messages to surface under-triggering — keywords
+    that would have fired a trigger to cover a tool the historical
+    model called but current narrowing would have cut.
+
+    Auto-detects: returns empty when ``--suggest-trigger-keywords`` is
+    off OR no scope has harvest data with sufficient cut volume per tool.
+
+    For each candidate cut tool, decides whether the suggestion should
+    augment an existing trigger group (the one whose ``tools`` already
+    lists this tool) or propose a new group.
+    """
+    if not getattr(args, "suggest_trigger_keywords", False):
+        return []
+    plugin_dir = Path(__file__).resolve().parent
+    triggers, status = _load_preset_triggers(plugin_dir)
+    if status != "ok":
+        # Reuse the dampener status messages — same failure modes.
+        warning = _EXCLUDES_STATUS_MESSAGE.get(
+            status, f"preset triggers unavailable: {status}"
+        )
+        print(f"warning: dynamic-tools analyzer (triggers): {warning}",
+              file=sys.stderr)
+
+    # Noise corpus: ALL harvest prediction previews per scope (capped
+    # at 2000 during collect_stats). This is the correct denominator —
+    # without it, common-everywhere phrases like "for a" appear in
+    # cut_previews but score precision=1.0 because the narrow noise
+    # pool (other-tools' cut_previews only) doesn't happen to contain
+    # them. Using the full prediction corpus puts genuine common-noise
+    # phrases out of the running.
+    noise_corpus: dict[str, list[str]] = {
+        scope: list(stat.harvest_all_previews) for scope, stat in stats.items()
+    }
+
+    rows: list[dict[str, Any]] = []
+    min_cuts = max(1, args.harvest_min_cuts)
+    for scope, stat in sorted(stats.items()):
+        if stat.harvest_predictions == 0:
+            continue
+        for tool, cut_count in stat.harvest_was_cut.most_common():
+            if cut_count < min_cuts:
+                continue
+            cut_previews = stat.harvest_cut_previews.get(tool, [])
+            if not cut_previews:
+                continue
+            # Noise = harvest previews where THIS tool was NOT cut.
+            other_previews = [
+                p for p in noise_corpus.get(scope, [])
+                if p not in cut_previews
+            ]
+            # Determine target trigger
+            target_group = _trigger_group_for_tool(tool, triggers)
+            if target_group:
+                existing_patterns = triggers.get(target_group, {}).get("keyword_patterns", [])
+                action = "add_keywords_to_trigger"
+            else:
+                target_group = _suggested_new_trigger_name(tool)
+                existing_patterns = []
+                action = "create_new_trigger"
+
+            candidates = _suggest_keywords_for_cut_tool(
+                cut_previews=cut_previews,
+                noise_previews=other_previews,
+                existing_patterns=existing_patterns,
+                min_n=args.dampener_min_n,
+                max_n=args.dampener_max_n,
+                min_support=args.dampener_min_support,
+                min_precision=args.dampener_min_precision,
+                max_candidates=args.dampener_max_candidates,
+            )
+            if not candidates:
+                continue
+            rows.append({
+                "scope": scope,
+                "tool": tool,
+                "cut_count": cut_count,
+                "target_trigger": target_group,
+                "action": action,
+                "existing_keyword_pattern_count": len(existing_patterns),
+                "candidates": candidates,
+                "preset_triggers_status": status,
+            })
+    return rows
 
 
 def dampener_candidates(stats: dict[str, ScopeStats], args: argparse.Namespace) -> list[dict[str, Any]]:
@@ -1003,6 +1281,7 @@ def summary_payload(
     recs: list[dict[str, Any]],
     args: argparse.Namespace,
     dampeners: list[dict[str, Any]] | None = None,
+    trigger_keywords: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     total_predictions = sum(stat.predictions for stat in stats.values())
     total_tool_calls = sum(sum(stat.tool_calls.values()) for stat in stats.values())
@@ -1037,6 +1316,7 @@ def summary_payload(
         "scopes": {scope: scope_payload(stat, args) for scope, stat in stats.items()},
         "recommendations": recs,
         "dampener_candidates": list(dampeners or []),
+        "trigger_keyword_candidates": list(trigger_keywords or []),
     }
 
 
@@ -1385,6 +1665,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--harvest-min-cuts", type=int, default=3,
         help="Minimum was_cut count before a tool surfaces as a harvest-driven "
              "promotion candidate. Filters thin-signal noise. (default: 3)")
+    parser.add_argument("--suggest-trigger-keywords", action="store_true",
+        help="Mine cut-tool message previews for candidate trigger keywords. "
+             "Symmetric inverse of --suggest-dampeners. Requires harvest data.")
     parser.add_argument("--dampener-max-candidates", type=int, default=DEFAULT_DAMPENER_MAX_CANDIDATES,
                         help="Max candidates surfaced per (scope, trigger)")
     return parser.parse_args()
@@ -1399,9 +1682,11 @@ def main() -> int:
     stats = collect_stats(predictions, tool_calls)
     recs = recommendation_rows(stats, args) + harvest_recommendation_rows(stats, args)
     dampeners = dampener_candidates(stats, args)
+    trigger_keywords = trigger_keyword_candidates(stats, args)
 
     if args.format == "json":
-        print(json.dumps(summary_payload(stats, recs, args, dampeners), indent=2, sort_keys=True))
+        print(json.dumps(summary_payload(stats, recs, args, dampeners, trigger_keywords),
+                         indent=2, sort_keys=True))
     else:
         print(format_summary(stats, recs, args, dampeners))
 
