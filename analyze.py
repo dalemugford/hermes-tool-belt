@@ -97,6 +97,18 @@ class ScopeStats:
     cohort_sessions: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     cohort_tool_calls: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     cohort_expansions: dict[str, int] = field(default_factory=lambda: defaultdict(int))
+    # Harvest-specific signal: per-tool count of historical calls that
+    # WOULD have been cut by current narrowing (was_cut == True on the
+    # tool_call row). Populated only when harvest-source rows are present.
+    # The corresponding `harvest_predictions` is the denominator for
+    # carry-cost math when proposing always-on promotion.
+    harvest_was_cut: Counter[str] = field(default_factory=Counter)
+    harvest_predictions: int = 0
+    harvest_tool_calls_total: int = 0
+    # Per-tool sample of message previews that led to a was_cut call.
+    # Used by the trigger-keyword suggester to mine candidate keywords
+    # for adding cut tools into existing or new trigger groups.
+    harvest_cut_previews: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
 
 
 def state_dir_from_env() -> Path:
@@ -276,6 +288,8 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
         learned_mode = str(row.get("learned_mode") or "").strip().lower()
         if learned_mode:
             stat.learned_modes[learned_mode] += 1
+        if policy_source == "harvest":
+            stat.harvest_predictions += 1
 
     for row in tool_calls:
         prediction_id = str(row.get("prediction_id") or "").strip()
@@ -291,6 +305,16 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
                 stat.cohort_tool_calls[cohort] += 1
             if prediction_id:
                 prediction_tools_called[prediction_id].add(tool)
+            # Harvest-source signal: count would-have-been cuts per tool
+            # and capture the prediction's message preview so the trigger-
+            # keyword suggester can mine candidates.
+            if cohort == "harvest" and row.get("was_cut") is True:
+                stat.harvest_was_cut[tool] += 1
+                preview = prediction_preview.get(prediction_id, "")
+                if preview and len(stat.harvest_cut_previews[tool]) < 200:
+                    stat.harvest_cut_previews[tool].append(preview)
+            if cohort == "harvest":
+                stat.harvest_tool_calls_total += 1
 
         if tool == "expand_tools":
             category = category_from_expand_row(row)
@@ -725,6 +749,95 @@ def dampener_candidates(stats: dict[str, ScopeStats], args: argparse.Namespace) 
                 "existing_exclude_keyword_count": len(existing),
                 "preset_excludes_status": excludes_status,
                 "candidates": candidates,
+            })
+    return rows
+
+
+def harvest_recommendation_rows(stats: dict[str, ScopeStats], args: argparse.Namespace) -> list[dict[str, Any]]:
+    """Per-tool promotion candidates derived from harvest telemetry.
+
+    Harvest rows carry ``was_cut: True`` whenever the historical model
+    called a tool that current narrowing would have gated. Each such
+    call represents a counterfactual ``expand_tools`` round-trip. The
+    direct auto-apply signal is:
+
+        net_savings = cuts × expand_round_trip_tokens
+                    − predictions × per_tool_tokens
+
+    Positive net favors always-on promotion; negative favors keeping
+    the tool trigger-gated (or improving trigger recall to cover its
+    use cases). Auto-detected — emits nothing when no harvest rows are
+    present, so the function is safe to call unconditionally.
+
+    Note this is a per-tool recommendation alongside the existing
+    per-category recommendations from ``recommendation_rows`` — the
+    two views answer different questions. Per-tool ("promote terminal
+    to always_on?") is what harvest data can answer directly. Per-
+    category ("is the browser expand round-trip net-positive?") needs
+    live expand_tools events with success-rate signal, which harvest
+    can't produce.
+    """
+    rows: list[dict[str, Any]] = []
+    min_cuts = max(1, args.harvest_min_cuts)
+    for scope, stat in sorted(stats.items()):
+        if stat.harvest_predictions == 0:
+            continue
+        denom = max(stat.harvest_predictions, 1)
+        for tool, cuts in stat.harvest_was_cut.most_common():
+            if cuts < min_cuts:
+                continue
+            round_trip_cost = cuts * args.expand_round_trip_tokens
+            carry_cost = denom * args.per_tool_tokens
+            net = round_trip_cost - carry_cost
+            cut_rate = cuts / denom
+            if net > 0:
+                action = "promote_always_on"
+                status = "review"
+                confidence = "medium" if cuts >= min_cuts * 3 else "low"
+            elif cut_rate >= 0.10:
+                # Frequently cut but carry cost outweighs round-trip.
+                # The right move is usually trigger broadening, not
+                # promotion. Flag it for human review.
+                action = "broaden_trigger_recall"
+                status = "review"
+                confidence = "medium"
+            else:
+                action = "keep_gated"
+                status = "watch"
+                confidence = "medium"
+            rows.append({
+                "scope": scope,
+                "kind": "harvest_tool_promotion",
+                "item": tool,
+                "action": action,
+                "status": status,
+                "confidence": confidence,
+                "metrics": {
+                    "harvest_predictions": stat.harvest_predictions,
+                    "harvest_was_cut": cuts,
+                    "cut_rate": round(cut_rate, 4),
+                    "round_trip_cost_tokens": round_trip_cost,
+                    "carry_cost_tokens": carry_cost,
+                    "net_savings_tokens": net,
+                },
+                "defaults": {
+                    "expand_round_trip_tokens": args.expand_round_trip_tokens,
+                    "per_tool_tokens": args.per_tool_tokens,
+                    "harvest_min_cuts": min_cuts,
+                },
+                "proposed_learned_patch": {
+                    "scopes": {
+                        scope: {
+                            "always_on": [tool] if action == "promote_always_on" else [],
+                        }
+                    }
+                },
+                "reason": (
+                    f"historical sessions called {tool} {cuts} time(s) "
+                    f"({cut_rate:.1%} of predictions) where current policy "
+                    f"would have cut it; round-trip cost {round_trip_cost:,} tok "
+                    f"vs carry cost {carry_cost:,} tok → net {net:+,} tok"
+                ),
             })
     return rows
 
@@ -1269,6 +1382,9 @@ def parse_args() -> argparse.Namespace:
                         help="Shortest n-gram length to consider (default 2)")
     parser.add_argument("--dampener-max-n", type=int, default=DEFAULT_DAMPENER_MAX_N,
                         help="Longest n-gram length to consider (default 4)")
+    parser.add_argument("--harvest-min-cuts", type=int, default=3,
+        help="Minimum was_cut count before a tool surfaces as a harvest-driven "
+             "promotion candidate. Filters thin-signal noise. (default: 3)")
     parser.add_argument("--dampener-max-candidates", type=int, default=DEFAULT_DAMPENER_MAX_CANDIDATES,
                         help="Max candidates surfaced per (scope, trigger)")
     return parser.parse_args()
@@ -1281,7 +1397,7 @@ def main() -> int:
     predictions = load_rows(predictions_paths)
     tool_calls = load_rows(tool_calls_paths)
     stats = collect_stats(predictions, tool_calls)
-    recs = recommendation_rows(stats, args)
+    recs = recommendation_rows(stats, args) + harvest_recommendation_rows(stats, args)
     dampeners = dampener_candidates(stats, args)
 
     if args.format == "json":

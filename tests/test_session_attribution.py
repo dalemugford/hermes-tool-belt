@@ -499,6 +499,104 @@ class TriggerFpLateBoundTpTests(unittest.TestCase):
             "blank session_id must fall back to same-prediction classification")
 
 
+class HarvestRecommendationTests(unittest.TestCase):
+    """The analyzer's harvest-aware recommendation generator should
+    surface per-tool promotion candidates from was_cut signal, with
+    clear actions for the three regimes (net-positive promote,
+    frequent-but-net-negative broaden, sparse keep)."""
+
+    def _harvest_row(self, *, pid, scope, tool=None, was_cut=False):
+        if tool is None:
+            return {
+                "prediction_id": pid,
+                "session_id": f"harvest:{pid[:4]}",
+                "scope": scope,
+                "agent": scope.split(":")[0],
+                "platform": scope.split(":")[1],
+                "policy_source": "harvest",
+                "message_preview": f"msg-{pid}",
+                "ceiling_count": 30, "narrowed_count": 15,
+                "ceiling_tokens": 100, "narrowed_tokens": 50,
+            }
+        return {
+            "prediction_id": pid,
+            "session_id": f"harvest:{pid[:4]}",
+            "scope": scope,
+            "tool_name": tool,
+            "was_cut": was_cut,
+            "policy_source": "harvest",
+        }
+
+    def _args(self, **overrides):
+        defaults = dict(
+            expand_round_trip_tokens=1500,
+            per_tool_tokens=388,
+            harvest_min_cuts=3,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def test_net_positive_surfaces_as_promote(self):
+        # 100 predictions, 50 was_cut for tool X → cost = 50*1500 = 75k
+        # carry = 100*388 = 38.8k → net +36.2k → promote
+        preds = [self._harvest_row(pid=f"p{i:03d}", scope="bernard:telegram") for i in range(100)]
+        calls = [self._harvest_row(pid=f"p{i:03d}", scope="bernard:telegram",
+                                   tool="terminal", was_cut=True) for i in range(50)]
+        stats = analyze.collect_stats(preds, calls)
+        rows = analyze.harvest_recommendation_rows(stats, self._args())
+        terminal_rec = next((r for r in rows if r["item"] == "terminal"), None)
+        self.assertIsNotNone(terminal_rec)
+        self.assertEqual(terminal_rec["action"], "promote_always_on")
+        self.assertGreater(terminal_rec["metrics"]["net_savings_tokens"], 0)
+
+    def test_frequent_but_net_negative_surfaces_as_broaden(self):
+        # 1000 predictions (carry = 388k), 150 was_cut for X (rt = 225k)
+        # → net -163k but cut_rate = 15% (above 10% threshold) → broaden
+        preds = [self._harvest_row(pid=f"p{i:04d}", scope="bernard:telegram") for i in range(1000)]
+        calls = [self._harvest_row(pid=f"p{i:04d}", scope="bernard:telegram",
+                                   tool="patch", was_cut=True) for i in range(150)]
+        stats = analyze.collect_stats(preds, calls)
+        rows = analyze.harvest_recommendation_rows(stats, self._args())
+        patch_rec = next((r for r in rows if r["item"] == "patch"), None)
+        self.assertIsNotNone(patch_rec)
+        self.assertEqual(patch_rec["action"], "broaden_trigger_recall")
+        self.assertLess(patch_rec["metrics"]["net_savings_tokens"], 0)
+
+    def test_sparse_cuts_keep_gated(self):
+        # 1000 predictions, only 5 was_cut → cut_rate 0.5%, net very
+        # negative → keep_gated
+        preds = [self._harvest_row(pid=f"p{i:04d}", scope="bernard:telegram") for i in range(1000)]
+        calls = [self._harvest_row(pid=f"p{i:04d}", scope="bernard:telegram",
+                                   tool="browser_vision", was_cut=True) for i in range(5)]
+        stats = analyze.collect_stats(preds, calls)
+        rows = analyze.harvest_recommendation_rows(stats, self._args())
+        rec = next((r for r in rows if r["item"] == "browser_vision"), None)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["action"], "keep_gated")
+
+    def test_below_min_cuts_does_not_surface(self):
+        # 1 was_cut < harvest_min_cuts=3 → no rec emitted
+        preds = [self._harvest_row(pid="p001", scope="bernard:telegram")]
+        calls = [self._harvest_row(pid="p001", scope="bernard:telegram",
+                                   tool="cronjob", was_cut=True)]
+        stats = analyze.collect_stats(preds, calls)
+        rows = analyze.harvest_recommendation_rows(stats, self._args())
+        self.assertFalse([r for r in rows if r["item"] == "cronjob"])
+
+    def test_no_harvest_rows_no_output(self):
+        # Live data only (no policy_source=harvest) → empty output
+        preds = [{
+            "prediction_id": "p1", "session_id": "live-s1", "scope": "bernard:telegram",
+            "policy_source": "preset", "message_preview": "x",
+            "ceiling_count": 1, "narrowed_count": 1, "ceiling_tokens": 1, "narrowed_tokens": 1,
+        }]
+        calls = [{"prediction_id": "p1", "session_id": "live-s1", "scope": "bernard:telegram",
+                  "tool_name": "terminal", "was_cut": True, "policy_source": "preset"}]
+        stats = analyze.collect_stats(preds, calls)
+        rows = analyze.harvest_recommendation_rows(stats, self._args())
+        self.assertFalse(rows, "live-only telemetry must not produce harvest recs")
+
+
 class ExpandToolsUsedAttributionTests(unittest.TestCase):
     """The ``expand_tools_used`` flag must only fire when expansion
     actually provided the tool — not when the model happens to call a
