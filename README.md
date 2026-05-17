@@ -1,20 +1,69 @@
 # dynamic-tools
 
-A Hermes plugin that narrows the tool definitions sent to the model on each
-gateway message based on detected intent. Falls back silently to no-narrowing
-on any failure. Strictly respects the user's existing `platform_toolsets`
-config as a hard ceiling.
+A [Hermes Agent](https://hermes-agent.nousresearch.com) plugin that
+narrows the tools sent to the model on each message — so the prompt
+budget pays only for the tools the current turn actually needs.
 
-Designed for Bernard, Sue, or any Hermes profile where tool overhead is the
-dominant token cost. Telemetry on Bernard's Telegram scope (pre-2026-05-17
-archive): **3.37M tokens saved across 109 sessions, ~57% reduction vs. baseline**,
-at an estimated **~388 tokens per tool per API call**. The
-2026-05-17 audit identified two attribution bugs and reset live telemetry
-for clean post-fix measurement (the savings number is unaffected — token
-math doesn't depend on the buggy fields).
+## The problem
+
+Every inbound message ships **every** tool definition the agent has.
+For a heavy profile (web, terminal, file, browser, MCP servers, custom
+skills) that can be 8–15k tokens of overhead on a message whose answer
+is "yes." Most of those tools aren't relevant to what's being asked
+right now — but the model still pays to read them.
+
+## What it does
+
+On every inbound gateway message, the plugin:
+
+1. **Reads the message** (and recent context, if lookback is enabled).
+2. **Predicts** which tool categories the agent will need this turn
+   using a configurable regex/keyword classifier.
+3. **Filters** the outbound API call's `tools` payload down to
+   `(always_on ∪ triggered ∪ expanded ∪ sticky) ∩ ceiling`. Your
+   existing `platform_toolsets` config remains a hard ceiling — the
+   plugin never *adds* tools you didn't sanction.
+4. **Hands the model an escape hatch.** An `expand_tools` meta-tool is
+   always loaded. If the predictor guesses wrong, the model calls
+   `expand_tools(category="browser")` (or any category) and the next
+   API call unions the resolved tools into the allowed set.
+5. **Logs everything** to append-only JSONL so you can audit and tune
+   the policy with real numbers, not vibes.
+
+Any failure — bad YAML, predictor exception, lookup miss — falls
+through to **no narrowing**. The plugin is invisible when broken, never
+destructive.
+
+## Measured impact
+
+Telemetry on Bernard's Telegram scope (pre-2026-05-17 audit reset):
+**3.37M tokens saved across 109 sessions, ~57% reduction vs.
+baseline**, at an estimated **~388 tokens per tool per API call**.
+
+> The 2026-05-17 audit found two attribution bugs in the analyzer
+> (`expand_tools_used` was 94% over-credited; trigger FPs were ~32%
+> under-counted by missing late-bound TPs) and reset live telemetry
+> for clean post-fix measurement. The savings figure above is
+> unaffected — token math doesn't depend on the buggy fields — but
+> per-trigger precision/recall numbers from before the fix should be
+> treated as approximate.
+>
+> Until clean post-fix data accumulates, the harvest-based view
+> ([scripts/bootstrap.py](scripts/bootstrap.py)) is the most reliable
+> source of per-profile auto-apply recommendations.
+
+## Releases
+
+This branch (`main`) is the trunk; everything ships from here. Lab
+features that aren't ready to be enabled by default are gated behind
+config flags (`enabled: false`, `learned_mode: off`, etc.) so an
+install of `main` is always safe.
+
+Release tags (`vX.Y.Z`) mark known-good states. For stability, pin a
+tag. For bleeding-edge, track `main`.
 
 Companion docs:
-- **[STRATEGY.md](STRATEGY.md)** — the north star: the promise, lab/live split, calibration flow, official-plugin readiness. **Start here** if you want to understand where this plugin is going.
+- **[STRATEGY.md](STRATEGY.md)** — the north star: the promise, release strategy, calibration flow, official-plugin readiness. **Start here** if you want to understand where this plugin is going.
 - [PLAN.md](PLAN.md) — current architecture, what's built vs. planned, validation status
 - [CALIBRATION-PLAN.md](CALIBRATION-PLAN.md) — design for the observe → handoff → steady-state flow that makes "install, activate, done" honest
 - [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md) — the writer-side script that closes the loop (telemetry-correctness audit cleared mechanically; see [docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md))

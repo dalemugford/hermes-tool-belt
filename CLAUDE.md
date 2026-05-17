@@ -13,21 +13,29 @@ architecture and status live in [PLAN.md](PLAN.md); user-facing docs in
 - The plugin is not yet publicly released. No back-compat is required —
   prefer the clean change over a shim.
 
-## Branch discipline
+## Branch discipline (trunk-based, as of 2026-05-17)
 
-- Two branches: `labs` (active work, data collection, experimentation) and
-  `main` (runtime-only, what would ship).
-- Develop on `labs`. Cherry-pick runtime-only changes to `main` when they
-  earn promotion under the criteria in [STRATEGY.md](STRATEGY.md) §"Lab vs.
-  Live."
-- Check the current branch before editing.
+- Develop on `main`. It's the trunk and the single source of truth.
+- Release stability comes from tags (`vX.Y.Z`), not from a parallel branch.
+- Features that aren't safe to enable by default ship behind config flags
+  (`enabled: false`, `learned_mode: off`, etc.), not behind branch quarantine.
+- The `labs` branch is reserved for the rare case where something is
+  genuinely unsafe to ship even off-by-default (e.g., live soak-testing
+  `apply.py` against real `learned.json`). Otherwise it stays unused.
+
+The previous split (`labs` = active dev, `main` = curated runtime) was
+abandoned because every feature was already gated by config or by being
+an opt-in script; the branch separation added cherry-pick friction without
+adding real safety.
 
 ## Where things live
 
-- Mechanism (live-eligible): [__init__.py](__init__.py),
-  [predictor.py](predictor.py), [presets.py](presets.py),
-  [expand_tools.py](expand_tools.py), [logger_io.py](logger_io.py),
-  [policy.yaml](policy.yaml)
-- Adaptive layer (lab): [learned.py](learned.py), [analyze.py](analyze.py)
+- Mechanism: [__init__.py](__init__.py), [predictor.py](predictor.py),
+  [presets.py](presets.py), [expand_tools.py](expand_tools.py),
+  [logger_io.py](logger_io.py), [policy.yaml](policy.yaml)
+- Adaptive layer (off-by-default): [learned.py](learned.py)
+- Dev / ops tools: [analyze.py](analyze.py), [scripts/](scripts/)
 - Telemetry: `~/.hermes/state/dynamic-tools/predictions.jsonl` +
   `tool_calls.jsonl`
+- Harvest output (separate from live telemetry):
+  `~/.hermes/state/dynamic-tools/harvest/`

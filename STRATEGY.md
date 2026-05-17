@@ -28,53 +28,44 @@ is real.
 
 ---
 
-## Lab vs. Live
+## Release strategy (trunk-based, since 2026-05-17)
 
-To make the promise honest without freezing all current experimentation,
-split the plugin into two surfaces:
+The plugin is **trunk-based**: all development happens on `main`, and
+release tags (`vX.Y.Z`) mark known-good states. The earlier `labs` vs.
+`main` split was abandoned because every adaptive feature was already
+gated by config (`enabled: false`, `learned_mode: off`) or invoked as
+an opt-in script — the branch separation added cherry-pick friction
+without adding real safety.
 
-### Live (`main` branch / shipped plugin)
+### What gets shipped
 
-What we'd be comfortable telling other Hermes users to install today.
-Stable, narrow scope, predictable behavior.
+Everything on `main` ships. The discipline shifts from "decide what
+merges to main" to "decide what defaults to on in the release notes."
 
-Includes:
-- The single shipped policy (`policy.yaml`) and the per-scope override surface
-- `predictor.py` (regex + `exclude_keywords` dampeners)
-- `_build_api_kwargs` patch — the actual narrowing mechanism
-- `expand_tools` meta-tool — the safety valve
-- Sticky residency (in-memory, per-session-key, TTL'd) — corrected from
-  the original per-scope keying after the 2026-05-17 audit found
-  cross-conversation leakage on the old design
-- Predictor lookback (1-turn default)
-- `triggers_suppressed` telemetry — minimal, useful for tuning
-- Basic `predictions.jsonl` / `tool_calls.jsonl` for jq spot-checks
-- Smoke-test harness (`scripts/smoke-test.py`) — mechanical validation
-  for the runtime surface above
+Three categories, each with a corresponding defaults rule:
 
-Approximately 600 lines. Everything in this set has been in production
-under Bernard:telegram and has measurable savings.
+**Default-on (safe, validated, low-blast-radius failure):**
+- Static policy + predictor + `_build_api_kwargs` patch + `expand_tools` safety valve
+- Per-session sticky residency + predictor lookback
+- Telemetry logging (`predictions.jsonl` / `tool_calls.jsonl`)
+- These ship as the active narrowing path. Failure mode is "no narrowing happens" — never destructive.
 
-### Lab (`labs` branch / not yet shipped)
+**Default-off, easy opt-in (mature, but the user should make the call):**
+- Adaptive overlay (`learned_mode: off` by default; flip to `recommend`/`auto`/`audit` to engage)
+- A/B bypass cohort sampler (`bypass_rate: 0.0` by default)
+- These exist in the codebase but require an explicit config to take effect.
 
-Where the adaptive ideas live until they prove themselves across profiles.
+**Manual invocation only (dev / ops tools that don't run automatically):**
+- The analyzer (`analyze.py`)
+- Smoke test (`scripts/smoke-test.py`)
+- Harvest infrastructure (`scripts/harvest-replay.py`, `scripts/bootstrap.py`)
+- Telemetry cron (`scripts/daily-analysis.sh`)
+- These ship in-tree because they're how the user audits, tunes, and warm-starts the plugin. Nothing in this group runs unless the user runs it.
 
-Includes:
-- `learned.json` overlay (`learned.py`, `learned_mode`)
-- Analyzer's recommendation engine (`recommendation_rows`,
-  `harvest_recommendation_rows`, `dampener_candidates`,
-  `trigger_keyword_candidates`, cohort comparison, net-value math)
-- A/B bypass cohort sampler
-- Harvest infrastructure — `scripts/harvest-replay.py` and the
-  harvest-aware analyzer modes (new since 2026-05-17)
-- First-install bootstrap UX (`scripts/bootstrap.py`) — currently
-  manually invoked; auto-bootstrap on `register()` is future work
-- The auto-apply layer described in [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md) — still unimplemented but with mechanical prereqs now cleared
-- The calibration-mode flow described in [CALIBRATION-PLAN.md](CALIBRATION-PLAN.md)
+### Promotion: from off-by-default to default-on
 
-### Promotion criteria (lab → live)
-
-A feature graduates to live when **all** of the following hold:
+A default-off feature graduates to default-on when **all** of the
+following hold:
 
 1. It works on at least one non-Bernard profile (see Cross-Profile
    Validation below) without per-scope tuning.
@@ -84,7 +75,17 @@ A feature graduates to live when **all** of the following hold:
 4. There's a way to disable it that doesn't require the user to
    understand the feature.
 
-Anything that fails a criterion stays in lab.
+The decision lives in the release-notes for the next minor version,
+not in a branch merge. Anything that fails a criterion stays
+off-by-default for that release.
+
+### When `labs` branch is appropriate
+
+Reserved for changes that aren't safe to ship even off-by-default —
+e.g., when `apply.py` is first being soak-tested against live
+`learned.json`. Once the soak clears, the change merges to `main`
+behind a config flag and follows the normal promotion path. Otherwise
+`labs` stays unused and the trunk is the only active branch.
 
 ---
 
