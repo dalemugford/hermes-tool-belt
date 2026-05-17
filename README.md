@@ -6,16 +6,21 @@ on any failure. Strictly respects the user's existing `platform_toolsets`
 config as a hard ceiling.
 
 Designed for Bernard, Sue, or any Hermes profile where tool overhead is the
-dominant token cost. Live telemetry across 109 sessions on Bernard's
-Telegram scope: **3.37M tokens saved, ~57% reduction vs. baseline**,
-at an estimated **~388 tokens per tool per API call**.
+dominant token cost. Telemetry on Bernard's Telegram scope (pre-2026-05-17
+archive): **3.37M tokens saved across 109 sessions, ~57% reduction vs. baseline**,
+at an estimated **~388 tokens per tool per API call**. The
+2026-05-17 audit identified two attribution bugs and reset live telemetry
+for clean post-fix measurement (the savings number is unaffected — token
+math doesn't depend on the buggy fields).
 
 Companion docs:
 - **[STRATEGY.md](STRATEGY.md)** — the north star: the promise, lab/live split, calibration flow, official-plugin readiness. **Start here** if you want to understand where this plugin is going.
 - [PLAN.md](PLAN.md) — current architecture, what's built vs. planned, validation status
-- [CALIBRATION-PLAN.md](CALIBRATION-PLAN.md) — design for the observe → handoff → steady-state flow that makes "install, activate, done" honest (deferred)
-- [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md) — the writer-side script that closes the loop (deferred; depends on telemetry-correctness audit)
+- [CALIBRATION-PLAN.md](CALIBRATION-PLAN.md) — design for the observe → handoff → steady-state flow that makes "install, activate, done" honest
+- [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md) — the writer-side script that closes the loop (telemetry-correctness audit cleared mechanically; see [docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md))
 - [TRIGGER-SCORING-PLAN.md](TRIGGER-SCORING-PLAN.md) — historical full-scoring plan; current direction is the lighter `exclude_keywords` dampener slice
+- [docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md) — first-pass telemetry-correctness audit (2 bugs found + fixed, 2 items clean, 3 items pending data accumulation)
+- [docs/harvest-followups.md](docs/harvest-followups.md) — open auto-apply candidates surfaced by harvest; resolve by edit or via the trigger-keyword suggester
 - [docs/dynamic-tools-hermes-surface.md](docs/dynamic-tools-hermes-surface.md) — patch-point reference; read before any Hermes upgrade
 - [docs/dynamic-tools-plan.md](docs/dynamic-tools-plan.md) — original design doc and categorization audit
 
@@ -36,6 +41,21 @@ Restart Hermes (or the gateway) so the plugin's `register()` runs. From the
 next message onward, tool definitions are narrowed per-message. The model
 always gets `expand_tools` as recourse if it needs a category that wasn't
 loaded.
+
+### Day-one recommendations (warm start)
+
+If you have any existing Hermes sessions under `~/.hermes/sessions/`,
+run the bootstrap script once after install to get concrete promotion
+candidates and trigger-keyword suggestions tailored to your own usage
+— no need to wait for live telemetry to accumulate:
+
+```bash
+python3 ~/.hermes/plugins/dynamic-tools/scripts/bootstrap.py
+```
+
+The script replays your session history through the predictor, runs
+the analyzer in harvest-aware mode, and prints a ranked **TOP ACTIONS**
+summary. See [scripts/README.md](scripts/README.md) for details.
 
 ## Policy
 
@@ -359,6 +379,7 @@ All thresholds are CLI flags, not hard-coded policy:
 | `--unused-carry-turns` | 10 | Always-on tools carried this many turns with zero calls become demotion candidates |
 | `--trigger-min-fires` | 3 | Minimum fires before a trigger gets a precision/recall recommendation |
 | `--expand-round-trip-tokens` | 1500 | Estimated total cost of one `expand_tools` round-trip (model output + result + extra API call). Folded into per-category net-value math and the headline net-savings number. |
+| `--harvest-min-cuts` | 3 | Minimum was_cut count before a tool surfaces as a harvest-driven promotion candidate. |
 
 The analyzer does **not** write `learned.json`. It only ever writes the
 markdown report and (with `--write-recommendations`) the recommendations
@@ -370,6 +391,44 @@ Per-category recommendations now include net-value math: `saved_round_trip_token
 clears the expand-rate/use-rate thresholds but has negative net value
 under the current defaults, the action becomes `review_net_negative`
 instead of `promote_candidate`.
+
+### Harvest-aware mode
+
+When the state dir contains `policy_source: harvest` rows (produced by
+[scripts/harvest-replay.py](scripts/harvest-replay.py)), the analyzer
+auto-activates two additional recommendation flows:
+
+**Per-tool promotion candidates** (`kind: harvest_tool_promotion`):
+direct was_cut-based ranking. Each historical tool call that current
+narrowing would have cut represents a counterfactual `expand_tools`
+round-trip. The math:
+
+    net_savings = cuts × expand_round_trip_tokens
+                − predictions × per_tool_tokens
+
+| Action | Trigger |
+|---|---|
+| `promote_always_on` | net positive — tool should join always-on |
+| `broaden_trigger_recall` | net negative but cut_rate ≥ 10% — fix the trigger keywords, don't pay per-turn carry |
+| `keep_gated` | sparse cuts; not worth either action |
+
+**Trigger-keyword candidates** (`--suggest-trigger-keywords`):
+symmetric inverse of `--suggest-dampeners`. Mines was_cut message
+previews for n-grams that would have fired a trigger to cover the
+tool. For each candidate, decides whether to suggest `add_keywords_to_trigger`
+(an existing group already claims the tool) or `create_new_trigger`
+(no group claims it yet — proposes a new group name from the tool's
+underscore prefix).
+
+```bash
+# Generate the harvest data, then run the analyzer against it
+python3 scripts/harvest-replay.py
+python3 analyze.py --state-dir ~/.hermes/state/dynamic-tools/harvest \
+    --suggest-trigger-keywords --suggest-dampeners
+```
+
+Or use [scripts/bootstrap.py](scripts/bootstrap.py) to do all of this
+in one shot with a ranked TOP ACTIONS summary.
 
 ## A/B baseline cohort
 
@@ -523,12 +582,31 @@ rm -rf ~/.hermes/plugins/dynamic-tools
 ├── expand_tools.py                  # the expand_tools meta-tool
 ├── logger_io.py                     # predictions.jsonl + tool_calls.jsonl
 ├── analyze.py                       # deterministic telemetry analyzer
-├── README.md                        # this file
-├── PLAN.md                          # current adaptive-layer plan and status
-├── TRIGGER-SCORING-PLAN.md          # historical full-scoring plan (deferred)
 ├── policy.yaml                      # the single shipped tool policy
+├── CLAUDE.md                        # in-dir editing rules (scope, no back-compat, labs/main)
+├── README.md                        # this file
+├── STRATEGY.md                      # north star — promise, lab/live split, official-plugin readiness
+├── PLAN.md                          # current architecture + status
+├── AUTO-APPLY-PLAN.md               # writer-side closure plan; prereqs partially cleared
+├── CALIBRATION-PLAN.md              # observe → handoff → steady-state flow
+├── TRIGGER-SCORING-PLAN.md          # historical full-scoring plan (deferred)
+├── docs/
+│   ├── telemetry-audit-2026-05-17.md  # first audit pass — 2 bugs fixed, 3 pending data
+│   ├── harvest-followups.md           # open auto-apply candidates surfaced by harvest
+│   ├── dynamic-tools-hermes-surface.md  # patch-point reference
+│   └── dynamic-tools-plan.md          # original design doc + categorization
 ├── scripts/
-│   └── check_trigger_dampeners.py   # smoke checks for exclude_keywords + learned merge
+│   ├── bootstrap.py                 # first-install warm-start UX wrapper
+│   ├── harvest-replay.py            # replay sessions/*.jsonl → synthetic telemetry
+│   ├── smoke-test.py                # end-to-end mechanical validation
+│   ├── daily-analysis.sh            # twice-daily analyzer cron
+│   ├── rotate-telemetry.sh          # archive live JSONL files (gateway-safe)
+│   ├── check_trigger_dampeners.py   # smoke checks for exclude_keywords + learned merge
+│   └── README.md                    # ops scripts inventory + invocation
+├── tests/
+│   ├── test_session_attribution.py  # 43 unit tests across attribution/expand/harvest/keywords
+│   ├── test_harvest_privacy.py      # privacy invariants for harvest output
+│   └── run_tests.py
 └── reports/                         # analyzer markdown output (dated)
 ```
 

@@ -43,24 +43,33 @@ Includes:
 - `predictor.py` (regex + `exclude_keywords` dampeners)
 - `_build_api_kwargs` patch — the actual narrowing mechanism
 - `expand_tools` meta-tool — the safety valve
-- Sticky residency (in-memory, per-scope, TTL'd)
+- Sticky residency (in-memory, per-session-key, TTL'd) — corrected from
+  the original per-scope keying after the 2026-05-17 audit found
+  cross-conversation leakage on the old design
 - Predictor lookback (1-turn default)
 - `triggers_suppressed` telemetry — minimal, useful for tuning
 - Basic `predictions.jsonl` / `tool_calls.jsonl` for jq spot-checks
+- Smoke-test harness (`scripts/smoke-test.py`) — mechanical validation
+  for the runtime surface above
 
 Approximately 600 lines. Everything in this set has been in production
 under Bernard:telegram and has measurable savings.
 
-### Lab (`lab` branch / not shipped)
+### Lab (`labs` branch / not yet shipped)
 
 Where the adaptive ideas live until they prove themselves across profiles.
 
 Includes:
 - `learned.json` overlay (`learned.py`, `learned_mode`)
 - Analyzer's recommendation engine (`recommendation_rows`,
-  `dampener_candidates`, cohort comparison, net-value math)
+  `harvest_recommendation_rows`, `dampener_candidates`,
+  `trigger_keyword_candidates`, cohort comparison, net-value math)
 - A/B bypass cohort sampler
-- The auto-apply layer described in [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md)
+- Harvest infrastructure — `scripts/harvest-replay.py` and the
+  harvest-aware analyzer modes (new since 2026-05-17)
+- First-install bootstrap UX (`scripts/bootstrap.py`) — currently
+  manually invoked; auto-bootstrap on `register()` is future work
+- The auto-apply layer described in [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md) — still unimplemented but with mechanical prereqs now cleared
 - The calibration-mode flow described in [CALIBRATION-PLAN.md](CALIBRATION-PLAN.md)
 
 ### Promotion criteria (lab → live)
@@ -105,6 +114,17 @@ Three phases:
 The shipped policy becomes the *seed* for the observe phase (or the
 fallback when calibration hasn't completed), not the destination. Full
 design in [CALIBRATION-PLAN.md](CALIBRATION-PLAN.md).
+
+**Update 2026-05-17:** `scripts/bootstrap.py` is the first concrete
+implementation of the handoff phase. It runs harvest-replay against
+existing `~/.hermes/sessions/*.jsonl` to produce synthetic telemetry,
+then runs the analyzer in harvest-aware mode to surface ranked TOP
+ACTIONS — concrete promotion candidates and trigger-keyword
+suggestions. Day-one recommendations exist; the user reviews and
+applies them by hand. Auto-bootstrap on plugin first activation (the
+"register() detects empty live telemetry → runs harvest →
+surfaces recommendations" magic UX) is the next step toward making
+the handoff fully automatic.
 
 ---
 

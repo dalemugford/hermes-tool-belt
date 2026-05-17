@@ -36,6 +36,8 @@ The plugin doesn't modify these — but it depends on their shape and behavior. 
 | `hermes_cli.config.load_config / cfg_get` | [hermes_cli/config.py:3491, 3574](../hermes-agent/hermes_cli/config.py#L3491) | Read plugin config from `~/.hermes/config.yaml`. |
 | `toolsets.resolve_toolset(name)` | [toolsets.py](../hermes-agent/toolsets.py) | Resolve a category/toolset name (e.g. `"browser"`) to its tool name list. Used by `expand_tools`. |
 | `_run_in_executor_with_context` propagates `ContextVar` | [gateway/run.py](../hermes-agent/gateway/run.py) (`copy_context()` + `ctx.run`) | Required for the prediction `ContextVar` to reach the agent's executor thread. |
+| `session_store._generate_session_key(event.source)` | [gateway/session.py](../hermes-agent/gateway/session.py) `SessionStore` | Resolve the canonical Hermes session key for telemetry. Added 2026-05-17 (audit fix #3) so `predictions.jsonl` rows carry the same session id Hermes uses for routing, instead of the AIAgent uuid. Plugin gracefully falls back to `HERMES_SESSION_KEY` env var, then `kwargs.session_id`, then `event.session_id`. Failure mode: `session_id` field is blank, which disables the bypass cohort + session-windowed FP classification but doesn't break narrowing. |
+| Canonical session-key shape `agent:main:{platform}:{chat_type}[:...]` | [gateway/session.py:build_session_key](../hermes-agent/gateway/session.py) | Position 1 is the literal string `"main"`, NOT the per-profile agent name. The plugin's `_parse_session_key_scope` validates this and extracts platform from position 2. If Hermes changes the key shape, scope attribution falls back to blank rather than synthesizing `main:<platform>`. |
 
 ## What an upstream update could break
 

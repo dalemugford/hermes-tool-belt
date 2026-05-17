@@ -1,8 +1,30 @@
 # dynamic-tools: Adaptive Layer Implementation Plan
 
-**Date:** 2026-05-12
-**Status:** Phase 2.1 analyzer implemented and hardened; trigger dampeners live-verified; 2026-05-12 measurement-layer additions landed (expand round-trip cost accounting, predictor lookback, A/B bypass cohort). Scope reverted to `{agent}:{platform}` after the simplification pass (see §6). Learned/adaptive policy still safe default off.
-**Context:** Based on live telemetry analysis showing substantial token savings and a small set of trigger false positives worth tightening.
+**Date:** 2026-05-17 (last major refresh; original plan dated 2026-05-12)
+**Status:** Telemetry-correctness audit (2026-05-17) cleared mechanical
+prereqs from [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md) — items #1, #2, #5
+fixed; items #3, #4 pending post-restart accumulation; #6 needs ≥2
+weeks of clean data. Harvest infrastructure built and validated; first
+harvest-driven auto-apply candidates already surfaced and tracked in
+[docs/harvest-followups.md](docs/harvest-followups.md). `apply.py`
+writer remains the open milestone — now strongly justified by the
+quality of harvest signal.
+
+**Context:** The 2026-05-17 session ([git log labs](.)) made three
+parallel pushes that collectively reframe this plan:
+
+1. **Telemetry-correctness audit** ([docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md))
+   found `expand_tools_used` was 94% spuriously inflated and trigger
+   FPs were ~32% under-counted (sticky carried late-bound TPs that the
+   same-prediction-only classifier missed). Both fixed at write + read.
+2. **Harvest-replay** ([scripts/harvest-replay.py](scripts/harvest-replay.py))
+   reads existing `~/.hermes/sessions/*.jsonl` and produces synthetic
+   telemetry tagged `policy_source: harvest`. Solves the cold-start
+   problem for new installs AND accelerates the audit timeline by 15×.
+3. **Harvest-aware analyzer modes** add per-tool promotion candidates
+   (was_cut math) and a trigger-keyword suggester (symmetric inverse
+   of dampener mining). Both surface concrete, data-backed
+   recommendations from existing sessions.
 
 ---
 
@@ -14,26 +36,42 @@
 
 ## Current State (What's Working)
 
+**Mechanism:**
 - Plugin patches `AIAgent._build_api_kwargs` to narrow tools per API call
-- Predictor uses regex triggers + attachment detection
-- `expand_tools` meta-tool recovers cut tools on-demand with sticky TTL (implementation default is currently 3 turns unless overridden in config; adjustable)
+- Predictor uses regex triggers + attachment detection + `exclude_keywords` dampeners
+- `expand_tools` meta-tool recovers cut tools on-demand with sticky TTL (default 3 turns)
+- Sticky residency is per-session (opaque sha1 key), not per-scope — no cross-session leakage
 - Telemetry writes `predictions.jsonl` and `tool_calls.jsonl` with full tool-name sets
-- Tool-call telemetry marks when an expanded tool is actually used, including category and turns until use
-- **Savings measured:** 3.37M tokens saved across 109 sessions, 57% reduction vs baseline
+- Tool-call telemetry correctly attributes expansion-driven use (post-2026-05-17 fix; rows with `was_initially_available: true` are not credited)
+- Trigger FP classification uses session-bounded N-turn (N=3) lookahead, falling back to same-prediction when session_id is blank
+
+**Measurement / validation:**
+- **Savings measured (pre-audit archive):** 3.37M tokens saved across 109 sessions, 57% reduction vs baseline. Token-savings math wasn't affected by the audited bugs.
 - **Per-tool cost measured:** ~388 tokens per tool per API call
+- **Smoke test** ([scripts/smoke-test.py](scripts/smoke-test.py)): 109 synthetic scenarios in <1s validate session_id population, bypass cohort, expand attribution, cross-session isolation, on_session_end eviction. Run after any gateway restart.
+- **Privacy invariants** (harvest output): tool args never written; message text never appears in derived files beyond 80-char preview. Enforced by tests/test_harvest_privacy.py.
+
+**Harvest infrastructure:**
+- [`scripts/harvest-replay.py`](scripts/harvest-replay.py): reads `sessions/*.jsonl` per profile, runs predictor against historical toolsets, emits synthetic `predictions.jsonl` + `tool_calls.jsonl` tagged `source: harvest` to a separate `state/dynamic-tools/harvest/` subdir.
+- [`scripts/bootstrap.py`](scripts/bootstrap.py): wraps harvest + analyzer into a single first-install UX with ranked TOP ACTIONS summary.
+- Analyzer harvest-aware mode: per-tool `harvest_tool_promotion` recommendations (was_cut × round-trip vs predictions × per-tool carry math), plus `--suggest-trigger-keywords` mining of cut-tool message previews.
+
+**Tests:** 43 unit tests + 8 smoke-test assertions, all green.
 
 ---
 
 ## What's Built / What's Missing
 
 The plugin now manipulates tools through:
-1. **Static preset YAML** (`presets/aggressive.yaml`) — hard-coded always_on and triggers
-2. **Manual config overrides** (`always_on_extra`, `always_off`) — requires editing config.yaml
-3. **Temporary sticky** (`_STICKY_BY_KEY`) — in-memory only, TTL-based, session-scoped, resets on session end
-4. **Learned state** (`learned.json`) — persistent per-scope overlays, applied only when `learned_mode` permits it
-5. **Analyzer recommendations** (`analyze.py`) — deterministic telemetry pass that emits markdown reports and optional `learned_recommendations.json`
+1. **Static policy YAML** ([`policy.yaml`](policy.yaml)) — hand-curated always_on + trigger groups
+2. **Manual config overrides** (`always_on_extra`, `always_off`) in `config.yaml` per scope
+3. **Temporary sticky** (`_STICKY_BY_KEY`, session-scoped, in-memory only, TTL-based)
+4. **Learned state** ([`learned.py`](learned.py) consuming `~/.hermes/state/dynamic-tools/learned.json`) — persistent per-scope overlays, applied only when `learned_mode` permits
+5. **Analyzer recommendations** ([`analyze.py`](analyze.py)) — deterministic telemetry pass that emits markdown reports and `learned_recommendations.json` covering: expanded_category recs, harvest_tool_promotion recs, trigger_quality recs, dampener_candidates, trigger_keyword_candidates
 
-The actuator path exists and the analyzer can now produce reviewable recommendations. The remaining gap is the review/apply loop: running the analyzer on live telemetry when requested, deciding which recommendations are worth testing, applying learned state deliberately, then measuring whether the policy change improves turn efficiency.
+**Still missing — the actual auto-apply writer:**
+- `apply.py` (per [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md)): the writer that consumes `learned_recommendations.json` under strict gates and updates `learned.json` with rate-limited changes + audit trail. Mechanical prereqs cleared; behavioral prereqs gated on post-restart data accumulation.
+- Auto-bootstrap on plugin first activation: today `scripts/bootstrap.py` must be invoked manually. Wiring it into `register()` would close the "install, activate, done" loop literally.
 
 ---
 

@@ -1,9 +1,19 @@
 # dynamic-tools: Calibration Mode — Plan
 
-**Date:** 2026-05-12
-**Status:** Design only; not implemented. Depends on the telemetry
-correctness audit in [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md) and
-cross-profile validation criteria in [STRATEGY.md](STRATEGY.md).
+**Date:** 2026-05-12 (original); status updated 2026-05-17
+**Status:** Partially implemented. The **handoff** phase (originally
+the unrealized middle of the observe → handoff → steady-state flow)
+shipped 2026-05-17 as [scripts/bootstrap.py](scripts/bootstrap.py).
+It runs [scripts/harvest-replay.py](scripts/harvest-replay.py) against
+the user's existing `~/.hermes/sessions/*.jsonl`, runs the analyzer in
+harvest-aware mode, and prints a ranked TOP ACTIONS summary the user
+reviews and applies by hand. The **observe** phase as originally
+designed (start with wildcard, accumulate telemetry, hand off after N
+sessions) is no longer the only path — harvest-replay sidesteps the
+wait when prior sessions exist. The fully-automatic handoff
+(`register()` auto-runs bootstrap on first activation) is the next
+step. The telemetry-correctness audit prerequisite cleared 2026-05-17
+for the mechanical items; see [docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md).
 
 ---
 

@@ -1,8 +1,12 @@
 # dynamic-tools: Auto-Apply Layer — Plan
 
-**Date:** 2026-05-12
-**Status:** design only; not implemented. Telemetry-correctness validation
-is a prerequisite before any auto-apply code runs against live state.
+**Date:** 2026-05-12 (original); status updated 2026-05-17
+**Status:** design only; not implemented. Telemetry-correctness audit
+ran 2026-05-17 — see [docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md)
+for full results. Mechanical prereqs (items #1, #2, #5) cleared with
+write+read fixes. Behavioral prereqs (#3, #4, partial #6) pending
+post-restart data accumulation. Harvest infrastructure has since
+shipped — see "Harvest changes the gate" section below.
 
 ---
 
@@ -29,39 +33,55 @@ all the safety boundaries the manual flow already enforces.
 ## Prerequisite: telemetry correctness audit
 
 **Before any apply code touches learned.json**, we have to be confident
-the analyzer's view of the world matches reality. Open questions:
+the analyzer's view of the world matches reality. Full audit ran
+2026-05-17; results in [docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md).
 
-1. **`expand_tools_used` accounting.** Does the post-tool-call hook
-   correctly distinguish "the model used a tool from the expanded set" vs.
-   "the model called an unrelated tool after expand_tools fired"? Sticky
-   residency complicates this — a tool may show as used because of sticky,
-   not because of the current expansion event.
-2. **Trigger false-positive classification.** A row is FP if the trigger
-   fired and no matching tool was called *within the same prediction*. But
-   the model often calls the tool 2–3 turns later (sticky carries the
-   expansion). Are we miscounting late-bound uses as FPs?
-3. **`session_id` coverage.** Several existing telemetry rows show
-   `session_id: ""` — confirm this is fixed in current code and that
-   future rows always carry a session id (necessary for cohort tracking
-   and revert logic).
-4. **Cohort populations.** Once `bypass_rate: 0.05` is live, confirm the
-   bypass cohort actually accumulates rows on `bernard:telegram` and
-   that `policy_source: bypass` shows up correctly. If bypass turns out
-   net-negative or noisy, recalibrate before trusting any apply gate
-   that depends on cohort comparison.
-5. **`tools_in_category` accuracy.** The expand-cost math uses
-   `expand_event.resolved_tools` for tools-per-category. Confirm this
-   matches the actual resolved tool list at the time of expansion across
-   different categories (some categories like `browser` have 12 tools;
-   small misses change net-value math meaningfully).
-6. **Dampener candidate sample sizes.** Auto-apply for dampeners requires
-   a high precision floor (≥0.95) and meaningful support (≥5). Validate
-   on at least two weeks of live telemetry that high-precision candidates
-   are *consistently* high-precision across non-overlapping windows — not
-   just a one-week artifact.
+| # | Question | Status (2026-05-17) |
+|---|---|---|
+| 1 | `expand_tools_used` accounting — does it correctly distinguish expansion-driven use from coincident sticky overlap? | **FIXED.** 94% of historical credits were spurious (tool already in `initial_allowed`). Writer + analyzer both filter now. Tests in `ExpandToolsUsedAttributionTests`. |
+| 2 | Trigger FP classification — sticky carries late-bound TPs; are we miscounting them as FPs? | **FIXED (analyzer).** Session-bounded 3-turn lookahead recovers ~32% of historical "FPs" as late-bound TPs. Falls back gracefully on blank-session rows. Tests in `TriggerFpLateBoundTpTests`. |
+| 3 | `session_id` coverage — confirm rows always carry a session id | **PENDING.** Canonical session-key fix committed (1f1b7e2); 91% of historical rows had blank session_id. Validate after gateway restart + ≥7 days organic accumulation. Smoke test confirms population mechanically. |
+| 4 | Cohort populations — bypass cohort actually accumulates? | **PENDING.** Config correct (`bypass_rate: 0.05` on `bernard:telegram`); was no-op while session_id was blank. Resolves with #3. |
+| 5 | `tools_in_category` accuracy across categories | **CLEAN.** `expand_event.resolved_tools` is internally consistent (terminal=2, file=4, browser=13). Expand-cost math is correct. |
+| 6 | Dampener candidate sample sizes — high-precision across non-overlapping windows | **PARTIAL.** Single-window candidates exist but no current cluster meets the auto-apply support threshold (fp≥5). Cross-window stability check deferred until ≥2 weeks of clean data. |
 
-**Gate:** until each of these is answered, treat the apply layer as a
-design exercise, not a build target.
+**Gate:** items #1, #2, #5 cleared. Items #3, #4 unblock on post-restart
+data (typical lead: 7 days). Item #6's stability check needs ~2 weeks.
+**The harvest path (next section) provides an alternate clearance path
+for #3, #4, and partial #6.**
+
+---
+
+## Harvest changes the gate
+
+After this plan was originally drafted, `scripts/harvest-replay.py`
+shipped. It reads existing Hermes session JSONLs and produces synthetic
+telemetry tagged `policy_source: harvest`. This sidesteps the
+"wait 1-2 weeks for organic data" gate for most of the audit:
+
+- **Trigger precision/recall:** computable directly from harvest data
+  (predictor runs on real user messages; assistant tool_calls are the
+  ground truth). No counterfactual needed.
+- **Dampener candidate mining:** real false-positive messages from real
+  conversations, in volume.
+- **Coverage gaps:** the new `trigger_keyword_candidates` analyzer mode
+  surfaces tools the model called frequently that no trigger predicts.
+
+What harvest *cannot* validate (counterfactual gap):
+- Actual token savings under narrowing (the historical model saw the
+  full toolset, so we can't know what it would have done with a cut)
+- `expand_tools_used` round-trip frequency (no narrowing was active
+  historically; the rate is hypothetical)
+- Bypass cohort behavioral comparison (no bypass existed historically)
+
+**Practical effect on the apply.py gate:**
+- Harvest gives us the trigger precision data and dampener support
+  data the audit asks for, without the 1-2 week wait.
+- The cohort comparison (#4) still requires live post-restart data
+  because there's no way to back-test bypass behavior on history.
+- Net: apply.py can move from "design only, all-prereqs-blocked" to
+  "design ready, behavioral-cohort-only blocked" once harvest data
+  is reviewed.
 
 ---
 
