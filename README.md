@@ -108,6 +108,7 @@ bleeding-edge, track `main`. Current release: **2026.5.17-beta**.
 - [PLAN.md](PLAN.md) — current architecture, what's built vs. planned, validation status
 - [CALIBRATION-PLAN.md](CALIBRATION-PLAN.md) — observe → handoff → steady-state flow that makes "install, activate, done" honest
 - [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md) — design for the writer-side script that closes the loop
+- [docs/expand-tools-evolution.md](docs/expand-tools-evolution.md) — next-step ideas for making `expand_tools` more precise before adding heavier retrieval
 - [docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md) — first-pass audit: 2 bugs fixed, 2 items clean, 3 pending data accumulation
 - [docs/harvest-followups.md](docs/harvest-followups.md) — open auto-apply candidates surfaced by harvest
 - [docs/dynamic-tools-hermes-surface.md](docs/dynamic-tools-hermes-surface.md) — patch-point reference; read before any Hermes upgrade

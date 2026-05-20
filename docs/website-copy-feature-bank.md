@@ -1,0 +1,98 @@
+# dynamic-tools website copy — feature bank
+
+Reusable marketing copy fragments for docs, website sections, release notes, and plugin listings.
+
+## One-liners
+
+- **Cut your Hermes agent's per-message tool overhead by shipping only the tools the current turn actually needs.**
+- **dynamic-tools narrows tool payloads per message, not per profile, so short turns stop subsidizing heavy ones.**
+- **Measured savings, graceful recovery, strict policy boundaries.**
+- **A tool-selection layer for Hermes that lowers cost without reducing the user’s allowed capability ceiling.**
+
+## Short descriptions
+
+### 25-word version
+A Hermes plugin that narrows tool definitions per gateway message, reducing tool overhead while preserving safe recovery paths and respecting the user's configured tool ceiling.
+
+### 50-word version
+`dynamic-tools` is a Hermes Agent plugin that sends only the tools each turn is likely to need. It reduces token overhead, recovers cleanly when the model needs something gated, and stays inside the user's existing tool permissions.
+
+### 75-word version
+`dynamic-tools` helps Hermes spend less on tool overhead by narrowing the tool definitions sent with each gateway message. It uses lightweight intent prediction, keeps a built-in recovery path through `expand_tools`, and never exceeds the user's configured `platform_toolsets` ceiling. The plugin is measured, observable, and designed to fail open, so users can save tokens without betting the workflow on fragile behavior.
+
+## Headline options
+
+- **Only ship the tools this turn needs.**
+- **Stop paying full tool overhead on every message.**
+- **Tool overhead, trimmed to fit the turn.**
+- **Measured savings for Hermes tool payloads.**
+- **A narrower tool payload for every smarter turn.**
+
+## Top feature bullets
+
+- **Per-message tool narrowing**
+  Predicts likely tool needs for the current turn and sends only that smaller set.
+
+- **Built-in recovery**
+  `expand_tools` lets the model pull in gated categories when it genuinely needs them.
+
+- **Strict user-bound ceilings**
+  The plugin narrows allowed tools. It does not re-enable tools the user disabled.
+
+- **Sticky residency**
+  Expanded categories can remain available across follow-up turns during active work.
+
+- **Telemetry-backed tuning**
+  Predictions and real tool usage are logged, so policy changes can be grounded in evidence.
+
+## Security and privacy bullets
+
+- **No full message logging** — telemetry stores a hash and short preview, not the whole message.
+- **No silent permission expansion** — the user’s configured tool ceiling remains authoritative.
+- **Session-scoped temporary state** — sticky admissions are in-memory and reset on restart.
+- **Fail-open behavior** — errors fall back to no narrowing rather than partial breakage.
+- **Minimal runtime patching** — a small wrapper at runtime, no Hermes source edits on disk.
+
+## Performance bullets
+
+- **57% measured reduction across 109 production sessions**
+- **3.37M tokens saved in observed traffic**
+- **About 388 tokens of cost per tool, per API call**
+- **Lightweight trigger-based prediction path**
+- **Sticky expansions reduce repeated round-trip cost**
+- **Bypass cohorts support real A/B comparison**
+
+## Ease-of-use copy
+
+### Short
+Install it, enable it, restart the gateway, and it starts trimming tool payloads on the next message.
+
+### Medium
+`dynamic-tools` asks for very little operational attention. Users can install it, enable it in Hermes config, restart the gateway, and begin saving tokens immediately. The shipped policy works as a starting point, while replay and telemetry provide a practical path to tuning.
+
+### Longer
+The plugin is designed to stay mostly invisible. It fits into Hermes as a runtime plugin, respects the user’s existing tool configuration, and begins working after a standard enable-and-restart flow. Teams that want more control can layer in per-scope overrides, telemetry review, replay-based warm starts, and learned overlays without taking on a complicated setup burden.
+
+## Trust and safety copy
+
+- **When the predictor is wrong, the plugin recovers.**
+- **When the plugin has an internal failure, Hermes falls back to the full toolset.**
+- **When the user has disabled a tool, dynamic-tools keeps it disabled.**
+
+## Audience-specific copy
+
+### For Hermes power users
+You already know tool payloads are expensive. `dynamic-tools` gives you a way to cut that waste per turn instead of living with full-profile overhead on every gateway message.
+
+### For plugin listing pages
+A Hermes Agent plugin that narrows the tools sent to the model on each gateway message. It reduces token overhead, supports safe category re-expansion, and respects the user's configured tool ceiling.
+
+### For release notes
+Added reusable website copy for positioning `dynamic-tools` around measured savings, graceful recovery, privacy-conscious telemetry, and lightweight adoption.
+
+## CTA ideas
+
+- **Install the plugin and start cutting tool overhead on the next message.**
+- **Turn wasted tool payload into usable context budget.**
+- **Get measured savings without expanding user permissions.**
+- **Make Hermes pay for capability when capability is actually needed.**
