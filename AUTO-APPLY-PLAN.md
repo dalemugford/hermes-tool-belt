@@ -1,12 +1,27 @@
 # dynamic-tools: Auto-Apply Layer — Plan
 
 **Date:** 2026-05-12 (original); status updated 2026-05-17, 2026-05-22
-**Status:** design only; not implemented. Telemetry-correctness audit
-ran 2026-05-17 — see [docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md)
-for full results. Mechanical prereqs (items #1, #2, #5) cleared with
-write+read fixes. Behavioral prereqs (#3, #4, partial #6) pending
-post-restart data accumulation. Harvest infrastructure has since
-shipped — see "Harvest changes the gate" section below.
+**Status:** design only; implementation unstarted. Telemetry correctness
+is sufficient to begin `apply.py`; live Bernard cohort validation still
+awaits gateway restart. See the 2026-05-22 update below for the post-fix
+state and the audit table for per-item status.
+
+## Build brief
+
+For a contributor picking this up cold:
+
+- **`apply.py` can start now.** The "reasoning from bent evidence"
+  blocker on telemetry correctness is cleared.
+- **v1 writes only the learned fields the runtime already consumes:**
+  `always_on`, `always_off`, `trigger_adjustments`.
+  `learned.py.apply_to_preset` reads these today. No schema change
+  needed.
+- **v2 adds `learned_excludes` (dampener auto-apply).** The runtime
+  does *not* yet read this field — extending `learned.py` is step 1
+  of v2. The schema sketch is in "Two change types" below.
+- **Harvest data is sufficient for trigger quality and coverage
+  recommendations.** It does *not* clear the bypass-cohort comparison
+  (item #4 in the audit) — that gate remains live-only.
 
 **2026-05-22 update:** two further telemetry-correctness bugs found
 and fixed (commit e574844): the writer's `expand_tools_used` credit
@@ -53,10 +68,15 @@ the analyzer's view of the world matches reality. Full audit ran
 | 5 | `tools_in_category` accuracy across categories | **CLEAN.** `expand_event.resolved_tools` is internally consistent (terminal=2, file=4, browser=13). Expand-cost math is correct. |
 | 6 | Dampener candidate sample sizes — high-precision across non-overlapping windows | **PARTIAL.** Single-window candidates exist but no current cluster meets the auto-apply support threshold (fp≥5). Cross-window stability check deferred until ≥2 weeks of clean data. |
 
-**Gate:** items #1, #2, #5 cleared. Items #3, #4 unblock on post-restart
-data (typical lead: 7 days). Item #6's stability check needs ~2 weeks.
-**The harvest path (next section) provides an alternate clearance path
-for #3, #4, and partial #6.**
+**Gate:**
+
+- Items #1, #2, #5 cleared (write+read fixes shipped).
+- Item #3 (session_id coverage) — harvest data covers this. Live
+  rows still need post-restart accumulation to confirm at scale.
+- Item #4 (bypass cohort) — **live-only.** No way to back-test
+  bypass behavior on history; harvest cannot help here.
+- Item #6 (dampener stability) — partial cover from harvest; full
+  cross-window stability still wants ~2 weeks of clean data.
 
 ---
 
@@ -89,13 +109,14 @@ What harvest *cannot* validate (counterfactual gap):
 - Bypass cohort behavioral comparison (no bypass existed historically).
 
 **Practical effect on the apply.py gate:**
-- Harvest gives us the trigger precision data and dampener support
-  data the audit asks for, without the 1-2 week wait.
-- The cohort comparison (#4) still requires live post-restart data
-  because there's no way to back-test bypass behavior on history.
-- Net: apply.py can move from "design only, all-prereqs-blocked" to
-  "design ready, behavioral-cohort-only blocked" once harvest data
-  is reviewed.
+- Harvest gives us the trigger-precision and dampener-support data
+  the audit asks for, without the 1–2 week wait.
+- The bypass-cohort comparison (#4) is live-only — apply.py's v1
+  promotion path either gates on something else (e.g. precision +
+  net-value floor only) or waits for live cohort data.
+- Net: v1 of `apply.py` can build now against harvest + cleared
+  audit items; the bypass-cohort gate ships in a later pass once
+  Bernard's live cohort populates.
 
 ---
 
@@ -129,7 +150,13 @@ learned.json at prediction time) remains a user-controlled config knob —
 
 ## Two change types
 
-### 1. Promote/demote (use existing `learned.json` schema)
+> **v1 vs v2.** The runtime today consumes only the fields under
+> change-type #1. Change-type #2 (`learned_excludes`) is a v2 schema
+> extension; `learned.py.apply_to_preset` does not yet read it.
+> Implementing v2 means landing the runtime merge path *before*
+> `apply.py` ever writes to that field.
+
+### 1. Promote/demote — v1, runtime-supported today
 
 The current schema already supports this:
 
@@ -165,9 +192,14 @@ The current schema already supports this:
 `learned.py.apply_to_preset` already handles `always_on` / `always_off` /
 `trigger_adjustments`. No schema change needed for this axis.
 
-### 2. Learned dampeners (new field)
+### 2. Learned dampeners — v2, not yet wired
 
-New per-scope field:
+**Runtime status:** `learned.py` does not currently reference
+`learned_excludes`. The merge into `TriggerGroup.exclude_patterns`
+described below has to land before `apply.py` can safely write this
+field. Treat the schema sketch below as the v2 target shape.
+
+New per-scope field (v2):
 
 ```json
 {
@@ -359,33 +391,46 @@ Things deliberately out of scope:
 
 ---
 
-## Implementation order (when we get there)
+## Implementation order
 
-Rough sequencing once the telemetry audit clears:
+### v1 — runtime-supported fields only
 
-1. **Schema extension**: add `learned_excludes` to learned.json. Update
-   `learned.py.apply_to_preset` to merge it into `TriggerGroup.exclude_patterns`.
-   Regression-guard with a smoke check (mirror the existing
-   `_check_learned_merge_preserves_dampeners` pattern).
-2. **apply.py skeleton**: CLI, telemetry loading, dry-run output. No
-   writes yet. Validate the proposed-diff output looks right against
-   live telemetry.
-3. **Promotion path**: read recommendations, filter under strict
-   thresholds, propose promotes/demotes. Still dry-run only.
-4. **Dampener path**: read dampener candidates, filter under strict
-   thresholds, propose dampener adds.
-5. **Audit trail + idempotency**: implement the change log and the
+No schema change needed. `learned.py.apply_to_preset` already merges
+`always_on` / `always_off` / `trigger_adjustments`.
+
+1. **`apply.py` skeleton**: CLI, telemetry loading, dry-run output.
+   No writes yet. Validate the proposed-diff output looks right
+   against live telemetry.
+2. **Promotion path**: read analyzer recommendations, filter under
+   the strict thresholds in the table above, propose promotes/demotes.
+   Still dry-run only.
+3. **Audit trail + idempotency**: implement the change log and the
    skip-if-already-present checks. Dry-run still.
-6. **Wire `--apply`**: actually write learned.json + change log. Smoke
-   test idempotency by running twice in a row.
-7. **Demote path**: read post-promotion telemetry, propose
-   demote/remove-learned-exclude. Dry-run first, then wire.
-8. **Cohort gate** (optional, depends on telemetry audit outcome): only
-   apply if the bypass cohort comparison shows the recommendation
-   doesn't degrade behavior on the narrowed cohort vs the bypass cohort.
+4. **Wire `--apply`**: actually write learned.json + change log.
+   Smoke-test idempotency by running twice in a row.
+5. **Demote path**: read post-promotion telemetry, propose
+   `demote_unused` for stale `always_on` entries. Dry-run first,
+   then wire.
+6. **Cohort gate** (blocked on Bernard live cohort populating):
+   only apply if the bypass-cohort comparison shows the
+   recommendation doesn't degrade behavior on the narrowed cohort
+   vs the bypass cohort.
 
-Each step is independently committable. Stop at any boundary if telemetry
-or behavior surfaces unexpected.
+### v2 — `learned_excludes` (dampener auto-apply)
+
+Gated on v1 producing measurable lift in production. Order:
+
+1. **Schema extension**: add `learned_excludes` to learned.json.
+   Update `learned.py.apply_to_preset` to merge it into
+   `TriggerGroup.exclude_patterns`. Regression-guard with a smoke
+   check (mirror the existing `_check_learned_merge_preserves_dampeners`
+   pattern). **This step must land before `apply.py` writes the field.**
+2. **Dampener path in `apply.py`**: read dampener candidates, filter
+   under the strict thresholds in the table above, propose dampener
+   adds (and removes once the demote-on-overshoot rule fires).
+
+Each step is independently committable. Stop at any boundary if
+telemetry or behavior surfaces unexpected.
 
 ---
 
@@ -431,5 +476,8 @@ or behavior surfaces unexpected.
 
 ---
 
-*Plan parked here; resume when telemetry-correctness audit clears the
-prerequisite list at the top.*
+*Build-ready as of 2026-05-22. Start with v1 per the Implementation
+order section above. v2 (`learned_excludes`) is queued after v1 has
+produced measurable lift in production. The remaining external
+dependency is a Bernard gateway restart so live cohort data starts
+accumulating against the corrected writer.*
