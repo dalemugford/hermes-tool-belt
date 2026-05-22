@@ -1,12 +1,20 @@
 # dynamic-tools: Auto-Apply Layer — Plan
 
-**Date:** 2026-05-12 (original); status updated 2026-05-17
+**Date:** 2026-05-12 (original); status updated 2026-05-17, 2026-05-22
 **Status:** design only; not implemented. Telemetry-correctness audit
 ran 2026-05-17 — see [docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md)
 for full results. Mechanical prereqs (items #1, #2, #5) cleared with
 write+read fixes. Behavioral prereqs (#3, #4, partial #6) pending
 post-restart data accumulation. Harvest infrastructure has since
 shipped — see "Harvest changes the gate" section below.
+
+**2026-05-22 update:** two further telemetry-correctness bugs found
+and fixed (commit e574844): the writer's `expand_tools_used` credit
+was missing legitimate sticky-carried calls (the *opposite* direction
+from #1's spurious-credit fix — both directions are now correct),
+and `_agent_platform_from_context` was silently labelling blank-agent
+rows `default:telegram`, hiding a four-day config regression. The
+audit table below reflects the post-fix state.
 
 ---
 
@@ -36,9 +44,9 @@ all the safety boundaries the manual flow already enforces.
 the analyzer's view of the world matches reality. Full audit ran
 2026-05-17; results in [docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md).
 
-| # | Question | Status (2026-05-17) |
+| # | Question | Status (latest) |
 |---|---|---|
-| 1 | `expand_tools_used` accounting — does it correctly distinguish expansion-driven use from coincident sticky overlap? | **FIXED.** 94% of historical credits were spurious (tool already in `initial_allowed`). Writer + analyzer both filter now. Tests in `ExpandToolsUsedAttributionTests`. |
+| 1 | `expand_tools_used` accounting — does it correctly distinguish expansion-driven use from coincident sticky overlap? | **FIXED both directions.** (2026-05-17) 94% of historical credits were spurious — read-side filter shipped. (2026-05-22) Opposite gap surfaced: legitimate sticky-carried calls were *never* credited because the predictor merged sticky into `allowed_tool_names` pre-filter, polluting `initial_allowed_tools`. Writer now snapshots a pre-sticky `baseline_allowed_tools` and uses it for the credit decision. Tests in `ExpandToolsUsedAttributionTests` + `BuildApiKwargsSnapshotTests`. |
 | 2 | Trigger FP classification — sticky carries late-bound TPs; are we miscounting them as FPs? | **FIXED (analyzer).** Session-bounded 3-turn lookahead recovers ~32% of historical "FPs" as late-bound TPs. Falls back gracefully on blank-session rows. Tests in `TriggerFpLateBoundTpTests`. |
 | 3 | `session_id` coverage — confirm rows always carry a session id | **PENDING.** Canonical session-key fix committed (1f1b7e2); 91% of historical rows had blank session_id. Validate after gateway restart + ≥7 days organic accumulation. Smoke test confirms population mechanically. |
 | 4 | Cohort populations — bypass cohort actually accumulates? | **PENDING.** Config correct (`bypass_rate: 0.05` on `bernard:telegram`); was no-op while session_id was blank. Resolves with #3. |
