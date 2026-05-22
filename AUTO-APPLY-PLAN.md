@@ -68,11 +68,17 @@ telemetry tagged `policy_source: harvest`. This sidesteps the
   surfaces tools the model called frequently that no trigger predicts.
 
 What harvest *cannot* validate (counterfactual gap):
-- Actual token savings under narrowing (the historical model saw the
-  full toolset, so we can't know what it would have done with a cut)
-- `expand_tools_used` round-trip frequency (no narrowing was active
-  historically; the rate is hypothetical)
-- Bypass cohort behavioral comparison (no bypass existed historically)
+- Actual token savings under narrowing for **pre-May-17 sessions** (the
+  historical model saw the full toolset there, so we can't know what it
+  would have done with a cut). Post-May-17 sessions ran under live
+  narrowing, so the same accounting *is* recoverable from those rows.
+- `expand_tools_used` round-trip frequency for pre-May-17 sessions
+  (no narrowing was active before then; the rate would be hypothetical).
+  Post-May-17 sessions contain real expand→use cycles; harvest-replay
+  doesn't currently reconstruct the credit field for those (see
+  scripts/harvest-replay.py:309-312 — the omission predates the live
+  rollout and should be revisited if the live-data sample stays thin).
+- Bypass cohort behavioral comparison (no bypass existed historically).
 
 **Practical effect on the apply.py gate:**
 - Harvest gives us the trigger precision data and dampener support
