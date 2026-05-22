@@ -165,9 +165,14 @@ def _wrap_build_api_kwargs(original):
             if allowed == WILDCARD_ALWAYS_ON or allowed is None:
                 names = _tool_names(tools)
                 state["ceiling_tools"] = names
-                state["initial_allowed_tools"] = names
-                state["cut_tools"] = []
-                state["unknown_kept_tools"] = []
+                # Snapshot once per prediction. Subsequent _build_api_kwargs
+                # calls within the same turn (after the model used a tool
+                # like expand_tools) must not overwrite the "what the model
+                # initially saw" record — otherwise expansion-driven calls
+                # look like they were available from the start.
+                state.setdefault("initial_allowed_tools", names)
+                state.setdefault("cut_tools", [])
+                state.setdefault("unknown_kept_tools", [])
                 _maybe_log_prediction(state, ceiling=tools, narrowed=tools)
                 return kwargs
 
@@ -220,9 +225,12 @@ def _wrap_build_api_kwargs(original):
             kwargs["tools"] = filtered
 
             state["ceiling_tools"] = ceiling_names
-            state["initial_allowed_tools"] = _tool_names(filtered)
-            state["cut_tools"] = cut_names
-            state["unknown_kept_tools"] = unknown_kept_names
+            # Snapshot once per prediction — see wildcard branch above. The
+            # filtered list on later calls reflects post-expansion state and
+            # would otherwise pollute "initial" with expansion-added tools.
+            state.setdefault("initial_allowed_tools", _tool_names(filtered))
+            state.setdefault("cut_tools", cut_names)
+            state.setdefault("unknown_kept_tools", unknown_kept_names)
 
             _maybe_log_prediction(state, ceiling=tools, narrowed=filtered)
             return kwargs
@@ -601,8 +609,15 @@ def _agent_platform_from_context(event: Any = None, kwargs: dict[str, Any] | Non
                 platform = name
                 break
 
-    agent = agent or "default"
-    platform = platform or "unknown"
+    # Preserve blank attribution when either slot can't be filled with
+    # real data. Synthesizing "default"/"unknown" hides legitimate
+    # regressions (e.g. an explicit `agent:` config line removed by
+    # accident) behind superficially valid scope strings — see the
+    # post-tool-call recovery path at _recover_attribution_without_state
+    # for the same invariant. The analyzer's normalize_scope() buckets
+    # blank rows as "unknown" so reports stay readable.
+    if not agent or not platform:
+        return "", "", ""
     return agent, platform, f"{agent}:{platform}"
 
 
@@ -883,7 +898,17 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         _decay_sticky(sticky_key)
         sticky_tools, sticky_categories, sticky_remaining = _live_sticky(sticky_key)
         allowed_tool_names = prediction.allowed_tool_names
-        if allowed_tool_names != WILDCARD_ALWAYS_ON and allowed_tool_names is not None:
+        # Capture the pre-sticky baseline. This is the set the model would
+        # see *without* any prior expansion (sticky carries tools forward
+        # only because a prior turn ran expand_tools). The credit decision
+        # in _on_post_tool_call needs this to distinguish "model could have
+        # called this anyway" from "this call is the payoff of an earlier
+        # expand". WILDCARD is preserved (bypass cohort / wildcard always_on
+        # already see every tool — nothing to attribute to expansion).
+        if allowed_tool_names == WILDCARD_ALWAYS_ON or allowed_tool_names is None:
+            baseline_allowed_tools: Any = WILDCARD_ALWAYS_ON
+        else:
+            baseline_allowed_tools = sorted(set(allowed_tool_names))
             allowed_tool_names = sorted(set(allowed_tool_names) | set(sticky_tools))
 
         # A/B baseline: deterministically bypass narrowing for a fraction of
@@ -898,6 +923,7 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         _PREDICTION_CV.set({
             "prediction_id": logger_io.new_prediction_id(),
             "allowed_tool_names": allowed_tool_names,
+            "baseline_allowed_tools": baseline_allowed_tools,
             "known_tool_names": known,
             "expansions": set(),
             "channel": channel,
@@ -979,6 +1005,20 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
         if tool_name:
             tool = str(tool_name)
             initial_allowed = set(state.get("initial_allowed_tools") or []) if state else set()
+            # Baseline = the allowed set *before* sticky carry-over merged in.
+            # Used for credit attribution: a tool only sticky-carries because
+            # a prior expand_tools ran — those calls should be credited to
+            # expansion, not classified as "initially available."
+            # Falls back to initial_allowed for rows written before this
+            # field existed; WILDCARD means "no narrowing", every tool is
+            # initially available.
+            baseline_raw = state.get("baseline_allowed_tools") if state else None
+            if baseline_raw == WILDCARD_ALWAYS_ON:
+                baseline_allowed: set[str] | None = None  # None means "everything"
+            elif baseline_raw is None:
+                baseline_allowed = set(initial_allowed)
+            else:
+                baseline_allowed = set(baseline_raw)
             cut_tools = set(state.get("cut_tools") or []) if state else set()
             expanded = set(state.get("expansions") or set()) if state else set()
             pending_expansion = dict(state.get("pending_expansion") or {}) if state else {}
@@ -990,11 +1030,21 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                 attribution_agent, attribution_platform, attribution_scope = (
                     _recover_attribution_without_state(session_id, kwargs)
                 )
+            # was_initially_available reflects the pre-sticky baseline so the
+            # analyzer's "credit only when not initially available" filter
+            # (analyze.py) lines up with the writer's credit decision below.
+            base_name = _base_tool_name(tool)
+            if baseline_allowed is None:
+                was_initially_available = True
+            else:
+                was_initially_available = (
+                    tool in baseline_allowed or base_name in baseline_allowed
+                )
             extra = {
                 "agent": attribution_agent,
                 "platform": attribution_platform,
                 "scope": attribution_scope,
-                "was_initially_available": tool in initial_allowed,
+                "was_initially_available": was_initially_available,
                 "was_cut": tool in cut_tools,
                 "was_expanded": tool in expanded,
             }
@@ -1010,7 +1060,7 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                 # record when an expansion happened, so analyzers can
                 # account for round-trip cost even when the eventual
                 # tool call wasn't expansion-driven.
-                already_available = tool in initial_allowed
+                already_available = was_initially_available
                 expand_use: dict[str, Any] = {}
                 if not already_available:
                     expand_use = _pending_expansion_for_tool(pending_expansion, tool)

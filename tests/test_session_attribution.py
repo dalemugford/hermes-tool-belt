@@ -274,6 +274,37 @@ class PostToolCallAttributionRecoveryTests(unittest.TestCase):
             )
         self.assertEqual((agent, platform, scope), ("", "", ""))
 
+    def test_context_returns_blank_when_agent_unresolved(self):
+        # Regression: a config without `agent:` and HERMES_HOME pointing
+        # at the Hermes root (not a profiles/<name> subdir) used to be
+        # silently labelled "default:telegram", masking the missing
+        # config line for four days in production. Blank attribution is
+        # the honest signal — analyzer's normalize_scope buckets these
+        # as "unknown" so the regression surfaces in reports.
+        with mock.patch.dict(
+            os.environ,
+            {"HERMES_HOME": "/Users/macmini/.hermes", "HERMES_PROFILE": "",
+             "HERMES_SESSION_KEY": REAL_KEY_TELEGRAM},
+            clear=False,
+        ):
+            plugin._CONFIG["agent"] = ""
+            agent, platform, scope = plugin._agent_platform_from_context(event=None, kwargs={})
+        self.assertEqual((agent, platform, scope), ("", "", ""),
+            "blank agent + real platform must NOT synthesize default:telegram")
+
+    def test_context_resolves_when_config_agent_set(self):
+        # The supported fix path: explicit `agent: bernard` in plugin
+        # config recovers attribution even when HERMES_HOME is the root.
+        with mock.patch.dict(
+            os.environ,
+            {"HERMES_HOME": "/Users/macmini/.hermes", "HERMES_PROFILE": "",
+             "HERMES_SESSION_KEY": REAL_KEY_TELEGRAM},
+            clear=False,
+        ):
+            plugin._CONFIG["agent"] = "bernard"
+            agent, platform, scope = plugin._agent_platform_from_context(event=None, kwargs={})
+        self.assertEqual((agent, platform, scope), ("bernard", "telegram", "bernard:telegram"))
+
     def test_post_tool_call_logs_recovered_attribution(self):
         plugin._on_post_tool_call(
             tool_name="terminal",
@@ -844,6 +875,32 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
             "tool cut from initial allowed set but reachable via sticky must be credited")
         self.assertEqual(row.get("expand_category"), "terminal")
 
+    def test_sticky_carried_tool_in_initial_allowed_still_credits_expansion(self):
+        # Regression: in production, sticky_tools get merged into the
+        # narrowed allowed set BEFORE filtering, so a sticky-carried tool
+        # ends up in initial_allowed_tools. Without a pre-sticky baseline,
+        # the credit decision saw was_initially_available=True and skipped
+        # the sticky-expansion branch, zeroing out expand_tools_used.
+        sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
+        self._seed_sticky(sticky_key, "terminal", ["terminal"])
+        # Terminal IS in initial_allowed (sticky merged in upstream)…
+        self._set_prediction_state(initial_allowed=["terminal", "memory"], sticky_key=sticky_key)
+        # …but the pre-sticky baseline does NOT include it.
+        state = plugin._PREDICTION_CV.get()
+        state["baseline_allowed_tools"] = ["memory"]
+        plugin._PREDICTION_CV.set(state)
+
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={}, result="ok", task_id="t1",
+            session_id=REAL_KEY_TELEGRAM,
+        )
+        row = self._latest_row()
+        self.assertFalse(row.get("was_initially_available"),
+            "baseline (pre-sticky) determines was_initially_available")
+        self.assertTrue(row.get("expand_tools_used"),
+            "sticky-carried tool must be credited as expansion-driven")
+        self.assertEqual(row.get("expand_category"), "terminal")
+
     def test_pending_expansion_skipped_when_already_available(self):
         # Same-turn expansion (pending_expansion) for a tool that was
         # already always-on: the round-trip happened but provided
@@ -869,6 +926,178 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
             "round-trip happened — should still record after_expand_tools")
         self.assertNotEqual(row.get("expand_tools_used"), True,
             "round-trip provided nothing new — must not be credited as expansion-driven")
+
+
+class BuildApiKwargsSnapshotTests(unittest.TestCase):
+    """``initial_allowed_tools`` must be a *snapshot* captured on the first
+    ``_build_api_kwargs`` call of a prediction, NOT a moving window that
+    follows post-expansion state. If it moves, expansion-driven tool calls
+    later in the same turn look like they were initially available, which
+    zeros out the expansion-success signal the analyzer (and apply.py)
+    depends on.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.profile_home = _make_profile_dir(self.tmp.name, "bernard")
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {"HERMES_HOME": self.profile_home, "HERMES_SESSION_KEY": ""},
+            clear=False,
+        )
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
+        self._original_config = dict(plugin._CONFIG)
+        plugin._CONFIG["enabled"] = True
+        plugin._CONFIG["log"] = False  # disable prediction-log writes
+        plugin._CONFIG["agent"] = "bernard"
+        self.addCleanup(self._restore_config)
+        plugin._PREDICTION_CV.set(None)
+
+    def _restore_config(self) -> None:
+        plugin._CONFIG.clear()
+        plugin._CONFIG.update(self._original_config)
+
+    def _run_wrapper_with_tools(self, tool_names: list[str]) -> dict:
+        tools = [{"name": n} for n in tool_names]
+        original = lambda self_, msgs: {"tools": list(tools)}
+        wrapped = plugin._wrap_build_api_kwargs(original)
+        return wrapped(SimpleNamespace(), [])
+
+    def test_initial_allowed_tools_snapshot_survives_post_expansion_call(self):
+        # Predictor narrowed to {memory, send_message}; terminal was cut.
+        plugin._PREDICTION_CV.set({
+            "prediction_id": "pred-1",
+            "allowed_tool_names": ["memory", "send_message"],
+            "baseline_allowed_tools": ["memory", "send_message"],
+            "known_tool_names": {"memory", "send_message", "terminal", "file_read"},
+            "expansions": set(),
+            "agent": "bernard", "platform": "telegram", "scope": "bernard:telegram",
+            "sticky_key": "k", "session_id": REAL_KEY_TELEGRAM,
+            "sticky_tools": [], "sticky_categories": [], "sticky_remaining_turns": {},
+        })
+
+        # First call: model sees the narrowed view.
+        kwargs1 = self._run_wrapper_with_tools(["memory", "send_message", "terminal", "file_read"])
+        state = plugin._PREDICTION_CV.get()
+        snapshot = list(state["initial_allowed_tools"])
+        self.assertEqual(sorted(snapshot), ["memory", "send_message"])
+        self.assertEqual(sorted(_tool_names_in(kwargs1["tools"])), ["memory", "send_message"])
+
+        # Model called expand_tools(terminal); expansions now non-empty.
+        state["expansions"] = {"terminal"}
+        plugin._PREDICTION_CV.set(state)
+
+        # Second call within the same prediction.
+        kwargs2 = self._run_wrapper_with_tools(["memory", "send_message", "terminal", "file_read"])
+        state = plugin._PREDICTION_CV.get()
+
+        # The SDK view widened (terminal is now allowed)…
+        self.assertIn("terminal", _tool_names_in(kwargs2["tools"]))
+        # …but the snapshot must NOT have moved.
+        self.assertEqual(
+            sorted(state["initial_allowed_tools"]), sorted(snapshot),
+            "initial_allowed_tools must be a one-time snapshot per prediction",
+        )
+
+    def test_end_to_end_recovered_tool_credits_expand_tools_used(self):
+        # Full flow: prediction with baseline excluding terminal, sticky
+        # carries terminal forward from a prior turn. The model calls
+        # terminal. The row must be credited as expansion-driven.
+        sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
+        plugin._STICKY_BY_KEY[sticky_key] = {
+            "terminal": {
+                "tools": {"terminal"},
+                "remaining_turns": 3,
+                "updated_at": 0.0,
+                "expanded_at_turn": 0,
+                "prediction_id": "pred-prior",
+            }
+        }
+        self.addCleanup(plugin._STICKY_BY_KEY.clear)
+
+        plugin._CONFIG["log"] = True  # need writes to verify the row
+        plugin._PREDICTION_CV.set({
+            "prediction_id": "pred-current",
+            "allowed_tool_names": ["memory", "terminal"],  # post-sticky merge
+            "baseline_allowed_tools": ["memory"],           # pre-sticky
+            "known_tool_names": {"memory", "terminal"},
+            "expansions": set(),
+            "agent": "bernard", "platform": "telegram", "scope": "bernard:telegram",
+            "sticky_key": sticky_key, "session_id": REAL_KEY_TELEGRAM,
+            "sticky_tools": ["terminal"], "sticky_categories": ["terminal"],
+            "sticky_remaining_turns": {"terminal": 3},
+            "cut_tools": ["terminal"], "pending_expansion": None,
+        })
+
+        # First _build_api_kwargs call — establishes initial_allowed_tools.
+        self._run_wrapper_with_tools(["memory", "terminal"])
+
+        # Model calls terminal.
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={}, result="ok",
+            task_id="t1", session_id=REAL_KEY_TELEGRAM,
+        )
+
+        tool_calls_path = Path(self.profile_home) / "state" / "dynamic-tools" / "tool_calls.jsonl"
+        rows = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l]
+        row = rows[-1]
+        self.assertFalse(row.get("was_initially_available"),
+            "baseline excluded terminal — it was only callable via sticky")
+        self.assertTrue(row.get("expand_tools_used"),
+            "sticky-recovered tool must be credited as expansion-driven")
+
+    def test_already_available_tool_never_credits_expansion(self):
+        # Tool present in baseline (no expansion involved) must not be
+        # credited, even with sticky residency coincidentally covering it.
+        sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
+        plugin._STICKY_BY_KEY[sticky_key] = {
+            "terminal": {
+                "tools": {"terminal"},
+                "remaining_turns": 3,
+                "updated_at": 0.0,
+                "expanded_at_turn": 0,
+                "prediction_id": "pred-prior",
+            }
+        }
+        self.addCleanup(plugin._STICKY_BY_KEY.clear)
+
+        plugin._CONFIG["log"] = True
+        plugin._PREDICTION_CV.set({
+            "prediction_id": "pred-current",
+            "allowed_tool_names": ["memory", "terminal"],
+            "baseline_allowed_tools": ["memory", "terminal"],  # terminal IS in baseline
+            "known_tool_names": {"memory", "terminal"},
+            "expansions": set(),
+            "agent": "bernard", "platform": "telegram", "scope": "bernard:telegram",
+            "sticky_key": sticky_key, "session_id": REAL_KEY_TELEGRAM,
+            "sticky_tools": ["terminal"], "sticky_categories": ["terminal"],
+            "sticky_remaining_turns": {"terminal": 3},
+            "cut_tools": [], "pending_expansion": None,
+        })
+
+        self._run_wrapper_with_tools(["memory", "terminal"])
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={}, result="ok",
+            task_id="t1", session_id=REAL_KEY_TELEGRAM,
+        )
+
+        tool_calls_path = Path(self.profile_home) / "state" / "dynamic-tools" / "tool_calls.jsonl"
+        rows = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l]
+        row = rows[-1]
+        self.assertTrue(row.get("was_initially_available"))
+        self.assertNotEqual(row.get("expand_tools_used"), True,
+            "tool in baseline must never be credited as expansion-driven")
+
+
+def _tool_names_in(tools: list[dict]) -> list[str]:
+    out = []
+    for t in tools:
+        n = t.get("name") if isinstance(t, dict) else None
+        if n:
+            out.append(n)
+    return out
 
 
 if __name__ == "__main__":
