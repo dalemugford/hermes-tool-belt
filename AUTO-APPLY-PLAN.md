@@ -12,10 +12,16 @@ For a contributor picking this up cold:
 
 - **`apply.py` can start now.** The "reasoning from bent evidence"
   blocker on telemetry correctness is cleared.
-- **v1 writes only the learned fields the runtime already consumes:**
-  `always_on`, `always_off`, `trigger_adjustments`.
-  `learned.py.apply_to_preset` reads these today. No schema change
-  needed.
+- **v1 writes `always_on` and `always_off` only.** Both are
+  runtime-supported (`learned.py.apply_to_preset`) and analyzer
+  emits concrete recommendations for both via the promote/demote
+  paths. No schema change needed.
+- **`trigger_adjustments` is runtime-supported but analyzer-blocked.**
+  `learned.py` reads it (`learned.py:204`), but the analyzer's
+  trigger-row recommendations currently emit an empty
+  `trigger_adjustments` patch (`analyze.py:1269`). Until the
+  analyzer produces concrete trigger-adjustment patches, apply.py
+  has nothing to apply there — keep it out of v1 scope.
 - **v2 adds `learned_excludes` (dampener auto-apply).** The runtime
   does *not* yet read this field — extending `learned.py` is step 1
   of v2. The schema sketch is in "Two change types" below.
@@ -71,8 +77,9 @@ the analyzer's view of the world matches reality. Full audit ran
 **Gate:**
 
 - Items #1, #2, #5 cleared (write+read fixes shipped).
-- Item #3 (session_id coverage) — harvest data covers this. Live
-  rows still need post-restart accumulation to confirm at scale.
+- Item #3 (session_id coverage) — **live-only.** Harvest emits
+  synthetic `harvest:<stem>` ids, so it cannot validate live-writer
+  session-id population. Confirm against post-restart live rows.
 - Item #4 (bypass cohort) — **live-only.** No way to back-test
   bypass behavior on history; harvest cannot help here.
 - Item #6 (dampener stability) — partial cover from harvest; full
@@ -150,11 +157,15 @@ learned.json at prediction time) remains a user-controlled config knob —
 
 ## Two change types
 
-> **v1 vs v2.** The runtime today consumes only the fields under
-> change-type #1. Change-type #2 (`learned_excludes`) is a v2 schema
-> extension; `learned.py.apply_to_preset` does not yet read it.
-> Implementing v2 means landing the runtime merge path *before*
-> `apply.py` ever writes to that field.
+> **v1 vs v2.** v1 writes `always_on` and `always_off` only. Both
+> are read by `learned.py.apply_to_preset` today AND have concrete
+> analyzer recommendations to consume. `trigger_adjustments` is
+> *runtime-supported but analyzer-blocked* — `learned.py:204` reads
+> it, but `analyze.py:1269` emits an empty patch, so apply.py has
+> nothing to act on there in v1. Change-type #2 (`learned_excludes`)
+> is a v2 schema extension; `learned.py.apply_to_preset` does not
+> yet read it. Implementing v2 means landing the runtime merge path
+> *before* `apply.py` ever writes to that field.
 
 ### 1. Promote/demote — v1, runtime-supported today
 
@@ -393,28 +404,46 @@ Things deliberately out of scope:
 
 ## Implementation order
 
-### v1 — runtime-supported fields only
+### v1 — `always_on` / `always_off` only
 
 No schema change needed. `learned.py.apply_to_preset` already merges
-`always_on` / `always_off` / `trigger_adjustments`.
+both fields and the analyzer's promote/demote paths produce concrete
+recommendation rows for them.
 
+0. **Analyzer recommendation contract** (prereq). `analyze.py`
+   currently folds live + bypass + harvest rows into one
+   `ScopeStats` (`analyze.py:246`) and the same recommendation
+   builder feeds both human reports and any future machine
+   consumer (`analyze.py:1123`). Before `apply.py` writes, add a
+   minimal source-typed recommendation surface so the applier can
+   ingest *typed*, *source-tagged* rows (e.g. "promote always_on,
+   sourced from live rows ≥X turns") rather than re-parsing the
+   markdown-targeted recommendation rows. Scope this tightly —
+   one helper function, not an analyzer refactor.
 1. **`apply.py` skeleton**: CLI, telemetry loading, dry-run output.
    No writes yet. Validate the proposed-diff output looks right
    against live telemetry.
-2. **Promotion path**: read analyzer recommendations, filter under
-   the strict thresholds in the table above, propose promotes/demotes.
-   Still dry-run only.
+2. **Promotion path**: read the typed recommendation rows from
+   step 0, filter under the strict thresholds in the table above,
+   propose `always_on` promotes. Expansion-success calibration
+   must be **live-only** (harvest can't reconstruct it; see audit
+   table item #1's 2026-05-22 update). Still dry-run only.
 3. **Audit trail + idempotency**: implement the change log and the
    skip-if-already-present checks. Dry-run still.
 4. **Wire `--apply`**: actually write learned.json + change log.
    Smoke-test idempotency by running twice in a row.
 5. **Demote path**: read post-promotion telemetry, propose
-   `demote_unused` for stale `always_on` entries. Dry-run first,
+   `demote_unused` (move tool from `always_on` to `always_off` or
+   simply remove it) for stale `always_on` entries. Dry-run first,
    then wire.
 6. **Cohort gate** (blocked on Bernard live cohort populating):
    only apply if the bypass-cohort comparison shows the
    recommendation doesn't degrade behavior on the narrowed cohort
    vs the bypass cohort.
+
+`trigger_adjustments` is out of v1. When/if the analyzer starts
+emitting non-empty trigger-adjustment patches (`analyze.py:1269`),
+it can be added as a v1 follow-on without a schema change.
 
 ### v2 — `learned_excludes` (dampener auto-apply)
 
