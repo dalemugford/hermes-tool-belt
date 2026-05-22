@@ -297,7 +297,7 @@ python3 apply.py --apply-min-precision 0.95 \
                  --apply-max-changes 5
 
 # Scope to a single agent or platform.
-python3 apply.py --apply --scope-filter "bernard:telegram:*"
+python3 apply.py --apply --scope-filter "bernard:telegram"
 
 # Window — default last 7 days, opt in to wider history.
 python3 apply.py --apply --window-days 14
@@ -394,7 +394,7 @@ Things deliberately out of scope:
   `learned_mode: off`, the plugin still ignores it. This is the master
   off-switch.
 - **Modifying static presets.** Even for the rare case where a hand-edit
-  to aggressive.yaml would be cleaner, that's a human call.
+  to policy.yaml would be cleaner, that's a human call.
 - **Touching sticky residency.** Sticky is intentionally session-grain;
   promoting always-on is its durable cousin.
 - **Auto-flipping `bypass_rate`.** The cohort sampler is a measurement

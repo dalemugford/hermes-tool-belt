@@ -70,7 +70,7 @@ The plugin now manipulates tools through:
 5. **Analyzer recommendations** ([`analyze.py`](analyze.py)) — deterministic telemetry pass that emits markdown reports and `learned_recommendations.json` covering: expanded_category recs, harvest_tool_promotion recs, trigger_quality recs, dampener_candidates, trigger_keyword_candidates
 
 **Still missing — the actual auto-apply writer:**
-- `apply.py` (per [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md)): the writer that consumes `learned_recommendations.json` under strict gates and updates `learned.json` with rate-limited changes + audit trail. Mechanical prereqs cleared; behavioral prereqs gated on post-restart data accumulation.
+- `apply.py` (per [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md)): the writer that consumes `learned_recommendations.json` under strict gates and updates `learned.json` with rate-limited changes + audit trail. Mechanical prereqs are cleared, so v1 can start now; live Bernard cohort comparison still waits on post-restart accumulation.
 - Auto-bootstrap on plugin first activation: today `scripts/bootstrap.py` must be invoked manually. Wiring it into `register()` would close the "install, activate, done" loop literally.
 
 ---
@@ -80,7 +80,7 @@ The plugin now manipulates tools through:
 ```
 User ceiling (platform_toolsets)
     ↓
-Static preset (aggressive.yaml)
+Static preset (policy.yaml)
     ↓
 Manual overrides (always_on_extra, always_off)
     ↓
@@ -328,7 +328,7 @@ Implementation details now live in the plugin:
 - `TriggerGroup.matches()` checks exclude patterns before positive keyword/attachment matching.
 - `predictor.py` records `triggers_suppressed` when a positive signal would have matched but an exclude vetoed the trigger.
 - `logger_io.py` writes `triggers_suppressed` into `predictions.jsonl`.
-- `presets/aggressive.yaml` contains the current dampeners for `file_write`, `delegation`, and `cronjob`.
+- `policy.yaml` contains the current dampeners for `file_write`, `delegation`, and `cronjob`.
 - `scripts/check_trigger_dampeners.py` is the smoke fixture for dampener behavior.
 
 Live verification after the 2026-05-11 gateway restart showed the dampener path active: Dale's Telegram check message fired `shell` but recorded `triggers_suppressed: ["file_write"]` because the phrase “Don’t change settings…” vetoed the otherwise-positive file-write signal.
@@ -409,7 +409,7 @@ hermes dynamic-tools apply               # apply recommendations from learned_re
 | `presets.py` | ✅ `_resolve_preset_inner` merges learned state after channel/scope overrides; trigger groups parse and apply `exclude_keywords` dampeners |
 | `predictor.py` | ✅ Records `triggers_suppressed` when an exclude vetoes a positive trigger signal |
 | `logger_io.py` | ✅ Adds `policy_source`, `policy_version`, learned-state fields, sticky fields, and `triggers_suppressed` |
-| `presets/aggressive.yaml` | ✅ Adds focused dampeners for `file_write`, `delegation`, and `cronjob` |
+| `policy.yaml` | ✅ Adds focused dampeners for `file_write`, `delegation`, and `cronjob` |
 | `scripts/check_trigger_dampeners.py` | ✅ Smoke fixture for dampener behavior |
 | `plugin.yaml` | ✅ Removed stale `on_session_start` hook |
 | `config.yaml` (user) | Add `learned_mode`, `channels.*.learned_mode` when ready to enable |
