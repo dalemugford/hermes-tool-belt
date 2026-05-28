@@ -112,6 +112,9 @@ class PredictionRecord:
     # lookback_turns_config > 0 means a session-first turn (no history yet).
     lookback_used: int = 0
     lookback_turns_config: int = 0
+    # True when the narrowed tool set differs from the previous turn in this
+    # session. A change busts provider-side prefix caching on tool schemas.
+    tool_set_changed: bool = False
 
     @property
     def tokens_saved(self) -> int:
@@ -161,6 +164,7 @@ class PredictionRecord:
             "learned_changes": self.learned_changes or [],
             "lookback_used": self.lookback_used,
             "lookback_turns_config": self.lookback_turns_config,
+            "tool_set_changed": self.tool_set_changed,
         }
 
 

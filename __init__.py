@@ -64,6 +64,10 @@ _PREDICTION_CV: contextvars.ContextVar[dict[str, Any] | None] = contextvars.Cont
     "dynamic_tools_prediction", default=None,
 )
 
+# Per-session record of the last narrowed tool set, keyed by session_id.
+# Used to detect tool-set changes that bust provider prefix-cache on tool schemas.
+_PREV_TOOL_SET: dict[str, frozenset[str]] = {}
+
 _CONFIG: dict[str, Any] = {
     "enabled": False,
     "log": True,
@@ -634,6 +638,10 @@ def _maybe_log_prediction(
     if not _CONFIG.get("log", True):
         return
     try:
+        _sid = str(state.get("session_id", ""))
+        _cur_set = frozenset(_tool_names(narrowed))
+        _tool_set_changed = _PREV_TOOL_SET.get(_sid) != _cur_set
+        _PREV_TOOL_SET[_sid] = _cur_set
         record = logger_io.PredictionRecord(
             ts=time.time(),
             prediction_id=state.get("prediction_id", ""),
@@ -669,6 +677,7 @@ def _maybe_log_prediction(
             learned_changes=list(state.get("learned_changes") or []),
             lookback_used=int(state.get("lookback_used", 0)),
             lookback_turns_config=int(state.get("lookback_turns_config", 0)),
+            tool_set_changed=_tool_set_changed,
         )
         logger_io.log_prediction(record)
     except Exception as exc:
