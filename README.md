@@ -97,23 +97,23 @@ bleeding-edge, track `main`. Current release: **2026.5.17-beta**.
 - **A/B baseline cohort** — set `bypass_rate: 0.05` and a deterministic
   5% of sessions ship the full toolset, so headline savings get a real
   control to compare against.
-- **Telemetry-correctness audit** ([docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md))
+- **Telemetry-correctness audit** ([docs/telemetry-audit-2026-05-17.md](docs/09.telemetry-audit-2026-05-17.md))
   — 2 attribution bugs found and fixed before they could mislead
   recommendations. Tests + smoke harness keep them from coming back.
 
 ## Companion docs
 
-- **[ROADMAP.md](ROADMAP.md)** — queued work + open design questions. Start here if you want to contribute.
-- [STRATEGY.md](STRATEGY.md) — the north star: the promise, release strategy, calibration flow, official-plugin readiness
-- [PLAN.md](PLAN.md) — current architecture, what's built vs. planned, validation status
-- [CALIBRATION-PLAN.md](CALIBRATION-PLAN.md) — observe → handoff → steady-state flow that makes "install, activate, done" honest
-- [AUTO-APPLY-PLAN.md](AUTO-APPLY-PLAN.md) — design for the writer-side script that closes the loop
-- [docs/expand-tools-evolution.md](docs/expand-tools-evolution.md) — next-step ideas for making `expand_tools` more precise before adding heavier retrieval
-- [docs/telemetry-audit-2026-05-17.md](docs/telemetry-audit-2026-05-17.md) — first-pass audit: 2 bugs fixed, 2 items clean, 3 pending data accumulation
-- [docs/harvest-followups.md](docs/harvest-followups.md) — open auto-apply candidates surfaced by harvest
-- [docs/dynamic-tools-hermes-surface.md](docs/dynamic-tools-hermes-surface.md) — patch-point reference; read before any Hermes upgrade
-- [docs/dynamic-tools-plan.md](docs/dynamic-tools-plan.md) — original design doc and categorization audit
-- [TRIGGER-SCORING-PLAN.md](TRIGGER-SCORING-PLAN.md) — historical full-scoring plan (deferred)
+- **[ROADMAP.md](docs/11.roadmap-2026-05-17.md)** — queued work + open design questions. Start here if you want to contribute.
+- [STRATEGY.md](docs/02.strategy-2026-05-12.md) — the north star: the promise, release strategy, calibration flow, official-plugin readiness
+- [PLAN.md](docs/03.plan-2026-05-12.md) — current architecture, what's built vs. planned, validation status
+- [CALIBRATION-PLAN.md](docs/05.calibration-plan-2026-05-12.md) — observe → handoff → steady-state flow that makes "install, activate, done" honest
+- [AUTO-APPLY-PLAN.md](docs/04.auto-apply-plan-2026-05-12.md) — design for the writer-side script that closes the loop
+- [docs/expand-tools-evolution.md](docs/12.expand-tools-evolution-2026-05-19.md) — next-step ideas for making `expand_tools` more precise before adding heavier retrieval
+- [docs/telemetry-audit-2026-05-17.md](docs/09.telemetry-audit-2026-05-17.md) — first-pass audit: 2 bugs fixed, 2 items clean, 3 pending data accumulation
+- [docs/harvest-followups.md](docs/10.harvest-followups-2026-05-17.md) — open auto-apply candidates surfaced by harvest
+- [docs/dynamic-tools-hermes-surface.md](docs/08.dynamic-tools-hermes-surface-2026-05-17.md) — patch-point reference; read before any Hermes upgrade
+- [docs/dynamic-tools-plan.md](docs/07.dynamic-tools-plan-2026-05-17.md) — original design doc and categorization audit
+- [TRIGGER-SCORING-PLAN.md](docs/06.trigger-scoring-plan-2026-05-12.md) — historical full-scoring plan (deferred)
 
 ## Policy
 
@@ -130,7 +130,7 @@ mode), set `bypass_rate: 1.0` for that scope — see
 through the predictor for telemetry but ships the full tool ceiling to
 the model.
 
-> A future "calibration mode" (see [CALIBRATION-PLAN.md](CALIBRATION-PLAN.md))
+> A future "calibration mode" (see [CALIBRATION-PLAN.md](docs/05.calibration-plan-2026-05-12.md))
 > will replace the hand-curated policy with one learned from each
 > profile's own usage. The shipped YAML is the warm-start seed for that
 > flow, not the destination.
@@ -643,16 +643,22 @@ rm -rf ~/.hermes/plugins/dynamic-tools
 ├── policy.yaml                      # the single shipped tool policy
 ├── CLAUDE.md                        # in-dir editing rules (scope, no back-compat, labs/main)
 ├── README.md                        # this file
-├── STRATEGY.md                      # north star — promise, lab/live split, official-plugin readiness
-├── PLAN.md                          # current architecture + status
-├── AUTO-APPLY-PLAN.md               # writer-side closure plan; prereqs partially cleared
-├── CALIBRATION-PLAN.md              # observe → handoff → steady-state flow
-├── TRIGGER-SCORING-PLAN.md          # historical full-scoring plan (deferred)
-├── docs/
-│   ├── telemetry-audit-2026-05-17.md  # first audit pass — 2 bugs fixed, 3 pending data
-│   ├── harvest-followups.md           # open auto-apply candidates surfaced by harvest
-│   ├── dynamic-tools-hermes-surface.md  # patch-point reference
-│   └── dynamic-tools-plan.md          # original design doc + categorization
+├── docs/                            # chronologically ordered (01..N)
+│   ├── 01.review-2026-05-07.md                          # early external code review
+│   ├── 02.strategy-2026-05-12.md                        # north star — promise, release strategy, official-plugin readiness
+│   ├── 03.plan-2026-05-12.md                            # current architecture + status
+│   ├── 04.auto-apply-plan-2026-05-12.md                 # writer-side closure plan; prereqs partially cleared
+│   ├── 05.calibration-plan-2026-05-12.md                # observe → handoff → steady-state flow
+│   ├── 06.trigger-scoring-plan-2026-05-12.md            # historical full-scoring plan (deferred)
+│   ├── 07.dynamic-tools-plan-2026-05-17.md              # original design doc + categorization
+│   ├── 08.dynamic-tools-hermes-surface-2026-05-17.md    # patch-point reference
+│   ├── 09.telemetry-audit-2026-05-17.md                 # first audit pass — 2 bugs fixed, 3 pending data
+│   ├── 10.harvest-followups-2026-05-17.md               # open auto-apply candidates surfaced by harvest
+│   ├── 11.roadmap-2026-05-17.md                         # queued work + open design questions
+│   ├── 12.expand-tools-evolution-2026-05-19.md          # next-step ideas for expand_tools precision
+│   ├── 13.website-copy-feature-bank-2026-05-19.md       # product page copy — feature bank
+│   ├── 14.website-copy-product-page-2026-05-19.md       # product page copy — main
+│   └── 15.cache-aware-pivot-2026-05-28.md               # pivot away from per-turn predictor mutation
 ├── scripts/
 │   ├── bootstrap.py                 # first-install warm-start UX wrapper
 │   ├── harvest-replay.py            # replay sessions/*.jsonl → synthetic telemetry

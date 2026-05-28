@@ -28,7 +28,7 @@ from typing import Any, Iterable
 logger = logging.getLogger(__name__)
 
 # Single shipped policy at the plugin root. Hand-curated; will eventually
-# become the calibration warm-start seed (see CALIBRATION-PLAN.md).
+# become the calibration warm-start seed (see docs/05.calibration-plan-2026-05-12.md).
 _POLICY_FILE = Path(__file__).parent / "policy.yaml"
 
 # Sentinel value for always_on meaning "load everything in the user's ceiling".

@@ -1,9 +1,9 @@
 # CLAUDE.md — dynamic-tools
 
 Rules for working in this directory. The entry point for understanding what
-this plugin is and where it's going is [STRATEGY.md](STRATEGY.md); current
-architecture and status live in [PLAN.md](PLAN.md); user-facing docs in
-[README.md](README.md).
+this plugin is and where it's going is [STRATEGY](docs/02.strategy-2026-05-12.md);
+current architecture and status live in [PLAN](docs/03.plan-2026-05-12.md);
+user-facing docs in [README.md](README.md).
 
 ## Scope of edits
 
