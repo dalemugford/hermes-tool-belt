@@ -47,6 +47,10 @@ def tool_calls_path() -> Path:
     return _state_dir() / "tool_calls.jsonl"
 
 
+def api_calls_path() -> Path:
+    return _state_dir() / "api_calls.jsonl"
+
+
 def new_prediction_id() -> str:
     return uuid.uuid4().hex[:16]
 
@@ -202,6 +206,26 @@ def log_prediction(record: PredictionRecord) -> None:
             f.write(line)
     except Exception as exc:
         logger.debug("dynamic-tools: log_prediction failed: %s", exc)
+
+
+def log_api_call(row: dict[str, Any]) -> None:
+    """Append one row per outbound API call. Errors are swallowed.
+
+    Schema is kept loose (free-form dict) because the post_api_request hook
+    payload evolves across providers; pinning a dataclass forces lossy
+    coercion. Callers are expected to include at minimum: ts, prediction_id,
+    session_id, api_call_idx, cache_read_tokens, cache_write_tokens,
+    input_tokens, output_tokens, tool_list_hash. Analysis joins to
+    predictions.jsonl on prediction_id.
+    """
+    try:
+        path = api_calls_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(row, ensure_ascii=False) + "\n"
+        with path.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception as exc:
+        logger.debug("dynamic-tools: log_api_call failed: %s", exc)
 
 
 def log_tool_call(

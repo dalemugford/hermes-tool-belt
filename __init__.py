@@ -183,6 +183,8 @@ def _wrap_build_api_kwargs(original):
                 state.setdefault("initial_allowed_tools", names)
                 state.setdefault("cut_tools", [])
                 state.setdefault("unknown_kept_tools", [])
+                state["last_tool_list_hash"] = _tool_list_hash(tools)
+                state["api_call_idx"] = int(state.get("api_call_idx", 0)) + 1
                 _maybe_log_prediction(state, ceiling=tools, narrowed=tools)
                 return kwargs
 
@@ -241,6 +243,13 @@ def _wrap_build_api_kwargs(original):
             state.setdefault("initial_allowed_tools", _tool_names(filtered))
             state.setdefault("cut_tools", cut_names)
             state.setdefault("unknown_kept_tools", unknown_kept_names)
+
+            # Per-call hash for response-side correlation with
+            # cache_read_tokens. Updated every API call so intra-turn
+            # mutations (expand_tools) show up distinctly from the
+            # snapshot stamped on the prediction row.
+            state["last_tool_list_hash"] = _tool_list_hash(filtered)
+            state["api_call_idx"] = int(state.get("api_call_idx", 0)) + 1
 
             _maybe_log_prediction(state, ceiling=tools, narrowed=filtered)
             return kwargs
@@ -1135,6 +1144,58 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
     return None
 
 
+# ─── Hook: post_api_request ────────────────────────────────────────────────
+
+def _on_post_api_request(**kwargs) -> None:
+    """Log per-API-call cache + token data for cache-economics analysis.
+
+    Hermes fires this once per outbound API call with a normalized ``usage``
+    dict (see AIAgent._usage_summary_for_api_request_hook). The tool-list
+    hash captured in the contextvar is the wire-level hash sent on THIS
+    call — intra-turn mutations from expand_tools produce distinct hashes
+    within a single prediction_id, which is what makes the
+    mutation→cache-miss correlation measurable.
+
+    Out-of-band API calls (no prediction state) are skipped — they aren't
+    gateway-dispatched and have no narrowing decision to attribute.
+    """
+    if not _CONFIG["enabled"] or not _CONFIG.get("log", True):
+        return None
+    try:
+        state = _PREDICTION_CV.get()
+        if state is None:
+            return None
+        usage = kwargs.get("usage") or {}
+        if not isinstance(usage, dict):
+            usage = {}
+        row = {
+            "ts": time.time(),
+            "prediction_id": str(state.get("prediction_id", "")),
+            "session_id": str(state.get("session_id", "")),
+            "scope": str(state.get("scope", "")),
+            "api_call_idx": int(state.get("api_call_idx", 0)),
+            "api_call_count": int(kwargs.get("api_call_count") or 0),
+            "model": str(kwargs.get("model") or state.get("model", "") or ""),
+            "provider": str(kwargs.get("provider") or state.get("provider", "") or ""),
+            "api_mode": str(kwargs.get("api_mode") or ""),
+            "tool_list_hash": str(state.get("last_tool_list_hash", "")),
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "cache_read_tokens": int(usage.get("cache_read_tokens") or 0),
+            "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
+            "reasoning_tokens": int(usage.get("reasoning_tokens") or 0),
+            "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+            "api_duration": float(kwargs.get("api_duration") or 0.0),
+            "finish_reason": str(kwargs.get("finish_reason") or ""),
+            "message_count": int(kwargs.get("message_count") or 0),
+        }
+        logger_io.log_api_call(row)
+    except Exception as exc:
+        logger.debug("dynamic-tools: post_api_request log failed: %s", exc)
+    return None
+
+
 # ─── Hook: on_session_end ──────────────────────────────────────────────────
 
 def _on_session_end(session_id=None, **kwargs) -> None:
@@ -1215,6 +1276,7 @@ def register(ctx) -> None:
     # Hooks
     ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
     ctx.register_hook("post_tool_call", _on_post_tool_call)
+    ctx.register_hook("post_api_request", _on_post_api_request)
     ctx.register_hook("on_session_end", _on_session_end)
 
     logger.info(
