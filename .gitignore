@@ -13,3 +13,7 @@ reports/
 .vscode/
 .idea/
 *.swp
+
+# Patch reject artifacts
+*.rej
+*.rej.orig
