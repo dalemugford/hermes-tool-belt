@@ -64,10 +64,6 @@ _PREDICTION_CV: contextvars.ContextVar[dict[str, Any] | None] = contextvars.Cont
     "dynamic_tools_prediction", default=None,
 )
 
-# Per-session record of the last narrowed tool set, keyed by session_id.
-# Used to detect tool-set changes that bust provider prefix-cache on tool schemas.
-_PREV_TOOL_SET: dict[str, frozenset[str]] = {}
-
 _CONFIG: dict[str, Any] = {
     "enabled": False,
     "log": True,
@@ -160,6 +156,16 @@ def _wrap_build_api_kwargs(original):
             tools = kwargs.get("tools")
             if not isinstance(tools, list) or not tools:
                 return kwargs
+
+            # Best-effort capture for cache-economics analysis. Both fields
+            # are nullable in the prediction record; blank when the adapter
+            # doesn't surface them at this layer. setdefault preserves the
+            # value across intra-turn calls (e.g. post-expand_tools).
+            state.setdefault("model", str(kwargs.get("model", "") or ""))
+            state.setdefault(
+                "provider",
+                str(getattr(self, "provider", "") or kwargs.get("provider", "") or ""),
+            )
 
             allowed = state.get("allowed_tool_names")
             expansions = state.get("expansions") or set()
@@ -280,6 +286,23 @@ def _base_tool_name(name: str) -> str:
 def _tool_names(tools: list) -> list[str]:
     """Return stable tool names from a tool-schema list."""
     return [name for name in (_tool_name(t) for t in tools) if name]
+
+
+def _tool_list_hash(tools: list) -> str:
+    """Truncated sha256 of the narrowed tool list in send-order.
+
+    Captures membership, ordering, and schema-content drift — provider
+    prefix-caches fingerprint the actual schema bytes, so a reorder or a
+    description change invalidates the cache even when the name set is
+    stable. Analysis derives "did the prefix change?" by comparing hashes
+    across consecutive turns in the same session.
+    """
+    try:
+        import json as _json
+        payload = _json.dumps(tools, sort_keys=False, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return ""
 
 
 def _trigger_tools_by_group(preset: Any, fired: list[str]) -> dict[str, list[str]]:
@@ -638,10 +661,6 @@ def _maybe_log_prediction(
     if not _CONFIG.get("log", True):
         return
     try:
-        _sid = str(state.get("session_id", ""))
-        _cur_set = frozenset(_tool_names(narrowed))
-        _tool_set_changed = _PREV_TOOL_SET.get(_sid) != _cur_set
-        _PREV_TOOL_SET[_sid] = _cur_set
         record = logger_io.PredictionRecord(
             ts=time.time(),
             prediction_id=state.get("prediction_id", ""),
@@ -677,7 +696,9 @@ def _maybe_log_prediction(
             learned_changes=list(state.get("learned_changes") or []),
             lookback_used=int(state.get("lookback_used", 0)),
             lookback_turns_config=int(state.get("lookback_turns_config", 0)),
-            tool_set_changed=_tool_set_changed,
+            tool_list_hash=_tool_list_hash(narrowed),
+            provider=str(state.get("provider", "")),
+            model=str(state.get("model", "")),
         )
         logger_io.log_prediction(record)
     except Exception as exc:

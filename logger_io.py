@@ -112,9 +112,18 @@ class PredictionRecord:
     # lookback_turns_config > 0 means a session-first turn (no history yet).
     lookback_used: int = 0
     lookback_turns_config: int = 0
-    # True when the narrowed tool set differs from the previous turn in this
-    # session. A change busts provider-side prefix caching on tool schemas.
-    tool_set_changed: bool = False
+    # sha256 of canonical-JSON-serialized narrowed tool schemas (truncated to
+    # 16 hex chars). Captures membership, order, and schema-content drift —
+    # provider prefix-caches fingerprint the actual schema bytes, so order
+    # and description changes invalidate the cache even when the tool name
+    # set is stable. Analysis derives "did the prefix change?" by comparing
+    # hashes across consecutive turns in the same session.
+    tool_list_hash: str = ""
+    # Provider and model identifiers when reachable from the API kwargs.
+    # Cache economics differ by provider; populated best-effort, blank when
+    # the kwargs shape doesn't expose them.
+    provider: str = ""
+    model: str = ""
 
     @property
     def tokens_saved(self) -> int:
@@ -164,7 +173,9 @@ class PredictionRecord:
             "learned_changes": self.learned_changes or [],
             "lookback_used": self.lookback_used,
             "lookback_turns_config": self.lookback_turns_config,
-            "tool_set_changed": self.tool_set_changed,
+            "tool_list_hash": self.tool_list_hash,
+            "provider": self.provider,
+            "model": self.model,
         }
 
 

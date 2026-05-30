@@ -113,6 +113,23 @@ class ScopeStats:
     # for keyword mining precision. Sized cap protects unbounded growth on
     # big harvests; sampling preserves precision math accuracy.
     harvest_all_previews: list[str] = field(default_factory=list)
+    # Tool-list stability metrics. A mutation = tool_list_hash differs from
+    # the previous turn in the same session (turn > 1). Mutations bust
+    # provider prefix-cache on tool schemas, billing the conversation
+    # history prefix at full input rate. Stable turns keep the cache warm.
+    # Turn 1 is excluded from both counts — first turns always warm a cold
+    # cache regardless of narrowing.
+    mutation_turns: int = 0
+    stable_turns: int = 0
+    first_turns: int = 0
+    hash_missing_turns: int = 0  # pre-Tier-1 rows or rows where hash unavailable
+    sessions_with_mutation: set[str] = field(default_factory=set)
+    # Per-provider/model rollups for stability. Empty key when the adapter
+    # didn't surface the value.
+    mutation_by_provider: Counter[str] = field(default_factory=Counter)
+    mutation_by_model: Counter[str] = field(default_factory=Counter)
+    stable_by_provider: Counter[str] = field(default_factory=Counter)
+    stable_by_model: Counter[str] = field(default_factory=Counter)
 
 
 def state_dir_from_env() -> Path:
@@ -416,6 +433,61 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
                 stat.trigger_needs[group] += 1
                 if group not in fired_groups:
                     stat.trigger_misses[group] += 1
+
+    # Tool-list stability pass. Iterate session-ordered predictions and
+    # compare each turn's tool_list_hash to the previous turn in the same
+    # session. A change = the wire-level tool schema bytes diverged from
+    # last turn = provider prefix-cache on tool schemas + everything after
+    # them (including the conversation history) is invalidated.
+    #
+    # Turn 1 is recorded separately — it's always a cold start and would
+    # bias any "did narrowing bust the cache?" comparison. Rows missing
+    # tool_list_hash (pre-Tier-1 telemetry or rows that failed to compute
+    # one) are counted in hash_missing_turns so coverage is visible.
+    pred_payload: dict[str, dict[str, Any]] = {}
+    for row in predictions:
+        pid = str(row.get("prediction_id") or "").strip()
+        if pid:
+            pred_payload[pid] = row
+
+    for sid, plist in session_ordered_preds.items():
+        prev_hash: str | None = None
+        for i, pid in enumerate(plist):
+            row = pred_payload.get(pid)
+            if row is None:
+                continue
+            scope = prediction_scope.get(pid, "unknown")
+            stat = get(scope)
+            current_hash = str(row.get("tool_list_hash") or "").strip()
+            provider = str(row.get("provider") or "").strip()
+            model = str(row.get("model") or "").strip()
+            if i == 0:
+                stat.first_turns += 1
+                prev_hash = current_hash if current_hash else None
+                continue
+            if not current_hash:
+                stat.hash_missing_turns += 1
+                # Don't update prev_hash — keep the last good hash as the
+                # baseline so a gap of pre-Tier-1 rows doesn't manufacture
+                # a spurious mutation when newer rows resume.
+                continue
+            if prev_hash is None:
+                # First scorable turn in this session — no baseline to
+                # compare against (turn 1 was either missing a hash or
+                # entirely absent). Treat as first_turns to be honest.
+                stat.first_turns += 1
+                prev_hash = current_hash
+                continue
+            if current_hash != prev_hash:
+                stat.mutation_turns += 1
+                stat.sessions_with_mutation.add(sid)
+                stat.mutation_by_provider[provider] += 1
+                stat.mutation_by_model[model] += 1
+            else:
+                stat.stable_turns += 1
+                stat.stable_by_provider[provider] += 1
+                stat.stable_by_model[model] += 1
+            prev_hash = current_hash
 
     return dict(sorted(stats.items()))
 
@@ -728,6 +800,47 @@ def _suggest_dampeners_for_trigger(
             "sample_previews": samples,
         })
     return out
+
+
+def _stability_payload(stat: "ScopeStats") -> dict[str, Any]:
+    """Per-scope tool-list stability summary.
+
+    Mutation = the wire-level tool schemas changed from one turn to the
+    next in the same session. Provider prefix-caches fingerprint the
+    actual schema bytes, so a mutation invalidates the cache for the
+    tool block AND everything after it (notably the conversation history,
+    which accumulates and is the dominant cost on long sessions).
+
+    A high mutation rate in a cache-on environment means narrowing's
+    schema savings are partially or fully eaten by re-billing the
+    history at full input rate. This payload reports the raw frequency;
+    the cost analysis requires response-time cache_read_tokens which
+    aren't yet captured.
+
+    Counts exclude turn-1 (always a cold cache by definition) and rows
+    missing tool_list_hash (pre-Tier-1 telemetry). hash_missing_turns is
+    surfaced as a coverage signal — high values mean the stability
+    figures are based on a narrow recent slice of data.
+    """
+    comparable = stat.mutation_turns + stat.stable_turns
+    return {
+        "first_turns": stat.first_turns,
+        "comparable_turns": comparable,
+        "mutation_turns": stat.mutation_turns,
+        "stable_turns": stat.stable_turns,
+        "hash_missing_turns": stat.hash_missing_turns,
+        "mutation_rate": round(stat.mutation_turns / comparable, 4) if comparable else 0.0,
+        "sessions_with_mutation": len(stat.sessions_with_mutation),
+        "sessions_observed": len(stat.sessions),
+        "sessions_with_mutation_rate": (
+            round(len(stat.sessions_with_mutation) / len(stat.sessions), 4)
+            if stat.sessions else 0.0
+        ),
+        "mutation_by_provider": dict(stat.mutation_by_provider),
+        "stable_by_provider": dict(stat.stable_by_provider),
+        "mutation_by_model": dict(stat.mutation_by_model),
+        "stable_by_model": dict(stat.stable_by_model),
+    }
 
 
 def _cohort_payload(stat: "ScopeStats") -> dict[str, Any]:
@@ -1293,6 +1406,15 @@ def summary_payload(
     )
     total_saved = sum(stat.total_tokens_saved for stat in stats.values())
     total_expand_cost = total_expansions * args.expand_round_trip_tokens
+    total_first_turns = sum(stat.first_turns for stat in stats.values())
+    total_mutation_turns = sum(stat.mutation_turns for stat in stats.values())
+    total_stable_turns = sum(stat.stable_turns for stat in stats.values())
+    total_hash_missing = sum(stat.hash_missing_turns for stat in stats.values())
+    total_comparable = total_mutation_turns + total_stable_turns
+    total_sessions_with_mutation = sum(
+        len(stat.sessions_with_mutation) for stat in stats.values()
+    )
+    total_sessions = sum(len(stat.sessions) for stat in stats.values())
     return {
         "version": 1,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -1311,6 +1433,15 @@ def summary_payload(
             "estimated_expand_round_trip_cost_tokens": total_expand_cost,
             "estimated_net_savings_tokens": total_saved - total_expand_cost,
             "recommendation_candidates": len(recs),
+            "first_turns": total_first_turns,
+            "comparable_turns": total_comparable,
+            "mutation_turns": total_mutation_turns,
+            "stable_turns": total_stable_turns,
+            "hash_missing_turns": total_hash_missing,
+            "mutation_rate": round(total_mutation_turns / total_comparable, 4) if total_comparable else 0.0,
+            "sessions_with_mutation": total_sessions_with_mutation,
+            "sessions_observed": total_sessions,
+            "sessions_with_mutation_rate": round(total_sessions_with_mutation / total_sessions, 4) if total_sessions else 0.0,
         },
         "thresholds": threshold_payload(args),
         "scopes": {scope: scope_payload(stat, args) for scope, stat in stats.items()},
@@ -1367,6 +1498,7 @@ def scope_payload(stat: ScopeStats, args: argparse.Namespace) -> dict[str, Any]:
             if tool not in PROTECTED_ALWAYS_ON
         },
         "cohorts": _cohort_payload(stat),
+        "tool_list_stability": _stability_payload(stat),
         "trigger_precision_recall": {
             trigger: {
                 "fires": fires,
@@ -1403,16 +1535,28 @@ def format_summary(
         f"(@ {args.expand_round_trip_tokens}/event)",
         f"est. net savings (saved − round-trip cost): {totals['estimated_net_savings_tokens']:+,} tok",
         f"recommendation candidates: {totals['recommendation_candidates']}",
+        (
+            f"tool-list stability: {totals['mutation_turns']:,}/{totals['comparable_turns']:,} comparable turns mutated "
+            f"({totals['mutation_rate'] * 100:.1f}%); "
+            f"{totals['sessions_with_mutation']}/{totals['sessions_observed']} sessions affected "
+            f"({totals['sessions_with_mutation_rate'] * 100:.1f}%); "
+            f"first turns excluded={totals['first_turns']:,}; "
+            f"hash-missing={totals['hash_missing_turns']:,}"
+        ),
     ]
     if args.include_archives:
         lines.append("archives: included by explicit flag")
     for scope, stat in stats.items():
         top_expansions = ", ".join(f"{k}={v}" for k, v in stat.expansions_by_category.most_common(3)) or "none"
         insufficient = sum(1 for rec in recs if rec.get("scope") == scope and rec.get("status") == "insufficient_data")
+        stability = _stability_payload(stat)
         lines.append(
             f"- {scope}: predictions={stat.predictions}, sessions={len(stat.sessions)}, "
             f"expansions={stat.expansion_events}, successful_expansions={sum(len(event_ids) for event_ids in stat.used_expansion_event_ids_by_category.values())}, "
-            f"expanded_use_rows={stat.used_expansion_rows}, top_expansions={top_expansions}, insufficient_data={insufficient}"
+            f"expanded_use_rows={stat.used_expansion_rows}, top_expansions={top_expansions}, insufficient_data={insufficient}, "
+            f"tool_list_mutation_rate={stability['mutation_rate'] * 100:.1f}% "
+            f"({stability['mutation_turns']}/{stability['comparable_turns']} comparable, "
+            f"{stability['sessions_with_mutation']} sessions affected)"
         )
     return "\n".join(lines)
 
@@ -1446,6 +1590,23 @@ def markdown_report(
         f"- Logged first-call tokens saved: **{totals['logged_first_call_tokens_saved']:,}**",
         f"- Estimated expand_tools round-trip cost: **{totals['estimated_expand_round_trip_cost_tokens']:,}** tokens",
         f"- Estimated net savings (saved − round-trip cost): **{totals['estimated_net_savings_tokens']:+,}** tokens",
+        "",
+        "## Tool-list Stability (prefix-cache impact)",
+        "",
+        "A *mutation* is a turn where the wire-level tool schemas differed from the previous turn in the same session. "
+        "Provider prefix-caches fingerprint the actual schema bytes, so a mutation invalidates the cache for the tool block AND the conversation history that follows it. "
+        "The savings model above (`logged_first_call_tokens_saved`) does **not** subtract that loss yet — it requires per-turn `cache_read_tokens` from the response, which isn't captured today. ",
+        "Turn 1 is excluded from comparable-turn counts (always a cold cache by definition). "
+        "`hash_missing_turns` flags pre-Tier-1 telemetry or rows where the hash couldn't be computed — when high, the stability figures reflect a narrow recent slice rather than the full archive.",
+        "",
+        f"- Comparable turns (turn > 1, hash present): **{totals['comparable_turns']:,}**",
+        f"- Mutation turns: **{totals['mutation_turns']:,}** ({totals['mutation_rate'] * 100:.1f}% of comparable)",
+        f"- Stable turns: **{totals['stable_turns']:,}**",
+        f"- First turns (excluded): {totals['first_turns']:,}",
+        f"- Hash-missing turns (excluded): {totals['hash_missing_turns']:,}",
+        f"- Sessions with at least one mutation: **{totals['sessions_with_mutation']:,}** of {totals['sessions_observed']:,} ({totals['sessions_with_mutation_rate'] * 100:.1f}%)",
+        "",
+        "Per-scope mutation rates appear in the Per-Scope Metrics section below.",
         "",
         "## Adjustable Defaults Used",
         "",
@@ -1496,6 +1657,39 @@ def markdown_report(
                 lines.append(f"- `{tool}`: {count}")
         else:
             lines.append("- none")
+        stability = _stability_payload(stat)
+        lines.extend([
+            "",
+            "Tool-list stability (prefix-cache impact):",
+            f"- Comparable turns: {stability['comparable_turns']}",
+            f"- Mutations: {stability['mutation_turns']} ({stability['mutation_rate'] * 100:.1f}% of comparable)",
+            f"- Stable: {stability['stable_turns']}",
+            f"- Sessions with at least one mutation: {stability['sessions_with_mutation']} of {stability['sessions_observed']} ({stability['sessions_with_mutation_rate'] * 100:.1f}%)",
+            f"- First turns excluded: {stability['first_turns']}; hash missing: {stability['hash_missing_turns']}",
+        ])
+        if stability["mutation_by_provider"] or stability["stable_by_provider"]:
+            providers = sorted(set(stability["mutation_by_provider"]) | set(stability["stable_by_provider"]))
+            lines.append("- By provider:")
+            for p in providers:
+                m = stability["mutation_by_provider"].get(p, 0)
+                s = stability["stable_by_provider"].get(p, 0)
+                label = p if p else "(blank)"
+                lines.append(
+                    f"  - `{label}`: mutations={m}, stable={s}, "
+                    f"mutation_rate={pct(m, m + s):.1f}%"
+                )
+        if stability["mutation_by_model"] or stability["stable_by_model"]:
+            models = sorted(set(stability["mutation_by_model"]) | set(stability["stable_by_model"]))
+            lines.append("- By model:")
+            for m_name in models:
+                m = stability["mutation_by_model"].get(m_name, 0)
+                s = stability["stable_by_model"].get(m_name, 0)
+                label = m_name if m_name else "(blank)"
+                lines.append(
+                    f"  - `{label}`: mutations={m}, stable={s}, "
+                    f"mutation_rate={pct(m, m + s):.1f}%"
+                )
+
         lines.extend(["", "Cohorts by policy_source:"])
         cohorts = _cohort_payload(stat)
         if cohorts:
