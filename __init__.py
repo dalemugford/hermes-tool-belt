@@ -252,6 +252,7 @@ def _wrap_build_api_kwargs(original):
                 state.setdefault("cut_tools", [])
                 state.setdefault("unknown_kept_tools", [])
                 state["last_tool_list_hash"] = _tool_list_hash(tools)
+                state["last_system_hash"] = _system_message_hash(api_messages)
                 state["api_call_idx"] = int(state.get("api_call_idx", 0)) + 1
                 _maybe_log_prediction(state, ceiling=tools, narrowed=tools)
                 return kwargs
@@ -317,6 +318,7 @@ def _wrap_build_api_kwargs(original):
             # mutations (expand_tools) show up distinctly from the
             # snapshot stamped on the prediction row.
             state["last_tool_list_hash"] = _tool_list_hash(filtered)
+            state["last_system_hash"] = _system_message_hash(api_messages)
             state["api_call_idx"] = int(state.get("api_call_idx", 0)) + 1
 
             # Phase 1: propagate any expansions back to the session's
@@ -391,6 +393,44 @@ def _tool_list_hash(tools: list) -> str:
     try:
         import json as _json
         payload = _json.dumps(tools, sort_keys=False, ensure_ascii=False, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return ""
+
+
+def _system_message_hash(api_messages: Any) -> str:
+    """Hash of the system message content for Mnemosyne-injection detection.
+
+    The system message sits BEFORE the tool block in the cached prefix.
+    Anything that mutates it (Mnemosyne injecting recalled memory into
+    the system prompt, prompt-caching strategy adjustments, etc.) busts
+    the entire downstream cache regardless of how stable the tool list
+    is. If this hash varies turn-over-turn within a session while
+    tool_list_hash stays stable, the freeze is doing its job and
+    something else upstream is the cache breaker.
+
+    Returns truncated sha256 of the first message's content when its
+    role is "system" or "developer"; empty string otherwise (some
+    providers route system content differently).
+    """
+    try:
+        if not isinstance(api_messages, list) or not api_messages:
+            return ""
+        first = api_messages[0]
+        if not isinstance(first, dict):
+            return ""
+        role = str(first.get("role") or "").lower()
+        if role not in ("system", "developer"):
+            return ""
+        content = first.get("content")
+        # Content can be str OR list-of-parts (Anthropic multimodal shape).
+        if isinstance(content, list):
+            import json as _json
+            payload = _json.dumps(content, sort_keys=False, ensure_ascii=False, separators=(",", ":"))
+        elif isinstance(content, str):
+            payload = content
+        else:
+            return ""
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
     except Exception:
         return ""
@@ -1827,6 +1867,7 @@ def _on_post_api_request(**kwargs) -> None:
             "provider": str(kwargs.get("provider") or state.get("provider", "") or ""),
             "api_mode": str(kwargs.get("api_mode") or ""),
             "tool_list_hash": current_hash,
+            "system_hash": str(state.get("last_system_hash", "")),
             "input_tokens": input_tokens,
             "output_tokens": int(usage.get("output_tokens") or 0),
             "cache_read_tokens": cache_read,
