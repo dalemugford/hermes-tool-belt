@@ -1629,12 +1629,15 @@ def _on_session_end(session_id=None, **kwargs) -> None:
         if sticky_key:
             _STICKY_BY_KEY.pop(sticky_key, None)
         _PRIOR_MESSAGES_BY_SESSION.pop(sid, None)
-        # Cache-aware state. Phase 0 keeps these dicts empty in practice
-        # (no Phase 1 writer yet), but the eviction wiring is part of the
-        # invariant the replay test enforces — on_session_end must clear
-        # all per-session state without exception.
-        _FROZEN_BY_SESSION.pop(sid, None)
-        _CACHE_MODE_BY_SESSION.pop(sid, None)
+        # NOTE: do NOT evict _FROZEN_BY_SESSION or _CACHE_MODE_BY_SESSION
+        # here. ``on_session_end`` is a misleading hook name — Hermes
+        # fires it at the end of every ``run_conversation`` call, which
+        # means once per user message in multi-turn sessions
+        # (conversation_loop.py:4680 warns about this explicitly).
+        # Evicting the freeze here would nuke it after the first turn,
+        # defeating the whole point of session-level freezing.
+        # Eviction lives in _on_session_reset (true /reset, /new) only;
+        # Phase 4 will add a compaction-driven eviction.
     return None
 
 
