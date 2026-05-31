@@ -130,6 +130,7 @@ _CONFIG: dict[str, Any] = {
 }
 
 _ORIGINAL_BUILD_API_KWARGS: Any = None
+_ORIGINAL_COMPRESS_CONTEXT: Any = None
 _PATCHED = False
 # Ephemeral sticky-residency state, keyed by sticky_key (a session-scoped
 # opaque token derived from session_id — NOT the coarse policy scope).
@@ -797,16 +798,64 @@ def _maybe_log_prediction(
         logger.debug("dynamic-tools: log_prediction failed: %s", exc)
 
 
+def _wrap_compress_context(original):
+    """Phase 4: evict the session's frozen snapshot after compaction.
+
+    Compaction rewrites the conversation history — the provider's
+    cached prefix becomes worthless because the bytes after the system
+    block differ. We treat that moment as a free reshape opportunity:
+    drop the frozen tool set so the next ``pre_gateway_dispatch``
+    runs the predictor fresh against the post-compaction state.
+
+    The wrapper runs around the original to keep the AIAgent's
+    compaction semantics intact even on failure paths — we evict only
+    after the original returns successfully.
+    """
+    def wrapped(self, messages, system_message, *args, **kwargs):
+        result = original(self, messages, system_message, *args, **kwargs)
+        if not _CONFIG.get("enabled"):
+            return result
+        try:
+            session_key = os.environ.get("HERMES_SESSION_KEY") or ""
+            evicted_keys: list[str] = []
+            if session_key and session_key in _FROZEN_BY_SESSION:
+                _FROZEN_BY_SESSION.pop(session_key, None)
+                _CACHE_MODE_BY_SESSION.pop(session_key, None)
+                evicted_keys.append(session_key)
+            # Defensive: also try the AIAgent's session_id (uuid). When
+            # the env var isn't set but Phase 1 keyed under the uuid as
+            # a fallback (it doesn't today, but if that changes we want
+            # the patch resilient), the eviction here catches it.
+            aid = getattr(self, "session_id", "") or ""
+            if aid and aid != session_key and aid in _FROZEN_BY_SESSION:
+                _FROZEN_BY_SESSION.pop(aid, None)
+                _CACHE_MODE_BY_SESSION.pop(aid, None)
+                evicted_keys.append(aid)
+            if evicted_keys:
+                logger.info(
+                    "dynamic-tools: compaction evicted freeze for session(s) %s — "
+                    "next dispatch will re-freeze",
+                    evicted_keys,
+                )
+        except Exception as exc:
+            logger.debug("dynamic-tools: compaction post-eviction failed: %s", exc)
+        return result
+
+    wrapped.__wrapped__ = original  # type: ignore[attr-defined]
+    return wrapped
+
+
 def _install_patches() -> bool:
-    """Install the _build_api_kwargs monkey-patch.
+    """Install the AIAgent monkey-patches.
 
     NOTE on the from-import / class-method situation:
-      AIAgent is a class; ``_build_api_kwargs`` is a method on it. Replacing
-      the method on the class affects ALL instances (existing and new). No
-      from-import binding problem here — methods are looked up via the
-      instance's class at call time.
+      AIAgent is a class; ``_build_api_kwargs`` and ``_compress_context``
+      are methods on it. Replacing methods on the class affects ALL
+      instances (existing and new). No from-import binding problem
+      here — methods are looked up via the instance's class at call
+      time.
     """
-    global _ORIGINAL_BUILD_API_KWARGS, _PATCHED
+    global _ORIGINAL_BUILD_API_KWARGS, _ORIGINAL_COMPRESS_CONTEXT, _PATCHED
     if _PATCHED:
         return True
     try:
@@ -823,8 +872,20 @@ def _install_patches() -> bool:
     _ORIGINAL_BUILD_API_KWARGS = AIAgent._build_api_kwargs
     AIAgent._build_api_kwargs = _wrap_build_api_kwargs(_ORIGINAL_BUILD_API_KWARGS)
 
+    # Phase 4: compaction-driven freeze eviction. No `post_compaction`
+    # hook exists in Hermes, so we wrap the forwarder method directly.
+    # Best-effort — when _compress_context is missing (older Hermes
+    # versions, custom builds) the freeze persists across compaction,
+    # which costs a single cache break on the next dispatch but doesn't
+    # corrupt anything.
+    if hasattr(AIAgent, "_compress_context"):
+        _ORIGINAL_COMPRESS_CONTEXT = AIAgent._compress_context
+        AIAgent._compress_context = _wrap_compress_context(_ORIGINAL_COMPRESS_CONTEXT)
+        logger.info("dynamic-tools: patches installed (_build_api_kwargs, _compress_context)")
+    else:
+        logger.info("dynamic-tools: patches installed (_build_api_kwargs only — _compress_context missing)")
+
     _PATCHED = True
-    logger.info("dynamic-tools: patches installed (AIAgent._build_api_kwargs)")
     return True
 
 
@@ -1730,8 +1791,33 @@ def _on_post_api_request(**kwargs) -> None:
             scope=str(state.get("scope", "")),
         )
 
+        # Phase 4: cache-TTL expiry detection. A stable-hash call with
+        # zero cache_read after a long idle gap is the signature of
+        # provider-side cache eviction (Anthropic's default 5m TTL).
+        # The freeze logic did everything right — the TTL just lapsed
+        # in between turns. Flagging this distinctly stops the analyzer
+        # from misattributing it as freeze-quality regression.
+        ttl_expired = False
+        now = time.time()
+        current_hash = str(state.get("last_tool_list_hash", ""))
+        if session_key:
+            mode_state = _CACHE_MODE_BY_SESSION.get(session_key) or {}
+            prev_ts = mode_state.get("last_call_ts")
+            prev_hash = mode_state.get("last_call_hash")
+            if (
+                prev_ts is not None
+                and prev_hash
+                and prev_hash == current_hash
+                and cache_read == 0
+                and (now - float(prev_ts)) > 300.0  # 5 min — Anthropic default TTL
+            ):
+                ttl_expired = True
+            mode_state["last_call_ts"] = now
+            mode_state["last_call_hash"] = current_hash
+            _CACHE_MODE_BY_SESSION[session_key] = mode_state
+
         row = {
-            "ts": time.time(),
+            "ts": now,
             "prediction_id": str(state.get("prediction_id", "")),
             "session_id": session_key,
             "scope": str(state.get("scope", "")),
@@ -1740,7 +1826,7 @@ def _on_post_api_request(**kwargs) -> None:
             "model": model,
             "provider": str(kwargs.get("provider") or state.get("provider", "") or ""),
             "api_mode": str(kwargs.get("api_mode") or ""),
-            "tool_list_hash": str(state.get("last_tool_list_hash", "")),
+            "tool_list_hash": current_hash,
             "input_tokens": input_tokens,
             "output_tokens": int(usage.get("output_tokens") or 0),
             "cache_read_tokens": cache_read,
@@ -1752,6 +1838,7 @@ def _on_post_api_request(**kwargs) -> None:
             "finish_reason": str(kwargs.get("finish_reason") or ""),
             "message_count": int(kwargs.get("message_count") or 0),
             "cache_mode": cache_mode,
+            "cache_ttl_expired": ttl_expired,
         }
         logger_io.log_api_call(row)
     except Exception as exc:
