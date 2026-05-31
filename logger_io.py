@@ -128,6 +128,13 @@ class PredictionRecord:
     # the kwargs shape doesn't expose them.
     provider: str = ""
     model: str = ""
+    # True when this turn reused a frozen session snapshot rather than
+    # re-running the predictor (Phase 1 of the cache-aware refactor).
+    # frozen_reuse_count is the index within the session — 1 on the
+    # second dispatch, 2 on the third, etc. Both blank for cache-off
+    # mode and for the first dispatch under cache-on (which freezes).
+    frozen_reuse: bool = False
+    frozen_reuse_count: int = 0
 
     @property
     def tokens_saved(self) -> int:
@@ -180,6 +187,8 @@ class PredictionRecord:
             "tool_list_hash": self.tool_list_hash,
             "provider": self.provider,
             "model": self.model,
+            "frozen_reuse": self.frozen_reuse,
+            "frozen_reuse_count": self.frozen_reuse_count,
         }
 
 

@@ -306,6 +306,20 @@ def _wrap_build_api_kwargs(original):
             state["last_tool_list_hash"] = _tool_list_hash(filtered)
             state["api_call_idx"] = int(state.get("api_call_idx", 0)) + 1
 
+            # Phase 1: propagate any expansions back to the session's
+            # frozen snapshot so the next dispatch reuses them. Without
+            # this, expand_tools events would only live for one turn and
+            # the model would have to re-expand on every subsequent
+            # turn — defeating the freeze's whole point.
+            sid = state.get("session_id", "")
+            if sid and sid in _FROZEN_BY_SESSION:
+                current_expansions = set(state.get("expansions") or set())
+                if current_expansions:
+                    frozen = _FROZEN_BY_SESSION[sid]
+                    prior = set(frozen.get("expansions") or set())
+                    if not current_expansions.issubset(prior):
+                        frozen["expansions"] = prior | current_expansions
+
             _maybe_log_prediction(state, ceiling=tools, narrowed=filtered)
             return kwargs
         except Exception as exc:
@@ -763,6 +777,8 @@ def _maybe_log_prediction(
             tool_list_hash=_tool_list_hash(narrowed),
             provider=str(state.get("provider", "")),
             model=str(state.get("model", "")),
+            frozen_reuse=bool(state.get("frozen_reuse", False)),
+            frozen_reuse_count=int(state.get("frozen_reuse_count", 0)),
         )
         logger_io.log_prediction(record)
     except Exception as exc:
@@ -956,6 +972,158 @@ def _channel_from_event(event: Any) -> str:
     return ""
 
 
+# ─── Cache-aware freeze (Phase 1) ──────────────────────────────────────────
+
+def _resolve_cache_mode_for_session(session_id: str) -> str:
+    """Decide whether this dispatch should freeze tools at the session level.
+
+    Returns "on" or "off". The decision is intentionally simple in Phase 1:
+
+      · Explicit ``cache_mode: off`` → "off" — keep per-turn narrowing.
+      · Explicit ``cache_mode: on`` → "on" — freeze.
+      · ``cache_mode: auto`` (default) → "on" — bias toward the safe
+        default per the pivot doc. Phase 3 will refine "auto" with
+        cross-session detection memory; today's in-memory
+        ``_CACHE_MODE_BY_SESSION`` only records per-session telemetry and
+        doesn't persist across restarts, so it can't yet drive the
+        freeze decision on turn 1.
+
+    Mid-session switching is intentionally not supported — switching
+    itself busts the cache. The detection telemetry from
+    ``_CACHE_MODE_BY_SESSION`` is for the analyzer and for next session,
+    never for this one.
+    """
+    mode = str(_CONFIG.get("cache_mode") or "auto").lower()
+    if mode == "off":
+        return "off"
+    return "on"
+
+
+def _freeze_session_snapshot(
+    session_id: str,
+    *,
+    allowed_tool_names: Any,
+    baseline_allowed_tools: Any,
+    known_tool_names: set[str],
+    preset_name: str,
+    always_on_count: int,
+    always_on_tools: list[str],
+    trigger_tools_by_group: dict[str, list[str]],
+    triggers_fired: list[str],
+    triggers_suppressed: list[str],
+    policy_source: str,
+    policy_version: str,
+    learned_mode: str,
+    learned_scope: str,
+    learned_changes: list[str],
+) -> None:
+    """Persist the first dispatch's tool-set decision for the session.
+
+    Captured on the first dispatch under cache-on mode and reused on
+    every subsequent dispatch in the same session. Eviction lives in
+    ``_on_session_end`` and ``_on_session_reset``; Phase 4 adds a
+    compaction-driven eviction.
+
+    ``triggers_fired`` / ``trigger_tools_by_group`` are stored on the
+    snapshot so subsequent turns' telemetry rows can describe the
+    decision honestly (this is what was triggered when we froze) rather
+    than blanking out as if the predictor never ran.
+    """
+    _FROZEN_BY_SESSION[session_id] = {
+        "allowed_tool_names": allowed_tool_names,
+        "baseline_allowed_tools": baseline_allowed_tools,
+        "known_tool_names": known_tool_names,
+        "expansions": set(),  # grown by expand_tools mid-session
+        "preset_name": preset_name,
+        "always_on_count": always_on_count,
+        "always_on_tools": list(always_on_tools or []),
+        "trigger_tools_by_group": dict(trigger_tools_by_group or {}),
+        "triggers_fired_at_freeze": list(triggers_fired or []),
+        "triggers_suppressed_at_freeze": list(triggers_suppressed or []),
+        "policy_source": policy_source,
+        "policy_version": policy_version,
+        "learned_mode": learned_mode,
+        "learned_scope": learned_scope,
+        "learned_changes": list(learned_changes or []),
+        "frozen_at": time.time(),
+        "reuses": 0,
+    }
+
+
+def _build_state_from_frozen(
+    frozen: dict[str, Any],
+    *,
+    session_id: str,
+    scope: str,
+    channel: str,
+    agent: str,
+    platform: str,
+    message: str,
+) -> dict[str, Any]:
+    """Construct the contextvar state for a dispatch that reuses a frozen snapshot.
+
+    Sticky residency and lookback are *not populated* — both were
+    per-turn-adjustment mechanisms; the freeze makes them redundant by
+    design (see [[dynamic-tools-design-principle]]). The fields are
+    still present in the state dict with empty values so downstream
+    consumers (telemetry, post_tool_call) don't need conditional reads.
+
+    The frozen snapshot's ``expansions`` set carries forward — any
+    expand_tools tools added in prior turns of this session stay
+    available without a fresh expand_tools round-trip.
+    """
+    frozen["reuses"] = int(frozen.get("reuses", 0)) + 1
+    return {
+        "prediction_id": logger_io.new_prediction_id(),
+        "allowed_tool_names": frozen["allowed_tool_names"],
+        "baseline_allowed_tools": frozen["baseline_allowed_tools"],
+        "known_tool_names": frozen["known_tool_names"],
+        # Carry expansions forward in-session — this is the core of the
+        # "stay frozen, including prior expansions" behavior.
+        "expansions": set(frozen.get("expansions") or set()),
+        "channel": channel,
+        "agent": agent,
+        "platform": platform,
+        "scope": scope,
+        # Sticky disabled under freeze — empty key short-circuits all
+        # sticky helpers and the post_tool_call credit logic falls back
+        # to the in-turn ``pending_expansion`` check, which is correct.
+        "sticky_key": "",
+        "session_id": session_id,
+        "message_hash": logger_io.hash_message(message),
+        "message_preview": logger_io.message_preview(message),
+        "preset": frozen["preset_name"],
+        # Triggers aren't recomputed per turn under freeze. We surface the
+        # at-freeze values so the prediction row tells an honest story
+        # ("this is what we froze on").
+        "triggers_fired": list(frozen.get("triggers_fired_at_freeze") or []),
+        "triggers_suppressed": list(frozen.get("triggers_suppressed_at_freeze") or []),
+        "always_on_count": int(frozen.get("always_on_count", 0)),
+        "always_on_tools": list(frozen.get("always_on_tools") or []),
+        "trigger_tools_by_group": dict(frozen.get("trigger_tools_by_group") or {}),
+        "sticky_tools": [],
+        "sticky_categories": [],
+        "sticky_remaining_turns": {},
+        # ``frozen`` policy_source is set on first-dispatch (could be
+        # "preset", "learned", or "bypass") — preserved on reuse so the
+        # cohort analyzer doesn't see the same session split across
+        # multiple sources.
+        "policy_source": frozen.get("policy_source", "preset"),
+        "policy_version": frozen.get("policy_version", ""),
+        "learned_mode": frozen.get("learned_mode", "off"),
+        "learned_scope": frozen.get("learned_scope", ""),
+        "learned_changes": list(frozen.get("learned_changes") or []),
+        # Lookback disabled under freeze.
+        "lookback_used": 0,
+        "lookback_turns_config": 0,
+        "logged": False,
+        # Marker for downstream telemetry — useful in the analyzer to
+        # tell first-dispatch from reuse without joining on session.
+        "frozen_reuse": True,
+        "frozen_reuse_count": frozen["reuses"],
+    }
+
+
 # ─── Hook: pre_gateway_dispatch ────────────────────────────────────────────
 
 def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwargs) -> None:
@@ -973,6 +1141,25 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         _POLICY_TURN_BY_SCOPE[scope] = _POLICY_TURN_BY_SCOPE.get(scope, 0) + 1
         channel = scope
         session_id = _canonical_session_key(event, session_store, kwargs)
+
+        # Phase 1: cache-on freeze. When this session already has a
+        # frozen tool-set decision, reuse it verbatim and skip the
+        # predictor entirely. The frozen path also disables sticky and
+        # lookback by construction.
+        cache_decision = _resolve_cache_mode_for_session(str(session_id))
+        if cache_decision == "on" and session_id and session_id in _FROZEN_BY_SESSION:
+            frozen = _FROZEN_BY_SESSION[session_id]
+            _PREDICTION_CV.set(_build_state_from_frozen(
+                frozen,
+                session_id=str(session_id),
+                scope=scope,
+                channel=channel,
+                agent=agent,
+                platform=platform,
+                message=message,
+            ))
+            return None
+
         # Narrow sticky-residency key: session-scoped, opaque. Distinct from the
         # coarse policy scope (agent:platform) used for telemetry/learned policy.
         sticky_key = _sticky_key_for_session(str(session_id))
@@ -1046,6 +1233,30 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             "lookback_turns_config": lookback_turns,
             "logged": False,
         })
+
+        # Phase 1: on the first dispatch under cache-on mode, freeze the
+        # decision we just made. Every subsequent dispatch in this
+        # session will reuse it via the frozen-path branch above. Skip
+        # when there's no usable session_id (out-of-band dispatch can't
+        # be re-identified, so caching the decision would only collide).
+        if cache_decision == "on" and session_id:
+            _freeze_session_snapshot(
+                str(session_id),
+                allowed_tool_names=allowed_tool_names,
+                baseline_allowed_tools=baseline_allowed_tools,
+                known_tool_names=known,
+                preset_name=prediction.preset_name,
+                always_on_count=prediction.always_on_count,
+                always_on_tools=always_on_tools,
+                trigger_tools_by_group=trigger_tools,
+                triggers_fired=prediction.triggers_fired,
+                triggers_suppressed=prediction.triggers_suppressed,
+                policy_source=policy_source,
+                policy_version=getattr(preset, "policy_version", ""),
+                learned_mode=getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "off")),
+                learned_scope=getattr(preset, "learned_scope", ""),
+                learned_changes=list(getattr(preset, "learned_changes", []) or []),
+            )
     except Exception as exc:
         logger.warning("dynamic-tools: pre_gateway_dispatch failed: %s", exc)
     return None
