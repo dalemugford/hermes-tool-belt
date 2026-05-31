@@ -149,6 +149,18 @@ _PRIOR_MESSAGES_BY_SESSION: dict[str, list[str]] = {}
 # and (Phase 4) on compaction.
 _FROZEN_BY_SESSION: dict[str, dict[str, Any]] = {}
 
+# Cross-session detection cache. Persisted JSON at
+# ``~/.hermes/state/dynamic-tools/cache_mode_detection.json``. Keyed by
+# scope (``agent:platform``) — model identity isn't reliable at
+# pre_gateway_dispatch (set later by the AIAgent) and scope is the
+# right granularity for "does this profile's provider cache?". Values:
+#   {scope: {"mode": "on"|"off", "locked_at": ts, "lock_reason": str,
+#            "hit_rate_at_lock": float, "sessions_locked": int,
+#            "last_model": str}}
+# Loaded once on register(); written on every per-session lock event.
+_DETECTION_CACHE: dict[str, dict[str, Any]] = {}
+_DETECTION_CACHE_LOADED = False
+
 # Cache-mode detection state per canonical session_key. Each entry:
 #   {
 #     "mode": "pending" | "on" | "off",
@@ -974,28 +986,32 @@ def _channel_from_event(event: Any) -> str:
 
 # ─── Cache-aware freeze (Phase 1) ──────────────────────────────────────────
 
-def _resolve_cache_mode_for_session(session_id: str) -> str:
+def _resolve_cache_mode_for_session(session_id: str, scope: str = "") -> str:
     """Decide whether this dispatch should freeze tools at the session level.
 
-    Returns "on" or "off". The decision is intentionally simple in Phase 1:
+    Returns "on" or "off":
 
       · Explicit ``cache_mode: off`` → "off" — keep per-turn narrowing.
       · Explicit ``cache_mode: on`` → "on" — freeze.
-      · ``cache_mode: auto`` (default) → "on" — bias toward the safe
-        default per the pivot doc. Phase 3 will refine "auto" with
-        cross-session detection memory; today's in-memory
-        ``_CACHE_MODE_BY_SESSION`` only records per-session telemetry and
-        doesn't persist across restarts, so it can't yet drive the
-        freeze decision on turn 1.
+      · ``cache_mode: auto`` (default) → consult the cross-session
+        detection cache (Phase 3). If a prior session of this scope
+        locked to a definite mode, honor it. Otherwise default to "on"
+        per the pivot doc's safe-default argument.
 
     Mid-session switching is intentionally not supported — switching
-    itself busts the cache. The detection telemetry from
-    ``_CACHE_MODE_BY_SESSION`` is for the analyzer and for next session,
+    itself busts the cache. The per-session detection telemetry from
+    ``_CACHE_MODE_BY_SESSION`` is for the analyzer and the NEXT session,
     never for this one.
     """
     mode = str(_CONFIG.get("cache_mode") or "auto").lower()
     if mode == "off":
         return "off"
+    if mode == "on":
+        return "on"
+    # auto: consult the cross-session cache; default "on" on a miss.
+    cached = _cached_detection_mode(scope)
+    if cached in ("on", "off"):
+        return cached
     return "on"
 
 
@@ -1146,7 +1162,7 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         # frozen tool-set decision, reuse it verbatim and skip the
         # predictor entirely. The frozen path also disables sticky and
         # lookback by construction.
-        cache_decision = _resolve_cache_mode_for_session(str(session_id))
+        cache_decision = _resolve_cache_mode_for_session(str(session_id), scope=scope)
         if cache_decision == "on" and session_id and session_id in _FROZEN_BY_SESSION:
             frozen = _FROZEN_BY_SESSION[session_id]
             _PREDICTION_CV.set(_build_state_from_frozen(
@@ -1417,12 +1433,163 @@ def _cache_auto_cfg() -> dict[str, Any]:
     return cfg if isinstance(cfg, dict) else {}
 
 
+def _detection_cache_path():
+    """Resolve the persisted detection cache path. Lazy import of os to keep
+    the helper cheap; pathlib.Path import avoided to dodge a circular bind."""
+    import os as _os
+    home = _os.environ.get("HERMES_HOME") or _os.path.expanduser("~/.hermes")
+    return _os.path.join(home, "state", "dynamic-tools", "cache_mode_detection.json")
+
+
+def _load_detection_cache() -> None:
+    """Read the persisted detection cache into memory exactly once.
+
+    Failures are silent — a missing or corrupt file means we fall through
+    to the safe-default "on" for every scope until the first lock writes
+    a new entry. No telemetry is lost in either direction.
+    """
+    global _DETECTION_CACHE_LOADED
+    if _DETECTION_CACHE_LOADED:
+        return
+    _DETECTION_CACHE_LOADED = True
+    import json as _json
+    try:
+        with open(_detection_cache_path(), "r", encoding="utf-8") as f:
+            data = _json.load(f)
+        if isinstance(data, dict):
+            for scope, entry in data.items():
+                if isinstance(scope, str) and isinstance(entry, dict):
+                    _DETECTION_CACHE[scope] = entry
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.debug("dynamic-tools: detection cache load failed: %s", exc)
+
+
+def _save_detection_cache() -> None:
+    """Persist the detection cache atomically."""
+    import json as _json
+    import os as _os
+    path = _detection_cache_path()
+    try:
+        _os.makedirs(_os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            _json.dump(_DETECTION_CACHE, f, ensure_ascii=False, indent=2, sort_keys=True)
+        _os.replace(tmp, path)
+    except Exception as exc:
+        logger.debug("dynamic-tools: detection cache save failed: %s", exc)
+
+
+def _persist_detection_lock(
+    scope: str,
+    state: dict[str, Any],
+    model: str,
+) -> None:
+    """Record a session's lock result to the cross-session cache.
+
+    The cache is keyed by scope. Same-scope sessions that lock the same
+    way bump ``sessions_locked``; a disagreeing lock overwrites with
+    ``sessions_locked = 1`` — the most recent reality wins. We don't
+    average or smooth because cache behavior is a property of the
+    provider+model setup, not a noisy signal that benefits from
+    averaging — when it changes, it changes hard (provider migration,
+    model swap).
+
+    Provider-blocklist locks are skipped: they're a config statement,
+    not an observation, and don't need persistence to be effective.
+    """
+    if not scope or state.get("mode") not in ("on", "off"):
+        return
+    if state.get("lock_reason") == "provider_blocklist":
+        return
+    cached = _DETECTION_CACHE.get(scope)
+    new_entry = {
+        "mode": state["mode"],
+        "locked_at": time.time(),
+        "lock_reason": state.get("lock_reason", ""),
+        "hit_rate_at_lock": state.get("hit_rate_at_lock", 0.0),
+        "last_model": model,
+    }
+    if cached and cached.get("mode") == new_entry["mode"]:
+        new_entry["sessions_locked"] = int(cached.get("sessions_locked", 0)) + 1
+    else:
+        new_entry["sessions_locked"] = 1
+    _DETECTION_CACHE[scope] = new_entry
+    _save_detection_cache()
+
+
+def _cached_detection_mode(scope: str) -> str:
+    """Consult the cross-session cache for a scope's prior locked mode.
+
+    Returns "on", "off", or "" (no cache entry). Auto mode at dispatch
+    time uses this to set the initial freeze decision intelligently —
+    skipping the freeze entirely for known cache-off scopes.
+    """
+    if not scope:
+        return ""
+    entry = _DETECTION_CACHE.get(scope)
+    if not entry:
+        return ""
+    mode = entry.get("mode")
+    return mode if mode in ("on", "off") else ""
+
+
+def _check_divergence(
+    state: dict[str, Any],
+    cache_read: int,
+    input_tokens: int,
+    cache_write: int,
+    scope: str,
+    session_key: str,
+) -> None:
+    """Post-lock observation: does the locked mode still match reality?
+
+    A session locked "on" with consistently low hit rate post-lock is
+    evidence that the freeze is the wrong call for this session —
+    Mnemosyne is busting prefix, a tools mismatch we didn't anticipate,
+    or simply a cold-cache window. We don't switch modes mid-session
+    (the switch itself busts cache), but we surface the divergence so
+    the analyzer can flag the session for forensic review.
+
+    Threshold: 3 consecutive post-lock calls with hit rate below 30%
+    when locked "on". 3 is short enough to fire on a real problem
+    without flapping on transient noise; 30% is below the empirical
+    "stable hash" floor (90.6% on Bernard), so true cache breakage
+    sits well clear of it.
+    """
+    if state.get("mode") != "on" or state.get("locked_at_call") is None:
+        return
+    if state.get("divergence_warned"):
+        return  # one warning per session is enough
+
+    denom = cache_read + input_tokens + cache_write
+    hit_rate = (cache_read / denom) if denom else 0.0
+
+    if hit_rate < 0.30:
+        state["divergence_streak"] = int(state.get("divergence_streak", 0)) + 1
+    else:
+        state["divergence_streak"] = 0
+
+    if state["divergence_streak"] >= 3:
+        state["divergence_warned"] = True
+        logger.warning(
+            "dynamic-tools: freeze divergence — scope=%s session=%s "
+            "locked_mode=on but %d consecutive post-lock calls hit <30%% "
+            "(last hit_rate=%.1f%%). Possible Mnemosyne prefix-break, "
+            "provider cache regression, or unmodeled tool mutation. "
+            "Session continues frozen; analyzer flags for review.",
+            scope, session_key, state["divergence_streak"], hit_rate * 100,
+        )
+
+
 def _update_cache_mode_detection(
     session_key: str,
     model: str,
     cache_read: int,
     cache_write: int,
     input_tokens: int,
+    scope: str = "",
 ) -> str:
     """Update detection state for a session and return the current mode.
 
@@ -1472,6 +1639,8 @@ def _update_cache_mode_detection(
     state["input"] += int(input_tokens or 0)
 
     if state["mode"] != "pending":
+        # Post-lock observation — divergence detection has teeth here.
+        _check_divergence(state, cache_read, input_tokens, cache_write, scope, session_key)
         return state["mode"]
 
     # Provider blocklist: lock "off" the moment we see a known-bad model.
@@ -1480,7 +1649,7 @@ def _update_cache_mode_detection(
         state["mode"] = "off"
         state["locked_at_call"] = state["calls_observed"]
         state["lock_reason"] = "provider_blocklist"
-        return state["mode"]
+        return state["mode"]  # not persisted — provider blocklist is config, not observation
 
     cfg = _cache_auto_cfg()
     try:
@@ -1509,6 +1678,11 @@ def _update_cache_mode_detection(
             state["mode"] = "off"
             state["lock_reason"] = "threshold_failed"
         state["locked_at_call"] = state["calls_observed"]
+        # Phase 3: persist the lock to the cross-session cache so the
+        # next session of this scope can default correctly without
+        # waiting for the observation window again.
+        if scope:
+            _persist_detection_lock(scope, state, model)
 
     return state["mode"]
 
@@ -1543,15 +1717,17 @@ def _on_post_api_request(**kwargs) -> None:
         cache_write = int(usage.get("cache_write_tokens") or 0)
         input_tokens = int(usage.get("input_tokens") or 0)
 
-        # Phase 0: observation only. The returned mode is logged on the
-        # row so we can replay the decision against historical data
-        # without re-running the state machine.
+        # Phase 0/3: detection state machine. Returns the current mode
+        # (pending → on/off once the lock criteria are met). Phase 3
+        # persists locks to the cross-session cache and runs divergence
+        # checks on post-lock calls.
         cache_mode = _update_cache_mode_detection(
             session_key=session_key,
             model=model,
             cache_read=cache_read,
             cache_write=cache_write,
             input_tokens=input_tokens,
+            scope=str(state.get("scope", "")),
         )
 
         row = {
@@ -1693,6 +1869,11 @@ def register(ctx) -> None:
     if not _CONFIG.get("enabled"):
         logger.info("dynamic-tools: disabled in config")
         return
+
+    # Phase 3: pre-load the cross-session detection cache so the first
+    # dispatch under cache_mode: auto picks up prior-session decisions
+    # instead of defaulting to a 5-call observation window every time.
+    _load_detection_cache()
 
     # Try eager patch install. If it fails (typically a transient circular
     # import during Hermes startup), defer to first dispatch — by then
