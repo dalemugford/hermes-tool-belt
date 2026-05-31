@@ -95,6 +95,38 @@ _CONFIG: dict[str, Any] = {
     # allowed_tool_names is set to WILDCARD and policy_source is "bypass".
     # 0.0 disables. Override per scope via channels.<scope>.bypass_rate.
     "bypass_rate": 0.0,
+    # Cache-aware mode (Phase 0 of the cache-aware refactor — observation
+    # only; no behavior change yet). Determines whether tools may be
+    # mutated mid-session.
+    #   auto — observe cache_read_tokens for the first few turns and
+    #          self-select on|off. Bias the default to "on" once the
+    #          empirical window concludes.
+    #   on   — assume provider prefix-caching is active; freeze tools at
+    #          session start (Phase 1 will honour this).
+    #   off  — assume caching is inactive; per-turn narrowing (current
+    #          behavior, kept alive for kimi/gpt-5.4-mini class providers).
+    "cache_mode": "auto",
+    "cache_auto": {
+        # Observe at least this many API calls before locking the mode.
+        # 5 (not 3) because call 1 of a turn is consistently cache-cold
+        # (~30% hit rate even on cache-on providers); 3 turns of mixed
+        # cold/warming would lock noise.
+        "detect_calls": 5,
+        # Also require this much accumulated input to lock. A 3-turn
+        # "hi / what time / ok" opener has tiny inputs and a collapsed
+        # hit-rate denominator — the resulting ratio is noise. Wait
+        # until there's enough volume for the signal to be real.
+        "detect_min_input_tokens": 5000,
+        # hit_rate ≥ on_threshold → lock "on"; else lock "off". Phase 3
+        # may switch this to a fresh-tokens-per-call quantity (the actual
+        # economic driver) but ratio is sufficient for Phase 0 baseline.
+        "on_threshold": 0.40,
+        # Providers/models with known-bad provider-side caching skip the
+        # detection window and lock "off" immediately. From the state.db
+        # 14-day rollup: kimi at 2.5%, gpt-5.4-mini at 2.9%. Don't waste
+        # 5 calls of observation to re-derive what we already measured.
+        "providers_off_models": ["kimi-k2.6:cloud", "gpt-5.4-mini"],
+    },
 }
 
 _ORIGINAL_BUILD_API_KWARGS: Any = None
@@ -110,6 +142,25 @@ _POLICY_TURN_BY_SCOPE: dict[str, int] = {}
 # Keyed by session_id. Cleared on on_session_end.
 _PRIOR_MESSAGES_BY_SESSION: dict[str, list[str]] = {}
 
+# ─── Cache-aware state (Phase 0: observation only, no behavior change) ────
+# Frozen tool-set decisions per canonical session_key. Populated by Phase 1;
+# Phase 0 leaves it empty but reserves the structure + eviction wiring so
+# the test surface stays stable. Eviction: on_session_end, on_session_reset,
+# and (Phase 4) on compaction.
+_FROZEN_BY_SESSION: dict[str, dict[str, Any]] = {}
+
+# Cache-mode detection state per canonical session_key. Each entry:
+#   {
+#     "mode": "pending" | "on" | "off",
+#     "calls_observed": int,
+#     "cache_read": int, "cache_write": int, "input": int,
+#     "locked_at_call": int | None,
+#     "lock_reason": str,  # "provider_blocklist" | "threshold_met" |
+#                          # "threshold_failed" | "forced_on" | "forced_off"
+#   }
+# Populated by _on_post_api_request; consumed by Phase 1 freeze decision.
+_CACHE_MODE_BY_SESSION: dict[str, dict[str, Any]] = {}
+
 
 # ─── Config loading ────────────────────────────────────────────────────────
 
@@ -121,7 +172,7 @@ def _load_user_config() -> None:
         plugin_cfg = cfg_get(cfg, "plugins", "dynamic-tools", default={})
         if not isinstance(plugin_cfg, dict):
             return
-        for key in ("enabled", "log", "agent", "learned_mode", "bypass_rate"):
+        for key in ("enabled", "log", "agent", "learned_mode", "bypass_rate", "cache_mode"):
             if key in plugin_cfg:
                 _CONFIG[key] = plugin_cfg[key]
         for key in ("channels", "always_on_extra", "always_off"):
@@ -135,6 +186,10 @@ def _load_user_config() -> None:
             predictor_cfg = dict(_CONFIG.get("predictor") or {})
             predictor_cfg.update(plugin_cfg["predictor"])
             _CONFIG["predictor"] = predictor_cfg
+        if isinstance(plugin_cfg.get("cache_auto"), dict):
+            cache_auto = dict(_CONFIG.get("cache_auto") or {})
+            cache_auto.update(plugin_cfg["cache_auto"])
+            _CONFIG["cache_auto"] = cache_auto
     except Exception as exc:
         logger.debug("dynamic-tools: config load failed (using defaults): %s", exc)
 
@@ -1144,6 +1199,109 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
     return None
 
 
+# ─── Cache-mode detection ──────────────────────────────────────────────────
+
+def _cache_auto_cfg() -> dict[str, Any]:
+    cfg = _CONFIG.get("cache_auto") or {}
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _update_cache_mode_detection(
+    session_key: str,
+    model: str,
+    cache_read: int,
+    cache_write: int,
+    input_tokens: int,
+) -> str:
+    """Update detection state for a session and return the current mode.
+
+    Phase 0: pure observation. Returns the mode string for the api_calls
+    log line; nothing downstream gates on it yet. Phase 1 will read this
+    state to decide whether to freeze the tool set at session start.
+
+    Decision rules (per the revised plan, doc 16 Phase 3):
+      · Forced mode (cache_mode != "auto") locks immediately.
+      · Models in cache_auto.providers_off_models lock "off" immediately.
+      · "pending" until BOTH `calls_observed >= detect_calls` AND
+        `input_observed >= detect_min_input_tokens` are met. Then:
+          hit_rate = read / (read + write + input)
+          ≥ on_threshold → "on", else → "off".
+      · Once locked, never switch mid-session.
+    """
+    if not session_key:
+        return "off"
+
+    forced = str(_CONFIG.get("cache_mode") or "auto").lower()
+    state = _CACHE_MODE_BY_SESSION.get(session_key)
+    if state is None:
+        state = {
+            "mode": "pending",
+            "calls_observed": 0,
+            "cache_read": 0,
+            "cache_write": 0,
+            "input": 0,
+            "locked_at_call": None,
+            "lock_reason": "",
+        }
+        _CACHE_MODE_BY_SESSION[session_key] = state
+
+        # Forced modes resolve before the first observation lands.
+        if forced == "on":
+            state["mode"] = "on"
+            state["lock_reason"] = "forced_on"
+        elif forced == "off":
+            state["mode"] = "off"
+            state["lock_reason"] = "forced_off"
+
+    # Update running stats regardless of lock state — useful for the
+    # divergence detection Phase 3 will add. Cheap.
+    state["calls_observed"] += 1
+    state["cache_read"] += int(cache_read or 0)
+    state["cache_write"] += int(cache_write or 0)
+    state["input"] += int(input_tokens or 0)
+
+    if state["mode"] != "pending":
+        return state["mode"]
+
+    # Provider blocklist: lock "off" the moment we see a known-bad model.
+    blocklist = _cache_auto_cfg().get("providers_off_models") or []
+    if model and isinstance(blocklist, list) and model in blocklist:
+        state["mode"] = "off"
+        state["locked_at_call"] = state["calls_observed"]
+        state["lock_reason"] = "provider_blocklist"
+        return state["mode"]
+
+    cfg = _cache_auto_cfg()
+    try:
+        detect_calls = max(1, int(cfg.get("detect_calls", 5)))
+    except Exception:
+        detect_calls = 5
+    try:
+        detect_min_input = max(0, int(cfg.get("detect_min_input_tokens", 5000)))
+    except Exception:
+        detect_min_input = 5000
+    try:
+        threshold = float(cfg.get("on_threshold", 0.40))
+    except Exception:
+        threshold = 0.40
+
+    enough_calls = state["calls_observed"] >= detect_calls
+    enough_input = (state["cache_read"] + state["cache_write"] + state["input"]) >= detect_min_input
+    if enough_calls and enough_input:
+        denom = state["cache_read"] + state["cache_write"] + state["input"]
+        hit_rate = (state["cache_read"] / denom) if denom else 0.0
+        state["hit_rate_at_lock"] = round(hit_rate, 4)
+        if hit_rate >= threshold:
+            state["mode"] = "on"
+            state["lock_reason"] = "threshold_met"
+        else:
+            state["mode"] = "off"
+            state["lock_reason"] = "threshold_failed"
+        state["locked_at_call"] = state["calls_observed"]
+
+    return state["mode"]
+
+
 # ─── Hook: post_api_request ────────────────────────────────────────────────
 
 def _on_post_api_request(**kwargs) -> None:
@@ -1168,27 +1326,45 @@ def _on_post_api_request(**kwargs) -> None:
         usage = kwargs.get("usage") or {}
         if not isinstance(usage, dict):
             usage = {}
+        session_key = str(state.get("session_id", ""))
+        model = str(kwargs.get("model") or state.get("model", "") or "")
+        cache_read = int(usage.get("cache_read_tokens") or 0)
+        cache_write = int(usage.get("cache_write_tokens") or 0)
+        input_tokens = int(usage.get("input_tokens") or 0)
+
+        # Phase 0: observation only. The returned mode is logged on the
+        # row so we can replay the decision against historical data
+        # without re-running the state machine.
+        cache_mode = _update_cache_mode_detection(
+            session_key=session_key,
+            model=model,
+            cache_read=cache_read,
+            cache_write=cache_write,
+            input_tokens=input_tokens,
+        )
+
         row = {
             "ts": time.time(),
             "prediction_id": str(state.get("prediction_id", "")),
-            "session_id": str(state.get("session_id", "")),
+            "session_id": session_key,
             "scope": str(state.get("scope", "")),
             "api_call_idx": int(state.get("api_call_idx", 0)),
             "api_call_count": int(kwargs.get("api_call_count") or 0),
-            "model": str(kwargs.get("model") or state.get("model", "") or ""),
+            "model": model,
             "provider": str(kwargs.get("provider") or state.get("provider", "") or ""),
             "api_mode": str(kwargs.get("api_mode") or ""),
             "tool_list_hash": str(state.get("last_tool_list_hash", "")),
-            "input_tokens": int(usage.get("input_tokens") or 0),
+            "input_tokens": input_tokens,
             "output_tokens": int(usage.get("output_tokens") or 0),
-            "cache_read_tokens": int(usage.get("cache_read_tokens") or 0),
-            "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
+            "cache_read_tokens": cache_read,
+            "cache_write_tokens": cache_write,
             "reasoning_tokens": int(usage.get("reasoning_tokens") or 0),
             "prompt_tokens": int(usage.get("prompt_tokens") or 0),
             "total_tokens": int(usage.get("total_tokens") or 0),
             "api_duration": float(kwargs.get("api_duration") or 0.0),
             "finish_reason": str(kwargs.get("finish_reason") or ""),
             "message_count": int(kwargs.get("message_count") or 0),
+            "cache_mode": cache_mode,
         }
         logger_io.log_api_call(row)
     except Exception as exc:
@@ -1242,6 +1418,57 @@ def _on_session_end(session_id=None, **kwargs) -> None:
         if sticky_key:
             _STICKY_BY_KEY.pop(sticky_key, None)
         _PRIOR_MESSAGES_BY_SESSION.pop(sid, None)
+        # Cache-aware state. Phase 0 keeps these dicts empty in practice
+        # (no Phase 1 writer yet), but the eviction wiring is part of the
+        # invariant the replay test enforces — on_session_end must clear
+        # all per-session state without exception.
+        _FROZEN_BY_SESSION.pop(sid, None)
+        _CACHE_MODE_BY_SESSION.pop(sid, None)
+    return None
+
+
+# ─── Hook: on_session_reset ────────────────────────────────────────────────
+
+def _on_session_reset(session_id=None, **kwargs) -> None:
+    """Discard cache-aware per-session state on /reset.
+
+    `/reset` keeps the same canonical session_key but wipes the agent's
+    message history — which, from the provider's cache perspective, is
+    identical to a fresh session. The frozen tool set and the mode
+    detection state from the prior conversation must be discarded so the
+    next ``pre_gateway_dispatch`` re-freezes against the new (empty)
+    history. Phase 1 will populate these dicts; Phase 0 verifies the
+    eviction path runs correctly even when they're empty.
+
+    Sticky/lookback state is also evicted by `on_session_end` semantics
+    and intentionally cleared here too — `/reset` is a stronger signal
+    than the gateway's per-message bookkeeping.
+    """
+    if not _CONFIG["enabled"]:
+        return None
+
+    eviction_ids: list[str] = []
+    canonical_key = ""
+    if isinstance(kwargs.get("session_key"), str) and kwargs["session_key"]:
+        canonical_key = str(kwargs["session_key"])
+    if not canonical_key:
+        env_key = os.environ.get("HERMES_SESSION_KEY") or ""
+        if env_key:
+            canonical_key = env_key
+    if canonical_key:
+        eviction_ids.append(canonical_key)
+    if session_id:
+        sid = str(session_id)
+        if sid and sid not in eviction_ids:
+            eviction_ids.append(sid)
+
+    for sid in eviction_ids:
+        _FROZEN_BY_SESSION.pop(sid, None)
+        _CACHE_MODE_BY_SESSION.pop(sid, None)
+        sticky_key = _sticky_key_for_session(sid)
+        if sticky_key:
+            _STICKY_BY_KEY.pop(sticky_key, None)
+        _PRIOR_MESSAGES_BY_SESSION.pop(sid, None)
     return None
 
 
@@ -1278,6 +1505,7 @@ def register(ctx) -> None:
     ctx.register_hook("post_tool_call", _on_post_tool_call)
     ctx.register_hook("post_api_request", _on_post_api_request)
     ctx.register_hook("on_session_end", _on_session_end)
+    ctx.register_hook("on_session_reset", _on_session_reset)
 
     logger.info(
         "dynamic-tools: active (policy=policy.yaml, log=%s, learned_mode=%s, bypass_rate=%s)",
