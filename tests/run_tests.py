@@ -2,7 +2,7 @@
 """Tiny entry point: ``python tests/run_tests.py``.
 
 The plugin directory name contains a hyphen, so ``python -m unittest
-dynamic-tools.tests.…`` doesn't work. This script registers the package
+tool-belt.tests.…`` doesn't work. This script registers the package
 under an importable alias and then discovers/runs the test suite.
 """
 

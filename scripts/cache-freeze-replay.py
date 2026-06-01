@@ -46,7 +46,7 @@ from typing import Any
 
 def default_state_dir() -> Path:
     home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    return Path(home) / "state" / "dynamic-tools"
+    return Path(home) / "state" / "tool-belt"
 
 
 # ─── Phase 5: price table + counterfactual ────────────────────────────────

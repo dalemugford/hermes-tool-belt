@@ -33,15 +33,15 @@ from unittest import mock
 # conftest.py is loaded by the run_tests.py entry; if a user invokes the
 # test module directly (``python tests/test_session_attribution.py``)
 # we still need to make sure the plugin package is registered.
-if "dynamic_tools_plugin" not in sys.modules:
+if "tool_belt_plugin" not in sys.modules:
     here = Path(__file__).resolve().parent
     sys.path.insert(0, str(here.parent.parent))
     sys.path.insert(0, str(here.parent))
     from tests import conftest  # noqa: F401 — side-effect: register package
 
-plugin = sys.modules["dynamic_tools_plugin"]
-logger_io = importlib.import_module("dynamic_tools_plugin.logger_io")
-analyze = importlib.import_module("dynamic_tools_plugin.analyze")
+plugin = sys.modules["tool_belt_plugin"]
+logger_io = importlib.import_module("tool_belt_plugin.logger_io")
+analyze = importlib.import_module("tool_belt_plugin.analyze")
 
 
 # The real Hermes session key shape from ``gateway/session.py::build_session_key``.
@@ -169,7 +169,7 @@ class PreGatewayDispatchSessionIdTests(unittest.TestCase):
         self.assertEqual(state["agent"], "bernard")
         self.assertEqual(state["platform"], "telegram")
         self.assertEqual(state["scope"], "bernard:telegram")
-        predictions = (Path(self.tmp.name) / "state" / "dynamic-tools" / "predictions.jsonl")
+        predictions = (Path(self.tmp.name) / "state" / "tool-belt" / "predictions.jsonl")
         plugin._maybe_log_prediction(state, ceiling=[], narrowed=[])
         rows = [json.loads(line) for line in predictions.read_text().splitlines() if line]
         self.assertTrue(rows, "expected at least one prediction row")
@@ -298,7 +298,7 @@ class PostToolCallAttributionRecoveryTests(unittest.TestCase):
             task_id="t1",
             session_id=REAL_KEY_TELEGRAM,
         )
-        tool_calls_path = Path(self.profile_home) / "state" / "dynamic-tools" / "tool_calls.jsonl"
+        tool_calls_path = Path(self.profile_home) / "state" / "tool-belt" / "tool_calls.jsonl"
         rows = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l]
         self.assertTrue(rows, "expected one tool-call row")
         row = rows[-1]
@@ -816,7 +816,7 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
         })
 
     def _latest_row(self) -> dict:
-        tool_calls_path = Path(self.profile_home) / "state" / "dynamic-tools" / "tool_calls.jsonl"
+        tool_calls_path = Path(self.profile_home) / "state" / "tool-belt" / "tool_calls.jsonl"
         rows = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l]
         self.assertTrue(rows, "expected at least one tool-call row")
         return rows[-1]
@@ -1025,7 +1025,7 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
             task_id="t1", session_id=REAL_KEY_TELEGRAM,
         )
 
-        tool_calls_path = Path(self.profile_home) / "state" / "dynamic-tools" / "tool_calls.jsonl"
+        tool_calls_path = Path(self.profile_home) / "state" / "tool-belt" / "tool_calls.jsonl"
         rows = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l]
         row = rows[-1]
         self.assertFalse(row.get("was_initially_available"),
@@ -1068,7 +1068,7 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
             task_id="t1", session_id=REAL_KEY_TELEGRAM,
         )
 
-        tool_calls_path = Path(self.profile_home) / "state" / "dynamic-tools" / "tool_calls.jsonl"
+        tool_calls_path = Path(self.profile_home) / "state" / "tool-belt" / "tool_calls.jsonl"
         rows = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l]
         row = rows[-1]
         self.assertTrue(row.get("was_initially_available"))

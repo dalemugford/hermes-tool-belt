@@ -30,7 +30,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import conftest  # noqa: F401
 
-plugin = sys.modules["dynamic_tools_plugin"]
+plugin = sys.modules["tool_belt_plugin"]
 
 
 def _seed_plugin_config(**overrides) -> None:

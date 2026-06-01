@@ -8,7 +8,7 @@ There's one policy YAML (``policy.yaml`` at the plugin root) that defines:
     ``has_attachment``).
 
 Per-scope overrides live in ~/.hermes/config.yaml under
-``plugins.dynamic-tools.channels.<scope>``. Override schema mirrors the
+``plugins.tool-belt.channels.<scope>``. Override schema mirrors the
 policy schema. Scope-level keys win over global. Missing keys fall through
 to the base policy.
 
@@ -96,7 +96,7 @@ def _compile_keywords(raw: list[str] | None) -> list[re.Pattern[str]]:
         try:
             out.append(re.compile(kw, flags=re.IGNORECASE))
         except re.error as exc:
-            logger.warning("dynamic-tools: bad regex %r: %s", kw, exc)
+            logger.warning("tool-belt: bad regex %r: %s", kw, exc)
     return out
 
 
@@ -154,7 +154,7 @@ def load_base_policy() -> Preset:
         return load_preset_file(_POLICY_FILE)
     except Exception as exc:
         logger.warning(
-            "dynamic-tools: failed to load policy.yaml (%s) — falling back to wildcard (no narrowing)",
+            "tool-belt: failed to load policy.yaml (%s) — falling back to wildcard (no narrowing)",
             exc,
         )
         return Preset(name="wildcard-fallback", always_on=WILDCARD_ALWAYS_ON, triggers=[])
@@ -183,7 +183,7 @@ def resolve_preset(
         return _resolve_preset_inner(plugin_config, channel)
     except Exception as exc:
         logger.warning(
-            "dynamic-tools: policy resolution failed for scope=%r, falling back to wildcard: %s",
+            "tool-belt: policy resolution failed for scope=%r, falling back to wildcard: %s",
             channel, exc,
         )
         return Preset(name="wildcard-fallback", always_on=WILDCARD_ALWAYS_ON, triggers=[])
@@ -232,7 +232,7 @@ def _resolve_preset_inner(plugin_config: dict[str, Any], channel: str) -> Preset
         setattr(result.preset, "learned_scope", result.learned_scope)
         return result.preset
     except Exception as exc:
-        logger.warning("dynamic-tools: learned state merge failed for %r: %s", channel, exc)
+        logger.warning("tool-belt: learned state merge failed for %r: %s", channel, exc)
         return resolved
 
 

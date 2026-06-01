@@ -1,7 +1,7 @@
 # Known Issues
 
 A short list of behaviors that look like bugs but aren't — at least not
-ones `dynamic-tools` can fix from where it sits. If you're seeing
+ones `tool-belt` can fix from where it sits. If you're seeing
 something here, the plugin is doing what it should; the cost lives
 elsewhere.
 
@@ -38,7 +38,7 @@ observed:
 that follows them. Savings figures for `gpt-5.4`-family scopes will be
 noisier than for Anthropic models, where cache behavior is more
 deterministic. The freeze mechanism itself is unaffected: the tool list
-stays stable across the session, which is everything `dynamic-tools`
+stays stable across the session, which is everything `tool-belt`
 can do here.
 
 **Workaround.** None owed by this plugin. The issue is upstream of
@@ -66,7 +66,7 @@ but the provider's cached prefix was keyed on the prior block's bytes,
 so the first post-restart turn is a cold-cache turn.
 
 Cache-mode detection state (`cache_mode_detection.json` at
-`~/.hermes/state/dynamic-tools/`) IS persisted, so the re-freeze uses
+`~/.hermes/state/tool-belt/`) IS persisted, so the re-freeze uses
 the same cache mode as before without paying for another detection
 window. Cache-off sticky residency is also in-memory and is cleared on
 restart in the same way.

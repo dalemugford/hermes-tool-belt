@@ -78,7 +78,7 @@ _POLICY_PATH = Path(__file__).resolve().parent.parent / "policy.yaml"
 
 def default_state_dir() -> Path:
     home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    return Path(home) / "state" / "dynamic-tools"
+    return Path(home) / "state" / "tool-belt"
 
 
 def load_shape_ceiling_defaults(policy_path: Path = _POLICY_PATH) -> dict[str, int]:

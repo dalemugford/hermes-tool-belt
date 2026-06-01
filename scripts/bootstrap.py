@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Day-one warm start for the dynamic-tools plugin — mode-aware.
+"""Day-one warm start for the tool-belt plugin — mode-aware.
 
 The plugin runs in two modes per scope (cache-on default for Anthropic /
 OpenAI auto-cache; cache-off fallback for kimi / gpt-5.4-mini). This script
@@ -48,7 +48,7 @@ def _discover_state_dirs(hermes_home: Path, profile_filter: str | None) -> list[
     directory. Used by the cache-on path (shape-ceiling reads live
     telemetry, not harvest)."""
     out: list[tuple[str, Path]] = []
-    root_state = hermes_home / "state" / "dynamic-tools"
+    root_state = hermes_home / "state" / "tool-belt"
     if (not profile_filter or profile_filter == "bernard") and root_state.is_dir():
         out.append(("bernard", root_state))
     profiles_dir = hermes_home / "profiles"
@@ -58,7 +58,7 @@ def _discover_state_dirs(hermes_home: Path, profile_filter: str | None) -> list[
                 continue
             if profile_filter and child.name != profile_filter:
                 continue
-            p_state = child / "state" / "dynamic-tools"
+            p_state = child / "state" / "tool-belt"
             if p_state.is_dir():
                 out.append((child.name, p_state))
     return out
@@ -213,12 +213,12 @@ def main() -> int:
             print(msg)
 
     info("=" * 64)
-    info("  dynamic-tools bootstrap — mode-aware warm start")
+    info("  tool-belt bootstrap — mode-aware warm start")
     info("=" * 64)
 
     state_dirs = _discover_state_dirs(args.hermes_home, args.profile)
     if not state_dirs:
-        print("\nNo dynamic-tools state directories found under", args.hermes_home, file=sys.stderr)
+        print("\nNo tool-belt state directories found under", args.hermes_home, file=sys.stderr)
         return 1
 
     # Cache-on path — shape-ceiling against live telemetry

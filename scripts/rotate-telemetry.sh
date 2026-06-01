@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rotate dynamic-tools telemetry to start a clean measurement window.
+# Rotate tool-belt telemetry to start a clean measurement window.
 #
 # Moves current predictions.jsonl + tool_calls.jsonl into
 # state-dir/archive/reset-<ts>/. Safe to run while the Hermes gateway
@@ -10,7 +10,7 @@
 # (e.g. ./rotate-telemetry.sh pre-simplification).
 set -euo pipefail
 
-STATE_DIR="${HERMES_STATE_DIR:-${HERMES_HOME:-$HOME/.hermes}/state/dynamic-tools}"
+STATE_DIR="${HERMES_STATE_DIR:-${HERMES_HOME:-$HOME/.hermes}/state/tool-belt}"
 TAG="${1:-}"
 TS="$(date -u +%Y-%m-%d-%H%M%S)"
 ARCHIVE_NAME="reset-${TS}${TAG:+-${TAG}}"

@@ -1,6 +1,6 @@
 """Append-only JSONL logging for predictions and tool calls.
 
-Two log files at ``~/.hermes/state/dynamic-tools/``:
+Two log files at ``~/.hermes/state/tool-belt/``:
 
   predictions.jsonl
     One row per inbound gateway message:
@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 def _state_dir() -> Path:
     home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    return Path(home) / "state" / "dynamic-tools"
+    return Path(home) / "state" / "tool-belt"
 
 
 def predictions_path() -> Path:
@@ -214,7 +214,7 @@ def log_prediction(record: PredictionRecord) -> None:
         with path.open("a", encoding="utf-8") as f:
             f.write(line)
     except Exception as exc:
-        logger.debug("dynamic-tools: log_prediction failed: %s", exc)
+        logger.debug("tool-belt: log_prediction failed: %s", exc)
 
 
 def log_api_call(row: dict[str, Any]) -> None:
@@ -234,7 +234,7 @@ def log_api_call(row: dict[str, Any]) -> None:
         with path.open("a", encoding="utf-8") as f:
             f.write(line)
     except Exception as exc:
-        logger.debug("dynamic-tools: log_api_call failed: %s", exc)
+        logger.debug("tool-belt: log_api_call failed: %s", exc)
 
 
 def log_tool_call(
@@ -271,4 +271,4 @@ def log_tool_call(
         with path.open("a", encoding="utf-8") as f:
             f.write(line)
     except Exception as exc:
-        logger.debug("dynamic-tools: log_tool_call failed: %s", exc)
+        logger.debug("tool-belt: log_tool_call failed: %s", exc)

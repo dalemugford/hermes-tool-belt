@@ -1,11 +1,8 @@
-# dynamic-tools
+# Hermes Tool Belt
 
-### Usage-aware tool loading for Hermes Agent.
+### Adaptive tool loadouts for agents. Carry only what you need, drop the rest. Sharpens with use.
 
-A [Hermes Agent](https://hermes-agent.nousresearch.com) plugin that
-carries the tools your agent actually needs, drops the ones it doesn't,
-and adapts both decisions based on real usage signal instead of
-hand-tuning.
+A plugin for [Hermes Agent](https://hermes-agent.nousresearch.com).
 
 The principle is the same regardless of provider; what changes is
 *when* the plugin makes the adjustment. On providers with prefix
@@ -28,7 +25,7 @@ busts that cache and re-bills the conversation history at the full
 input rate. On a multi-turn session, the lost cache costs more than
 the schema savings.
 
-`dynamic-tools` resolves the tension: under cache-on providers it picks
+`tool-belt` resolves the tension: under cache-on providers it picks
 a tool set once per session and holds it stable, learning from actual
 `expand_tools` events to shape the *next* session's starting ceiling.
 Under cache-off providers it falls back to the original per-turn
@@ -72,14 +69,14 @@ User: "run the build script and check the logs"
 ## Install
 
 ```bash
-hermes plugins install dalemugford/hermes-dynamic-tools
+hermes plugins install dalemugford/hermes-tool-belt
 ```
 
 Enable in `~/.hermes/config.yaml`:
 
 ```yaml
 plugins:
-  dynamic-tools:
+  tool-belt:
     enabled: true
 ```
 
@@ -90,7 +87,7 @@ chosen automatically per scope.
 ### Day-one warm start (if you already use Hermes)
 
 ```bash
-python3 ~/.hermes/plugins/dynamic-tools/scripts/bootstrap.py
+python3 ~/.hermes/plugins/tool-belt/scripts/bootstrap.py
 ```
 
 Inspects your existing telemetry per profile. Under cache-on scopes,
@@ -152,7 +149,7 @@ bare platform — so an override on `bernard:telegram` wins over a generic
 
 ```yaml
 plugins:
-  dynamic-tools:
+  tool-belt:
     enabled: true
     channels:
       cli:
@@ -170,7 +167,7 @@ The plugin runs in one of two modes per scope. The mode is detected
 automatically from observed cache behavior over the first few API
 calls of a session, then locked for the session's lifetime. The
 locked decision persists across sessions in
-`~/.hermes/state/dynamic-tools/cache_mode_detection.json` so subsequent
+`~/.hermes/state/tool-belt/cache_mode_detection.json` so subsequent
 sessions skip the observation window.
 
 ### Cache-on mode (default for Anthropic, OpenAI auto-cache)
@@ -239,7 +236,7 @@ The original per-turn pipeline. On every dispatch:
 
 ```yaml
 plugins:
-  dynamic-tools:
+  tool-belt:
     enabled: true
     log: true
 
@@ -285,7 +282,7 @@ plugins:
 
 ## Telemetry
 
-When `log: true`, two append-only JSONL files at `~/.hermes/state/dynamic-tools/`:
+When `log: true`, two append-only JSONL files at `~/.hermes/state/tool-belt/`:
 
 - **predictions.jsonl** — one row per inbound gateway message:
   `prediction_id`, `session_id`, `agent`, `platform`, `scope`,
@@ -312,14 +309,14 @@ When `log: true`, two append-only JSONL files at `~/.hermes/state/dynamic-tools/
 **Watch live as messages flow in:**
 
 ```bash
-tail -f ~/.hermes/state/dynamic-tools/predictions.jsonl | \
+tail -f ~/.hermes/state/tool-belt/predictions.jsonl | \
   jq -c '{scope, msg: .message_preview, triggers: .triggers_fired, suppressed: .triggers_suppressed, saved: .tokens_saved, pct: .reduction_pct}'
 ```
 
 **Spot-check the last 5 predictions:**
 
 ```bash
-tail -5 ~/.hermes/state/dynamic-tools/predictions.jsonl | \
+tail -5 ~/.hermes/state/tool-belt/predictions.jsonl | \
   jq -c '{scope, msg: .message_preview[:50], triggers: .triggers_fired, ceiling: .ceiling_count, narrowed: .narrowed_count, saved: .tokens_saved, pct: .reduction_pct}'
 ```
 
@@ -327,34 +324,34 @@ tail -5 ~/.hermes/state/dynamic-tools/predictions.jsonl | \
 
 ```bash
 jq -s 'map(.tokens_saved) | {n: length, total_saved: add, avg_saved: (add/length | floor), avg_pct: (map(.reduction_pct) | add/length | (.*10|floor)/10)}' \
-  ~/.hermes/state/dynamic-tools/predictions.jsonl
+  ~/.hermes/state/tool-belt/predictions.jsonl
 ```
 
 **Trigger frequency — which triggers fire most often:**
 
 ```bash
 jq -r '.triggers_fired | if length == 0 then "(none)" else join(",") end' \
-  ~/.hermes/state/dynamic-tools/predictions.jsonl | sort | uniq -c | sort -rn
+  ~/.hermes/state/tool-belt/predictions.jsonl | sort | uniq -c | sort -rn
 ```
 
 **Trigger dampener audit — what got suppressed by `exclude_keywords`:**
 
 ```bash
 jq -c 'select((.triggers_suppressed // []) | length > 0) | {msg: .message_preview[:60], suppressed: .triggers_suppressed, fired: .triggers_fired}' \
-  ~/.hermes/state/dynamic-tools/predictions.jsonl | tail -20
+  ~/.hermes/state/tool-belt/predictions.jsonl | tail -20
 ```
 
 **Tool calls per session — what actually got used:**
 
 ```bash
-jq -r '.tool_name' ~/.hermes/state/dynamic-tools/tool_calls.jsonl | sort | uniq -c | sort -rn
+jq -r '.tool_name' ~/.hermes/state/tool-belt/tool_calls.jsonl | sort | uniq -c | sort -rn
 ```
 
 **Expansion success rate — when did `expand_tools` lead to a real call?**
 
 ```bash
 jq -c 'select(.expand_tools_used == true) | {scope, category: .expand_category, tool: .expanded_tool, turns_until_used}' \
-  ~/.hermes/state/dynamic-tools/tool_calls.jsonl | tail -20
+  ~/.hermes/state/tool-belt/tool_calls.jsonl | tail -20
 ```
 
 Use [analyze.py](analyze.py) (below) for proper per-scope precision/recall
@@ -377,7 +374,7 @@ effectiveness separately from "no positive match."
 Smoke check:
 
 ```bash
-hermes-agent/venv/bin/python3 plugins/dynamic-tools/scripts/check_trigger_dampeners.py
+hermes-agent/venv/bin/python3 plugins/tool-belt/scripts/check_trigger_dampeners.py
 ```
 
 ### Auto-suggesting new dampeners from telemetry
@@ -390,7 +387,7 @@ extracts 2–4 word n-grams, and surfaces n-grams that show up frequently
 in false-positive messages but rarely (or never) in true-positive ones.
 
 ```bash
-hermes-agent/venv/bin/python3 plugins/dynamic-tools/analyze.py \
+hermes-agent/venv/bin/python3 plugins/tool-belt/analyze.py \
   --suggest-dampeners
 ```
 
@@ -415,7 +412,7 @@ candidate → tighter YAML → fewer false positives next batch.
 ## Learned policy (`learned_mode`)
 
 Beyond the static preset, the plugin supports a persistent per-scope overlay
-in `~/.hermes/state/dynamic-tools/learned.json`. Shape:
+in `~/.hermes/state/tool-belt/learned.json`. Shape:
 
 ```json
 {
@@ -468,10 +465,10 @@ prints a summary, writes a dated markdown report under `reports/`, and can
 optionally emit `learned_recommendations.json` for review.
 
 ```bash
-hermes-agent/venv/bin/python3 plugins/dynamic-tools/analyze.py
-hermes-agent/venv/bin/python3 plugins/dynamic-tools/analyze.py --format json
-hermes-agent/venv/bin/python3 plugins/dynamic-tools/analyze.py --write-recommendations
-hermes-agent/venv/bin/python3 plugins/dynamic-tools/analyze.py --include-archives
+hermes-agent/venv/bin/python3 plugins/tool-belt/analyze.py
+hermes-agent/venv/bin/python3 plugins/tool-belt/analyze.py --format json
+hermes-agent/venv/bin/python3 plugins/tool-belt/analyze.py --write-recommendations
+hermes-agent/venv/bin/python3 plugins/tool-belt/analyze.py --include-archives
 ```
 
 All thresholds are CLI flags, not hard-coded policy:
@@ -529,7 +526,7 @@ underscore prefix).
 ```bash
 # Generate the harvest data, then run the analyzer against it
 python3 scripts/harvest-replay.py
-python3 analyze.py --state-dir ~/.hermes/state/dynamic-tools/harvest \
+python3 analyze.py --state-dir ~/.hermes/state/tool-belt/harvest \
     --suggest-trigger-keywords --suggest-dampeners
 ```
 
@@ -544,7 +541,7 @@ fraction of sessions through with no narrowing:
 
 ```yaml
 plugins:
-  dynamic-tools:
+  tool-belt:
     bypass_rate: 0.05   # 5% global baseline
     channels:
       bernard:telegram:
@@ -557,7 +554,7 @@ run the predictor for telemetry but stamp `policy_source: "bypass"` so the
 analyzer's `cohorts` payload can compare:
 
 ```bash
-hermes-agent/venv/bin/python3 plugins/dynamic-tools/analyze.py --format json \
+hermes-agent/venv/bin/python3 plugins/tool-belt/analyze.py --format json \
   | jq '.scopes["bernard:telegram"].cohorts'
 ```
 
@@ -574,7 +571,7 @@ session before regex matching. This recovers intent for short replies like
 
 ```yaml
 plugins:
-  dynamic-tools:
+  tool-belt:
     predictor:
       lookback_turns: 1   # 0 disables
 ```
@@ -605,12 +602,12 @@ Sticky decrements happen once per inbound user turn (in
 
 ```bash
 # After restarting Hermes:
-tail -f ~/.hermes/state/dynamic-tools/predictions.jsonl
+tail -f ~/.hermes/state/tool-belt/predictions.jsonl
 # Send a message in any gateway channel. You should see a row appear with
 # the triggers that fired and the counts of tools loaded.
 
 # Or check Hermes' own logs:
-grep "dynamic-tools" ~/.hermes/logs/agent.log
+grep "tool-belt" ~/.hermes/logs/agent.log
 # Should show "patches installed" at startup and "active (policy=policy.yaml, ...)"
 ```
 
@@ -674,20 +671,20 @@ Either:
 
 ```yaml
 plugins:
-  dynamic-tools:
+  tool-belt:
     enabled: false
 ```
 
 …or remove the directory entirely:
 
 ```bash
-rm -rf ~/.hermes/plugins/dynamic-tools
+rm -rf ~/.hermes/plugins/tool-belt
 ```
 
 ## Files
 
 ```
-~/.hermes/plugins/dynamic-tools/
+~/.hermes/plugins/tool-belt/
 ├── plugin.yaml                      # manifest
 ├── __init__.py                      # register(); freeze + filter patches; hooks; cache-mode detection
 ├── predictor.py                     # regex/keyword classifier (runs on freeze + cache-off dispatches)
@@ -727,5 +724,5 @@ rm -rf ~/.hermes/plugins/dynamic-tools
 ```
 # one line per run: timestamp, status, prediction count, scopes, expand events,
 # net savings, recommendation count, dampener candidates
-cat ~/.hermes/state/dynamic-tools/cron-logs/daily-summary.log
+cat ~/.hermes/state/tool-belt/cron-logs/daily-summary.log
 ```

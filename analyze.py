@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic telemetry analyzer for the dynamic-tools plugin.
+"""Deterministic telemetry analyzer for the tool-belt plugin.
 
 Reads append-only JSONL telemetry and emits a human-readable summary plus a
 markdown report. The analyzer is intentionally conservative: it tolerates older
@@ -134,7 +134,7 @@ class ScopeStats:
 
 def state_dir_from_env() -> Path:
     home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    return Path(home) / "state" / "dynamic-tools"
+    return Path(home) / "state" / "tool-belt"
 
 
 def safe_int(value: Any, default: int = 0) -> int:
@@ -1032,7 +1032,7 @@ def trigger_keyword_candidates(
         warning = _EXCLUDES_STATUS_MESSAGE.get(
             status, f"preset triggers unavailable: {status}"
         )
-        print(f"warning: dynamic-tools analyzer (triggers): {warning}",
+        print(f"warning: tool-belt analyzer (triggers): {warning}",
               file=sys.stderr)
 
     # Noise corpus: ALL harvest prediction previews per scope (capped
@@ -1112,7 +1112,7 @@ def dampener_candidates(stats: dict[str, ScopeStats], args: argparse.Namespace) 
         warning = _EXCLUDES_STATUS_MESSAGE.get(
             excludes_status, f"preset excludes unavailable: {excludes_status}"
         )
-        print(f"warning: dynamic-tools analyzer: {warning}", file=sys.stderr)
+        print(f"warning: tool-belt analyzer: {warning}", file=sys.stderr)
     rows: list[dict[str, Any]] = []
     for scope, stat in stats.items():
         for trigger, fp_previews in stat.trigger_fp_previews.items():
@@ -1523,7 +1523,7 @@ def format_summary(
     payload = summary_payload(stats, recs, args, dampeners)
     totals = payload["totals"]
     lines = [
-        "dynamic-tools analyzer",
+        "tool-belt analyzer",
         f"scopes: {totals['scopes']}",
         f"prediction rows: {totals['prediction_rows']}",
         f"tool-call rows: {totals['tool_call_rows']}",
@@ -1573,7 +1573,7 @@ def markdown_report(
     totals = payload["totals"]
 
     lines = [
-        "# dynamic-tools Analyzer Report",
+        "# tool-belt Analyzer Report",
         "",
         f"Generated: {generated}",
         f"State dir: `{args.state_dir}`",
@@ -1867,7 +1867,7 @@ def write_recommendations(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Analyze dynamic-tools JSONL telemetry")
+    parser = argparse.ArgumentParser(description="Analyze tool-belt JSONL telemetry")
     parser.add_argument("--state-dir", type=Path, default=state_dir_from_env(), help="Directory containing predictions.jsonl and tool_calls.jsonl")
     parser.add_argument("--reports-dir", type=Path, default=None, help="Directory for markdown reports; default: plugin reports/")
     parser.add_argument("--no-report", action="store_true", help="Print summary only; do not write markdown report")

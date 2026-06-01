@@ -1,6 +1,6 @@
 # CONFIGURATION
 
-Reference for every configuration surface in `dynamic-tools`. For
+Reference for every configuration surface in `tool-belt`. For
 behavior — what the plugin does at runtime, when freezes happen, how
 the cache-mode state machine evolves — see
 [ARCHITECTURE.md](ARCHITECTURE.md).
@@ -16,10 +16,10 @@ Configuration is assembled from three files with distinct ownership:
 | `learned.json` (state dir) | `shape-ceiling.py` | Auto-tuned promote/demote per scope. Generally not hand-edited. |
 
 State files (`learned.json`, `cache_mode_detection.json`, JSONL
-telemetry) live under `~/.hermes/state/dynamic-tools/` by default. When
+telemetry) live under `~/.hermes/state/tool-belt/` by default. When
 `HERMES_HOME` is set (per-profile installs), all state paths resolve
 relative to it — so per-profile state lands under
-`$HERMES_HOME/state/dynamic-tools/`.
+`$HERMES_HOME/state/tool-belt/`.
 
 Resolution order at dispatch time (later layers override earlier):
 
@@ -34,14 +34,14 @@ See [`presets.py:resolve_preset`](../presets.py) for the resolver.
 
 ## `config.yaml` reference
 
-User config lives under the `plugins.dynamic-tools` key of Hermes'
+User config lives under the `plugins.tool-belt` key of Hermes'
 `config.yaml`. The loader is
 [`_load_user_config`](../__init__.py); defaults come from the
 `_CONFIG` dict in the same file.
 
 ```yaml
 plugins:
-  dynamic-tools:
+  tool-belt:
     enabled: true
     log: true
     cache_mode: auto
@@ -379,8 +379,8 @@ forking the preset.
 
 ## `learned.json` reference
 
-Path: `$HERMES_HOME/state/dynamic-tools/learned.json` (or
-`~/.hermes/state/dynamic-tools/learned.json` when `HERMES_HOME` is
+Path: `$HERMES_HOME/state/tool-belt/learned.json` (or
+`~/.hermes/state/tool-belt/learned.json` when `HERMES_HOME` is
 unset). Read-mostly: owned by `scripts/shape-ceiling.py`; consumed by
 [`learned.py:apply_to_preset`](../learned.py) when
 `learned_mode in {auto, audit}`.
@@ -458,7 +458,7 @@ auto-tuned state.
 
 ## Cache mode detection state
 
-Path: `$HERMES_HOME/state/dynamic-tools/cache_mode_detection.json`.
+Path: `$HERMES_HOME/state/tool-belt/cache_mode_detection.json`.
 Owned by the runtime; written on every per-session lock event by
 [`_persist_detection_lock`](../__init__.py).
 
@@ -504,7 +504,7 @@ Owned by the runtime; written on every per-session lock event by
 
 All telemetry writes through [`logger_io.py`](../logger_io.py) and is
 controlled by `log: true`. Files are append-only JSONL at
-`$HERMES_HOME/state/dynamic-tools/`.
+`$HERMES_HOME/state/tool-belt/`.
 
 ### `predictions.jsonl`
 

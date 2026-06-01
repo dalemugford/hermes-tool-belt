@@ -1,7 +1,7 @@
-"""Persistent learned policy state for dynamic-tools.
+"""Persistent learned policy state for tool-belt.
 
 The learned layer is deliberately small and inspectable: a JSON file under
-``$HERMES_HOME/state/dynamic-tools/learned.json``. Prediction only reads from
+``$HERMES_HOME/state/tool-belt/learned.json``. Prediction only reads from
 it. Analyzer or explicit user action writes it.
 """
 
@@ -41,7 +41,7 @@ class LearnedMergeResult:
 
 def state_dir() -> Path:
     home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    return Path(home) / "state" / "dynamic-tools"
+    return Path(home) / "state" / "tool-belt"
 
 
 def learned_path() -> Path:
@@ -92,7 +92,7 @@ def load_state(force: bool = False) -> dict[str, Any]:
         _CACHE.update({"path": str(path), "mtime_ns": None, "state": {}, "hash": ""})
         return {}
     except Exception as exc:
-        logger.debug("dynamic-tools: learned state stat failed: %s", exc)
+        logger.debug("tool-belt: learned state stat failed: %s", exc)
         return {}
 
     if (
@@ -109,13 +109,13 @@ def load_state(force: bool = False) -> dict[str, Any]:
         if not isinstance(data, dict):
             raise ValueError("learned state root is not an object")
         if int(data.get("version", LEARNED_VERSION)) != LEARNED_VERSION:
-            logger.warning("dynamic-tools: unsupported learned state version %r", data.get("version"))
+            logger.warning("tool-belt: unsupported learned state version %r", data.get("version"))
             data = {}
         digest = hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()[:12]
         _CACHE.update({"path": str(path), "mtime_ns": stat.st_mtime_ns, "state": data, "hash": digest})
         return deepcopy(data)
     except Exception as exc:
-        logger.warning("dynamic-tools: failed to load learned state %s: %s", path, exc)
+        logger.warning("tool-belt: failed to load learned state %s: %s", path, exc)
         _CACHE.update({"path": str(path), "mtime_ns": stat.st_mtime_ns, "state": {}, "hash": ""})
         return {}
 

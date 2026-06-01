@@ -1,4 +1,4 @@
-# dynamic-tools scripts
+# tool-belt scripts
 
 Operational scripts that live next to the plugin. Each is safe to run by
 hand or under a scheduler. The shaper (`shape-ceiling.py`) writes to
@@ -33,9 +33,9 @@ following scripts support tuning that path:
 | Script | Purpose | When to run |
 |---|---|---|
 | [`smoke-test.py`](smoke-test.py) | End-to-end mechanical validation. Synthetic sessions through the plugin in an isolated tempdir. Currently covers the per-turn path; cache-on freeze-path assertions are a TODO. | After any gateway restart that loads new plugin code, or before committing changes that touch the hook surface. |
-| [`rotate-telemetry.sh`](rotate-telemetry.sh) | Archive current `predictions.jsonl` + `tool_calls.jsonl` + `api_calls.jsonl` to `state/dynamic-tools/archive/reset-<ts>/`. Gateway-safe. | After a meaningful change to plugin behavior, when you want a clean measurement window. |
+| [`rotate-telemetry.sh`](rotate-telemetry.sh) | Archive current `predictions.jsonl` + `tool_calls.jsonl` + `api_calls.jsonl` to `state/tool-belt/archive/reset-<ts>/`. Gateway-safe. | After a meaningful change to plugin behavior, when you want a clean measurement window. |
 | [`daily-analysis.sh`](daily-analysis.sh) | Run analyzer with full recommendations + dampener mining, drop a markdown report + recommendations JSON. | Scheduled twice daily via launchd, or by hand any time. |
-| [`com.dalemugford.hermes.dynamic-tools-analyzer.plist`](com.dalemugford.hermes.dynamic-tools-analyzer.plist) | launchd LaunchAgent template; runs `daily-analysis.sh` at 00:00 and 12:00 local time. | Install once. |
+| [`com.dalemugford.hermes.tool-belt-analyzer.plist`](com.dalemugford.hermes.tool-belt-analyzer.plist) | launchd LaunchAgent template; runs `daily-analysis.sh` at 00:00 and 12:00 local time. | Install once. |
 
 ## Shape next session's frozen ceiling
 
@@ -101,7 +101,7 @@ Run after any restart that loads new plugin code.
 ./rotate-telemetry.sh [tag]
 ```
 
-Moves the live JSONL files into `~/.hermes/state/dynamic-tools/archive/reset-<UTC-timestamp>[-<tag>]/`.
+Moves the live JSONL files into `~/.hermes/state/tool-belt/archive/reset-<UTC-timestamp>[-<tag>]/`.
 The plugin re-creates the files on the next write (logger_io opens in
 append mode every call, so an `mv` is atomic and gateway-safe).
 
@@ -113,25 +113,25 @@ e.g. `./rotate-telemetry.sh pre-simplification` produces
 
 ```bash
 # install
-cp com.dalemugford.hermes.dynamic-tools-analyzer.plist ~/Library/LaunchAgents/
+cp com.dalemugford.hermes.tool-belt-analyzer.plist ~/Library/LaunchAgents/
 launchctl bootstrap gui/$(id -u) \
-    ~/Library/LaunchAgents/com.dalemugford.hermes.dynamic-tools-analyzer.plist
+    ~/Library/LaunchAgents/com.dalemugford.hermes.tool-belt-analyzer.plist
 
 # confirm it's scheduled
-launchctl print gui/$(id -u)/com.dalemugford.hermes.dynamic-tools-analyzer \
+launchctl print gui/$(id -u)/com.dalemugford.hermes.tool-belt-analyzer \
     | grep -E "state|next run"
 
 # run once on demand (smoke test or ad-hoc)
-launchctl kickstart gui/$(id -u)/com.dalemugford.hermes.dynamic-tools-analyzer
+launchctl kickstart gui/$(id -u)/com.dalemugford.hermes.tool-belt-analyzer
 ```
 
 Outputs land in three places:
 
-- `~/.hermes/plugins/dynamic-tools/reports/YYYY-MM-DD-HHMMSS-analysis.md`
+- `~/.hermes/plugins/tool-belt/reports/YYYY-MM-DD-HHMMSS-analysis.md`
   — the human-readable per-run report.
-- `~/.hermes/state/dynamic-tools/learned_recommendations.json` —
+- `~/.hermes/state/tool-belt/learned_recommendations.json` —
   the latest machine-readable recommendation set. Overwritten each run.
-- `~/.hermes/state/dynamic-tools/cron-logs/` — per-run JSON output,
+- `~/.hermes/state/tool-belt/cron-logs/` — per-run JSON output,
   any stderr captured during a failed run, and `daily-summary.log` with
   one line per run for at-a-glance review.
 
@@ -139,24 +139,24 @@ Outputs land in three places:
 
 ```bash
 # Scan the summary log
-cat ~/.hermes/state/dynamic-tools/cron-logs/daily-summary.log
+cat ~/.hermes/state/tool-belt/cron-logs/daily-summary.log
 
 # Open the most recent markdown report (now includes Harvest-Driven and
 # Trigger-Keyword sections when harvest data is present)
-ls -t ~/.hermes/plugins/dynamic-tools/reports/*.md | head -1 | xargs open
+ls -t ~/.hermes/plugins/tool-belt/reports/*.md | head -1 | xargs open
 
 # Inspect the latest recommendations JSON — includes harvest_tool_promotion
 # kinds alongside expanded_category and trigger_group recs
 jq '.dampener_candidates, .recommendations, .trigger_keyword_candidates' \
-   ~/.hermes/state/dynamic-tools/learned_recommendations.json
+   ~/.hermes/state/tool-belt/learned_recommendations.json
 ```
 
 ## Uninstall
 
 ```bash
 launchctl bootout gui/$(id -u) \
-    ~/Library/LaunchAgents/com.dalemugford.hermes.dynamic-tools-analyzer.plist
-rm ~/Library/LaunchAgents/com.dalemugford.hermes.dynamic-tools-analyzer.plist
+    ~/Library/LaunchAgents/com.dalemugford.hermes.tool-belt-analyzer.plist
+rm ~/Library/LaunchAgents/com.dalemugford.hermes.tool-belt-analyzer.plist
 ```
 
 The script files and their outputs aren't touched by uninstall —

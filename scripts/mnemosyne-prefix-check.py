@@ -15,7 +15,7 @@ stay stable across turns?
     friendly.
   · system_hash varies → Mnemosyne (or something) is mutating the
     system prompt itself. The freeze headline is partly attributable
-    to whatever else is constant, not to dynamic-tools alone. The
+    to whatever else is constant, not to tool-belt alone. The
     savings story changes shape.
 
 This is a verification gate, not an A/B test. We don't need to disable
@@ -40,7 +40,7 @@ from typing import Any
 
 def default_state_dir() -> Path:
     home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    return Path(home) / "state" / "dynamic-tools"
+    return Path(home) / "state" / "tool-belt"
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -174,7 +174,7 @@ def main() -> int:
         print("VERDICT: PREFIX_STABLE")
         print("  System message is stable across turns within sessions. If Mnemosyne is injecting")
         print("  memory, it lands in a cache-friendly position (most-recent message). The freeze")
-        print("  headline is real — dynamic-tools' freeze is the cache-stability mechanism.")
+        print("  headline is real — tool-belt' freeze is the cache-stability mechanism.")
     elif v == "MNEMOSYNE_MUTATES_PREFIX":
         print("VERDICT: MNEMOSYNE_MUTATES_PREFIX")
         print(f"  {r['sys_only_mutated_sessions']} session(s) show system_hash variation with stable")

@@ -28,8 +28,8 @@ sys.path.insert(0, str(PLUGIN_DIR))
 sys.path.insert(0, str(PLUGIN_DIR / "tests"))
 import conftest  # noqa: F401
 
-plugin = sys.modules["dynamic_tools_plugin"]
-presets_mod = importlib.import_module("dynamic_tools_plugin.presets")
+plugin = sys.modules["tool_belt_plugin"]
+presets_mod = importlib.import_module("tool_belt_plugin.presets")
 
 # Load the harvest-replay script as a module so we can call its
 # functions in-process. Lives under scripts/, not in the package.

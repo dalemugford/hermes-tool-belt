@@ -1,6 +1,6 @@
-# dynamic-tools Architecture
+# tool-belt Architecture
 
-`dynamic-tools` is a Hermes plugin that reduces per-request tool overhead by
+`tool-belt` is a Hermes plugin that reduces per-request tool overhead by
 sending the model only the tools likely to matter, while leaving the user's
 `platform_toolsets` ceiling intact. This document describes how the plugin
 makes that decision, where it intercepts the request lifecycle, and how its
@@ -26,7 +26,7 @@ boundary that sits in the middle of the prefix. The provider then
 re-bills the conversation history at the full input rate. On a multi-turn
 session, that loss exceeds the schema-token savings from narrowing.
 
-`dynamic-tools` resolves this by separating the *goal* from the *cadence*:
+`tool-belt` resolves this by separating the *goal* from the *cadence*:
 
 - **Goal**: usage-aware tool loading at per-tool granularity. Tools the
   model needs are loaded; tools it doesn't are dropped.
@@ -94,7 +94,7 @@ Configuration:
 
 ```yaml
 plugins:
-  dynamic-tools:
+  tool-belt:
     cache_mode: auto    # auto | on | off
 ```
 
@@ -118,7 +118,7 @@ Tunable under `cache_auto`:
 
 ```yaml
 plugins:
-  dynamic-tools:
+  tool-belt:
     cache_auto:
       detect_calls: 5              # min calls before locking
       detect_min_input_tokens: 5000 # min cumulative input before locking
@@ -129,7 +129,7 @@ plugins:
 ```
 
 Locked decisions persist per-scope (`{agent}:{platform}`) to
-`~/.hermes/state/dynamic-tools/cache_mode_detection.json`. Subsequent
+`~/.hermes/state/tool-belt/cache_mode_detection.json`. Subsequent
 sessions of the same scope skip the observation window.
 
 The detection code is `_update_cache_mode_detection` in
@@ -264,7 +264,7 @@ learning:
 ```
 
 CLI flags override per-run. Output is merged into
-`~/.hermes/state/dynamic-tools/learned.json` under
+`~/.hermes/state/tool-belt/learned.json` under
 `scopes[].cache_aware`, with `promote` mirrored to `scopes[].always_on`
 and `demote` to `scopes[].always_off` so the existing
 `apply_to_preset` reader picks them up.
@@ -351,7 +351,7 @@ never widen past it.
 ## State on disk
 
 ```
-~/.hermes/state/dynamic-tools/
+~/.hermes/state/tool-belt/
 ├── predictions.jsonl              # one row per inbound dispatch
 ├── tool_calls.jsonl               # one row per tool call, linked by prediction_id
 ├── api_calls.jsonl                # one row per outbound API call, with cache + hash data

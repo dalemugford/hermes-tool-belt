@@ -1,4 +1,4 @@
-# CLAUDE.md — dynamic-tools
+# CLAUDE.md — tool-belt
 
 Rules for working in this directory. Architecture and behavior live in
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Every configuration knob
@@ -10,7 +10,7 @@ disagrees with the code, fix the doc.
 
 ## Scope of edits
 
-- Changes belong **only** inside `plugins/dynamic-tools/`. Do not edit
+- Changes belong **only** inside `plugins/tool-belt/`. Do not edit
   Hermes core, other plugins, profiles, or anything else in `~/.hermes/`
   while working on this plugin.
 - The plugin is not yet publicly released. No back-compat is required —
@@ -38,7 +38,7 @@ adding real safety.
   [logger_io.py](logger_io.py), [policy.yaml](policy.yaml)
 - Adaptive layer (off-by-default): [learned.py](learned.py)
 - Dev / ops tools: [analyze.py](analyze.py), [scripts/](scripts/)
-- Telemetry: `~/.hermes/state/dynamic-tools/predictions.jsonl` +
+- Telemetry: `~/.hermes/state/tool-belt/predictions.jsonl` +
   `tool_calls.jsonl`
 - Harvest output (separate from live telemetry):
-  `~/.hermes/state/dynamic-tools/harvest/`
+  `~/.hermes/state/tool-belt/harvest/`

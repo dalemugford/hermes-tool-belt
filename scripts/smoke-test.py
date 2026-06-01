@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end smoke test for the dynamic-tools plugin (both modes).
+"""End-to-end smoke test for the tool-belt plugin (both modes).
 
 Runs hand-curated session scenarios through the plugin in an isolated
 tempdir, then asserts on the resulting telemetry that the plugin's
@@ -55,10 +55,10 @@ sys.path.insert(0, str(PLUGIN_DIR))
 # internally. Reuse it so this script and the unit tests load the
 # plugin the same way.
 sys.path.insert(0, str(PLUGIN_DIR / "tests"))
-import conftest  # noqa: F401 — side-effect: register dynamic_tools_plugin
+import conftest  # noqa: F401 — side-effect: register tool_belt_plugin
 
-plugin = sys.modules["dynamic_tools_plugin"]
-logger_io = importlib.import_module("dynamic_tools_plugin.logger_io")
+plugin = sys.modules["tool_belt_plugin"]
+logger_io = importlib.import_module("tool_belt_plugin.logger_io")
 
 
 # Minimal but realistic-shaped Hermes tools payload. Each entry is the
@@ -488,10 +488,10 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         original_config = dict(plugin._CONFIG)
         off_home = Path(tmp) / "off" / "profiles" / "bernard"
-        off_state = off_home / "state" / "dynamic-tools"
+        off_state = off_home / "state" / "tool-belt"
         off_state.mkdir(parents=True, exist_ok=True)
         on_home = Path(tmp) / "on" / "profiles" / "bernard"
-        on_state = on_home / "state" / "dynamic-tools"
+        on_state = on_home / "state" / "tool-belt"
         on_state.mkdir(parents=True, exist_ok=True)
 
         try:

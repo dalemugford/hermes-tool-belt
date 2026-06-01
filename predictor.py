@@ -67,7 +67,7 @@ def predict(
     try:
         return _predict_inner(message, attachments, preset)
     except Exception as exc:
-        logger.warning("dynamic-tools: predictor failed (%s) — falling back to wildcard", exc)
+        logger.warning("tool-belt: predictor failed (%s) — falling back to wildcard", exc)
         return Prediction(
             allowed_tool_names=WILDCARD_ALWAYS_ON,
             triggers_fired=[],

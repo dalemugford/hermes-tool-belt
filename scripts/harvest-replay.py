@@ -3,7 +3,7 @@
 
 The replay reads ``~/.hermes/sessions/*.jsonl`` (and each profile's
 ``profiles/*/sessions/*.jsonl``), runs every user message through the
-dynamic-tools predictor against the session's recorded toolset, then
+tool-belt predictor against the session's recorded toolset, then
 emits synthetic ``predictions.jsonl`` and ``tool_calls.jsonl`` tagged
 ``source: harvest`` / ``policy_source: harvest``. The analyzer reads
 these alongside live telemetry and weights them differently.
@@ -58,12 +58,12 @@ PLUGIN_DIR = HERE.parent
 sys.path.insert(0, str(PLUGIN_DIR.parent))
 sys.path.insert(0, str(PLUGIN_DIR))
 sys.path.insert(0, str(PLUGIN_DIR / "tests"))
-import conftest  # noqa: F401 — registers dynamic_tools_plugin
+import conftest  # noqa: F401 — registers tool_belt_plugin
 
-plugin = sys.modules["dynamic_tools_plugin"]
-predictor = importlib.import_module("dynamic_tools_plugin.predictor")
-presets_mod = importlib.import_module("dynamic_tools_plugin.presets")
-logger_io = importlib.import_module("dynamic_tools_plugin.logger_io")
+plugin = sys.modules["tool_belt_plugin"]
+predictor = importlib.import_module("tool_belt_plugin.predictor")
+presets_mod = importlib.import_module("tool_belt_plugin.presets")
+logger_io = importlib.import_module("tool_belt_plugin.logger_io")
 
 
 # How far ahead in JSONL order to look for tool calls that "respond" to
@@ -339,7 +339,7 @@ def iter_session_files(root_or_profile_dir: Path, window_days: int | None) -> It
 
 
 def _load_plugin_config(profile_home: Path) -> dict[str, Any]:
-    """Load the dynamic-tools section from the profile's config.yaml.
+    """Load the tool-belt section from the profile's config.yaml.
 
     Matters because per-profile ``always_on_extra`` / ``always_off`` /
     ``channels.*`` overrides change the predictor's narrowing behavior.
@@ -348,7 +348,7 @@ def _load_plugin_config(profile_home: Path) -> dict[str, Any]:
     execute_code + write_file + patch additions).
 
     Returns a config dict shaped exactly like what the plugin's
-    register() builds from ``cfg_get("plugins.dynamic-tools.*")``, with
+    register() builds from ``cfg_get("plugins.tool-belt.*")``, with
     ``enabled: True`` so resolve_preset proceeds. Returns ``{"enabled":
     True}`` (no overrides) if config.yaml is missing or unreadable —
     matches the live fail-safe behavior.
@@ -362,7 +362,7 @@ def _load_plugin_config(profile_home: Path) -> dict[str, Any]:
     except Exception:
         return {"enabled": True}
     plugins = (data.get("plugins") or {}) if isinstance(data.get("plugins"), dict) else {}
-    dt_cfg = plugins.get("dynamic-tools") or {}
+    dt_cfg = plugins.get("tool-belt") or {}
     if not isinstance(dt_cfg, dict):
         return {"enabled": True}
     # Force-enable for harvest so resolve_preset doesn't short-circuit on
@@ -458,7 +458,7 @@ def main() -> int:
         print(f"  user messages → predictions: {len(predictions)}")
         print(f"  historical tool calls: {len(tool_calls)}")
 
-        state_dir = profile_home / "state" / "dynamic-tools"
+        state_dir = profile_home / "state" / "tool-belt"
         write_outputs(state_dir, predictions, tool_calls, dry_run=args.dry_run)
 
         grand_total_sessions += sessions_processed

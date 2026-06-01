@@ -2,34 +2,34 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  LaunchAgent: dynamic-tools daily analysis (00:00 and 12:00 local time).
+  LaunchAgent: tool-belt daily analysis (00:00 and 12:00 local time).
 
   Install:
-    cp scripts/com.dalemugford.hermes.dynamic-tools-analyzer.plist \
+    cp scripts/com.dalemugford.hermes.tool-belt-analyzer.plist \
        ~/Library/LaunchAgents/
     launchctl bootstrap gui/$(id -u) \
-       ~/Library/LaunchAgents/com.dalemugford.hermes.dynamic-tools-analyzer.plist
+       ~/Library/LaunchAgents/com.dalemugford.hermes.tool-belt-analyzer.plist
 
   Verify scheduled:
-    launchctl print gui/$(id -u)/com.dalemugford.hermes.dynamic-tools-analyzer \
+    launchctl print gui/$(id -u)/com.dalemugford.hermes.tool-belt-analyzer \
        | grep -E "state|next run"
 
   Run once on demand:
-    launchctl kickstart gui/$(id -u)/com.dalemugford.hermes.dynamic-tools-analyzer
+    launchctl kickstart gui/$(id -u)/com.dalemugford.hermes.tool-belt-analyzer
 
   Uninstall:
     launchctl bootout gui/$(id -u) \
-       ~/Library/LaunchAgents/com.dalemugford.hermes.dynamic-tools-analyzer.plist
-    rm ~/Library/LaunchAgents/com.dalemugford.hermes.dynamic-tools-analyzer.plist
+       ~/Library/LaunchAgents/com.dalemugford.hermes.tool-belt-analyzer.plist
+    rm ~/Library/LaunchAgents/com.dalemugford.hermes.tool-belt-analyzer.plist
 -->
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.dalemugford.hermes.dynamic-tools-analyzer</string>
+  <string>com.dalemugford.hermes.tool-belt-analyzer</string>
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/macmini/.hermes/plugins/dynamic-tools/scripts/daily-analysis.sh</string>
+    <string>/Users/macmini/.hermes/plugins/tool-belt/scripts/daily-analysis.sh</string>
   </array>
 
   <key>StartCalendarInterval</key>
@@ -54,11 +54,11 @@
   <false/>
 
   <!-- launchd captures stdout/stderr to these files. The script itself
-       also writes a structured summary to state/dynamic-tools/cron-logs/. -->
+       also writes a structured summary to state/tool-belt/cron-logs/. -->
   <key>StandardOutPath</key>
-  <string>/Users/macmini/.hermes/state/dynamic-tools/cron-logs/launchd.stdout</string>
+  <string>/Users/macmini/.hermes/state/tool-belt/cron-logs/launchd.stdout</string>
   <key>StandardErrorPath</key>
-  <string>/Users/macmini/.hermes/state/dynamic-tools/cron-logs/launchd.stderr</string>
+  <string>/Users/macmini/.hermes/state/tool-belt/cron-logs/launchd.stderr</string>
 
   <!-- Ensure HERMES_HOME is set for the script in case it inherits a sparse
        environment. -->

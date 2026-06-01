@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Scheduled twice-daily run of the dynamic-tools analyzer.
+# Scheduled twice-daily run of the tool-belt analyzer.
 #
-# Walks every dynamic-tools telemetry source on this host — the root
+# Walks every tool-belt telemetry source on this host — the root
 # state dir plus each profile-scoped state dir under HERMES_HOME/profiles/*/
 # — and runs analyze.py against each one that has data. Each source gets
 # its own dated markdown report (under reports/<label>/) and its own
 # line in the consolidated daily-summary.log, prefixed with the source
 # label so a week of runs is still scannable with one `cat`.
 #
-# Designed to be invoked by launchd (see com.dalemugford.hermes.dynamic-tools-analyzer.plist)
+# Designed to be invoked by launchd (see com.dalemugford.hermes.tool-belt-analyzer.plist)
 # but safe to run by hand any time.
 set -euo pipefail
 
@@ -18,7 +18,7 @@ PYTHON="${HERMES_PYTHON:-${HERMES_HOME}/hermes-agent/venv/bin/python3}"
 
 # Logs are always written to the root state dir, regardless of which
 # source the run is analyzing — keeps the summary log consolidated.
-ROOT_LOG_DIR="${HERMES_HOME}/state/dynamic-tools/cron-logs"
+ROOT_LOG_DIR="${HERMES_HOME}/state/tool-belt/cron-logs"
 SUMMARY_LOG="${ROOT_LOG_DIR}/daily-summary.log"
 mkdir -p "${ROOT_LOG_DIR}"
 
@@ -33,10 +33,10 @@ fi
 
 # Build the list of (label, state_dir) pairs to process.
 SOURCES=()
-SOURCES+=("root:${HERMES_HOME}/state/dynamic-tools")
+SOURCES+=("root:${HERMES_HOME}/state/tool-belt")
 shopt -s nullglob
-for profile_state in "${HERMES_HOME}"/profiles/*/state/dynamic-tools; do
-    # Extract <name> from <home>/profiles/<name>/state/dynamic-tools
+for profile_state in "${HERMES_HOME}"/profiles/*/state/tool-belt; do
+    # Extract <name> from <home>/profiles/<name>/state/tool-belt
     profile_name="$(basename "$(dirname "$(dirname "${profile_state}")")")"
     SOURCES+=("${profile_name}:${profile_state}")
 done

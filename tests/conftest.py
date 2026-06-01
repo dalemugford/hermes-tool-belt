@@ -1,10 +1,10 @@
-"""Test bootstrap for the dynamic-tools plugin.
+"""Test bootstrap for the tool-belt plugin.
 
 The plugin directory is named with a hyphen, so we can't ``import
-dynamic-tools`` directly — Python won't let us. Instead we load the
+tool-belt`` directly — Python won't let us. Instead we load the
 package via ``importlib.util.spec_from_file_location`` with the plugin
 directory wired up as the package's search path, then register it under
-the importable name ``dynamic_tools_plugin``. Submodules (``logger_io``,
+the importable name ``tool_belt_plugin``. Submodules (``logger_io``,
 ``analyze`` …) load automatically through the package mechanism so the
 existing ``from . import …`` statements keep working.
 """
@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
-_PACKAGE_NAME = "dynamic_tools_plugin"
+_PACKAGE_NAME = "tool_belt_plugin"
 
 
 def _load_plugin_package() -> None:
@@ -32,7 +32,7 @@ def _load_plugin_package() -> None:
     sys.modules[_PACKAGE_NAME] = module
     spec.loader.exec_module(module)
     # Eagerly load submodules used by tests so they're addressable via
-    # sys.modules["dynamic_tools_plugin.<name>"].
+    # sys.modules["tool_belt_plugin.<name>"].
     for sub in ("logger_io", "analyze"):
         importlib.import_module(f"{_PACKAGE_NAME}.{sub}")
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused smoke checks for dynamic-tools trigger dampeners.
+"""Focused smoke checks for tool-belt trigger dampeners.
 
 Loads policy.yaml and verifies that the high-noise trigger groups still
 fire for direct action requests while discussion/meta phrasing is vetoed by
@@ -18,10 +18,10 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 
-# The plugin directory is named ``dynamic-tools`` (hyphen), which is not a
+# The plugin directory is named ``tool-belt`` (hyphen), which is not a
 # valid Python module name. We construct a synthetic package so the modules
 # inside can use their normal ``from .presets import …`` relative imports.
-_PKG_NAME = "_dynamic_tools_smoke"
+_PKG_NAME = "_tool_belt_smoke"
 _pkg = types.ModuleType(_PKG_NAME)
 _pkg.__path__ = [str(PLUGIN_DIR)]  # type: ignore[attr-defined]
 sys.modules[_PKG_NAME] = _pkg
@@ -74,7 +74,7 @@ def main() -> int:
     # file_write: direct edits still load write tools; planning/meta talk does not.
     assert_fires("file_write", "Save notes on this to a markdown file.")
     assert_fires("file_write", "Patch `presets.py` with that change.")
-    assert_fires("file_write", "Update `/Users/macmini/.hermes/plugins/dynamic-tools/PLAN.md`.")
+    assert_fires("file_write", "Update `/Users/macmini/.hermes/plugins/tool-belt/PLAN.md`.")
     assert_suppressed("file_write", "Should we save this as a file later?")
     assert_suppressed("file_write", "What do you think about the file-write trigger?")
     assert_suppressed("file_write", "Talk through the approach before editing anything.")
@@ -115,7 +115,7 @@ def _check_learned_merge_preserves_dampeners() -> None:
         original_home = os.environ.get("HERMES_HOME")
         os.environ["HERMES_HOME"] = tmpdir
         try:
-            state_dir = Path(tmpdir) / "state" / "dynamic-tools"
+            state_dir = Path(tmpdir) / "state" / "tool-belt"
             state_dir.mkdir(parents=True, exist_ok=True)
             # Write a minimal learned.json that triggers the merge path (a
             # promotion forces apply_to_preset to take the "rebuild triggers"

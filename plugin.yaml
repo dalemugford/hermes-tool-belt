@@ -1,6 +1,8 @@
-name: dynamic-tools
+name: tool-belt
+display_name: Hermes Tool Belt
 version: 2026.5.17-beta
-description: Narrow the tool definitions sent to the model on each gateway message based on detected intent. Respects the user's existing platform_toolsets ceiling. Falls back to no-narrowing on any failure.
+description: Adaptive tool loadouts for agents. Carry only what you need, drop the rest. Sharpens with use.
+long_description: Picks the tool set per session under prefix-cache-friendly providers (Anthropic, OpenAI), per turn under cache-off providers. Learns from real expand_tools events what to promote into future sessions. Respects the user's existing platform_toolsets ceiling. Falls back to no-narrowing on any failure.
 author: Dale Mugford
 provides_tools:
   - expand_tools

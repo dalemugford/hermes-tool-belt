@@ -1,4 +1,4 @@
-"""dynamic-tools — usage-aware tool loading: carry what's needed, drop what isn't.
+"""tool-belt — usage-aware tool loading: carry what's needed, drop what isn't.
 
 The plugin reduces per-API-call tool overhead by sending the model only the
 tools likely to be useful, while respecting the user's ``platform_toolsets``
@@ -117,7 +117,7 @@ logger = logging.getLogger(__name__)
 # The dict IS mutable — expand_tools writes into it; subsequent
 # _build_api_kwargs calls see the additions.
 _PREDICTION_CV: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
-    "dynamic_tools_prediction", default=None,
+    "tool_belt_prediction", default=None,
 )
 
 _CONFIG: dict[str, Any] = {
@@ -215,7 +215,7 @@ _PRIOR_MESSAGES_BY_SESSION: dict[str, list[str]] = {}
 _FROZEN_BY_SESSION: dict[str, dict[str, Any]] = {}
 
 # Cross-session detection cache. Persisted JSON at
-# ``~/.hermes/state/dynamic-tools/cache_mode_detection.json``. Keyed by
+# ``~/.hermes/state/tool-belt/cache_mode_detection.json``. Keyed by
 # scope (``agent:platform``) — model identity isn't reliable at
 # pre_gateway_dispatch (set later by the AIAgent) and scope is the
 # right granularity for "does this profile's provider cache?". Values:
@@ -246,7 +246,7 @@ def _load_user_config() -> None:
     try:
         from hermes_cli.config import load_config, cfg_get  # type: ignore[import-not-found]
         cfg = load_config()
-        plugin_cfg = cfg_get(cfg, "plugins", "dynamic-tools", default={})
+        plugin_cfg = cfg_get(cfg, "plugins", "tool-belt", default={})
         if not isinstance(plugin_cfg, dict):
             return
         for key in ("enabled", "log", "agent", "learned_mode", "bypass_rate", "cache_mode"):
@@ -272,7 +272,7 @@ def _load_user_config() -> None:
             cache_auto.update(plugin_cfg["cache_auto"])
             _CONFIG["cache_auto"] = cache_auto
     except Exception as exc:
-        logger.debug("dynamic-tools: config load failed (using defaults): %s", exc)
+        logger.debug("tool-belt: config load failed (using defaults): %s", exc)
 
 
 # ─── The narrowing patch ───────────────────────────────────────────────────
@@ -363,7 +363,7 @@ def _wrap_build_api_kwargs(original):
             # Diagnostic: log what's happening on the FIRST call per turn.
             if not state.get("logged"):
                 logger.info(
-                    "dynamic-tools: filter input tools=%d allowed_set=%d known=%d "
+                    "tool-belt: filter input tools=%d allowed_set=%d known=%d "
                     "→ kept=%d cut=%d (sample_names=%s, sample_cut=%s)",
                     len(tools), len(allowed_set), len(known),
                     len(filtered), len(cut_names),
@@ -407,7 +407,7 @@ def _wrap_build_api_kwargs(original):
             return kwargs
         except Exception as exc:
             logger.warning(
-                "dynamic-tools: narrowing failed (%s) — returning unfiltered tools",
+                "tool-belt: narrowing failed (%s) — returning unfiltered tools",
                 exc,
             )
             return kwargs
@@ -894,7 +894,7 @@ def _maybe_log_prediction(
         )
         logger_io.log_prediction(record)
     except Exception as exc:
-        logger.debug("dynamic-tools: log_prediction failed: %s", exc)
+        logger.debug("tool-belt: log_prediction failed: %s", exc)
 
 
 def _wrap_compress_context(original):
@@ -932,12 +932,12 @@ def _wrap_compress_context(original):
                 evicted_keys.append(aid)
             if evicted_keys:
                 logger.info(
-                    "dynamic-tools: compaction evicted freeze for session(s) %s — "
+                    "tool-belt: compaction evicted freeze for session(s) %s — "
                     "next dispatch will re-freeze",
                     evicted_keys,
                 )
         except Exception as exc:
-            logger.debug("dynamic-tools: compaction post-eviction failed: %s", exc)
+            logger.debug("tool-belt: compaction post-eviction failed: %s", exc)
         return result
 
     wrapped.__wrapped__ = original  # type: ignore[attr-defined]
@@ -960,12 +960,12 @@ def _install_patches() -> bool:
     try:
         import run_agent  # type: ignore[import-not-found]
     except ImportError as exc:
-        logger.warning("dynamic-tools: cannot import run_agent: %s", exc)
+        logger.warning("tool-belt: cannot import run_agent: %s", exc)
         return False
 
     AIAgent = getattr(run_agent, "AIAgent", None)
     if AIAgent is None or not hasattr(AIAgent, "_build_api_kwargs"):
-        logger.warning("dynamic-tools: AIAgent._build_api_kwargs not found")
+        logger.warning("tool-belt: AIAgent._build_api_kwargs not found")
         return False
 
     _ORIGINAL_BUILD_API_KWARGS = AIAgent._build_api_kwargs
@@ -980,9 +980,9 @@ def _install_patches() -> bool:
     if hasattr(AIAgent, "_compress_context"):
         _ORIGINAL_COMPRESS_CONTEXT = AIAgent._compress_context
         AIAgent._compress_context = _wrap_compress_context(_ORIGINAL_COMPRESS_CONTEXT)
-        logger.info("dynamic-tools: patches installed (_build_api_kwargs, _compress_context)")
+        logger.info("tool-belt: patches installed (_build_api_kwargs, _compress_context)")
     else:
-        logger.info("dynamic-tools: patches installed (_build_api_kwargs only — _compress_context missing)")
+        logger.info("tool-belt: patches installed (_build_api_kwargs only — _compress_context missing)")
 
     _PATCHED = True
     return True
@@ -1226,7 +1226,7 @@ def _build_state_from_frozen(
 
     Sticky residency and lookback are *not populated* — both were
     per-turn-adjustment mechanisms; the freeze makes them redundant by
-    design (see [[dynamic-tools-design-principle]]). The fields are
+    design (see [[tool-belt-design-principle]]). The fields are
     still present in the state dict with empty values so downstream
     consumers (telemetry, post_tool_call) don't need conditional reads.
 
@@ -1454,7 +1454,7 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
                 learned_changes=list(getattr(preset, "learned_changes", []) or []),
             )
     except Exception as exc:
-        logger.warning("dynamic-tools: pre_gateway_dispatch failed: %s", exc)
+        logger.warning("tool-belt: pre_gateway_dispatch failed: %s", exc)
     return None
 
 
@@ -1605,7 +1605,7 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                 args=log_args, result=log_result, extra=extra,
             )
     except Exception as exc:
-        logger.debug("dynamic-tools: post_tool_call log failed: %s", exc)
+        logger.debug("tool-belt: post_tool_call log failed: %s", exc)
     return None
 
 
@@ -1621,7 +1621,7 @@ def _detection_cache_path():
     the helper cheap; pathlib.Path import avoided to dodge a circular bind."""
     import os as _os
     home = _os.environ.get("HERMES_HOME") or _os.path.expanduser("~/.hermes")
-    return _os.path.join(home, "state", "dynamic-tools", "cache_mode_detection.json")
+    return _os.path.join(home, "state", "tool-belt", "cache_mode_detection.json")
 
 
 def _load_detection_cache() -> None:
@@ -1646,7 +1646,7 @@ def _load_detection_cache() -> None:
     except FileNotFoundError:
         pass
     except Exception as exc:
-        logger.debug("dynamic-tools: detection cache load failed: %s", exc)
+        logger.debug("tool-belt: detection cache load failed: %s", exc)
 
 
 def _save_detection_cache() -> None:
@@ -1661,7 +1661,7 @@ def _save_detection_cache() -> None:
             _json.dump(_DETECTION_CACHE, f, ensure_ascii=False, indent=2, sort_keys=True)
         _os.replace(tmp, path)
     except Exception as exc:
-        logger.debug("dynamic-tools: detection cache save failed: %s", exc)
+        logger.debug("tool-belt: detection cache save failed: %s", exc)
 
 
 def _persist_detection_lock(
@@ -1757,7 +1757,7 @@ def _check_divergence(
     if state["divergence_streak"] >= 3:
         state["divergence_warned"] = True
         logger.warning(
-            "dynamic-tools: freeze divergence — scope=%s session=%s "
+            "tool-belt: freeze divergence — scope=%s session=%s "
             "locked_mode=on but %d consecutive post-lock calls hit <30%% "
             "(last hit_rate=%.1f%%). Possible Mnemosyne prefix-break, "
             "provider cache regression, or unmodeled tool mutation. "
@@ -1965,7 +1965,7 @@ def _on_post_api_request(**kwargs) -> None:
         }
         logger_io.log_api_call(row)
     except Exception as exc:
-        logger.debug("dynamic-tools: post_api_request log failed: %s", exc)
+        logger.debug("tool-belt: post_api_request log failed: %s", exc)
     return None
 
 
@@ -2088,7 +2088,7 @@ def _on_session_reset(session_id=None, **kwargs) -> None:
 def register(ctx) -> None:
     _load_user_config()
     if not _CONFIG.get("enabled"):
-        logger.info("dynamic-tools: disabled in config")
+        logger.info("tool-belt: disabled in config")
         return
 
     # Phase 3: pre-load the cross-session detection cache so the first
@@ -2101,20 +2101,20 @@ def register(ctx) -> None:
     # run_agent is fully loaded and the import will succeed.
     if not _install_patches():
         logger.info(
-            "dynamic-tools: eager patch install deferred (will retry on first dispatch)"
+            "tool-belt: eager patch install deferred (will retry on first dispatch)"
         )
 
     # Register the expand_tools meta-tool
     try:
         ctx.register_tool(
             name="expand_tools",
-            toolset="dynamic-tools",
+            toolset="tool-belt",
             schema=expand_tools_mod.SCHEMA,
             handler=expand_tools_mod.make_handler(_PREDICTION_CV, sticky_refresh_fn=_refresh_sticky),
             description=expand_tools_mod.SCHEMA["description"],
         )
     except Exception as exc:
-        logger.warning("dynamic-tools: expand_tools registration failed: %s", exc)
+        logger.warning("tool-belt: expand_tools registration failed: %s", exc)
 
     # Hooks
     ctx.register_hook("pre_gateway_dispatch", _on_pre_gateway_dispatch)
@@ -2124,6 +2124,6 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_reset", _on_session_reset)
 
     logger.info(
-        "dynamic-tools: active (policy=policy.yaml, log=%s, learned_mode=%s, bypass_rate=%s)",
+        "tool-belt: active (policy=policy.yaml, log=%s, learned_mode=%s, bypass_rate=%s)",
         _CONFIG.get("log"), _CONFIG.get("learned_mode"), _CONFIG.get("bypass_rate"),
     )
