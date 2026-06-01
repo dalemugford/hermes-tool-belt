@@ -118,21 +118,6 @@ class SessionKeyParsingTests(unittest.TestCase):
         # return blank rather than guessing.
         self.assertEqual(plugin._platform_from_session_key("20260516_123456_deadbeef"), "")
 
-    def test_parse_session_key_scope_uses_profile_agent_not_parts_1(self):
-        # The bug to regress: parts[1] is "main", and the old code would
-        # surface ("main", "telegram", "main:telegram"). With a profile
-        # in scope, we should now see the profile agent instead.
-        plugin._CONFIG["agent"] = "bernard"
-        agent, platform, scope = plugin._parse_session_key_scope(REAL_KEY_TELEGRAM)
-        self.assertEqual((agent, platform, scope), ("bernard", "telegram", "bernard:telegram"))
-
-    def test_parse_session_key_scope_blank_without_profile(self):
-        # Without a profile-derived agent, the helper must return blanks
-        # — falling back to "main:telegram" would be a regression.
-        with mock.patch.dict(os.environ, {}, clear=True):
-            agent, platform, scope = plugin._parse_session_key_scope(REAL_KEY_TELEGRAM)
-        self.assertEqual((agent, platform, scope), ("", "", ""))
-
     def test_profile_agent_from_hermes_home(self):
         with tempfile.TemporaryDirectory() as tmp:
             profile_dir = _make_profile_dir(tmp, "sue")

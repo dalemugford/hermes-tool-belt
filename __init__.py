@@ -98,7 +98,6 @@ import contextvars
 import hashlib
 import logging
 import os
-import sys
 import time
 from typing import Any
 
@@ -736,27 +735,6 @@ def _platform_from_session_key(session_key: Any) -> str:
     return ""
 
 
-def _parse_session_key_scope(session_key: Any) -> tuple[str, str, str]:
-    """Resolve ``(agent, platform, scope)`` from a canonical session key.
-
-    Platform comes from the session key itself; agent comes from profile
-    context (see :func:`_profile_agent_name`). Both must be non-empty for
-    a populated result — otherwise returns ``("", "", "")`` so callers
-    leave the row blank rather than synthesizing a misleading scope.
-
-    The previous implementation read the agent from ``parts[1]``, which
-    is always the literal ``"main"`` — that produced spurious
-    ``main:telegram`` attribution for every profile.
-    """
-    platform = _platform_from_session_key(session_key)
-    if not platform:
-        return "", "", ""
-    agent = _profile_agent_name()
-    if not agent:
-        return "", "", ""
-    return agent, platform, f"{agent}:{platform}"
-
-
 def _canonical_session_key(
     event: Any = None,
     session_store: Any = None,
@@ -1144,21 +1122,6 @@ def _should_bypass(scope: str, session_id: str) -> bool:
     # First 4 bytes → uniform float in [0, 1)
     bucket = int.from_bytes(digest[:4], "big") / 0x1_0000_0000
     return bucket < rate
-
-
-def _channel_from_event(event: Any) -> str:
-    for attr in ("platform", "channel", "source", "transport"):
-        try:
-            v = getattr(event, attr, None)
-        except Exception:
-            v = None
-        if isinstance(v, str) and v:
-            return v.lower()
-        # Handle enum-like values (e.g. Platform.TELEGRAM)
-        val = getattr(v, "value", None) if v is not None else None
-        if isinstance(val, str) and val:
-            return val.lower()
-    return ""
 
 
 # ─── Cache-aware freeze (Phase 1) ──────────────────────────────────────────

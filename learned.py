@@ -125,15 +125,6 @@ def state_hash() -> str:
     return str(_CACHE.get("hash") or "")
 
 
-def empty_state() -> dict[str, Any]:
-    return {
-        "version": LEARNED_VERSION,
-        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "scopes": {},
-        "global": {},
-    }
-
-
 def write_state(state: dict[str, Any], path: Path | None = None) -> None:
     """Atomically write learned state. Intended for analyzer/manual commands."""
     target = path or learned_path()
