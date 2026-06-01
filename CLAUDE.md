@@ -1,9 +1,12 @@
 # CLAUDE.md — dynamic-tools
 
-Rules for working in this directory. The entry point for understanding what
-this plugin is and where it's going is [STRATEGY](docs/02.strategy-2026-05-12.md);
-current architecture and status live in [PLAN](docs/03.plan-2026-05-12.md);
-user-facing docs in [README.md](README.md).
+Rules for working in this directory. The current architecture target is
+[16.cache-aware-refactor-plan-2026-05-30.md](docs/16.cache-aware-refactor-plan-2026-05-30.md);
+the pivot decision rationale is in
+[15.cache-aware-pivot-2026-05-28.md](docs/15.cache-aware-pivot-2026-05-28.md).
+Older strategy/plan docs (02, 03) carry forward-pointer notes and stay
+useful for cache-off-mode background; pre-pivot designs live under
+[docs/archive/](docs/archive/). User-facing docs in [README.md](README.md).
 
 ## Scope of edits
 

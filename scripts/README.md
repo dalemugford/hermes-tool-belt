@@ -1,61 +1,86 @@
 # dynamic-tools scripts
 
 Operational scripts that live next to the plugin. Each is safe to run by
-hand or under a scheduler. None mutate `learned.json` or other policy
-state — those changes remain manual (see [AUTO-APPLY-PLAN.md](../AUTO-APPLY-PLAN.md)).
+hand or under a scheduler. The shaper (`shape-ceiling.py`) writes to
+`learned.json` under its own `cache_aware` sub-key; nothing else mutates
+policy state.
 
-## Inventory
+## Cache-aware default (current)
+
+Under cache-on providers (Anthropic, OpenAI auto-cache — ~80% of typical
+traffic), tools are frozen at session start. The scripts most relevant
+to that path are at the top:
 
 | Script | Purpose | When to run |
 |---|---|---|
-| [`bootstrap.py`](bootstrap.py) | First-install warm-start. Runs `harvest-replay.py` then the analyzer in harvest-aware mode and prints a ranked **TOP ACTIONS** summary derived from your existing Hermes sessions. Closes the cold-start gap so day-one is useful, not "wait a week." | Once, immediately after `hermes plugins install`. Idempotent — re-run any time to refresh recommendations against current session history. |
-| [`harvest-replay.py`](harvest-replay.py) | Replay user messages from `~/.hermes/sessions/*` (and per-profile `profiles/*/sessions/*`) through the dynamic-tools predictor and emit synthetic `predictions.jsonl` + `tool_calls.jsonl` tagged `policy_source: harvest` into a `state/dynamic-tools/harvest/` subdir. | Called by `bootstrap.py`. Run by hand to refresh harvest data after a policy.yaml change, or when investigating a specific window with `--window-days N`. |
-| [`smoke-test.py`](smoke-test.py) | End-to-end mechanical validation. Runs 109 synthetic session scenarios through the plugin in an isolated tempdir; asserts session_id population, bypass-cohort distribution, expand_tools_used attribution, cross-session isolation, on_session_end eviction. | After any gateway restart that loads new plugin code, or before committing changes that touch the hook surface. Pass/fail in <1 second, no side effects. |
-| [`rotate-telemetry.sh`](rotate-telemetry.sh) | Archive current `predictions.jsonl` + `tool_calls.jsonl` to `state/dynamic-tools/archive/reset-<ts>/`. Gateway-safe. | After a meaningful change to plugin behavior, when you want a clean measurement window. |
-| [`daily-analysis.sh`](daily-analysis.sh) | Run analyzer with full recommendations + dampener mining, drop a markdown report + recommendations JSON, append a one-line summary to `cron-logs/daily-summary.log`. | Scheduled twice daily via launchd, or by hand any time. Skips cleanly when telemetry is empty. |
-| [`check_trigger_dampeners.py`](check_trigger_dampeners.py) | Smoke checks: dampeners still veto + dampeners survive the learned-merge path. | Before committing changes to policy.yaml or learned merge logic. |
-| [`com.dalemugford.hermes.dynamic-tools-analyzer.plist`](com.dalemugford.hermes.dynamic-tools-analyzer.plist) | launchd LaunchAgent template; runs `daily-analysis.sh` at 00:00 and 12:00 local time. | Install once; the system handles scheduling. |
+| [`shape-ceiling.py`](shape-ceiling.py) | Between-session shaper (Phase 2 of doc 16). Reads `predictions.jsonl` + `tool_calls.jsonl` per scope, identifies per-tool **promote** candidates (tools reached via `expand_tools` in recent sessions) and **demote** candidates (always-on tools unused across enough sessions), writes to `learned.json` under `scopes[].cache_aware`. Conservative thresholds. | After ~20 sessions of organic use per scope. Run with `--dry-run` first. |
+| [`cache-freeze-replay.py`](cache-freeze-replay.py) | Phase 0/5 replay harness. Reports freeze efficacy (would-break mutations eliminated) and Phase 5 matched-counterfactual cache savings with per-model price table. | After each meaningful change to the freeze logic; also useful for periodic health checks. |
+| [`mnemosyne-prefix-check.py`](mnemosyne-prefix-check.py) | Verification harness (pre-Phase-1 gate). Confirms that `system_hash` stays stable across turns — i.e., Mnemosyne memory injection lands in a cache-friendly position rather than mutating the prefix. Gate passed on both profiles 2026-05-31; retained for regression detection. | After Mnemosyne config changes or upstream Mnemosyne upgrades. |
 
-## First install — run `bootstrap.py`
+## Cache-off mode (kimi, gpt-5.4-mini, anything provider-side caching doesn't reach)
 
-```bash
-python3 scripts/bootstrap.py
-```
+The per-turn predictor stays alive for cache-off providers, and the
+following scripts support tuning that path:
 
-Produces a ranked TOP ACTIONS summary like:
+| Script | Purpose | When to run |
+|---|---|---|
+| [`bootstrap.py`](bootstrap.py) | First-install warm-start. Runs `harvest-replay.py` then the analyzer in harvest-aware mode and prints a ranked **TOP ACTIONS** summary derived from your existing Hermes sessions. Useful primarily on cache-off scopes — on cache-on, `shape-ceiling.py` consumes actual `expand_tools` evidence and produces stronger recommendations. | Optional. Once after install, if you have any cache-off-mode scopes. |
+| [`harvest-replay.py`](harvest-replay.py) | Replay user messages from `~/.hermes/sessions/*` through the per-turn predictor and emit synthetic telemetry tagged `policy_source: harvest`. | When tuning per-turn triggers on cache-off scopes. |
+| [`check_trigger_dampeners.py`](check_trigger_dampeners.py) | Smoke checks: dampeners still veto + dampeners survive the learned-merge path. The learned-merge regression guard applies to all modes; the trigger-firing checks are cache-off-mode validation. | Before committing changes to policy.yaml or learned merge logic. |
 
-```
-================================================================
-  TOP ACTIONS
-================================================================
-  Tool promotions (edit policy.yaml or channels.<scope>.always_on_extra):
-    1. [PROMOTE  ] bernard:telegram  terminal  cuts= 516  net=+499,684 tok
-    2. [PROMOTE  ] bernard:slack     terminal  cuts=  13  net=+12,128 tok
-    3. [BROADEN  ] bernard:telegram  patch     cuts= 132  net=-76,316 tok
+## Ops utilities (mode-agnostic)
 
-  Trigger keyword candidates (add to the named trigger's `keywords` list):
-    1. bernard:telegram  shell       ← "deploy the app"
-    2. bernard:telegram  file_write  ← "load the hermes"
-    ...
-```
+| Script | Purpose | When to run |
+|---|---|---|
+| [`smoke-test.py`](smoke-test.py) | End-to-end mechanical validation. Synthetic sessions through the plugin in an isolated tempdir. Currently covers the per-turn path; cache-on freeze-path assertions are a TODO. | After any gateway restart that loads new plugin code, or before committing changes that touch the hook surface. |
+| [`rotate-telemetry.sh`](rotate-telemetry.sh) | Archive current `predictions.jsonl` + `tool_calls.jsonl` + `api_calls.jsonl` to `state/dynamic-tools/archive/reset-<ts>/`. Gateway-safe. | After a meaningful change to plugin behavior, when you want a clean measurement window. |
+| [`daily-analysis.sh`](daily-analysis.sh) | Run analyzer with full recommendations + dampener mining, drop a markdown report + recommendations JSON. | Scheduled twice daily via launchd, or by hand any time. |
+| [`com.dalemugford.hermes.dynamic-tools-analyzer.plist`](com.dalemugford.hermes.dynamic-tools-analyzer.plist) | launchd LaunchAgent template; runs `daily-analysis.sh` at 00:00 and 12:00 local time. | Install once. |
 
-Flags: `--profile <name>` (one profile only), `--window-days N`
-(recent sessions only), `--quiet` (suppress phase output).
-
-## Replay sessions to refresh harvest
+## Shape next session's frozen ceiling
 
 ```bash
-python3 scripts/harvest-replay.py
+python3 scripts/shape-ceiling.py --dry-run        # report
+python3 scripts/shape-ceiling.py                  # write learned.json
 ```
 
-Reads `sessions/*.jsonl` per profile, runs each user message through
-the predictor against the session's recorded toolset, and writes
-synthetic telemetry to `state/dynamic-tools/harvest/`. Output rows are
-stamped `policy_source: harvest` so the analyzer can weight them
-differently from live data. Tool call arguments are NEVER written —
-only `message_hash` + 80-char `message_preview`. See
-[tests/test_harvest_privacy.py](../tests/test_harvest_privacy.py) for
-the enforced privacy invariants.
+Reads recent live telemetry per scope and reports per-tool promote /
+demote candidates. Conservative thresholds (promote: ≥2 sessions and ≥3
+calls; demote: ≥20 sessions of evidence). Writes to `learned.json` under
+`scopes[].cache_aware` and mirrors to `scopes[].always_on` /
+`scopes[].always_off` so the existing `apply_to_preset` reader picks
+them up when `learned_mode` is `auto` or `audit`.
+
+## Replay live data through the freeze policy
+
+```bash
+python3 scripts/cache-freeze-replay.py
+```
+
+Reports freeze coverage (matches vs would_break mutations), per-model
+cache-adjusted savings under matched counterfactual, and dollar
+estimates from the per-model price table. Add `--scope bernard:telegram`
+to filter; `--markdown` to emit a report-friendly format.
+
+## Confirm Mnemosyne stays cache-friendly
+
+```bash
+python3 scripts/mnemosyne-prefix-check.py
+```
+
+Verdict: `PREFIX_STABLE` or `MNEMOSYNE_MUTATES_PREFIX`. Run after any
+Mnemosyne config change or upstream Mnemosyne upgrade.
+
+## Cache-off fallback: bootstrap + replay
+
+```bash
+python3 scripts/bootstrap.py                       # cache-off scopes only
+python3 scripts/harvest-replay.py                  # replay through per-turn predictor
+```
+
+These remain useful for tuning cache-off-mode scopes (kimi, gpt-5.4-mini).
+On cache-on scopes, prefer `shape-ceiling.py` — actual `expand_tools`
+events are stronger evidence than regex trigger guesses.
 
 ## Validate the plugin's runtime behavior
 

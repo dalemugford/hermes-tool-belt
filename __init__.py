@@ -1,36 +1,93 @@
-"""dynamic-tools — narrow tool definitions per message based on detected intent.
+"""dynamic-tools — usage-aware tool loading: carry what's needed, drop what isn't.
 
-ARCHITECTURE NOTE — narrowing layer:
-  We patch ``AIAgent._build_api_kwargs`` (called once per outbound API
-  request), NOT ``__init__`` or ``get_tool_definitions``. Hermes caches
-  AIAgent instances per session for up to 1 hour idle, so __init__ runs
-  only on first message; subsequent messages reuse the cached agent.
-  Per-call narrowing in _build_api_kwargs catches every message correctly.
+The plugin reduces per-API-call tool overhead by sending the model only the
+tools likely to be useful, while respecting the user's ``platform_toolsets``
+ceiling and keeping ``expand_tools`` as a safety valve for the cases the
+plugin guessed wrong.
 
-  ``self.tools`` is left as the full ceiling — we filter the kwargs that
-  go on the wire. Cleanest separation: agent state stays canonical;
-  only the per-request payload is narrowed.
+ARCHITECTURE — two modes, one mechanism
+=======================================
 
-Lifecycle:
+The cost calculus differs sharply between providers with active prefix
+caching (Anthropic, OpenAI auto-cache — ~80% of typical traffic) and those
+without (kimi, gpt-5.4-mini). The plugin runs in one of two modes:
+
+  cache-on (default under ``cache_mode: auto | on``)
+    Freeze the tool set at session start. Subsequent dispatches in the
+    same session reuse the frozen set verbatim. Tool-list mutation between
+    turns would otherwise bust the provider prefix cache and re-bill the
+    conversation history at the full input rate — a cost that dwarfs the
+    schema-token savings from per-turn narrowing. The freeze is evicted
+    only at moments that already cost a cache break: session reset, true
+    session end, and compaction (Phase 4 monkey-patches the compressor).
+
+    Sticky residency, lookback, and per-turn predictor execution are all
+    skipped on the frozen path — they were per-turn-adjustment mechanisms
+    that the freeze makes redundant by design. ``expand_tools`` continues
+    to mutate the frozen set in-place; that mutation is model-driven and
+    pays one cache break for the value of getting the tool the model
+    actually wanted.
+
+  cache-off (``cache_mode: off`` or auto-detected for known-uncached models)
+    Per-turn narrowing with sticky residency carrying expanded tools
+    forward a few turns. This is the original behavior, preserved as a
+    fallback for providers where prefix caching doesn't apply.
+
+See docs/16.cache-aware-refactor-plan-2026-05-30.md for the full design
+target and docs/15.cache-aware-pivot-2026-05-28.md for the rationale.
+
+PATCH SURFACE — minimal, runtime-applied
+========================================
+
+  · ``AIAgent._build_api_kwargs`` — filters ``kwargs["tools"]`` per call.
+    Source of the filter is either the session's frozen set (cache-on) or
+    the per-turn predictor's allowed set (cache-off).
+  · ``AIAgent._compress_context`` — evicts the freeze on compaction so the
+    next dispatch re-freezes against the post-compaction state.
+
+``self.tools`` on the AIAgent is left untouched — we narrow the on-the-wire
+payload only.
+
+LIFECYCLE
+=========
+
   · register(ctx)
-      - install monkey-patch (AIAgent._build_api_kwargs across all bindings)
-      - register the expand_tools meta-tool
-      - register hooks (pre_gateway_dispatch, post_tool_call, on_session_end)
+      - load detection cache (Phase 3 cross-session memory)
+      - install monkey-patches
+      - register expand_tools meta-tool
+      - register hooks: pre_gateway_dispatch, post_tool_call,
+        post_api_request, on_session_end, on_session_reset
 
   · pre_gateway_dispatch(event, ...)
-      - run predictor on message text + attachments
-      - stash prediction state in a contextvars.ContextVar
-      - state is mutable: expand_tools mutates the same dict to add expansions
+      - resolve cache_mode for the session (config + cross-session cache)
+      - cache-on with frozen state: reuse the frozen set, skip predictor
+      - cache-on first dispatch: run predictor, freeze the result
+      - cache-off: run predictor (sticky + lookback enabled)
+      - stash state in a contextvar (expand_tools mutates this same dict)
 
   · patched _build_api_kwargs(self, api_messages)
       - call original to get the full kwargs
-      - read prediction state from contextvar
-      - filter kwargs["tools"] down to (always_on ∪ triggered ∪ expanded) ∩ ceiling
-      - on first invocation per turn: write the prediction row to predictions.jsonl
-      - return the filtered kwargs
+      - read state from the contextvar
+      - filter kwargs["tools"] down to the allowed set
+      - on first call per turn: write the prediction row
+      - on every call: write the api_calls row (cache tokens, system_hash, …)
+      - propagate any new expansions back to the session's frozen snapshot
 
-  · post_tool_call(tool_name, ...)
+  · post_tool_call(tool_name, …)
       - append row to tool_calls.jsonl with prediction_id linkage
+
+  · post_api_request(usage, …)
+      - per-call cache_read / cache_write capture
+      - cache-mode detection state machine (locks "on"/"off" per session)
+      - cache-TTL expiry detection (stable hash + cold cache after >5min)
+      - cross-session lock persistence to cache_mode_detection.json
+
+  · on_session_end (fires per-turn — Hermes' hook semantics)
+      - sticky + lookback eviction only; freeze + cache-mode state stay
+        because this hook fires after every turn, not just at session end
+
+  · on_session_reset (true /reset or /new)
+      - evict all per-session state
 
 Failure mode: any exception anywhere falls through to no-narrowing.
 """
@@ -72,6 +129,11 @@ _CONFIG: dict[str, Any] = {
     "always_off": [],
     "agent": "",
     "learned_mode": "off",
+    # Sticky residency — CACHE-OFF MODE ONLY.
+    # Under cache-on (the default), the frozen tool set carries forward
+    # in-session expansions verbatim via _FROZEN_BY_SESSION, so per-turn
+    # sticky carry-over is redundant. Settings here apply only to
+    # cache_mode: off sessions; they're inert on cache-on.
     "sticky": {
         "enabled": True,
         "ttl_turns": 3,
@@ -81,6 +143,11 @@ _CONFIG: dict[str, Any] = {
         # model-facing toolset name resolved through Hermes' toolset table.
         "categories": ["terminal", "file", "browser", "web", "code_execution", "delegation"],
     },
+    # Predictor lookback — CACHE-OFF MODE ONLY.
+    # Cache-on skips the per-turn predictor on every dispatch after the
+    # first (the frozen set is reused), so lookback is irrelevant. The
+    # setting still applies to cache-off providers (kimi, gpt-5.4-mini)
+    # where per-turn prediction runs every dispatch.
     "predictor": {
         # Number of prior user messages from the same session to prepend to
         # the current message before regex classification. Catches signal in
@@ -733,16 +800,25 @@ def _canonical_session_key(
 
 
 def _agent_platform_from_context(event: Any = None, kwargs: dict[str, Any] | None = None) -> tuple[str, str, str]:
-    """Return ``(agent, platform, scope)`` for per-agent/platform learning.
+    """Return ``(agent, platform, scope)`` for the gateway-dispatch path.
 
-    Scope is ``{agent}:{platform}``. Agent identity comes from profile
-    context (explicit config, HERMES_HOME profile dir, HERMES_PROFILE);
-    platform comes from the canonical session key's platform segment, then
-    from kwargs/event hints. Hermes' own ``HERMES_SESSION_KEY`` is shaped
-    ``agent:main:{platform}:{chat_type}[:...]`` — position 1 is the
-    literal ``"main"``, never the per-profile agent name, so we don't
-    consult it for agent resolution. Falls through to ``default:unknown``
-    only when nothing real is discoverable.
+    Companion to :func:`_recover_attribution_without_state` (post-tool-call
+    recovery path); the two intentionally use different precedence rules:
+
+      · This function: env session key → kwargs hints → event attrs, with
+        each later source *overwriting* the earlier — the event is
+        authoritative when a message is being dispatched (we trust the
+        gateway over any leftover env state).
+      · Recovery path: passed-in session_id → env key → kwargs hints, with
+        each later source only used when the earlier returned blank — when
+        we have no context, the first plausible answer wins.
+
+    Scope is ``{agent}:{platform}``. Agent comes from profile context
+    (explicit config, HERMES_HOME profile dir, HERMES_PROFILE). Hermes'
+    ``HERMES_SESSION_KEY`` is shaped ``agent:main:{platform}:...`` —
+    position 1 is the literal ``"main"``, never a per-profile agent name.
+    Returns ``("", "", "")`` when either slot can't be filled with real
+    data (analyzer buckets blank rows as "unknown").
     """
     kwargs = kwargs or {}
     session_key = str(os.environ.get("HERMES_SESSION_KEY") or "")
@@ -1277,24 +1353,46 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             ))
             return None
 
-        # Narrow sticky-residency key: session-scoped, opaque. Distinct from the
-        # coarse policy scope (agent:platform) used for telemetry/learned policy.
-        sticky_key = _sticky_key_for_session(str(session_id))
+        # Under cache-on, the freeze about to happen makes sticky residency
+        # and lookback redundant — the frozen set carries forward verbatim
+        # via _build_state_from_frozen, including any in-session
+        # expand_tools additions, and the per-turn predictor doesn't run
+        # on subsequent dispatches. Skipping these helpers on the cache-on
+        # first dispatch avoids polluting the freeze baseline with stale
+        # carry-over state and keeps the design-principle invariant clean:
+        # cache-on changes the cadence of adjustment, not the granularity.
+        cache_on = (cache_decision == "on")
 
-        lookback_turns = _predictor_lookback_turns()
-        prior_messages = _lookback_prior_messages(str(session_id), lookback_turns)
-        predictor_input = _compose_predictor_input(prior_messages, message)
+        if cache_on:
+            sticky_key = ""
+            lookback_turns = 0
+            prior_messages: list[str] = []
+            predictor_input = message
+        else:
+            # Narrow sticky-residency key: session-scoped, opaque. Distinct
+            # from the coarse policy scope (agent:platform).
+            sticky_key = _sticky_key_for_session(str(session_id))
+            lookback_turns = _predictor_lookback_turns()
+            prior_messages = _lookback_prior_messages(str(session_id), lookback_turns)
+            predictor_input = _compose_predictor_input(prior_messages, message)
 
         preset = presets_mod.resolve_preset(_CONFIG, scope)
         prediction = predictor_mod.predict(predictor_input, attachments, preset)
-        # Push the current message onto the session's lookback ring AFTER
-        # prediction so we don't include the current message as its own prior.
-        _record_lookback_message(str(session_id), message, lookback_turns)
         known = _all_known_tool_names(preset)
         always_on_tools = list(preset.always_on) if isinstance(preset.always_on, list) else []
         trigger_tools = _trigger_tools_by_group(preset, prediction.triggers_fired)
-        _decay_sticky(sticky_key)
-        sticky_tools, sticky_categories, sticky_remaining = _live_sticky(sticky_key)
+
+        if cache_on:
+            sticky_tools: list[str] = []
+            sticky_categories: list[str] = []
+            sticky_remaining: dict[str, int] = {}
+        else:
+            # Push the current message onto the session's lookback ring AFTER
+            # prediction so we don't include the current message as its own prior.
+            _record_lookback_message(str(session_id), message, lookback_turns)
+            _decay_sticky(sticky_key)
+            sticky_tools, sticky_categories, sticky_remaining = _live_sticky(sticky_key)
+
         allowed_tool_names = prediction.allowed_tool_names
         # Capture the pre-sticky baseline. This is the set the model would
         # see *without* any prior expansion (sticky carries tools forward
@@ -1303,19 +1401,31 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         # called this anyway" from "this call is the payoff of an earlier
         # expand". WILDCARD is preserved (bypass cohort / wildcard always_on
         # already see every tool — nothing to attribute to expansion).
+        # Under cache-on, sticky_tools is empty so the merge is a no-op.
         if allowed_tool_names == WILDCARD_ALWAYS_ON or allowed_tool_names is None:
             baseline_allowed_tools: Any = WILDCARD_ALWAYS_ON
         else:
             baseline_allowed_tools = sorted(set(allowed_tool_names))
-            allowed_tool_names = sorted(set(allowed_tool_names) | set(sticky_tools))
+            if sticky_tools:
+                allowed_tool_names = sorted(set(allowed_tool_names) | set(sticky_tools))
 
         # A/B baseline: deterministically bypass narrowing for a fraction of
         # sessions. The predictor still ran so we keep telemetry, but the
         # allowed set widens to the full ceiling and the policy_source is
-        # stamped so the analyzer can compare cohorts.
+        # stamped so the analyzer can compare cohorts. Under cache-on this
+        # is decided once and frozen for the session's life — no per-turn
+        # flap risk.
         bypassed = _should_bypass(scope, str(session_id))
         if bypassed:
             allowed_tool_names = WILDCARD_ALWAYS_ON
+            # Bypass means WILDCARD — sticky/lookback aren't narrowing
+            # anything, so their telemetry fields would falsely imply
+            # narrowing signal in the bypass cohort. Zero them out for
+            # cohort-comparison cleanliness.
+            sticky_tools = []
+            sticky_categories = []
+            sticky_remaining = {}
+            prior_messages = []
         policy_source = "bypass" if bypassed else getattr(preset, "policy_source", "preset")
 
         _PREDICTION_CV.set({
@@ -1387,16 +1497,19 @@ def _recover_attribution_without_state(
 ) -> tuple[str, str, str]:
     """Best-effort ``(agent, platform, scope)`` for out-of-band tool calls.
 
-    Used when the contextvar has no per-turn state — typically background
-    tools fired outside a gateway-dispatched message loop. Resolution:
+    Companion to :func:`_agent_platform_from_context` (the dispatch path);
+    see that docstring for why the two functions have different
+    precedence semantics. Used when the contextvar has no per-turn
+    state — typically background tools fired outside a gateway-dispatched
+    message loop.
 
-      · Agent — from profile/config context only
-        (:func:`_profile_agent_name`). The canonical session key's
-        position 1 is always the literal ``"main"`` and must never be
-        used as the agent identity.
-      · Platform — from the passed ``session_id`` if it carries the
-        canonical shape, else from ``HERMES_SESSION_KEY`` in env, else
-        from kwargs hints (platform/source/transport).
+    Resolution order (each later source only used when earlier returned
+    blank — "first plausible answer wins"):
+
+      · Platform — passed ``session_id`` if it carries the canonical
+        ``agent:main:{platform}:...`` shape, else ``HERMES_SESSION_KEY``
+        env, else kwargs hints (platform/source/transport).
+      · Agent — :func:`_profile_agent_name` only.
 
     Returns ``("", "", "")`` when either slot can't be filled with real
     data — preserves blank attribution for legitimately untrackable rows
@@ -1890,12 +2003,23 @@ def _on_post_api_request(**kwargs) -> None:
 # ─── Hook: on_session_end ──────────────────────────────────────────────────
 
 def _on_session_end(session_id=None, **kwargs) -> None:
-    """Clear all per-session state when a session ends.
+    """WARNING: this hook fires PER TURN, not at actual session end.
 
-    The contextvar is task-scoped so it auto-cleans, but we explicitly
-    clear here to keep state hygiene clean if the same task processes
-    another message. Sticky residency and lookback history are keyed by
-    session so they must be evicted here to prevent cross-session bleed.
+    ``on_session_end`` is a misleading hook name — Hermes fires it at the
+    end of every ``run_conversation`` call, which means once per user
+    message in multi-turn sessions. The Hermes core comment at
+    conversation_loop.py:4680 calls this out explicitly.
+
+    DO NOT evict any state here that needs to survive across turns within
+    a session. In particular: ``_FROZEN_BY_SESSION``,
+    ``_CACHE_MODE_BY_SESSION``, and any other per-session memory must
+    remain. They're cleared by :func:`_on_session_reset` (true /reset or
+    /new) and by the Phase 4 compaction patch only.
+
+    What we DO clear here: the contextvar (task-scoped so it auto-cleans,
+    but explicit clear keeps state hygiene clean) and the per-turn
+    helpers (sticky residency, lookback history) which were designed
+    around the per-turn semantics this hook actually has.
 
     Hermes invokes this hook with ``session_id`` set to the AIAgent's
     uuid/timestamp identifier — NOT the canonical gateway session key
