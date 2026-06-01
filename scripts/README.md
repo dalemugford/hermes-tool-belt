@@ -45,8 +45,10 @@ python3 scripts/shape-ceiling.py                  # write learned.json
 ```
 
 Reads recent live telemetry per scope and reports per-tool promote /
-demote candidates. Conservative thresholds (promote: ≥2 sessions and ≥3
-calls; demote: ≥20 sessions of evidence). Writes to `learned.json` under
+demote candidates. Default thresholds are inherited from `policy.yaml`
+under `learning.shape_ceiling` (the shipped values remain promote: ≥2
+sessions and ≥3 calls; demote: ≥20 sessions of evidence). CLI flags
+still override for ad-hoc runs. Writes to `learned.json` under
 `scopes[].cache_aware` and mirrors to `scopes[].always_on` /
 `scopes[].always_off` so the existing `apply_to_preset` reader picks
 them up when `learned_mode` is `auto` or `audit`.

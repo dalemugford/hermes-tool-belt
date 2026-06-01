@@ -47,6 +47,9 @@ Usage
   python3 scripts/shape-ceiling.py --dry-run            # report only
   python3 scripts/shape-ceiling.py --scope bernard:telegram
   python3 scripts/shape-ceiling.py --window 50          # consider last 50 sessions per scope
+
+Threshold defaults come from ``policy.yaml`` under
+``learning.shape_ceiling``. CLI flags still win when passed explicitly.
 """
 
 from __future__ import annotations
@@ -70,10 +73,104 @@ DEFAULTS = {
     "version": 1,
 }
 
+_POLICY_PATH = Path(__file__).resolve().parent.parent / "policy.yaml"
+
 
 def default_state_dir() -> Path:
     home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
     return Path(home) / "state" / "dynamic-tools"
+
+
+def load_shape_ceiling_defaults(policy_path: Path = _POLICY_PATH) -> dict[str, int]:
+    """Load shaper defaults from policy.yaml, falling back silently on errors.
+
+    Prefer PyYAML when available so the parser follows the real policy shape.
+    If this runtime lacks PyYAML, fall back to a tiny indentation-based reader
+    for the `learning.shape_ceiling` block rather than disabling inheritance.
+    """
+    try:
+        raw = policy_path.read_text(encoding="utf-8")
+    except Exception:
+        return dict(DEFAULTS)
+
+    data: dict[str, Any] | None = None
+    try:
+        import yaml  # type: ignore[import-untyped]
+        loaded = yaml.safe_load(raw) or {}
+        if isinstance(loaded, dict):
+            data = loaded
+    except Exception:
+        data = None
+
+    if isinstance(data, dict):
+        learning = data.get("learning")
+        if isinstance(learning, dict):
+            shape = learning.get("shape_ceiling")
+            if isinstance(shape, dict):
+                return _merge_shape_defaults(shape)
+
+    shape: dict[str, int] = {}
+    in_learning = False
+    in_shape = False
+    learning_indent = None
+    shape_indent = None
+    for raw_line in raw.splitlines():
+        line = raw_line.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        stripped = line.strip()
+
+        if stripped == "learning:":
+            in_learning = True
+            in_shape = False
+            learning_indent = indent
+            shape_indent = None
+            continue
+        if in_learning and learning_indent is not None and indent <= learning_indent and stripped != "learning:":
+            in_learning = False
+            in_shape = False
+            learning_indent = None
+            shape_indent = None
+        if not in_learning:
+            continue
+
+        if stripped == "shape_ceiling:":
+            in_shape = True
+            shape_indent = indent
+            continue
+        if in_shape and shape_indent is not None and indent <= shape_indent and stripped != "shape_ceiling:":
+            in_shape = False
+            shape_indent = None
+        if not in_shape or ":" not in stripped:
+            continue
+
+        key, value = [part.strip() for part in stripped.split(":", 1)]
+        if key not in {"session_window", "promote_min_sessions", "promote_min_calls", "demote_min_sessions_no_use"}:
+            continue
+        try:
+            parsed = int(value)
+        except Exception:
+            continue
+        if parsed > 0:
+            shape[key] = parsed
+
+    return _merge_shape_defaults(shape)
+
+
+def _merge_shape_defaults(overrides: dict[str, Any]) -> dict[str, int]:
+    merged = dict(DEFAULTS)
+    for key in ("session_window", "promote_min_sessions", "promote_min_calls", "demote_min_sessions_no_use"):
+        value = overrides.get(key)
+        if value is None:
+            continue
+        try:
+            parsed = int(value)
+        except Exception:
+            continue
+        if parsed > 0:
+            merged[key] = parsed
+    return merged
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -271,13 +368,14 @@ def merge_into_learned(
 
 
 def main() -> int:
+    defaults = load_shape_ceiling_defaults()
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--state-dir", default=str(default_state_dir()))
     ap.add_argument("--scope", default="", help="filter to a specific scope (default: all)")
-    ap.add_argument("--window", type=int, default=DEFAULTS["session_window"])
-    ap.add_argument("--promote-min-sessions", type=int, default=DEFAULTS["promote_min_sessions"])
-    ap.add_argument("--promote-min-calls", type=int, default=DEFAULTS["promote_min_calls"])
-    ap.add_argument("--demote-min-sessions", type=int, default=DEFAULTS["demote_min_sessions_no_use"])
+    ap.add_argument("--window", type=int, default=defaults["session_window"])
+    ap.add_argument("--promote-min-sessions", type=int, default=defaults["promote_min_sessions"])
+    ap.add_argument("--promote-min-calls", type=int, default=defaults["promote_min_calls"])
+    ap.add_argument("--demote-min-sessions", type=int, default=defaults["demote_min_sessions_no_use"])
     ap.add_argument("--dry-run", action="store_true", help="report only, don't write learned.json")
     args = ap.parse_args()
 

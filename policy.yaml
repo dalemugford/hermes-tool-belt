@@ -8,6 +8,15 @@ description: >
   channels. The model can call `expand_tools(category=...)` if it needs something
   that wasn't loaded.
 
+# Between-session shaper defaults. `scripts/shape-ceiling.py` inherits these
+# values unless explicit CLI flags override them for an ad-hoc run.
+learning:
+  shape_ceiling:
+    session_window: 20
+    promote_min_sessions: 2
+    promote_min_calls: 3
+    demote_min_sessions_no_use: 20
+
 # Tools loaded on every message in this mode, regardless of content.
 # Anything in the user's platform_toolsets ceiling but NOT listed here AND
 # NOT named under any trigger below is considered "unknown" and kept on
