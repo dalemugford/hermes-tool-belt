@@ -128,32 +128,30 @@ _CONFIG: dict[str, Any] = {
     "always_off": [],
     "agent": "",
     "learned_mode": "off",
-    # Sticky residency — CACHE-OFF MODE ONLY.
-    # Under cache-on (the default), the frozen tool set carries forward
-    # in-session expansions verbatim via _FROZEN_BY_SESSION, so per-turn
-    # sticky carry-over is redundant. Settings here apply only to
-    # cache_mode: off sessions; they're inert on cache-on.
-    "sticky": {
-        "enabled": True,
-        "ttl_turns": 3,
-        # Toolset names passed to expand_tools(category=...), NOT YAML trigger
-        # group names. policy.yaml's trigger groups are named differently
-        # (e.g. file_write, web_extract); sticky residency keys on the
-        # model-facing toolset name resolved through Hermes' toolset table.
-        "categories": ["terminal", "file", "browser", "web", "code_execution", "delegation"],
-    },
-    # Predictor lookback — CACHE-OFF MODE ONLY.
-    # Cache-on skips the per-turn predictor on every dispatch after the
-    # first (the frozen set is reused), so lookback is irrelevant. The
-    # setting still applies to cache-off providers (kimi, gpt-5.4-mini)
-    # where per-turn prediction runs every dispatch.
-    "predictor": {
-        # Number of prior user messages from the same session to prepend to
-        # the current message before regex classification. Catches signal in
-        # short replies like "yes" / "go ahead" / "no, don't" whose intent
-        # lives in the preceding turn. 0 disables, restoring the original
-        # single-message behavior.
-        "lookback_turns": 1,
+    # Cache-off mode pipeline — sticky residency + per-turn predictor
+    # lookback. Both are inert under cache-on (the default), where the
+    # frozen tool set carries forward in-session expansions verbatim
+    # via _FROZEN_BY_SESSION. The cache_off sub-section makes the
+    # dual-mode structure explicit instead of layering MODE-ONLY notes
+    # on top-level keys.
+    "cache_off": {
+        "sticky": {
+            "enabled": True,
+            "ttl_turns": 3,
+            # Toolset names passed to expand_tools(category=...), NOT YAML
+            # trigger group names. policy.yaml's trigger groups are named
+            # differently (e.g. file_write, web_extract); sticky residency
+            # keys on the model-facing toolset name resolved through
+            # Hermes' toolset table.
+            "categories": ["terminal", "file", "browser", "web", "code_execution", "delegation"],
+        },
+        "predictor": {
+            # Number of prior user messages from the same session to prepend
+            # to the current message before regex classification. Catches
+            # signal in short replies like "yes" / "go ahead" / "no, don't"
+            # whose intent lives in the preceding turn. 0 disables.
+            "lookback_turns": 1,
+        },
     },
     # Fraction of sessions (deterministic by session_id hash) to bypass
     # narrowing entirely, providing an A/B baseline cohort. Bypassed
@@ -257,14 +255,18 @@ def _load_user_config() -> None:
         for key in ("channels", "always_on_extra", "always_off"):
             if key in plugin_cfg and plugin_cfg[key] is not None:
                 _CONFIG[key] = plugin_cfg[key]
-        if isinstance(plugin_cfg.get("sticky"), dict):
-            sticky = dict(_CONFIG.get("sticky") or {})
-            sticky.update(plugin_cfg["sticky"])
-            _CONFIG["sticky"] = sticky
-        if isinstance(plugin_cfg.get("predictor"), dict):
-            predictor_cfg = dict(_CONFIG.get("predictor") or {})
-            predictor_cfg.update(plugin_cfg["predictor"])
-            _CONFIG["predictor"] = predictor_cfg
+        if isinstance(plugin_cfg.get("cache_off"), dict):
+            cache_off = dict(_CONFIG.get("cache_off") or {})
+            user_cache_off = plugin_cfg["cache_off"]
+            if isinstance(user_cache_off.get("sticky"), dict):
+                sticky = dict(cache_off.get("sticky") or {})
+                sticky.update(user_cache_off["sticky"])
+                cache_off["sticky"] = sticky
+            if isinstance(user_cache_off.get("predictor"), dict):
+                predictor_cfg = dict(cache_off.get("predictor") or {})
+                predictor_cfg.update(user_cache_off["predictor"])
+                cache_off["predictor"] = predictor_cfg
+            _CONFIG["cache_off"] = cache_off
         if isinstance(plugin_cfg.get("cache_auto"), dict):
             cache_auto = dict(_CONFIG.get("cache_auto") or {})
             cache_auto.update(plugin_cfg["cache_auto"])
@@ -512,7 +514,10 @@ def _trigger_tools_by_group(preset: Any, fired: list[str]) -> dict[str, list[str
 
 
 def _sticky_config() -> dict[str, Any]:
-    cfg = _CONFIG.get("sticky") or {}
+    cache_off = _CONFIG.get("cache_off") or {}
+    if not isinstance(cache_off, dict):
+        return {}
+    cfg = cache_off.get("sticky") or {}
     return cfg if isinstance(cfg, dict) else {}
 
 
@@ -1028,7 +1033,8 @@ def _message_text_from_event(event: Any) -> str:
 
 
 def _predictor_lookback_turns() -> int:
-    cfg = _CONFIG.get("predictor") or {}
+    cache_off = _CONFIG.get("cache_off") or {}
+    cfg = cache_off.get("predictor") if isinstance(cache_off, dict) else None
     if not isinstance(cfg, dict):
         return 0
     try:

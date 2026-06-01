@@ -505,8 +505,10 @@ def main() -> int:
                 "bypass_rate": 0.05,
                 "cache_mode": "off",  # exercise the legacy per-turn path
                 "channels": {},
-                "sticky": {"enabled": True, "ttl_turns": 3, "categories": ["*"]},
-                "predictor": {"lookback_turns": 1},
+                "cache_off": {
+                    "sticky": {"enabled": True, "ttl_turns": 3, "categories": ["*"]},
+                    "predictor": {"lookback_turns": 1},
+                },
             })
 
             scenarios = TARGETED_SCENARIOS + FILLER_SCENARIOS

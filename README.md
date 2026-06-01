@@ -126,23 +126,12 @@ bleeding-edge, track `main`. Current release: **2026.5.17-beta**.
 
 ## Companion docs
 
-**Canonical (current architecture):**
+The code is the source of truth. The active doc set is intentionally small:
 
-- [docs/16.cache-aware-refactor-plan-2026-05-30.md](docs/16.cache-aware-refactor-plan-2026-05-30.md) — the architecture target. Cache-on freeze, cache-off fallback, the design principle, phase sequencing.
-- [docs/15.cache-aware-pivot-2026-05-28.md](docs/15.cache-aware-pivot-2026-05-28.md) — rationale for the pivot from per-turn to session-boundary.
+- [docs/16.cache-aware-refactor-plan-2026-05-30.md](docs/16.cache-aware-refactor-plan-2026-05-30.md) — the architecture: cache-on freeze, cache-off fallback, design principle, phase sequencing.
 - [docs/17.codex-reasoning-cache-artifact-2026-05-31.md](docs/17.codex-reasoning-cache-artifact-2026-05-31.md) — Codex-side cache caveat affecting gpt-5.4 savings figures.
 
-**Historical / scoped to cache-off:**
-
-- [docs/02.strategy-2026-05-12.md](docs/02.strategy-2026-05-12.md) — earlier north-star strategy doc; has a forward-pointer note about the pivot.
-- [docs/03.plan-2026-05-12.md](docs/03.plan-2026-05-12.md) — earlier architecture and status; supersedes by doc 16 but useful for cache-off path detail.
-- [docs/07.dynamic-tools-plan-2026-05-17.md](docs/07.dynamic-tools-plan-2026-05-17.md) — original design doc; cost-categorization table is canonical for `policy.yaml`'s structure.
-- [docs/08.dynamic-tools-hermes-surface-2026-05-17.md](docs/08.dynamic-tools-hermes-surface-2026-05-17.md) — patch-point reference; read before any Hermes upgrade.
-- [docs/09.telemetry-audit-2026-05-17.md](docs/09.telemetry-audit-2026-05-17.md) — earlier audit; findings #1-#2 still load-bearing.
-- [docs/11.roadmap-2026-05-17.md](docs/11.roadmap-2026-05-17.md) — earlier roadmap; partially superseded by doc 16's phase plan.
-- [docs/12.expand-tools-evolution-2026-05-19.md](docs/12.expand-tools-evolution-2026-05-19.md) — granularity ideas for `expand_tools`; nice-to-have polish.
-
-Pre-pivot designs that no longer guide work are at [docs/archive/](docs/archive/).
+Everything else from the plugin's evolution — strategy docs, per-turn-era plans, pivot decision rationale, marketing copy drafts, telemetry audits, the prior roadmap — lives under [docs/archive/](docs/archive/) for git archaeology, not for guiding current work.
 
 ## Policy
 
@@ -268,19 +257,21 @@ plugins:
     always_on_extra: []
     always_off: []
 
-    # Sticky residency (in-memory only, per active session)
-    sticky:
-      enabled: true
-      ttl_turns: 3
-      # Toolset names passed to expand_tools(category=...). NOT YAML trigger
-      # group names. Empty list / "*" / null disables filtering.
-      categories: [terminal, file, browser, web, code_execution, delegation]
-
-    # Predictor lookback — concat last N user messages from the same
-    # session into the regex input. Catches signal in short replies like
-    # "yes", "go ahead", "no don't". Set 0 to disable.
-    predictor:
-      lookback_turns: 1
+    # Cache-off mode pipeline — inert under cache-on (the default).
+    # Both sticky residency and predictor lookback only apply when the
+    # session resolves to cache_mode: off (kimi, gpt-5.4-mini, etc.).
+    cache_off:
+      sticky:
+        enabled: true
+        ttl_turns: 3
+        # Toolset names passed to expand_tools(category=...). NOT YAML
+        # trigger group names. Empty / "*" / null disables filtering.
+        categories: [terminal, file, browser, web, code_execution, delegation]
+      predictor:
+        # Concat last N user messages from the same session into the
+        # regex input. Catches signal in short replies like "yes",
+        # "go ahead", "no don't". Set 0 to disable.
+        lookback_turns: 1
 
     # A/B baseline cohort — deterministically bypass narrowing for a
     # fraction of sessions so the analyzer can compare narrowed vs
@@ -718,20 +709,10 @@ rm -rf ~/.hermes/plugins/dynamic-tools
 ├── policy.yaml                      # the single shipped tool policy
 ├── CLAUDE.md                        # in-dir editing rules
 ├── README.md                        # this file
-├── docs/                            # chronologically ordered
-│   ├── 02.strategy-2026-05-12.md                        # earlier north-star (forward-pointer to 16)
-│   ├── 03.plan-2026-05-12.md                            # earlier architecture (forward-pointer to 16)
-│   ├── 07.dynamic-tools-plan-2026-05-17.md              # original design + cost-categorization table
-│   ├── 08.dynamic-tools-hermes-surface-2026-05-17.md    # patch-point reference
-│   ├── 09.telemetry-audit-2026-05-17.md                 # earlier audit; findings #1-#2 still apply
-│   ├── 11.roadmap-2026-05-17.md                         # earlier roadmap (partially superseded)
-│   ├── 12.expand-tools-evolution-2026-05-19.md          # expand_tools granularity (polish)
-│   ├── 13.website-copy-feature-bank-2026-05-19.md       # marketing — PAUSED (needs Phase 5 numbers)
-│   ├── 14.website-copy-product-page-2026-05-19.md       # marketing — PAUSED
-│   ├── 15.cache-aware-pivot-2026-05-28.md               # pivot decision rationale
+├── docs/
 │   ├── 16.cache-aware-refactor-plan-2026-05-30.md       # ★ CANONICAL ARCHITECTURE
 │   ├── 17.codex-reasoning-cache-artifact-2026-05-31.md  # Codex cache caveat
-│   └── archive/                                          # pre-pivot designs (kept for archaeology)
+│   └── archive/                                          # working docs from the plugin's evolution
 ├── scripts/
 │   ├── shape-ceiling.py             # cache-on: between-session shaper (per-tool promote/demote)
 │   ├── cache-freeze-replay.py       # cache-on: freeze efficacy + Phase 5 corrected savings
