@@ -120,18 +120,13 @@ bleeding-edge, track `main`. Current release: **2026.5.17-beta**.
 - **A/B baseline cohort** — set `bypass_rate: 0.05` and a deterministic
   5% of sessions ship the full toolset, so headline savings get a real
   control to compare against.
-- **Telemetry-correctness audit** ([docs/telemetry-audit-2026-05-17.md](docs/09.telemetry-audit-2026-05-17.md))
-  — 2 attribution bugs found and fixed before they could mislead
-  recommendations. Tests + smoke harness keep them from coming back.
-
 ## Companion docs
 
 The code is the source of truth. The active doc set is intentionally small:
 
-- [docs/16.cache-aware-refactor-plan-2026-05-30.md](docs/16.cache-aware-refactor-plan-2026-05-30.md) — the architecture: cache-on freeze, cache-off fallback, design principle, phase sequencing.
-- [docs/17.codex-reasoning-cache-artifact-2026-05-31.md](docs/17.codex-reasoning-cache-artifact-2026-05-31.md) — Codex-side cache caveat affecting gpt-5.4 savings figures.
-
-Everything else from the plugin's evolution — strategy docs, per-turn-era plans, pivot decision rationale, marketing copy drafts, telemetry audits, the prior roadmap — lives under [docs/archive/](docs/archive/) for git archaeology, not for guiding current work.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the plugin works: the two modes, the freeze mechanism, `expand_tools`, between-session shaping, where in the request lifecycle the patches sit.
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — every knob in `config.yaml`, `policy.yaml`, and `learned.json`, with defaults.
+- [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) — behaviors that look like bugs but aren't (Codex reasoning cache, gateway-restart freeze loss).
 
 ## Policy
 
@@ -147,11 +142,6 @@ mode), set `bypass_rate: 1.0` for that scope — see
 [A/B baseline cohort](#ab-baseline-cohort) below. This routes the scope
 through the predictor for telemetry but ships the full tool ceiling to
 the model.
-
-> A future "calibration mode" (see [CALIBRATION-PLAN.md](docs/05.calibration-plan-2026-05-12.md))
-> will replace the hand-curated policy with one learned from each
-> profile's own usage. The shipped YAML is the warm-start seed for that
-> flow, not the destination.
 
 ## Per-channel / per-scope override
 
@@ -659,7 +649,7 @@ out of the way of plugin updates.
   model produces reasoning tokens, the resulting message-history mutation
   busts cache on the next call regardless of what the plugin does.
   Anthropic-side cache is more deterministic. See
-  [docs/17.codex-reasoning-cache-artifact-2026-05-31.md](docs/17.codex-reasoning-cache-artifact-2026-05-31.md).
+  [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
 - **`learned_mode: auto`/`audit` is not the default.** Adaptive promotion
   is deliberately opt-in until recommendations have been reviewed for a
   given scope. Start with `recommend`.
@@ -710,9 +700,9 @@ rm -rf ~/.hermes/plugins/dynamic-tools
 ├── CLAUDE.md                        # in-dir editing rules
 ├── README.md                        # this file
 ├── docs/
-│   ├── 16.cache-aware-refactor-plan-2026-05-30.md       # ★ CANONICAL ARCHITECTURE
-│   ├── 17.codex-reasoning-cache-artifact-2026-05-31.md  # Codex cache caveat
-│   └── archive/                                          # working docs from the plugin's evolution
+│   ├── ARCHITECTURE.md                                   # how the plugin works
+│   ├── CONFIGURATION.md                                  # every config knob, with defaults
+│   └── KNOWN_ISSUES.md                                   # upstream + restart caveats
 ├── scripts/
 │   ├── shape-ceiling.py             # cache-on: between-session shaper (per-tool promote/demote)
 │   ├── cache-freeze-replay.py       # cache-on: freeze efficacy + Phase 5 corrected savings
@@ -725,6 +715,7 @@ rm -rf ~/.hermes/plugins/dynamic-tools
 │   ├── check_trigger_dampeners.py   # cache-off: trigger dampener regression guard
 │   └── README.md                    # ops scripts inventory + invocation
 ├── tests/
+│   ├── test_cache_aware.py
 │   ├── test_session_attribution.py
 │   ├── test_harvest_privacy.py
 │   └── run_tests.py

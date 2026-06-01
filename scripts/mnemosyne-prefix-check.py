@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Mnemosyne A/B verification — does memory injection break the cached prefix?
 
-Pre-Phase-1 gate per docs/16.cache-aware-refactor-plan-2026-05-30.md.
-The freeze numbers we measured (90.6% cache hit on stable-hash calls)
-treat ``tool_list_hash`` as a proxy for cache-prefix stability. That
-only holds if NOTHING else mutates the prefix between turns. Mnemosyne
-is the obvious threat — it fires ``pre_llm_call`` and can inject
-recalled memory content into the message array.
+The freeze in cache-on mode treats ``tool_list_hash`` as a proxy for
+cache-prefix stability. That only holds if NOTHING else mutates the prefix
+between turns. Mnemosyne is the obvious threat — it fires ``pre_llm_call``
+and can inject recalled memory content into the message array.
 
 This script answers: within a session, does the SYSTEM message bytes
 stay stable across turns?

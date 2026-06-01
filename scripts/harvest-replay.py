@@ -10,9 +10,9 @@ these alongside live telemetry and weights them differently.
 
 This unlocks two things:
 
-  1. Audit acceleration — items #3/#4/#6 from
-     docs/09.telemetry-audit-2026-05-17.md get answered now instead of after
-     7-14 days of organic accumulation.
+  1. Audit acceleration — open questions about trigger precision/recall and
+     dampener candidates can be answered now instead of after 7-14 days of
+     organic accumulation.
   2. Public-release warm start — on first install, the plugin runs harvest
      against the user's existing sessions so day-one recommendations are
      real, not "wait a week".

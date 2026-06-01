@@ -33,8 +33,8 @@ without (kimi, gpt-5.4-mini). The plugin runs in one of two modes:
     forward a few turns. This is the original behavior, preserved as a
     fallback for providers where prefix caching doesn't apply.
 
-See docs/16.cache-aware-refactor-plan-2026-05-30.md for the full design
-target and docs/15.cache-aware-pivot-2026-05-28.md for the rationale.
+See docs/ARCHITECTURE.md for the full design and docs/CONFIGURATION.md
+for every config knob.
 
 PATCH SURFACE — minimal, runtime-applied
 ========================================

@@ -1,12 +1,12 @@
 # CLAUDE.md — dynamic-tools
 
-Rules for working in this directory. The current architecture target is
-[16.cache-aware-refactor-plan-2026-05-30.md](docs/16.cache-aware-refactor-plan-2026-05-30.md);
-the pivot decision rationale is in
-[15.cache-aware-pivot-2026-05-28.md](docs/15.cache-aware-pivot-2026-05-28.md).
-Older strategy/plan docs (02, 03) carry forward-pointer notes and stay
-useful for cache-off-mode background; pre-pivot designs live under
-[docs/archive/](docs/archive/). User-facing docs in [README.md](README.md).
+Rules for working in this directory. Architecture and behavior live in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Every configuration knob
+is documented in [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+Behaviors that look like bugs but aren't are catalogued in
+[docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md). User-facing entry point
+is [README.md](README.md). The code is the source of truth; if a doc
+disagrees with the code, fix the doc.
 
 ## Scope of edits
 
