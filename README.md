@@ -1,54 +1,73 @@
 # dynamic-tools
 
-### Cut your Hermes agent's per-message tool overhead in half. Today.
+### Usage-aware tool loading for Hermes Agent.
 
 A [Hermes Agent](https://hermes-agent.nousresearch.com) plugin that
-ships only the tools the current turn actually needs.
+carries the tools your agent actually needs, drops the ones it doesn't,
+and adapts both decisions based on real usage signal instead of
+hand-tuning.
 
-**Measured: 57% reduction across 109 production sessions, 3.37M tokens
-saved.** ~388 tokens per tool, per API call, per message — that adds up
-fast.
+The principle is the same regardless of provider; what changes is
+*when* the plugin makes the adjustment. On providers with prefix
+caching (Anthropic, OpenAI auto-cache), tools are shaped per
+**session** so the cached prefix stays intact. On providers without
+provider-side caching (kimi, gpt-5.4-mini), tools are shaped per
+**turn**. Same goal, different cadence — picked automatically.
 
 ## Why
 
-Every message you send your agent ships **every** tool definition. For
-a heavy profile — web, terminal, file, browser, MCP servers, custom
-skills — that's 8–15k tokens of overhead on a message whose answer is
-"yes." Your `"hi"` costs the same as `"deploy the build script"` in
-tool overhead. The model still pays to read them all.
+Every message ships tool definitions to the model. For a heavy profile
+— web, terminal, file, browser, MCP servers, custom skills — that's
+8–15k tokens of overhead on a message whose answer is `"yes."` Your
+`"hi"` costs the same as `"deploy the build script"` in tool overhead.
+
+But the *naive fix* — re-narrow the tool list every turn — fights
+provider prefix-caching. Modern providers cache the system prompt +
+tools block + history prefix; changing the tool block between turns
+busts that cache and re-bills the conversation history at the full
+input rate. On a multi-turn session, the lost cache costs more than
+the schema savings.
+
+`dynamic-tools` resolves the tension: under cache-on providers it picks
+a tool set once per session and holds it stable, learning from actual
+`expand_tools` events to shape the *next* session's starting ceiling.
+Under cache-off providers it falls back to the original per-turn
+narrowing.
 
 ## See it
 
-```text
-User: "hi, how's it going?"
-  ceiling:    37 tools  (~3,500 tok)
-  shipped:    12 tools  (~1,200 tok)   ← always-on only; no triggers fired
-  saved:      2,300 tok / message
+**Cache-on session (Anthropic, OpenAI auto-cache):**
 
+```text
+User: "morning, what's on the agenda?"
+  ceiling:    37 tools (~3,500 tok)
+  frozen:     14 tools (~1,500 tok)   ← session frozen — predictor ran once
+  cache:      cold on turn 1
+
+User: "summarize the inbox briefly"
+  frozen:     14 tools                ← reused verbatim
+  cache:      hot — ~95% prefix cache hit, only the new user message billed fresh
+
+User: "open https://example.com in a browser and tell me the title"
+  model calls: expand_tools(category="browser")
+  frozen:     14 + 12 browser tools   ← expanded, persists for rest of session
+  cache:      one break this turn; subsequent turns reuse expanded set
+```
+
+**Cache-off session (kimi, gpt-5.4-mini):**
+
+```text
 User: "run the build script and check the logs"
   ceiling:    37 tools
-  shipped:    14 tools                  ← always-on + `shell` trigger
-  saved:      ~1,800 tok / message      (terminal+process loaded;
-                                         browser, image_gen, MCP cut)
-
-User: (any message the predictor guesses wrong on)
-  model calls: expand_tools(category="browser")
-  next API call ships browser_* tools — recovers cleanly,
-  ~1,500 tok extra round-trip vs. multiple K saved across the session
+  shipped:    14 tools                ← per-turn: always-on + `shell` trigger
+  saved:      ~1,800 tok / message    (terminal+process loaded; browser cut)
 ```
 
 ## Three things that make this safe to install
 
 - **Fails invisibly.** Any error — bad YAML, predictor exception, missing lookup — falls through to "no narrowing." The plugin can save you tokens; it can never break your agent.
 - **Strict ceiling.** Can only *narrow* what your `platform_toolsets` config already allowed. Never adds a tool you didn't sanction.
-- **Day-one recommendations from your own data.** [`scripts/bootstrap.py`](scripts/bootstrap.py) replays your existing Hermes sessions through the predictor and prints concrete per-tool promotion candidates — no week-long wait for telemetry to accumulate. Real first-run output for one author:
-
-  ```
-  TOP ACTIONS
-    1. [PROMOTE]  bernard:telegram  terminal  cuts=516  net=+499,684 tok
-    2. [PROMOTE]  bernard:slack     terminal  cuts= 13  net= +12,128 tok
-    3. [BROADEN]  bernard:telegram  patch     cuts=132  (broaden file_write trigger)
-  ```
+- **Learning signal is real usage, not guessing.** Every time the model calls `expand_tools` because it wanted a tool that wasn't in the loaded set, that's evidence the plugin can act on. Between sessions, the shaper folds repeatedly-reached-for tools into the next session's frozen ceiling. Per-tool, learned from observation, applied at a free moment.
 
 ## Install
 
@@ -64,8 +83,9 @@ plugins:
     enabled: true
 ```
 
-Restart the gateway. From the next message onward, tool definitions
-are narrowed per-turn.
+Restart the gateway. From the next message onward, the plugin starts
+adapting tool payloads based on detected intent. Cache-aware mode is
+chosen automatically per scope.
 
 ### Day-one warm start (if you already use Hermes)
 
@@ -73,9 +93,12 @@ are narrowed per-turn.
 python3 ~/.hermes/plugins/dynamic-tools/scripts/bootstrap.py
 ```
 
-Replays your existing session history through the predictor and prints
-a ranked **TOP ACTIONS** summary tailored to your usage — concrete
-edits you can make today, derived from real conversations.
+Inspects your existing telemetry per profile. Under cache-on scopes,
+runs the between-session shaper (`scripts/shape-ceiling.py`) to
+identify per-tool promote/demote candidates from real `expand_tools`
+evidence. Under cache-off scopes, runs harvest-replay + analyzer to
+mine trigger-keyword tweaks. Either path produces a ranked **TOP
+ACTIONS** summary tailored to your usage.
 
 ---
 
@@ -103,17 +126,23 @@ bleeding-edge, track `main`. Current release: **2026.5.17-beta**.
 
 ## Companion docs
 
-- **[ROADMAP.md](docs/11.roadmap-2026-05-17.md)** — queued work + open design questions. Start here if you want to contribute.
-- [STRATEGY.md](docs/02.strategy-2026-05-12.md) — the north star: the promise, release strategy, calibration flow, official-plugin readiness
-- [PLAN.md](docs/03.plan-2026-05-12.md) — current architecture, what's built vs. planned, validation status
-- [CALIBRATION-PLAN.md](docs/05.calibration-plan-2026-05-12.md) — observe → handoff → steady-state flow that makes "install, activate, done" honest
-- [AUTO-APPLY-PLAN.md](docs/04.auto-apply-plan-2026-05-12.md) — design for the writer-side script that closes the loop
-- [docs/expand-tools-evolution.md](docs/12.expand-tools-evolution-2026-05-19.md) — next-step ideas for making `expand_tools` more precise before adding heavier retrieval
-- [docs/telemetry-audit-2026-05-17.md](docs/09.telemetry-audit-2026-05-17.md) — first-pass audit: 2 bugs fixed, 2 items clean, 3 pending data accumulation
-- [docs/harvest-followups.md](docs/10.harvest-followups-2026-05-17.md) — open auto-apply candidates surfaced by harvest
-- [docs/dynamic-tools-hermes-surface.md](docs/08.dynamic-tools-hermes-surface-2026-05-17.md) — patch-point reference; read before any Hermes upgrade
-- [docs/dynamic-tools-plan.md](docs/07.dynamic-tools-plan-2026-05-17.md) — original design doc and categorization audit
-- [TRIGGER-SCORING-PLAN.md](docs/06.trigger-scoring-plan-2026-05-12.md) — historical full-scoring plan (deferred)
+**Canonical (current architecture):**
+
+- [docs/16.cache-aware-refactor-plan-2026-05-30.md](docs/16.cache-aware-refactor-plan-2026-05-30.md) — the architecture target. Cache-on freeze, cache-off fallback, the design principle, phase sequencing.
+- [docs/15.cache-aware-pivot-2026-05-28.md](docs/15.cache-aware-pivot-2026-05-28.md) — rationale for the pivot from per-turn to session-boundary.
+- [docs/17.codex-reasoning-cache-artifact-2026-05-31.md](docs/17.codex-reasoning-cache-artifact-2026-05-31.md) — Codex-side cache caveat affecting gpt-5.4 savings figures.
+
+**Historical / scoped to cache-off:**
+
+- [docs/02.strategy-2026-05-12.md](docs/02.strategy-2026-05-12.md) — earlier north-star strategy doc; has a forward-pointer note about the pivot.
+- [docs/03.plan-2026-05-12.md](docs/03.plan-2026-05-12.md) — earlier architecture and status; supersedes by doc 16 but useful for cache-off path detail.
+- [docs/07.dynamic-tools-plan-2026-05-17.md](docs/07.dynamic-tools-plan-2026-05-17.md) — original design doc; cost-categorization table is canonical for `policy.yaml`'s structure.
+- [docs/08.dynamic-tools-hermes-surface-2026-05-17.md](docs/08.dynamic-tools-hermes-surface-2026-05-17.md) — patch-point reference; read before any Hermes upgrade.
+- [docs/09.telemetry-audit-2026-05-17.md](docs/09.telemetry-audit-2026-05-17.md) — earlier audit; findings #1-#2 still load-bearing.
+- [docs/11.roadmap-2026-05-17.md](docs/11.roadmap-2026-05-17.md) — earlier roadmap; partially superseded by doc 16's phase plan.
+- [docs/12.expand-tools-evolution-2026-05-19.md](docs/12.expand-tools-evolution-2026-05-19.md) — granularity ideas for `expand_tools`; nice-to-have polish.
+
+Pre-pivot designs that no longer guide work are at [docs/archive/](docs/archive/).
 
 ## Policy
 
@@ -158,36 +187,74 @@ plugins:
 
 ## How it works
 
-1. **`pre_gateway_dispatch` hook** runs on every inbound gateway message. It
-   reads the message text + attachments, runs a regex/keyword classifier
-   ([predictor.py](predictor.py)) against the active policy (loaded from
-   [policy.yaml](policy.yaml) and resolved through the global → per-scope →
-   learned overlay chain in [presets.py](presets.py) and
-   [learned.py](learned.py)), and stashes the prediction in a
-   `contextvars.ContextVar`.
+The plugin runs in one of two modes per scope. The mode is detected
+automatically from observed cache behavior over the first few API
+calls of a session, then locked for the session's lifetime. The
+locked decision persists across sessions in
+`~/.hermes/state/dynamic-tools/cache_mode_detection.json` so subsequent
+sessions skip the observation window.
 
-2. **Monkey-patched `AIAgent._build_api_kwargs`** ([__init__.py](__init__.py))
-   runs once per outbound API call. It reads the contextvar and filters
-   `kwargs["tools"]` down to `(always_on ∪ triggered ∪ expanded ∪ sticky) ∩ ceiling`.
-   This is the right hook because Hermes caches `AIAgent` instances per
-   session for up to an hour; patching `__init__` would only narrow the first
-   message. `self.tools` is left as the full ceiling — only the per-request
-   payload is narrowed.
+### Cache-on mode (default for Anthropic, OpenAI auto-cache)
 
-3. **`expand_tools` meta-tool** is always loaded. The model can call it
-   (`expand_tools(category="browser")`) when it needs something gated. The
-   handler appends the category to the contextvar's `expansions` set; the
-   next `_build_api_kwargs` call unions the resolved tools into the allowed
-   set. Expansions also refresh in-memory **sticky residency** for the active
-   session via a private sticky key, so a category stays available for
-   `ttl_turns` further turns without re-expanding.
+1. **First dispatch in a session** — `pre_gateway_dispatch` runs the
+   predictor ([predictor.py](predictor.py)) against the active policy
+   ([policy.yaml](policy.yaml) → per-scope overrides → learned overlay
+   via [presets.py](presets.py) and [learned.py](learned.py)), then
+   *freezes* the resulting tool set into a per-session snapshot
+   keyed by canonical session key.
 
-4. **`post_tool_call` hook** logs every actual tool call alongside the
-   prediction id — including whether the tool came from the initial allowed
-   set, from `expand_tools`, or via sticky residency. This is what lets the
-   analyzer measure precision (did the trigger fire and the tool actually
-   get used?) and expansion success rate (did the expansion lead to a real
-   tool call?).
+2. **Every subsequent dispatch in the same session** reuses the frozen
+   snapshot verbatim. The predictor doesn't run. Sticky residency and
+   lookback are disabled — the frozen set carries forward in-session
+   expansions, making per-turn carry-over redundant.
+
+3. **`expand_tools` is the safety valve.** When the model calls
+   `expand_tools(category="browser")` mid-session, the resolved tools
+   are added to the frozen snapshot in-place and stay available for
+   the rest of the session. This trades one cache break (model-driven,
+   for a tool the model demonstrably needed) for permanent access to
+   that tool group within the session.
+
+4. **The freeze is evicted only at moments that already cost a cache
+   break**: true `/reset` or `/new`, end of session, and compaction
+   (the plugin patches `AIAgent._compress_context` to re-freeze
+   against the post-compaction state).
+
+5. **Between sessions**, [`scripts/shape-ceiling.py`](scripts/shape-ceiling.py)
+   reads accumulated `expand_tools` evidence and writes per-tool
+   promote/demote recommendations into `learned.json`. Tools the model
+   reached for repeatedly join the next session's frozen ceiling;
+   always-on tools that went unused for many sessions get demoted.
+
+### Cache-off mode (kimi, gpt-5.4-mini, anything provider-side caching doesn't reach)
+
+The original per-turn pipeline. On every dispatch:
+
+1. **`pre_gateway_dispatch`** runs the predictor on message text +
+   attachments + the last few user messages (lookback), produces an
+   allowed set, merges with sticky residency from prior expansions.
+
+2. **Patched `_build_api_kwargs`** filters `kwargs["tools"]` down to
+   `(always_on ∪ triggered ∪ expanded ∪ sticky) ∩ ceiling` on every
+   outbound API call.
+
+3. **`expand_tools`** mid-turn adds the category to the contextvar's
+   expansions set. Successful expansions refresh sticky residency so
+   the category stays available for `ttl_turns` further turns without
+   re-expanding.
+
+### Shared pieces (both modes)
+
+- **`post_tool_call` hook** logs every actual tool call linked by
+  `prediction_id`, with flags for whether the tool was initially
+  available, expanded, sticky-carried, etc. This is what makes the
+  analyzer's precision and expansion-success math possible.
+- **`post_api_request` hook** captures per-call cache_read /
+  cache_write tokens and a hash of the tool block, so cache economics
+  can be measured directly rather than inferred.
+- **`self.tools` on the AIAgent is left untouched.** The plugin only
+  narrows the on-the-wire payload via the `_build_api_kwargs` patch;
+  agent state stays canonical.
 
 ## Configuration reference
 
@@ -585,18 +652,26 @@ out of the way of plugin updates.
 ## Limitations and known sharp edges
 
 - **CLI sessions don't fire `pre_gateway_dispatch`.** CLI messages bypass
-  the gateway, so the predictor isn't run and no narrowing happens.
+  the gateway, so neither narrowing nor freeze applies. No telemetry written.
 - **Subagents are not narrowed.** When `delegate_task` spawns a subagent,
   the parent's tool curation is inherited; the predictor doesn't run again.
 - **Cron jobs are not narrowed.** Cron sessions get explicit per-job
   toolsets via Hermes' own `_resolve_cron_enabled_toolsets`.
 - **Unknown plugin tools default to always-on.** Tools whose names aren't
   in the policy's known sets are kept on (safer for shipping new plugins).
-- **Sticky residency is per-process.** A gateway restart clears it. This is
-  intentional — sticky is a session-grain optimization, not a learned policy.
+- **In-memory session state doesn't survive gateway restarts.** Both the
+  cache-on frozen snapshot and cache-off sticky residency live in process
+  memory. A restart between turns will re-freeze (cache-on) or clear
+  sticky carry-over (cache-off). The cross-session detection cache and
+  `learned.json` are on disk; only the per-session memory is volatile.
+- **Codex (gpt-5.4) reasoning trace breaks cache mid-session.** When the
+  model produces reasoning tokens, the resulting message-history mutation
+  busts cache on the next call regardless of what the plugin does.
+  Anthropic-side cache is more deterministic. See
+  [docs/17.codex-reasoning-cache-artifact-2026-05-31.md](docs/17.codex-reasoning-cache-artifact-2026-05-31.md).
 - **`learned_mode: auto`/`audit` is not the default.** Adaptive promotion
-  is deliberately opt-in until the analyzer's recommendations have been
-  reviewed for a given scope. Start with `recommend`.
+  is deliberately opt-in until recommendations have been reviewed for a
+  given scope. Start with `recommend`.
 
 ## Failure modes
 
@@ -633,43 +708,44 @@ rm -rf ~/.hermes/plugins/dynamic-tools
 ```
 ~/.hermes/plugins/dynamic-tools/
 ├── plugin.yaml                      # manifest
-├── __init__.py                      # register(); _build_api_kwargs patch; hooks; sticky residency
-├── predictor.py                     # regex/keyword classifier with dampener support
+├── __init__.py                      # register(); freeze + filter patches; hooks; cache-mode detection
+├── predictor.py                     # regex/keyword classifier (runs on freeze + cache-off dispatches)
 ├── presets.py                       # YAML loader + per-scope resolver
 ├── learned.py                       # learned.json loader + preset merge (mtime-cached)
 ├── expand_tools.py                  # the expand_tools meta-tool
-├── logger_io.py                     # predictions.jsonl + tool_calls.jsonl
+├── logger_io.py                     # predictions.jsonl, tool_calls.jsonl, api_calls.jsonl
 ├── analyze.py                       # deterministic telemetry analyzer
 ├── policy.yaml                      # the single shipped tool policy
-├── CLAUDE.md                        # in-dir editing rules (scope, no back-compat, labs/main)
+├── CLAUDE.md                        # in-dir editing rules
 ├── README.md                        # this file
-├── docs/                            # chronologically ordered (01..N)
-│   ├── 01.review-2026-05-07.md                          # early external code review
-│   ├── 02.strategy-2026-05-12.md                        # north star — promise, release strategy, official-plugin readiness
-│   ├── 03.plan-2026-05-12.md                            # current architecture + status
-│   ├── 04.auto-apply-plan-2026-05-12.md                 # writer-side closure plan; prereqs partially cleared
-│   ├── 05.calibration-plan-2026-05-12.md                # observe → handoff → steady-state flow
-│   ├── 06.trigger-scoring-plan-2026-05-12.md            # historical full-scoring plan (deferred)
-│   ├── 07.dynamic-tools-plan-2026-05-17.md              # original design doc + categorization
+├── docs/                            # chronologically ordered
+│   ├── 02.strategy-2026-05-12.md                        # earlier north-star (forward-pointer to 16)
+│   ├── 03.plan-2026-05-12.md                            # earlier architecture (forward-pointer to 16)
+│   ├── 07.dynamic-tools-plan-2026-05-17.md              # original design + cost-categorization table
 │   ├── 08.dynamic-tools-hermes-surface-2026-05-17.md    # patch-point reference
-│   ├── 09.telemetry-audit-2026-05-17.md                 # first audit pass — 2 bugs fixed, 3 pending data
-│   ├── 10.harvest-followups-2026-05-17.md               # open auto-apply candidates surfaced by harvest
-│   ├── 11.roadmap-2026-05-17.md                         # queued work + open design questions
-│   ├── 12.expand-tools-evolution-2026-05-19.md          # next-step ideas for expand_tools precision
-│   ├── 13.website-copy-feature-bank-2026-05-19.md       # product page copy — feature bank
-│   ├── 14.website-copy-product-page-2026-05-19.md       # product page copy — main
-│   └── 15.cache-aware-pivot-2026-05-28.md               # pivot away from per-turn predictor mutation
+│   ├── 09.telemetry-audit-2026-05-17.md                 # earlier audit; findings #1-#2 still apply
+│   ├── 11.roadmap-2026-05-17.md                         # earlier roadmap (partially superseded)
+│   ├── 12.expand-tools-evolution-2026-05-19.md          # expand_tools granularity (polish)
+│   ├── 13.website-copy-feature-bank-2026-05-19.md       # marketing — PAUSED (needs Phase 5 numbers)
+│   ├── 14.website-copy-product-page-2026-05-19.md       # marketing — PAUSED
+│   ├── 15.cache-aware-pivot-2026-05-28.md               # pivot decision rationale
+│   ├── 16.cache-aware-refactor-plan-2026-05-30.md       # ★ CANONICAL ARCHITECTURE
+│   ├── 17.codex-reasoning-cache-artifact-2026-05-31.md  # Codex cache caveat
+│   └── archive/                                          # pre-pivot designs (kept for archaeology)
 ├── scripts/
-│   ├── bootstrap.py                 # first-install warm-start UX wrapper
-│   ├── harvest-replay.py            # replay sessions/*.jsonl → synthetic telemetry
+│   ├── shape-ceiling.py             # cache-on: between-session shaper (per-tool promote/demote)
+│   ├── cache-freeze-replay.py       # cache-on: freeze efficacy + Phase 5 corrected savings
+│   ├── mnemosyne-prefix-check.py    # cache-on: prefix-stability verification
+│   ├── bootstrap.py                 # mode-aware day-one warm start
+│   ├── harvest-replay.py            # cache-off: replay sessions → synthetic telemetry
 │   ├── smoke-test.py                # end-to-end mechanical validation
 │   ├── daily-analysis.sh            # twice-daily analyzer cron
-│   ├── rotate-telemetry.sh          # archive live JSONL files (gateway-safe)
-│   ├── check_trigger_dampeners.py   # smoke checks for exclude_keywords + learned merge
+│   ├── rotate-telemetry.sh          # archive live JSONLs (gateway-safe)
+│   ├── check_trigger_dampeners.py   # cache-off: trigger dampener regression guard
 │   └── README.md                    # ops scripts inventory + invocation
 ├── tests/
-│   ├── test_session_attribution.py  # 43 unit tests across attribution/expand/harvest/keywords
-│   ├── test_harvest_privacy.py      # privacy invariants for harvest output
+│   ├── test_session_attribution.py
+│   ├── test_harvest_privacy.py
 │   └── run_tests.py
 └── reports/                         # analyzer markdown output (dated)
 ```

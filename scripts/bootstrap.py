@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
-"""First-install warm-start for the dynamic-tools plugin.
+"""Day-one warm start for the dynamic-tools plugin — mode-aware.
 
-The plugin's value proposition is "install, activate, done — saves
-tokens on tool overhead." That promise has a cold-start problem: on
-day one, there's no telemetry, so the analyzer has nothing to
-recommend, and the user sees no immediate value beyond the static
-narrowing.
+The plugin runs in two modes per scope (cache-on default for Anthropic /
+OpenAI auto-cache; cache-off fallback for kimi / gpt-5.4-mini). This script
+runs the right warm-start for each:
 
-This script closes that gap. It runs harvest-replay against the
-user's existing Hermes sessions, then runs the analyzer in
-harvest-aware mode with both suggesters (dampener + trigger-keyword)
-enabled. Output is a single concise summary of the top actions the
-user should consider — meaningful recommendations from day one,
-backed by their own real session history.
+  · Cache-on scopes → ``shape-ceiling.py`` reports per-tool promote /
+    demote candidates from real ``expand_tools`` evidence in live
+    telemetry. Conservative thresholds; nothing surfaces until ≥2
+    sessions of data per scope.
 
-Designed to be invoked once after `hermes plugins install
-dalemugford/dynamic-tools`. Idempotent: re-running just refreshes
-the harvest from current session data without disrupting live
-telemetry collection (harvest lives in a separate `harvest/` subdir).
+  · Cache-off scopes → ``harvest-replay.py`` replays your existing
+    Hermes session JSONLs through the per-turn predictor, then the
+    analyzer mines trigger-keyword candidates and tool promotions.
+    Useful on day one because it leverages history you already have.
+
+Both paths produce a unified ranked **TOP ACTIONS** summary. If neither
+finds anything, that's reported honestly — usually means thin sample
+size, not that the plugin has nothing to do.
+
+Idempotent: re-runs refresh the harvest and re-read live telemetry
+without disrupting either.
 
 Usage:
   python3 scripts/bootstrap.py
-  python3 scripts/bootstrap.py --window-days 60  # restrict harvest window
-  python3 scripts/bootstrap.py --profile sue     # one profile only
-  python3 scripts/bootstrap.py --quiet           # only print top actions
+  python3 scripts/bootstrap.py --profile sue      # one profile only
+  python3 scripts/bootstrap.py --window-days 60   # harvest window
+  python3 scripts/bootstrap.py --skip-harvest     # cache-on path only
+  python3 scripts/bootstrap.py --skip-shape       # cache-off path only
+  python3 scripts/bootstrap.py --quiet            # only print top actions
 """
 from __future__ import annotations
 
@@ -38,18 +43,14 @@ HERE = Path(__file__).resolve().parent
 PLUGIN_DIR = HERE.parent
 
 
-def _run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, check=True, **kwargs)
-
-
-def _discover_harvest_dirs(hermes_home: Path, profile_filter: str | None) -> list[tuple[str, Path]]:
-    """Return ``[(label, state_dir/harvest), ...]`` for every profile
-    that successfully produced harvest output."""
+def _discover_state_dirs(hermes_home: Path, profile_filter: str | None) -> list[tuple[str, Path]]:
+    """Return ``[(label, state_dir), ...]`` for every profile's live state
+    directory. Used by the cache-on path (shape-ceiling reads live
+    telemetry, not harvest)."""
     out: list[tuple[str, Path]] = []
-    root_harvest = hermes_home / "state" / "dynamic-tools" / "harvest"
-    if root_harvest.is_dir() and not profile_filter or profile_filter == "bernard":
-        if (root_harvest / "predictions.jsonl").exists():
-            out.append(("bernard", root_harvest))
+    root_state = hermes_home / "state" / "dynamic-tools"
+    if (not profile_filter or profile_filter == "bernard") and root_state.is_dir():
+        out.append(("bernard", root_state))
     profiles_dir = hermes_home / "profiles"
     if profiles_dir.is_dir():
         for child in sorted(profiles_dir.iterdir()):
@@ -57,16 +58,85 @@ def _discover_harvest_dirs(hermes_home: Path, profile_filter: str | None) -> lis
                 continue
             if profile_filter and child.name != profile_filter:
                 continue
-            p_harvest = child / "state" / "dynamic-tools" / "harvest"
-            if p_harvest.is_dir() and (p_harvest / "predictions.jsonl").exists():
-                out.append((child.name, p_harvest))
+            p_state = child / "state" / "dynamic-tools"
+            if p_state.is_dir():
+                out.append((child.name, p_state))
     return out
 
 
-def _top_actions(harvest_dirs: list[tuple[str, Path]], python: str) -> list[dict]:
-    """Run analyzer in JSON mode against each harvest dir; collect the
-    most actionable items across all scopes, ranked by impact."""
-    all_recs: list[dict] = []
+def _discover_harvest_dirs(hermes_home: Path, profile_filter: str | None) -> list[tuple[str, Path]]:
+    """Return ``[(label, harvest_dir), ...]`` for every profile that produced
+    harvest output (used by the cache-off path)."""
+    out: list[tuple[str, Path]] = []
+    for label, state_dir in _discover_state_dirs(hermes_home, profile_filter):
+        harvest = state_dir / "harvest"
+        if harvest.is_dir() and (harvest / "predictions.jsonl").exists():
+            out.append((label, harvest))
+    return out
+
+
+def _shape_ceiling_actions(state_dirs: list[tuple[str, Path]], python: str) -> list[dict]:
+    """Run shape-ceiling.py --dry-run against each profile's live state.
+    Surfaces cache-on promote/demote candidates."""
+    actions: list[dict] = []
+    for label, sdir in state_dirs:
+        try:
+            result = subprocess.run(
+                [python, str(PLUGIN_DIR / "scripts" / "shape-ceiling.py"),
+                 "--state-dir", str(sdir),
+                 "--dry-run"],
+                capture_output=True, text=True, check=False, env={**os.environ, "HERMES_HOME": str(sdir.parent.parent)},
+            )
+            # Re-parse: shape-ceiling.py emits human-readable text, but we
+            # can re-invoke its inner machinery via JSON-mode if available.
+            # For now: parse the stdout structure. Format we emit:
+            #   === scope:platform  (sessions_considered=N) ===
+            #     Promote: ...
+            #     Demote: ...
+            current_scope = ""
+            in_promote = False
+            in_demote = False
+            for line in result.stdout.splitlines():
+                line = line.rstrip()
+                if line.startswith("=== "):
+                    current_scope = line.lstrip("= ").split(" (")[0].strip()
+                    in_promote = in_demote = False
+                elif line.lstrip().startswith("Promote:"):
+                    in_promote = True
+                    in_demote = False
+                elif line.lstrip().startswith("Demote:"):
+                    in_demote = True
+                    in_promote = False
+                elif (in_promote or in_demote) and line.lstrip().startswith("+ "):
+                    # Promote row: "    + tool_name      sessions=N  calls=M  evidence=..."
+                    parts = line.lstrip("+ ").split()
+                    if parts:
+                        actions.append({
+                            "kind": "shape_promote" if in_promote else "shape_demote",
+                            "label": label,
+                            "scope": current_scope,
+                            "tool": parts[0],
+                            "raw": line.strip(),
+                        })
+                elif (in_promote or in_demote) and line.lstrip().startswith("- "):
+                    parts = line.lstrip("- ").split()
+                    if parts:
+                        actions.append({
+                            "kind": "shape_demote",
+                            "label": label,
+                            "scope": current_scope,
+                            "tool": parts[0],
+                            "raw": line.strip(),
+                        })
+        except Exception as exc:
+            print(f"  warning: shape-ceiling failed on {label}: {exc}", file=sys.stderr)
+    return actions
+
+
+def _harvest_actions(harvest_dirs: list[tuple[str, Path]], python: str) -> list[dict]:
+    """Run analyzer in JSON mode against each harvest dir; collect tool-
+    promotion + trigger-keyword candidates ranked by impact."""
+    actions: list[dict] = []
     for label, hdir in harvest_dirs:
         try:
             result = subprocess.run(
@@ -85,8 +155,8 @@ def _top_actions(harvest_dirs: list[tuple[str, Path]], python: str) -> list[dict
                 if rec.get("kind") == "harvest_tool_promotion" and rec.get("action") in (
                     "promote_always_on", "broaden_trigger_recall"
                 ):
-                    all_recs.append({
-                        "kind": "promotion",
+                    actions.append({
+                        "kind": "harvest_promotion",
                         "label": label,
                         "scope": rec["scope"],
                         "action": rec["action"],
@@ -98,8 +168,8 @@ def _top_actions(harvest_dirs: list[tuple[str, Path]], python: str) -> list[dict
                 if not row.get("candidates"):
                     continue
                 top = row["candidates"][0]
-                all_recs.append({
-                    "kind": "keyword",
+                actions.append({
+                    "kind": "harvest_keyword",
                     "label": label,
                     "scope": row["scope"],
                     "tool": row["tool"],
@@ -115,14 +185,18 @@ def _top_actions(harvest_dirs: list[tuple[str, Path]], python: str) -> list[dict
         except json.JSONDecodeError as exc:
             print(f"  warning: analyzer output not parseable for {label}: {exc}",
                   file=sys.stderr)
-    return all_recs
+    return actions
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profile", help="restrict to one profile")
     parser.add_argument("--window-days", type=int, default=None,
-        help="only process sessions modified within the last N days")
+        help="harvest window for cache-off path (sessions modified within last N days)")
+    parser.add_argument("--skip-shape", action="store_true",
+        help="skip the cache-on shape-ceiling path")
+    parser.add_argument("--skip-harvest", action="store_true",
+        help="skip the cache-off harvest path")
     parser.add_argument("--quiet", action="store_true",
         help="only print top actions, suppress per-phase status output")
     parser.add_argument("--hermes-home", type=Path,
@@ -139,74 +213,92 @@ def main() -> int:
             print(msg)
 
     info("=" * 64)
-    info("  dynamic-tools bootstrap — first-install warm start")
+    info("  dynamic-tools bootstrap — mode-aware warm start")
     info("=" * 64)
 
-    # Phase 1: harvest
-    harvest_cmd = [args.python, str(PLUGIN_DIR / "scripts" / "harvest-replay.py")]
-    if args.profile:
-        harvest_cmd += ["--profile", args.profile]
-    if args.window_days is not None:
-        harvest_cmd += ["--window-days", str(args.window_days)]
-    if args.hermes_home:
-        harvest_cmd += ["--hermes-home", str(args.hermes_home)]
-    info("\n[1/2] Replaying session history into synthetic telemetry...")
-    try:
-        result = subprocess.run(harvest_cmd, capture_output=args.quiet,
-                                text=True, check=True)
-    except subprocess.CalledProcessError as exc:
-        print(f"\nerror: harvest-replay failed (rc={exc.returncode})", file=sys.stderr)
-        if exc.stderr:
-            print(exc.stderr[-500:], file=sys.stderr)
+    state_dirs = _discover_state_dirs(args.hermes_home, args.profile)
+    if not state_dirs:
+        print("\nNo dynamic-tools state directories found under", args.hermes_home, file=sys.stderr)
         return 1
 
-    # Phase 2: analyze + collect top actions
-    harvest_dirs = _discover_harvest_dirs(args.hermes_home, args.profile)
-    if not harvest_dirs:
-        print("\nNo harvest output found. Likely causes:", file=sys.stderr)
-        print("  - No sessions/*.jsonl files exist for this profile yet.", file=sys.stderr)
-        print("  - --profile filter didn't match any profile directory.", file=sys.stderr)
-        return 1
+    # Cache-on path — shape-ceiling against live telemetry
+    shape_actions: list[dict] = []
+    if not args.skip_shape:
+        info(f"\n[cache-on] Running shape-ceiling across {len(state_dirs)} profile(s)...")
+        shape_actions = _shape_ceiling_actions(state_dirs, args.python)
+        if not shape_actions:
+            info("  No cache-on candidates yet (need ≥2 sessions per scope with expand_tools evidence).")
 
-    info(f"\n[2/2] Analyzing harvest output across {len(harvest_dirs)} profile(s)...")
-    actions = _top_actions(harvest_dirs, args.python)
+    # Cache-off path — harvest + analyzer
+    harvest_actions: list[dict] = []
+    if not args.skip_harvest:
+        info("\n[cache-off] Harvesting session history...")
+        harvest_cmd = [args.python, str(PLUGIN_DIR / "scripts" / "harvest-replay.py")]
+        if args.profile:
+            harvest_cmd += ["--profile", args.profile]
+        if args.window_days is not None:
+            harvest_cmd += ["--window-days", str(args.window_days)]
+        if args.hermes_home:
+            harvest_cmd += ["--hermes-home", str(args.hermes_home)]
+        try:
+            subprocess.run(harvest_cmd, capture_output=args.quiet, text=True, check=True)
+        except subprocess.CalledProcessError as exc:
+            print(f"\n  warning: harvest-replay failed (rc={exc.returncode})", file=sys.stderr)
+            if exc.stderr:
+                print(exc.stderr[-500:], file=sys.stderr)
 
-    # Final summary — the user-facing deliverable
+        harvest_dirs = _discover_harvest_dirs(args.hermes_home, args.profile)
+        if harvest_dirs:
+            info(f"  Analyzing harvest across {len(harvest_dirs)} profile(s)...")
+            harvest_actions = _harvest_actions(harvest_dirs, args.python)
+        else:
+            info("  No harvest output (no sessions/*.jsonl, or window too narrow).")
+
+    # ─── Unified TOP ACTIONS ────────────────────────────────────────────
     print("\n" + "=" * 64)
     print("  TOP ACTIONS")
     print("=" * 64)
-    if not actions:
-        print("\n  No actionable recommendations surfaced. Either:")
-        print("    - Your existing policy already covers everything your usage needs.")
-        print("    - Sample size is too thin for confident recommendations yet.")
-        print("\n  The plugin is now narrowing tool sets per the default policy.")
-        print("  Re-run this script after a week of live use for an updated audit.")
+    if not shape_actions and not harvest_actions:
+        print("\n  No actionable recommendations surfaced today. Reasons:")
+        print("    · cache-on scopes need ≥2 sessions of real expand_tools evidence")
+        print("    · cache-off scopes need sessions/*.jsonl content to harvest")
+        print("    · or your current policy already covers your usage")
+        print("\n  Re-run after a few days of organic use for a fuller picture.")
         return 0
 
-    # Rank: promotions first (sorted by net), then keyword suggestions
-    promotions = sorted([a for a in actions if a["kind"] == "promotion"],
-                        key=lambda a: -a.get("net", 0))
-    keywords = sorted([a for a in actions if a["kind"] == "keyword"],
-                      key=lambda a: -a["cuts"])
+    # Shape-ceiling output (cache-on, organic) first — it's stronger signal
+    shape_promotes = [a for a in shape_actions if a["kind"] == "shape_promote"]
+    shape_demotes = [a for a in shape_actions if a["kind"] == "shape_demote"]
+    if shape_promotes:
+        print("\n  [cache-on] Promote into the frozen ceiling (from real expand_tools evidence):")
+        for i, a in enumerate(shape_promotes, 1):
+            print(f"    {i}. {a['scope']:<22} + {a['tool']}    ({a['raw'].split(a['tool'], 1)[-1].strip()})")
+    if shape_demotes:
+        print("\n  [cache-on] Demote from always-on (unused across recent sessions):")
+        for i, a in enumerate(shape_demotes, 1):
+            print(f"    {i}. {a['scope']:<22} − {a['tool']}    ({a['raw'].split(a['tool'], 1)[-1].strip()})")
 
-    if promotions:
-        print("\n  Tool promotions (edit policy.yaml or channels.<scope>.always_on_extra):")
-        for i, p in enumerate(promotions, 1):
-            tag = "PROMOTE  " if p["action"] == "promote_always_on" else "BROADEN  "
+    # Harvest output (cache-off, historical) second
+    harvest_promotions = sorted([a for a in harvest_actions if a["kind"] == "harvest_promotion"],
+                                key=lambda a: -a.get("net", 0))
+    harvest_keywords = sorted([a for a in harvest_actions if a["kind"] == "harvest_keyword"],
+                              key=lambda a: -a["cuts"])
+    if harvest_promotions:
+        print("\n  [cache-off / harvest] Tool promotions (edit policy.yaml or channels.<scope>.always_on_extra):")
+        for i, p in enumerate(harvest_promotions, 1):
+            tag = "PROMOTE" if p["action"] == "promote_always_on" else "BROADEN"
             print(f"    {i}. [{tag}] {p['scope']:<22} {p['item']:<20} "
                   f"cuts={p['cuts']:>4}  net={p['net']:+,} tok")
-
-    if keywords:
-        print("\n  Trigger keyword candidates (add to the named trigger's `keywords` list):")
-        for i, k in enumerate(keywords[:10], 1):
+    if harvest_keywords:
+        print("\n  [cache-off / harvest] Trigger keyword candidates (add to the named trigger's `keywords`):")
+        for i, k in enumerate(harvest_keywords[:10], 1):
             print(f"    {i}. {k['scope']:<22} {k['target_trigger']:<14} ← \"{k['pattern']}\"")
             print(f"       (cuts {k['cuts']}, precision {k['precision']:.2f} — "
                   f"would have fired for {k['tool']})")
 
-    print("\n  Full details:")
-    for label, hdir in harvest_dirs:
-        print(f"    {label}: {hdir}/")
-    print("    (run `analyze.py --state-dir <harvest-dir>` for the full markdown report)")
+    print()
+    print("  To activate cache-on recommendations: set `learned_mode: auto` for the scope in config.yaml,")
+    print("  then re-run `shape-ceiling.py` (without --dry-run) to write learned.json.")
     print()
     return 0
 
