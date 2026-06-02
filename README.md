@@ -4,54 +4,90 @@
 
 A plugin for [Hermes Agent](https://hermes-agent.nousresearch.com).
 
-The principle is the same regardless of provider; what changes is
-*when* the plugin makes the adjustment. On providers with prefix
-caching (Anthropic, OpenAI auto-cache), tools are shaped per
-**session** so the cached prefix stays intact. On providers without
-provider-side caching (kimi, gpt-5.4-mini), tools are shaped per
-**turn**. Same goal, different cadence — picked automatically.
-
 ## Why
 
-Every message ships tool definitions to the model. For a heavy profile
-— web, terminal, file, browser, MCP servers, custom skills — that's
+Every message ships tool definitions to the model. For a heavy profile —
+web, terminal, file, browser, MCP servers, custom skills — that's
 8–15k tokens of overhead on a message whose answer is `"yes."` Your
 `"hi"` costs the same as `"deploy the build script"` in tool overhead.
 
-But the *naive fix* — re-narrow the tool list every turn — fights
-provider prefix-caching. Modern providers cache the system prompt +
-tools block + history prefix; changing the tool block between turns
-busts that cache and re-bills the conversation history at the full
-input rate. On a multi-turn session, the lost cache costs more than
-the schema savings.
+The naive fix — re-narrow the tool list every turn — fights provider
+prefix-caching: changing the tool block between turns busts the cache
+and re-bills the conversation history at full input rate. On a
+multi-turn session, lost cache costs more than schema savings.
 
-`tool-belt` resolves the tension: under cache-on providers it picks
-a tool set once per session and holds it stable, learning from actual
-`expand_tools` events to shape the *next* session's starting ceiling.
-Under cache-off providers it falls back to the original per-turn
-narrowing.
+Tool Belt resolves the tension. Three features, working together.
 
-## See it
+## 1. `expand_tools` — the safety valve that learns
 
-**Cache-on session (Anthropic, OpenAI auto-cache):**
+A meta-tool the model calls when it needs something that wasn't loaded.
+Narrowing never strands the agent: it asks, gets it, the conversation
+continues. Every call is logged as evidence the tool was wanted —
+between sessions, the shaper folds repeatedly-reached-for tools into
+the next session's ceiling.
+
+**The model's reach IS the promotion vote.** Your loadout grows toward
+what you actually use, with no hand-tuning required.
+
+```text
+User: "search the docs for X and read me the relevant section"
+  loadout:     14 tools (file, web, search)
+  model calls: expand_tools(category="browser")
+  result:      12 browser tools join the loadout
+  → next session, browser is pre-loaded (shaper promoted it)
+```
+
+## 2. Deterministic shaping — rules over routing
+
+The narrowing decision is a regex match on the message, an attachment
+check, and a YAML lookup — **no LLM-as-router.** No extra API call,
+no non-deterministic mis-route. Every decision is auditable in
+`predictions.jsonl`.
+
+Hand-tune triggers in `policy.yaml`, layer per-scope overrides in
+`config.yaml`, and the telemetry feeds the analyzer back recommendations
+— all the same shape. The YAML is the truth.
+
+```yaml
+# policy.yaml
+always_on:
+  - read_file
+  - send_message
+  - expand_tools
+triggers:
+  - name: shell
+    tools: [terminal]
+    keywords: ['\b(run|install|execute|deploy)\b']
+    exclude_keywords: ['\b(should we|might|maybe)\b']
+  - name: vision
+    tools: [vision_analyze]
+    has_attachment: image
+```
+
+## 3. Cache-aware adaptation — one goal, two cadences
+
+Same predictor, same policy, same `expand_tools`. What changes is
+**when** the narrowing happens.
+
+**Cache-on session** (Anthropic, OpenAI auto-cache):
 
 ```text
 User: "morning, what's on the agenda?"
   ceiling:    37 tools (~3,500 tok)
-  frozen:     14 tools (~1,500 tok)   ← session frozen — predictor ran once
+  frozen:     14 tools (~1,500 tok)   ← session-frozen — predictor ran once
   cache:      cold on turn 1
 
 User: "summarize the inbox briefly"
   frozen:     14 tools                ← reused verbatim
-  cache:      hot — ~95% prefix cache hit, only the new user message billed fresh
+  cache:      hot — ~95% prefix cache hit, only the new message billed fresh
 
-User: "open https://example.com in a browser and tell me the title"
+User: "open https://example.com and tell me the title"
   model calls: expand_tools(category="browser")
   frozen:     14 + 12 browser tools   ← expanded, persists for rest of session
   cache:      one break this turn; subsequent turns reuse expanded set
 ```
 
-**Cache-off session (kimi, gpt-5.4-mini):**
+**Cache-off session** (kimi, gpt-5.4-mini):
 
 ```text
 User: "run the build script and check the logs"
@@ -60,11 +96,27 @@ User: "run the build script and check the logs"
   saved:      ~1,800 tok / message    (terminal+process loaded; browser cut)
 ```
 
+Mode is **auto-detected per scope** from observed `cache_read` tokens
+and locked. Anthropic / OpenAI auto-cache → cache-on by default.
+Kimi / gpt-5.4-mini → cache-off. You set nothing.
+
+| Shared in both modes | Cache-ON | Cache-OFF |
+|---|---|---|
+| Policy + always_on + triggers | Freeze at session start | Re-narrow each turn |
+| `expand_tools` safety valve | Persists for the session | Sticky for N turns |
+| Telemetry + savings math | (predictor skipped on reuse) | Lookback to prior message active |
+| Bypass cohort (A/B baseline) | ✓ | ✓ |
+| Strict `platform_toolsets` ceiling | ✓ | ✓ |
+| Honest tokenizer (tiktoken when available) | ✓ | ✓ |
+
+The headline: the same plugin saves tokens regardless of provider — and
+picks the right cadence on its own.
+
 ## Three things that make this safe to install
 
-- **Fails invisibly.** Any error — bad YAML, predictor exception, missing lookup — falls through to "no narrowing." The plugin can save you tokens; it can never break your agent.
+- **Fails invisibly.** Any error — bad YAML, predictor exception, missing lookup — falls through to "no narrowing." Tool Belt can save you tokens; it can never break your agent.
 - **Strict ceiling.** Can only *narrow* what your `platform_toolsets` config already allowed. Never adds a tool you didn't sanction.
-- **Learning signal is real usage, not guessing.** Every time the model calls `expand_tools` because it wanted a tool that wasn't in the loaded set, that's evidence the plugin can act on. Between sessions, the shaper folds repeatedly-reached-for tools into the next session's frozen ceiling. Per-tool, learned from observation, applied at a free moment.
+- **Honest telemetry.** Every prediction logged with the savings math. Token counts via `tiktoken-cl100k` when installed, `chars/4` heuristic otherwise — every row records which estimator was used. Provider-billed tokens recorded directly from API responses. Anyone can verify your savings claims from the raw JSONL. See [docs/SAVINGS.md](docs/SAVINGS.md) for the methodology.
 
 ## Install
 
