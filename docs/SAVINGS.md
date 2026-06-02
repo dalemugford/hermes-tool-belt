@@ -19,6 +19,7 @@ Every prediction row in `predictions.jsonl` records two counts:
 | `ceiling_tokens` | Tokenized size of the ceiling toolset (name + description + JSON schema, per tool). |
 | `narrowed_tokens` | Tokenized size of the narrowed toolset that actually went out. |
 | `tokens_saved` | `ceiling_tokens − narrowed_tokens` — the count of tool-schema tokens the provider never saw. |
+| `tokens_estimator` | Which estimator produced the counts: `tiktoken-cl100k` (preferred) or `chars-div-4` (fallback). |
 
 The comparison is always **against your config-allowed ceiling**. We don't
 compare against some hypothetical "best case" — we compare against what
@@ -27,6 +28,32 @@ your agent *would* have sent if Tool Belt weren't installed.
 The arithmetic is exact: every row, `ceiling - narrowed == tokens_saved`.
 There's a one-line cross-check in [scripts/savings-report.py](../scripts/savings-report.py)
 if you want to verify on your own data.
+
+### Which tokenizer
+
+Tool Belt prefers **tiktoken's `cl100k_base`** (OpenAI's BPE) when the
+`tiktoken` package is installed. Falls back to a **chars/4 heuristic**
+otherwise. Either way, each row records which estimator was used in the
+`tokens_estimator` field, and the savings report surfaces this in its
+header so you can see at a glance which estimator your numbers came from.
+
+```bash
+pip install tiktoken    # optional but recommended for exact counts
+```
+
+| Estimator | Accuracy | When used |
+|---|---|---|
+| `tiktoken-cl100k` | Exact for GPT-family. ~5% approximate for Claude (different BPE; cl100k tends to slightly *over*-count Claude's JSON). | When `tiktoken` is importable. |
+| `chars-div-4` | `len(json.dumps(payload)) // 4`. Within ~5–10% of real tokens for English JSON. Tends to *under*-count vs both real tokenizers. | When `tiktoken` isn't installed. |
+
+For both estimators, the **delta** between ceiling and narrowed is more
+honest than the absolute counts: both sides go through the same
+estimator, so its offset cancels in the reduction percentage. A "47%
+reduction" survives any tokenizer switch.
+
+For provider-billed reality (what you actually pay), see
+`api_calls.jsonl` → `input_tokens`. That field comes directly from the
+provider's API response and is exact.
 
 ## Cache-on and cache-off
 

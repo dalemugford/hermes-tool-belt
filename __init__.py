@@ -888,6 +888,7 @@ def _maybe_log_prediction(
             narrowed_count=len(narrowed),
             ceiling_tokens=logger_io.estimate_tokens(ceiling),
             narrowed_tokens=logger_io.estimate_tokens(narrowed),
+            tokens_estimator=logger_io.token_estimator_name(),
             ceiling_tools=list(state.get("ceiling_tools") or _tool_names(ceiling)),
             allowed_tools=list(state.get("initial_allowed_tools") or _tool_names(narrowed)),
             cut_tools=list(state.get("cut_tools") or []),

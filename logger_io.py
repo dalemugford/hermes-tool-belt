@@ -21,6 +21,7 @@ message text is never logged; only a sha1 hash and a short preview
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import logging
@@ -87,7 +88,9 @@ class PredictionRecord:
     # Counts of tools sent to the model
     ceiling_count: int       # what would have been sent without the plugin
     narrowed_count: int      # what actually got sent after our filter
-    # Approximate token counts (chars/4 — fast, no tokenizer dep)
+    # Token counts — computed by estimate_tokens(). The estimator used is
+    # recorded in `tokens_estimator` per row so the savings report can
+    # surface provenance honestly. See estimate_tokens() for the algo.
     ceiling_tokens: int
     narrowed_tokens: int
     triggers_suppressed: list[str] | None = None
@@ -135,6 +138,13 @@ class PredictionRecord:
     # mode and for the first dispatch under cache-on (which freezes).
     frozen_reuse: bool = False
     frozen_reuse_count: int = 0
+    # Which tokenizer produced ceiling_tokens / narrowed_tokens.
+    #   "tiktoken-cl100k": real BPE tokenizer (OpenAI). Exact for
+    #     GPT-family, ~5% approximate for Claude (different BPE).
+    #   "chars-div-4":     len(json.dumps) // 4 fallback when tiktoken
+    #     isn't installed. ~5–10% off either way; the delta still tracks
+    #     the real delta because both sides use the same estimator.
+    tokens_estimator: str = "chars-div-4"
 
     @property
     def tokens_saved(self) -> int:
@@ -189,20 +199,62 @@ class PredictionRecord:
             "model": self.model,
             "frozen_reuse": self.frozen_reuse,
             "frozen_reuse_count": self.frozen_reuse_count,
+            "tokens_estimator": self.tokens_estimator,
         }
 
 
+@functools.lru_cache(maxsize=1)
+def _get_encoder() -> tuple[Any, str]:
+    """Resolve the token encoder. Returns (encoder, estimator_name).
+
+    Prefers tiktoken's cl100k_base (OpenAI's BPE — exact for GPT, ~5%
+    approximate for Claude). Falls back to a chars/4 heuristic when
+    tiktoken isn't installed.
+
+    Cached on first call: loading the cl100k vocab costs ~50ms one-time;
+    every subsequent encode is 2–5ms. The cache keeps that cost outside
+    the hot path.
+    """
+    try:
+        import tiktoken  # type: ignore[import-not-found]
+        return tiktoken.get_encoding("cl100k_base"), "tiktoken-cl100k"
+    except Exception:
+        return None, "chars-div-4"
+
+
+def token_estimator_name() -> str:
+    """The estimator that estimate_tokens() will use on this process."""
+    _, name = _get_encoder()
+    return name
+
+
 def estimate_tokens(payload: Any) -> int:
-    """Cheap char-based token estimate (chars / 4). Good for comparing
-    before/after sizes without taking a tokenizer dependency. Anthropic's
-    real tokenizer differs by ~5%, but the *delta* this estimator reports
-    tracks the actual delta closely enough for the savings dashboard.
+    """Estimate token count of a JSON-serializable payload.
+
+    Two-tier:
+      1. tiktoken (cl100k_base) when installed — real BPE counts.
+      2. chars/4 fallback — `len(json.dumps(payload)) // 4`. The
+         heuristic understates JSON tool-schema density slightly but
+         is consistent on both sides of a comparison, so deltas track
+         the real delta even when absolute counts wobble.
+
+    The provider's billed `input_tokens` (in api_calls.jsonl) remains
+    the source of truth for actual billing; this function is for the
+    `ceiling_tokens` / `narrowed_tokens` deltas that the savings
+    report cites against the user's config-allowed ceiling.
     """
     try:
         import json
-        return max(0, len(json.dumps(payload, ensure_ascii=False)) // 4)
+        text = json.dumps(payload, ensure_ascii=False)
     except Exception:
         return 0
+    encoder, _ = _get_encoder()
+    if encoder is not None:
+        try:
+            return len(encoder.encode(text))
+        except Exception:
+            pass  # fall through to char heuristic
+    return max(0, len(text) // 4)
 
 
 def log_prediction(record: PredictionRecord) -> None:

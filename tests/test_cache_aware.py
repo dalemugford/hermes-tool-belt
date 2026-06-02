@@ -19,6 +19,7 @@ that have already been fixed once:
 """
 from __future__ import annotations
 
+import importlib
 import os
 import sys
 import tempfile
@@ -522,6 +523,69 @@ class SlashCommandBypassTests(unittest.TestCase):
         self.assertIsNotNone(frozen, "real message should build a fresh freeze")
         self.assertEqual(frozen["reuses"], 0,
                          "fresh freeze should have reuses=0 (not a reuse of a stale snapshot)")
+
+
+class TokenEstimatorTests(unittest.TestCase):
+    """Verify estimate_tokens uses tiktoken when available, chars/4 when not.
+
+    The soft-dep pattern: tiktoken IS imported lazily inside _get_encoder,
+    cached via functools.lru_cache. The estimator name is exposed via
+    token_estimator_name() so per-row provenance is honest.
+    """
+
+    def setUp(self):
+        # Import logger_io fresh and clear the encoder cache so each test
+        # exercises whichever environment we set up here.
+        self.logger_io = importlib.import_module("tool_belt_plugin.logger_io")
+        self.logger_io._get_encoder.cache_clear()
+
+    def tearDown(self):
+        # Restore the natural state of the cache (re-detect on next call).
+        self.logger_io._get_encoder.cache_clear()
+
+    def test_chars_div_4_fallback_when_tiktoken_missing(self):
+        """When tiktoken can't be imported, fall back to chars/4 and stamp
+        the row with the fallback name."""
+        original_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __import__
+
+        def block_tiktoken(name, *args, **kwargs):
+            if name == "tiktoken":
+                raise ImportError("tiktoken not installed (simulated)")
+            return original_import(name, *args, **kwargs)
+
+        with mock.patch("builtins.__import__", side_effect=block_tiktoken):
+            self.assertEqual(self.logger_io.token_estimator_name(), "chars-div-4")
+            # Sample payload: 16 chars of JSON → 4 tokens
+            self.assertEqual(self.logger_io.estimate_tokens(["abcdef"]), len('["abcdef"]') // 4)
+
+    def test_tiktoken_path_when_available(self):
+        """When tiktoken IS importable, prefer it and stamp the row."""
+        try:
+            import tiktoken  # noqa: F401
+        except ImportError:
+            self.skipTest("tiktoken not installed in this environment")
+
+        self.assertEqual(self.logger_io.token_estimator_name(), "tiktoken-cl100k")
+        # Sanity: a non-trivial payload returns a positive count, and that
+        # count is plausibly different from the chars/4 heuristic.
+        payload = [{"name": "read_file",
+                    "description": "Read a file from disk.",
+                    "parameters": {"type": "object",
+                                   "properties": {"path": {"type": "string"}},
+                                   "required": ["path"]}}]
+        n = self.logger_io.estimate_tokens(payload)
+        self.assertGreater(n, 0)
+
+    def test_encoder_cached_across_calls(self):
+        """The encoder load is one-time per process (lru_cache)."""
+        name1 = self.logger_io.token_estimator_name()
+        name2 = self.logger_io.token_estimator_name()
+        self.assertEqual(name1, name2)
+        # Calling _get_encoder directly should also hit the cache:
+        info_before = self.logger_io._get_encoder.cache_info()
+        self.logger_io._get_encoder()
+        info_after = self.logger_io._get_encoder.cache_info()
+        self.assertEqual(info_after.hits, info_before.hits + 1)
 
 
 if __name__ == "__main__":

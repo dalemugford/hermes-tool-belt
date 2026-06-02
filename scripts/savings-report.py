@@ -215,7 +215,8 @@ def cohort_stats(predictions: list[dict[str, Any]],
 def print_text_report(scope: str, on_stats: dict[str, Any], off_stats: dict[str, Any],
                       pending_stats: dict[str, Any],
                       tool_source_counts: dict[str, int], n_expand_events: int,
-                      locked_mode: str, locked_reason: str) -> None:
+                      locked_mode: str, locked_reason: str,
+                      estimator_breakdown: dict[str, int]) -> None:
     width = 70
     line = "─" * width
 
@@ -227,6 +228,16 @@ def print_text_report(scope: str, on_stats: dict[str, Any], off_stats: dict[str,
     if locked_mode:
         reason = f" ({locked_reason})" if locked_reason else ""
         print(f"  Cache-mode lock: {locked_mode.upper()}{reason}")
+    if estimator_breakdown:
+        total = sum(estimator_breakdown.values())
+        primary = max(estimator_breakdown, key=estimator_breakdown.get)
+        primary_pct = (estimator_breakdown[primary] / total * 100) if total else 0
+        est_label = {
+            "tiktoken-cl100k": "tiktoken-cl100k (BPE — exact for GPT-family, ~5% off Claude)",
+            "chars-div-4": "chars/4 (heuristic — install tiktoken for exact counts)",
+        }.get(primary, primary)
+        print(f"  Token estimator: {est_label}  ({primary_pct:.0f}% of rows)")
+        print(f"  (For provider-billed truth see api_calls.jsonl:input_tokens)")
     print()
 
     # CACHE-ON cohort
@@ -357,6 +368,13 @@ def main() -> int:
         locked_mode = str(locked.get("mode") or "")
         locked_reason = str(locked.get("lock_reason") or "")
 
+        # Per-row token estimator provenance. Rows written before this
+        # field existed default to "chars-div-4" so historical data stays
+        # interpretable.
+        est_counts: dict[str, int] = defaultdict(int)
+        for p in preds:
+            est_counts[str(p.get("tokens_estimator") or "chars-div-4")] += 1
+
         if args.json:
             json_report["scopes"][scope] = {
                 "cache_on": on_stats,
@@ -366,10 +384,11 @@ def main() -> int:
                 "expand_tools_events": n_expand,
                 "locked_mode": locked_mode,
                 "locked_reason": locked_reason,
+                "token_estimators": dict(est_counts),
             }
         else:
             print_text_report(scope, on_stats, off_stats, pending_stats, tc_counts,
-                              n_expand, locked_mode, locked_reason)
+                              n_expand, locked_mode, locked_reason, dict(est_counts))
 
     if args.json:
         print(json.dumps(json_report, indent=2, sort_keys=True))

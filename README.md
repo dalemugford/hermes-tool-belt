@@ -84,6 +84,21 @@ Restart the gateway. From the next message onward, the plugin starts
 adapting tool payloads based on detected intent. Cache-aware mode is
 chosen automatically per scope.
 
+### Optional: real-tokenizer counts
+
+For exact token counts in the savings report instead of the chars/4
+heuristic:
+
+```bash
+pip install tiktoken
+```
+
+Auto-detected on next gateway restart; every row in `predictions.jsonl`
+records which estimator was used (`tokens_estimator` field). The savings
+delta is honest either way — both sides use the same estimator — but
+absolute counts are more accurate with `tiktoken`. See
+[docs/SAVINGS.md](docs/SAVINGS.md#which-tokenizer) for the full story.
+
 ### Day-one warm start (if you already use Hermes)
 
 ```bash
