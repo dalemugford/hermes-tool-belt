@@ -148,14 +148,21 @@ def count_tool_call_sources(tool_calls: list[dict[str, Any]]) -> dict[str, int]:
 
 def classify_prediction_mode(p: dict[str, Any],
                              api_last: dict[str, dict[str, Any]]) -> str:
-    """Classify one prediction as cache-on, cache-off, or pending.
+    """Classify one prediction as bypass, cache-on, cache-off, or pending.
 
     Precedence:
-      1. The last api_call's cache_mode (most-evolved detection state).
-      2. If api_calls didn't record a cache_mode AND frozen_reuse is
+      1. Bypass cohort (A/B baseline) takes precedence — these sessions
+         deliberately ship the full toolset and aren't subject to
+         narrowing. Including them in the cache-on/off savings figures
+         would drag the average down with rows that NEVER narrowed by
+         design. See SAVINGS.md for the A/B mechanic.
+      2. The last api_call's cache_mode (most-evolved detection state).
+      3. If api_calls didn't record a cache_mode AND frozen_reuse is
          true, treat as "on" (a reuse implies the freeze exists, which
          only happens under cache-on).
     """
+    if str(p.get("policy_source") or "") == "bypass":
+        return "bypass"
     pid = str(p.get("prediction_id") or "")
     last = api_last.get(pid, {})
     mode = str(last.get("cache_mode") or "")
@@ -213,7 +220,7 @@ def cohort_stats(predictions: list[dict[str, Any]],
 
 
 def print_text_report(scope: str, on_stats: dict[str, Any], off_stats: dict[str, Any],
-                      pending_stats: dict[str, Any],
+                      pending_stats: dict[str, Any], bypass_stats: dict[str, Any],
                       tool_source_counts: dict[str, int], n_expand_events: int,
                       locked_mode: str, locked_reason: str,
                       estimator_breakdown: dict[str, int]) -> None:
@@ -285,6 +292,24 @@ def print_text_report(scope: str, on_stats: dict[str, Any], off_stats: dict[str,
         print(f"  │     ({pending_stats['n_predictions']} predictions across {pending_stats['n_sessions']} session(s))".ljust(width + 3) + "│")
         print(f"  │{' ' * width}│")
         print(f"  │  Tokens saved:    {pending_stats['saved_tokens_total']:>5,}  total  (will be re-classified once locked)".ljust(width + 3) + "│")
+        print(f"  └{line}┘")
+        print()
+
+    # Bypass cohort (A/B baseline — narrowing intentionally off)
+    if bypass_stats.get("n_predictions"):
+        n_pred = bypass_stats["n_predictions"]
+        n_sess = bypass_stats["n_sessions"]
+        ceiling_avg = bypass_stats["ceiling_count_avg"]
+        ceiling_total = bypass_stats["ceiling_tokens_total"]
+        print(f"  ┌{line}┐")
+        print(f"  │  BYPASS COHORT (A/B baseline — narrowing intentionally off)".ljust(width + 3) + "│")
+        print(f"  │     ({n_pred} prediction(s) across {n_sess} session(s))".ljust(width + 3) + "│")
+        print(f"  │{' ' * width}│")
+        print(f"  │  Full toolset shipped:  {ceiling_avg:>5.1f} tools per turn".ljust(width + 3) + "│")
+        print(f"  │  Tokens shipped:        {ceiling_total:>6,}  total".ljust(width + 3) + "│")
+        print(f"  │{' ' * width}│")
+        print(f"  │  Excluded from savings figures above — these sessions are".ljust(width + 3) + "│")
+        print(f"  │  the deterministic A/B control (see bypass_rate in config).".ljust(width + 3) + "│")
         print(f"  └{line}┘")
         print()
 
@@ -362,6 +387,7 @@ def main() -> int:
         on_stats = cohort_stats(preds, api_last, api_calls, mode_filter="on")
         off_stats = cohort_stats(preds, api_last, api_calls, mode_filter="off")
         pending_stats = cohort_stats(preds, api_last, api_calls, mode_filter="pending")
+        bypass_stats = cohort_stats(preds, api_last, api_calls, mode_filter="bypass")
         tc_counts = count_tool_call_sources(tc_by_scope.get(scope, []))
         n_expand = expand_by_scope.get(scope, 0)
         locked = detection_cache.get(scope, {}) if isinstance(detection_cache, dict) else {}
@@ -380,6 +406,7 @@ def main() -> int:
                 "cache_on": on_stats,
                 "cache_off": off_stats,
                 "pending": pending_stats,
+                "bypass": bypass_stats,
                 "tool_call_source_counts": tc_counts,
                 "expand_tools_events": n_expand,
                 "locked_mode": locked_mode,
@@ -387,8 +414,9 @@ def main() -> int:
                 "token_estimators": dict(est_counts),
             }
         else:
-            print_text_report(scope, on_stats, off_stats, pending_stats, tc_counts,
-                              n_expand, locked_mode, locked_reason, dict(est_counts))
+            print_text_report(scope, on_stats, off_stats, pending_stats, bypass_stats,
+                              tc_counts, n_expand, locked_mode, locked_reason,
+                              dict(est_counts))
 
     if args.json:
         print(json.dumps(json_report, indent=2, sort_keys=True))

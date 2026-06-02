@@ -106,6 +106,30 @@ sessions skip the observation window. See
 [ARCHITECTURE.md](ARCHITECTURE.md#mode-detection) for the full state
 machine.
 
+## The A/B baseline cohort
+
+When `bypass_rate > 0` is set (globally or per-scope in `config.yaml`),
+a deterministic fraction of sessions ship the **full toolset** with no
+narrowing. The hash `sha1(scope|session_id)` decides — same session is
+always in or out of the cohort so behavior stays internally consistent.
+
+Bypass rows are written to `predictions.jsonl` with `policy_source:
+"bypass"` and `ceiling_count == narrowed_count` (nothing was narrowed
+by design). They serve as a real control group:
+
+- **They are excluded from the cache-on and cache-off savings figures.**
+  Including them would tank the average with rows that intentionally
+  didn't narrow. The headline numbers reflect only the rows where
+  narrowing actually applied.
+- **They appear as their own cohort in the savings report.** The
+  "Bypass cohort" section shows how many sessions ran without
+  narrowing and the full-toolset token volume — the apples-to-apples
+  baseline for "what would the bill look like without Tool Belt?"
+
+To turn narrowing off entirely on a scope without disabling the plugin,
+set `bypass_rate: 1.0` on it. To run a small control sample for
+comparison, set `bypass_rate: 0.05` (5% of sessions).
+
 ## What's excluded
 
 Three classes of tool calls are *not* subject to narrowing and are

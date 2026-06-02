@@ -525,6 +525,81 @@ class SlashCommandBypassTests(unittest.TestCase):
                          "fresh freeze should have reuses=0 (not a reuse of a stale snapshot)")
 
 
+class BypassCohortTests(unittest.TestCase):
+    """Regression guard: bypass-cohort rows must not pollute cache-on/off
+    savings figures.
+
+    The A/B baseline cohort (config: bypass_rate > 0) deterministically
+    ships the full toolset for a fraction of sessions so the analyzer
+    can compare narrowed vs unnarrowed cohorts. These rows write
+    policy_source: "bypass" and ceiling_count == narrowed_count
+    (i.e. tokens_saved == 0). Including them in the headline cache-on
+    or cache-off "tokens saved" figure would tank the average with rows
+    that NEVER narrowed by design.
+    """
+
+    def setUp(self):
+        # Import the savings-report module by file path — it lives under
+        # scripts/ not the importable plugin package, so we load it
+        # explicitly. This mirrors how the script is invoked in practice.
+        scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+        spec = importlib.util.spec_from_file_location(
+            "savings_report", scripts_dir / "savings-report.py"
+        )
+        assert spec and spec.loader, "could not load savings-report.py"
+        self.report = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.report)
+
+    def _bypass_row(self, prediction_id: str = "bp1") -> dict[str, Any]:
+        return {
+            "prediction_id": prediction_id,
+            "session_id": "agent:main:slack:dm:D0X:1780000000",
+            "policy_source": "bypass",
+            "ceiling_count": 46, "narrowed_count": 46,
+            "ceiling_tokens": 12521, "narrowed_tokens": 12521,
+        }
+
+    def _narrowed_row(self, prediction_id: str = "nx1") -> dict[str, Any]:
+        return {
+            "prediction_id": prediction_id,
+            "session_id": "agent:main:slack:dm:D0Y:1780000001",
+            "policy_source": "preset",
+            "ceiling_count": 46, "narrowed_count": 29,
+            "ceiling_tokens": 12521, "narrowed_tokens": 7137,
+            "frozen_reuse": False,
+        }
+
+    def test_bypass_row_classifies_as_bypass(self):
+        api_last = {"bp1": {"cache_mode": "on"}}  # api says on, but bypass wins
+        self.assertEqual(
+            self.report.classify_prediction_mode(self._bypass_row(), api_last),
+            "bypass",
+        )
+
+    def test_bypass_row_excluded_from_cache_on_cohort(self):
+        """The cache-on cohort must not include bypass rows even when
+        the underlying api_call cache_mode says 'on'."""
+        api_last = {"bp1": {"cache_mode": "on"}, "nx1": {"cache_mode": "on"}}
+        rows = [self._bypass_row(), self._narrowed_row()]
+        on_stats = self.report.cohort_stats(rows, api_last, [], mode_filter="on")
+        self.assertEqual(on_stats["n_predictions"], 1,
+                         "cache-on cohort should contain only the narrowed row")
+        self.assertEqual(on_stats["saved_tokens_total"], 5384,
+                         "saved total should reflect ONLY the narrowed row")
+
+    def test_bypass_cohort_collected_separately(self):
+        """Bypass rows are still counted — just under their own cohort."""
+        api_last = {"bp1": {"cache_mode": "on"}}
+        bypass_stats = self.report.cohort_stats(
+            [self._bypass_row()], api_last, [], mode_filter="bypass"
+        )
+        self.assertEqual(bypass_stats["n_predictions"], 1)
+        # Bypass shipped the full ceiling — "saved" should be 0
+        # honestly (no narrowing happened by design).
+        self.assertEqual(bypass_stats["saved_tokens_total"], 0)
+        self.assertEqual(bypass_stats["ceiling_tokens_total"], 12521)
+
+
 class TokenEstimatorTests(unittest.TestCase):
     """Verify estimate_tokens uses tiktoken when available, chars/4 when not.
 
