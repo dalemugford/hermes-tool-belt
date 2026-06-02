@@ -1930,11 +1930,30 @@ def main() -> int:
     dampeners = dampener_candidates(stats, args)
     trigger_keywords = trigger_keyword_candidates(stats, args)
 
+    # Break down tool_calls by source so the headline counts don't conflate
+    # narrowed gateway calls with cron / subagent calls that bypass narrowing.
+    source_counts = {"gateway": 0, "cron": 0, "subagent": 0}
+    for row in tool_calls:
+        src = row.get("source")
+        if src not in source_counts:
+            sid = str(row.get("session_id") or "")
+            pid = str(row.get("prediction_id") or "")
+            src = "cron" if sid.startswith("cron_") else ("gateway" if pid else "subagent")
+        source_counts[src] += 1
+
     if args.format == "json":
-        print(json.dumps(summary_payload(stats, recs, args, dampeners, trigger_keywords),
-                         indent=2, sort_keys=True))
+        payload = summary_payload(stats, recs, args, dampeners, trigger_keywords)
+        payload["totals"]["tool_call_source_counts"] = source_counts
+        print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         print(format_summary(stats, recs, args, dampeners))
+        excluded = source_counts["cron"] + source_counts["subagent"]
+        if excluded:
+            print(
+                f"  └─ {source_counts['gateway']} narrowed (gateway), "
+                f"{source_counts['cron']} excluded (cron), "
+                f"{source_counts['subagent']} excluded (subagent)"
+            )
 
     status_stream = sys.stderr if args.format == "json" else sys.stdout
 

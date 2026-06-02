@@ -1580,10 +1580,31 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                 was_initially_available = (
                     tool in baseline_allowed or base_name in baseline_allowed
                 )
+            # Tag the call's source so the analyzer can filter cleanly.
+            #   gateway  — a real prediction context was attached (the
+            #              normal path: pre_gateway_dispatch ran for this
+            #              user message and the tool call belongs to it).
+            #   cron     — Hermes' cron runner uses `cron_<hash>_<ts>`
+            #              session ids and bypasses pre_gateway_dispatch
+            #              entirely, so there's no prediction context to
+            #              attribute against. These calls are NOT narrowed.
+            #   subagent — A subagent call inside a parent gateway session.
+            #              The parent has a prediction context; the
+            #              subagent doesn't see it. These calls inherit
+            #              the parent's tool ceiling but aren't subject
+            #              to narrowing themselves.
+            sid_str = str(session_id or "")
+            if sid_str.startswith("cron_"):
+                source = "cron"
+            elif prediction_id:
+                source = "gateway"
+            else:
+                source = "subagent"
             extra = {
                 "agent": attribution_agent,
                 "platform": attribution_platform,
                 "scope": attribution_scope,
+                "source": source,
                 "was_initially_available": was_initially_available,
                 "was_cut": tool in cut_tools,
                 "was_expanded": tool in expanded,
