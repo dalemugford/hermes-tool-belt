@@ -61,6 +61,7 @@ def _reset_plugin_state() -> None:
     plugin._PRIOR_MESSAGES_BY_SESSION.clear()
     plugin._FROZEN_BY_SESSION.clear()
     plugin._CACHE_MODE_BY_SESSION.clear()
+    plugin._LAST_CANONICAL_BY_PLATFORM.clear()
     plugin._DETECTION_CACHE.clear()
     plugin._DETECTION_CACHE_LOADED = False
 
@@ -400,6 +401,127 @@ class SessionHookSemanticsTests(unittest.TestCase):
         plugin._on_session_reset(session_id="sid", session_key="sid")
         self.assertNotIn("sid", plugin._FROZEN_BY_SESSION)
         self.assertNotIn("sid", plugin._CACHE_MODE_BY_SESSION)
+
+
+class SlashCommandBypassTests(unittest.TestCase):
+    """Regression guards for the /new freeze-pollution bug.
+
+    Hermes' gateway fires pre_gateway_dispatch BEFORE routing slash
+    commands to their handlers. Without the bypass, the predictor runs
+    on the command text and creates a freeze that's never reached by
+    an LLM call but pollutes the next real-message dispatch with
+    frozen_reuse=true. Then on_session_reset (which Hermes fires with
+    only the NEW session UUID + platform) can't evict the freeze
+    because the canonical key isn't in the hook kwargs.
+
+    The fix is two-part:
+      1. Track the canonical session_key per platform during dispatch
+      2. Skip the build pipeline for slash-command messages
+      3. on_session_reset falls back to the platform-tracked canonical
+    """
+
+    PLATFORM = "telegram"
+    CANONICAL = "agent:main:telegram:dm:8499413300"
+
+    def setUp(self):
+        _seed_plugin_config()
+        _reset_plugin_state()
+
+    def _make_event(self, text: str):
+        from types import SimpleNamespace
+        # Use SimpleNamespace so undefined attrs return None — MagicMock
+        # would auto-create infinite-recursion-ready stubs that confuse
+        # the platform extractor.
+        platform_obj = SimpleNamespace(value=self.PLATFORM)
+        source = SimpleNamespace(platform=platform_obj, chat_id="8499413300", user_id="dale")
+        return SimpleNamespace(text=text, message=text, source=source, platform=None)
+
+    def _make_session_store(self):
+        store = mock.MagicMock()
+        store._generate_session_key.return_value = self.CANONICAL
+        return store
+
+    def test_pre_gateway_dispatch_skips_slash_command(self):
+        """A /new message must not build a freeze."""
+        event = self._make_event("/new")
+        store = self._make_session_store()
+        plugin._on_pre_gateway_dispatch(event=event, session_store=store)
+        self.assertNotIn(self.CANONICAL, plugin._FROZEN_BY_SESSION,
+                         "freeze should not be created for slash-command messages")
+
+    def test_pre_gateway_dispatch_records_canonical_for_slash_command(self):
+        """Even though /new is bypassed, the canonical key must be tracked
+        so the subsequent on_session_reset can find it."""
+        event = self._make_event("/new")
+        store = self._make_session_store()
+        plugin._on_pre_gateway_dispatch(event=event, session_store=store)
+        self.assertEqual(
+            plugin._LAST_CANONICAL_BY_PLATFORM.get(self.PLATFORM),
+            self.CANONICAL,
+            "canonical key should be recorded even on bypassed slash commands"
+        )
+
+    def test_on_session_reset_evicts_via_platform_fallback(self):
+        """Hermes fires on_session_reset with only session_id (new UUID)
+        and platform — never the canonical key. Eviction must succeed by
+        falling back to _LAST_CANONICAL_BY_PLATFORM."""
+        # Seed: a freeze under the canonical key, with the platform back-ref
+        plugin._freeze_session_snapshot(
+            self.CANONICAL,
+            allowed_tool_names=["read_file"],
+            baseline_allowed_tools=["read_file"],
+            known_tool_names={"read_file"},
+            preset_name="aggressive",
+            always_on_count=1,
+            always_on_tools=["read_file"],
+            trigger_tools_by_group={},
+            triggers_fired=[],
+            triggers_suppressed=[],
+            policy_source="preset",
+            policy_version="v1",
+            learned_mode="off",
+            learned_scope="",
+            learned_changes=[],
+        )
+        plugin._LAST_CANONICAL_BY_PLATFORM[self.PLATFORM] = self.CANONICAL
+
+        # Call _on_session_reset with the new session UUID Hermes hands
+        # us — NOT the canonical key — exactly as Hermes' gateway does
+        # after /new.
+        plugin._on_session_reset(
+            session_id="20260601_162555_d16739f9",
+            platform=self.PLATFORM,
+        )
+
+        self.assertNotIn(self.CANONICAL, plugin._FROZEN_BY_SESSION,
+                         "freeze under canonical key should be evicted via platform fallback")
+
+    def test_new_then_message_does_not_reuse_freeze(self):
+        """End-to-end: /new arrives, then a real message. The real message
+        must produce frozen_reuse=False because /new should have skipped
+        building any freeze, and any pre-existing freeze must have been
+        evicted by on_session_reset's platform fallback."""
+        store = self._make_session_store()
+
+        # Step 1: /new arrives. pre_gateway_dispatch fires.
+        plugin._on_pre_gateway_dispatch(event=self._make_event("/new"), session_store=store)
+        self.assertNotIn(self.CANONICAL, plugin._FROZEN_BY_SESSION)
+
+        # Step 2: Gateway routes /new → on_session_reset with new UUID.
+        plugin._on_session_reset(
+            session_id="20260601_162555_d16739f9",
+            platform=self.PLATFORM,
+        )
+        self.assertNotIn(self.CANONICAL, plugin._FROZEN_BY_SESSION)
+
+        # Step 3: Real user message arrives. With cache_mode=on, this
+        # should build a fresh freeze (reuses=0), not reuse one.
+        plugin._CONFIG["cache_mode"] = "on"
+        plugin._on_pre_gateway_dispatch(event=self._make_event("Hey Bernard, comms test"), session_store=store)
+        frozen = plugin._FROZEN_BY_SESSION.get(self.CANONICAL)
+        self.assertIsNotNone(frozen, "real message should build a fresh freeze")
+        self.assertEqual(frozen["reuses"], 0,
+                         "fresh freeze should have reuses=0 (not a reuse of a stale snapshot)")
 
 
 if __name__ == "__main__":

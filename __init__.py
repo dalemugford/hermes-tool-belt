@@ -239,6 +239,25 @@ _DETECTION_CACHE_LOADED = False
 _CACHE_MODE_BY_SESSION: dict[str, dict[str, Any]] = {}
 
 
+# Most-recently-seen canonical session key per platform. Populated in
+# _on_pre_gateway_dispatch (which sees the real session_store-derived key)
+# and consumed by _on_session_reset to recover the freeze's canonical key.
+#
+# Why this exists: Hermes' gateway fires on_session_reset with only the
+# NEW session UUID and the platform string — not the canonical session_key
+# the freeze is stored under. The new UUID is meaningless to us; without
+# this back-reference, the eviction path is a silent no-op.
+#
+# Multi-chat tradeoff: under several active chats on the same platform,
+# this map only tracks the latest. /new in one chat will evict that
+# chat's freeze (correct) but not other chats' (also correct, because
+# /new is per-chat and we only just touched this one). If chats fire
+# back-to-back, the last-touched wins eviction; the others continue
+# normally. Per-chat granularity would require Hermes core passing
+# session_key to the hook.
+_LAST_CANONICAL_BY_PLATFORM: dict[str, str] = {}
+
+
 # ─── Config loading ────────────────────────────────────────────────────────
 
 def _load_user_config() -> None:
@@ -1304,6 +1323,23 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         channel = scope
         session_id = _canonical_session_key(event, session_store, kwargs)
 
+        # Record the canonical session_key for this platform so that the
+        # next on_session_reset hook (which Hermes fires with only the
+        # NEW session UUID + platform) can find what to evict.
+        if platform and session_id:
+            _LAST_CANONICAL_BY_PLATFORM[str(platform)] = str(session_id)
+
+        # Slash-command messages (/new, /reset, /resume, /model, ...) are
+        # intercepted by the gateway's command router AFTER this hook
+        # fires but BEFORE any LLM call. A freeze built here would
+        # snapshot the predictor's read of the command text itself and
+        # never reach an API call to be logged. Skip the whole pipeline
+        # for these — we've already tracked the canonical key above so
+        # the subsequent on_session_reset can evict any pre-existing
+        # freeze cleanly.
+        if isinstance(message, str) and message.strip().startswith("/"):
+            return None
+
         # Phase 1: cache-on freeze. When this session already has a
         # frozen tool-set decision, reuse it verbatim and skip the
         # predictor entirely. The frozen path also disables sticky and
@@ -2072,6 +2108,19 @@ def _on_session_reset(session_id=None, **kwargs) -> None:
         sid = str(session_id)
         if sid and sid not in eviction_ids:
             eviction_ids.append(sid)
+
+    # Hermes' on_session_reset hook passes only the NEW session UUID
+    # (post-rotation) and the platform string. The freeze is keyed by
+    # the canonical session_key (agent:main:<platform>:...) which the
+    # hook does NOT pass. Recover it from the platform back-reference
+    # we populate in _on_pre_gateway_dispatch — that hook fires for
+    # /new BEFORE the command router routes it, so the most-recent
+    # canonical key for the platform is the one being reset.
+    platform = kwargs.get("platform") or ""
+    if platform:
+        last_canonical = _LAST_CANONICAL_BY_PLATFORM.get(str(platform), "")
+        if last_canonical and last_canonical not in eviction_ids:
+            eviction_ids.append(last_canonical)
 
     for sid in eviction_ids:
         _FROZEN_BY_SESSION.pop(sid, None)
