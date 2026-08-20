@@ -21,6 +21,7 @@ Covers:
 from __future__ import annotations
 
 import importlib
+from collections import Counter
 import json
 import os
 import sys
@@ -386,6 +387,12 @@ class AnalyzerExcludesDegradedModeTests(unittest.TestCase):
         self.assertEqual(out, {})
         self.assertEqual(status, "no_policy")
 
+    def test_load_preset_always_on_falls_back_without_pyyaml(self):
+        tools, status = analyze._load_preset_always_on(Path(plugin.__file__).parent)
+        self.assertEqual(status, "ok")
+        self.assertIn("mnemosyne_recall", tools)
+        self.assertIn("process", tools)
+
     def test_dampener_candidates_emits_warning_when_degraded(self):
         stat = analyze.ScopeStats(scope="bernard:telegram")
         stat.trigger_fp_previews["browser"] = [
@@ -744,6 +751,44 @@ class HarvestRecommendationTests(unittest.TestCase):
         stats = analyze.collect_stats(preds, calls)
         rows = analyze.harvest_recommendation_rows(stats, self._args())
         self.assertFalse(rows, "live-only telemetry must not produce harvest recs")
+
+    def test_harvest_skips_tools_pinned_always_on_by_policy(self):
+        preds = [self._harvest_row(pid=f"p{i:03d}", scope="bernard:telegram") for i in range(100)]
+        calls = [self._harvest_row(pid=f"p{i:03d}", scope="bernard:telegram",
+                                   tool="terminal", was_cut=True) for i in range(50)]
+        stats = analyze.collect_stats(preds, calls)
+        rows = analyze.harvest_recommendation_rows(
+            stats,
+            self._args(),
+            protected_always_on={"terminal"},
+        )
+        self.assertFalse([r for r in rows if r["item"] == "terminal"])
+
+
+class RecommendationRowProtectionTests(unittest.TestCase):
+    def _args(self, **overrides):
+        defaults = dict(
+            min_expansions=2,
+            promote_expand_rate=0.5,
+            promote_use_rate=0.8,
+            expand_round_trip_tokens=1500,
+            per_tool_tokens=388,
+            unused_carry_turns=10,
+            trigger_min_fires=3,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def test_policy_always_on_tool_is_not_flagged_for_demote(self):
+        stat = analyze.ScopeStats(scope="bernard:telegram")
+        stat.predictions = 25
+        stat.always_on_carry_turns = Counter({"mnemosyne_recall": 25})
+        rows = analyze.recommendation_rows(
+            {"bernard:telegram": stat},
+            self._args(),
+            protected_always_on={"mnemosyne_recall"},
+        )
+        self.assertFalse([r for r in rows if r.get("item") == "mnemosyne_recall"])
 
 
 class ExpandToolsUsedAttributionTests(unittest.TestCase):

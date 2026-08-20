@@ -34,7 +34,7 @@ following scripts support tuning that path:
 |---|---|---|
 | [`smoke-test.py`](smoke-test.py) | End-to-end mechanical validation. Synthetic sessions through the plugin in an isolated tempdir. Currently covers the per-turn path; cache-on freeze-path assertions are a TODO. | After any gateway restart that loads new plugin code, or before committing changes that touch the hook surface. |
 | [`rotate-telemetry.sh`](rotate-telemetry.sh) | Archive current `predictions.jsonl` + `tool_calls.jsonl` + `api_calls.jsonl` to `state/tool-belt/archive/reset-<ts>/`. Gateway-safe. | After a meaningful change to plugin behavior, when you want a clean measurement window. |
-| [`daily-analysis.sh`](daily-analysis.sh) | Run analyzer with full recommendations + dampener mining, drop a markdown report + recommendations JSON. | Scheduled twice daily via launchd, or by hand any time. |
+| [`daily-analysis.sh`](daily-analysis.sh) | Run analyzer with full recommendations + dampener mining, drop a markdown report + recommendations JSON, then run `shape-ceiling.py` to update `learned.json` for scopes with enough evidence. | Scheduled twice daily via launchd, or by hand any time. |
 | [`com.dalemugford.hermes.tool-belt-analyzer.plist`](com.dalemugford.hermes.tool-belt-analyzer.plist) | launchd LaunchAgent template; runs `daily-analysis.sh` at 00:00 and 12:00 local time. | Install once. |
 
 ## Shape next session's frozen ceiling
@@ -125,15 +125,20 @@ launchctl print gui/$(id -u)/com.dalemugford.hermes.tool-belt-analyzer \
 launchctl kickstart gui/$(id -u)/com.dalemugford.hermes.tool-belt-analyzer
 ```
 
-Outputs land in three places:
+Outputs land in four places:
 
-- `~/.hermes/plugins/tool-belt/reports/YYYY-MM-DD-HHMMSS-analysis.md`
-  — the human-readable per-run report.
-- `~/.hermes/state/tool-belt/learned_recommendations.json` —
-  the latest machine-readable recommendation set. Overwritten each run.
+- `~/.hermes/plugins/tool-belt/reports/<label>/YYYY-MM-DD-HHMMSS-analysis.md`
+  — the human-readable per-run report for root / each profile.
+- `<state-dir>/learned_recommendations.json` — the latest
+  machine-readable recommendation set for that telemetry source.
+  Overwritten each run.
+- `<state-dir>/learned.json` — the applied learned overlay written by
+  `shape-ceiling.py` when the evidence changes. Consumed on the next
+  session when `learned_mode` is `auto` or `audit`.
 - `~/.hermes/state/tool-belt/cron-logs/` — per-run JSON output,
-  any stderr captured during a failed run, and `daily-summary.log` with
-  one line per run for at-a-glance review.
+  shaper logs for writes/failures, any stderr captured during a failed
+  run, and `daily-summary.log` with one line per stage for at-a-glance
+  review.
 
 ## Review a week's worth of data
 

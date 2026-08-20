@@ -774,7 +774,7 @@ rm -rf ~/.hermes/plugins/tool-belt
 │   ├── bootstrap.py                 # mode-aware day-one warm start
 │   ├── harvest-replay.py            # cache-off: replay sessions → synthetic telemetry
 │   ├── smoke-test.py                # end-to-end mechanical validation
-│   ├── daily-analysis.sh            # twice-daily analyzer cron
+│   ├── daily-analysis.sh            # twice-daily analyzer + learned.json shaper cron
 │   ├── rotate-telemetry.sh          # archive live JSONLs (gateway-safe)
 │   ├── check_trigger_dampeners.py   # cache-off: trigger dampener regression guard
 │   └── README.md                    # ops scripts inventory + invocation

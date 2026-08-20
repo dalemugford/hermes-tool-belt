@@ -135,21 +135,12 @@ triggers:
       - '\b(read (this )?(aloud|out loud)|say this|speak (this|it)|read it out|TTS|out loud)\b'
       - '\bvoice (over|this)\b'
 
-  # Browser automation — entire 12-tool family loads on signal
+  # Browser automation — Browser Use CLI mode (the Hermes default as of
+  # 2026-07-17) exposes the whole browser_* surface as one consolidated
+  # tool, browser_exec, instead of the old 12-tool atomic family.
   - name: browser
     tools:
-      - browser_navigate
-      - browser_snapshot
-      - browser_click
-      - browser_type
-      - browser_scroll
-      - browser_back
-      - browser_press
-      - browser_get_images
-      - browser_vision
-      - browser_console
-      - browser_cdp
-      - browser_dialog
+      - browser_exec
     keywords:
       - '\b(browse|navigate to|open .* in (a |the )?browser|browser automation)\b'
       - '\b(fill (out|in)|click on|select|hover|scroll)\b.*\b(form|page|button|link|element)\b'

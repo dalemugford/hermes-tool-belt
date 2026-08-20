@@ -42,7 +42,7 @@ DEFAULT_DAMPENER_MIN_N = 2
 DEFAULT_DAMPENER_MAX_N = 4
 DEFAULT_DAMPENER_MAX_CANDIDATES = 10
 
-PROTECTED_ALWAYS_ON = {
+BASE_PROTECTED_ALWAYS_ON = {
     "memory",
     "session_search",
     "clarify",
@@ -552,13 +552,13 @@ def _load_preset_excludes(
     which previously made an empty result look like a real policy state
     on a runtime that simply lacked PyYAML.
     """
+    path = plugin_dir / "policy.yaml"
+    if not path.exists():
+        return {}, "no_policy"
     try:
         import yaml  # type: ignore[import-untyped]
     except Exception:
         return {}, "no_yaml"
-    path = plugin_dir / "policy.yaml"
-    if not path.exists():
-        return {}, "no_policy"
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
@@ -601,6 +601,70 @@ _EXCLUDES_STATUS_MESSAGE = {
 }
 
 
+def _load_preset_always_on(plugin_dir: Path) -> tuple[set[str], str]:
+    """Load the preset always_on tool names from policy.yaml.
+
+    Returns ``(tools, status)`` using the same status enum as
+    :func:`_load_preset_excludes`. When PyYAML is unavailable, fall back
+    to a tiny line-oriented parser for the top-level ``always_on`` list
+    so the analyzer still honors explicit resident tools.
+    """
+    path = plugin_dir / "policy.yaml"
+    if not path.exists():
+        return set(), "no_policy"
+
+    def fallback_parse() -> set[str]:
+        tools: set[str] = set()
+        in_always_on = False
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            if not in_always_on:
+                if stripped == "always_on:":
+                    in_always_on = True
+                continue
+            if raw_line and not raw_line.startswith((" ", "	")):
+                break
+            if stripped.startswith("- "):
+                item = stripped[2:].split("#", 1)[0].strip()
+                if item:
+                    tools.add(item)
+        return tools
+
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except Exception:
+        tools = fallback_parse()
+        return tools, "ok" if tools else "no_yaml"
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        tools = fallback_parse()
+        return tools, "ok" if tools else "parse_error"
+    tools = {
+        str(tool).strip()
+        for tool in (data.get("always_on") or [])
+        if str(tool).strip()
+    }
+    return tools, "ok"
+
+
+def effective_protected_always_on(plugin_dir: Path | None = None) -> set[str]:
+    """Return the analyzer's effective do-not-suggest always-on set.
+
+    ``policy.yaml`` is the source of truth. The hard-coded base set is a
+    safe fallback when YAML is unavailable so we still avoid noisy
+    suggestions for core meta tools.
+    """
+    protected = set(BASE_PROTECTED_ALWAYS_ON)
+    if plugin_dir is None:
+        plugin_dir = Path(__file__).resolve().parent
+    preset_tools, _status = _load_preset_always_on(plugin_dir)
+    protected.update(preset_tools)
+    return protected
+
+
 def _load_preset_triggers(
     plugin_dir: Path,
 ) -> tuple[dict[str, dict[str, Any]], str]:
@@ -614,13 +678,13 @@ def _load_preset_triggers(
       · Avoid re-suggesting keywords that an existing trigger pattern
         already matches.
     """
+    path = plugin_dir / "policy.yaml"
+    if not path.exists():
+        return {}, "no_policy"
     try:
         import yaml  # type: ignore[import-untyped]
     except Exception:
         return {}, "no_yaml"
-    path = plugin_dir / "policy.yaml"
-    if not path.exists():
-        return {}, "no_policy"
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
@@ -1144,7 +1208,11 @@ def dampener_candidates(stats: dict[str, ScopeStats], args: argparse.Namespace) 
     return rows
 
 
-def harvest_recommendation_rows(stats: dict[str, ScopeStats], args: argparse.Namespace) -> list[dict[str, Any]]:
+def harvest_recommendation_rows(
+    stats: dict[str, ScopeStats],
+    args: argparse.Namespace,
+    protected_always_on: set[str] | None = None,
+) -> list[dict[str, Any]]:
     """Per-tool promotion candidates derived from harvest telemetry.
 
     Harvest rows carry ``was_cut: True`` whenever the historical model
@@ -1169,12 +1237,15 @@ def harvest_recommendation_rows(stats: dict[str, ScopeStats], args: argparse.Nam
     can't produce.
     """
     rows: list[dict[str, Any]] = []
+    protected = set(protected_always_on or BASE_PROTECTED_ALWAYS_ON)
     min_cuts = max(1, args.harvest_min_cuts)
     for scope, stat in sorted(stats.items()):
         if stat.harvest_predictions == 0:
             continue
         denom = max(stat.harvest_predictions, 1)
         for tool, cuts in stat.harvest_was_cut.most_common():
+            if tool in protected:
+                continue
             if cuts < min_cuts:
                 continue
             round_trip_cost = cuts * args.expand_round_trip_tokens
@@ -1233,8 +1304,13 @@ def harvest_recommendation_rows(stats: dict[str, ScopeStats], args: argparse.Nam
     return rows
 
 
-def recommendation_rows(stats: dict[str, ScopeStats], args: argparse.Namespace) -> list[dict[str, Any]]:
+def recommendation_rows(
+    stats: dict[str, ScopeStats],
+    args: argparse.Namespace,
+    protected_always_on: set[str] | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    protected = set(protected_always_on or BASE_PROTECTED_ALWAYS_ON)
     for scope, stat in stats.items():
         denominator = max(stat.predictions, 1)
         for category, count in stat.expansions_by_category.most_common():
@@ -1318,7 +1394,7 @@ def recommendation_rows(stats: dict[str, ScopeStats], args: argparse.Namespace) 
             })
 
         for tool, carried in stat.always_on_carry_turns.most_common():
-            if tool in PROTECTED_ALWAYS_ON:
+            if tool in protected:
                 continue
             calls = stat.tool_calls.get(tool, 0)
             if carried >= args.unused_carry_turns and calls == 0:
@@ -1464,6 +1540,7 @@ def threshold_payload(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def scope_payload(stat: ScopeStats, args: argparse.Namespace) -> dict[str, Any]:
+    protected = effective_protected_always_on(Path(__file__).resolve().parent)
     used_events = sum(len(event_ids) for event_ids in stat.used_expansion_event_ids_by_category.values())
     expand_round_trip_total = stat.expansion_events * args.expand_round_trip_tokens
     net_savings = stat.total_tokens_saved - expand_round_trip_total
@@ -1495,7 +1572,7 @@ def scope_payload(stat: ScopeStats, args: argparse.Namespace) -> dict[str, Any]:
         "estimated_always_on_carrying_cost_tokens": {
             tool: carrying_cost(turns, args.per_tool_tokens)
             for tool, turns in stat.always_on_carry_turns.items()
-            if tool not in PROTECTED_ALWAYS_ON
+            if tool not in protected
         },
         "cohorts": _cohort_payload(stat),
         "tool_list_stability": _stability_payload(stat),
@@ -1522,6 +1599,7 @@ def format_summary(
 ) -> str:
     payload = summary_payload(stats, recs, args, dampeners)
     totals = payload["totals"]
+    protected = effective_protected_always_on(Path(__file__).resolve().parent)
     lines = [
         "tool-belt analyzer",
         f"scopes: {totals['scopes']}",
@@ -1571,6 +1649,7 @@ def markdown_report(
     generated = time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime())
     payload = summary_payload(stats, recs, args, dampeners, trigger_keywords)
     totals = payload["totals"]
+    protected = effective_protected_always_on(Path(__file__).resolve().parent)
 
     lines = [
         "# tool-belt Analyzer Report",
@@ -1718,7 +1797,7 @@ def markdown_report(
         unused = [
             (tool, carried)
             for tool, carried in stat.always_on_carry_turns.most_common()
-            if tool not in PROTECTED_ALWAYS_ON and stat.tool_calls.get(tool, 0) == 0 and carried >= args.unused_carry_turns
+            if tool not in protected and stat.tool_calls.get(tool, 0) == 0 and carried >= args.unused_carry_turns
         ]
         if unused:
             for tool, carried in unused[:10]:
@@ -1926,7 +2005,8 @@ def main() -> int:
     predictions = load_rows(predictions_paths)
     tool_calls = load_rows(tool_calls_paths)
     stats = collect_stats(predictions, tool_calls)
-    recs = recommendation_rows(stats, args) + harvest_recommendation_rows(stats, args)
+    protected_always_on = effective_protected_always_on(Path(__file__).resolve().parent)
+    recs = recommendation_rows(stats, args, protected_always_on) + harvest_recommendation_rows(stats, args, protected_always_on)
     dampeners = dampener_candidates(stats, args)
     trigger_keywords = trigger_keyword_candidates(stats, args)
 

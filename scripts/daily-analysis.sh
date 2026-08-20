@@ -64,7 +64,7 @@ for entry in "${SOURCES[@]}"; do
     STDERR_LOG="${ROOT_LOG_DIR}/${TS_LOCAL}-${label}.stderr"
     REPORTS_DIR="${PLUGIN_DIR}/reports/${label}"
 
-    if ! "${PYTHON}" "${PLUGIN_DIR}/analyze.py" \
+    if "${PYTHON}" "${PLUGIN_DIR}/analyze.py" \
             --state-dir "${state_dir}" \
             --reports-dir "${REPORTS_DIR}" \
             --format json \
@@ -72,6 +72,8 @@ for entry in "${SOURCES[@]}"; do
             --write-recommendations \
             > "${JSON_OUT}" \
             2> "${STDERR_LOG}"; then
+        :
+    else
         rc=$?
         echo "${TS_UTC}  [${label}]  error  analyzer exited rc=${rc}; see ${STDERR_LOG}" \
             | tee -a "${SUMMARY_LOG}" >&2
@@ -109,12 +111,38 @@ PY
 
     echo "${line}" | tee -a "${SUMMARY_LOG}"
 
+    SHAPE_LOG="${ROOT_LOG_DIR}/${TS_LOCAL}-${label}.shape.log"
+    if "${PYTHON}" "${PLUGIN_DIR}/scripts/shape-ceiling.py" \
+            --state-dir "${state_dir}" \
+            > "${SHAPE_LOG}" \
+            2>&1; then
+        :
+    else
+        rc=$?
+        echo "${TS_UTC}  [${label}]  shape_error  shaper exited rc=${rc}; see ${SHAPE_LOG}" \
+            | tee -a "${SUMMARY_LOG}" >&2
+        overall_rc=$rc
+        continue
+    fi
+
+    if grep -q "Wrote updated recommendations" "${SHAPE_LOG}"; then
+        echo "${TS_UTC}  [${label}]  shape_ok  learned.json updated" \
+            | tee -a "${SUMMARY_LOG}"
+    else
+        echo "${TS_UTC}  [${label}]  shape_ok  learned.json unchanged" \
+            | tee -a "${SUMMARY_LOG}"
+    fi
+
     # On success the stderr log only holds the analyzer's "report:" /
     # "recommendations:" info lines (analyzer routes those to stderr when
     # --format json so stdout stays parseable). Drop it to keep the
     # directory readable — a real failure exits non-zero above and stderr
-    # is preserved.
+    # is preserved. Keep the shaper log only when it actually wrote or
+    # failed, so normal no-op runs stay tidy while first writes are auditable.
     rm -f "${STDERR_LOG}"
+    if ! grep -q "Wrote updated recommendations" "${SHAPE_LOG}"; then
+        rm -f "${SHAPE_LOG}"
+    fi
 done
 
 if [[ "${ran_any}" -eq 0 ]]; then
