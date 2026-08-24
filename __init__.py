@@ -358,6 +358,7 @@ def _wrap_build_api_kwargs(original):
             ceiling_names = []
             cut_names = []
             unknown_kept_names = []
+            mcp_passthrough_names = []
             for t in tools:
                 if not isinstance(t, dict):
                     continue
@@ -371,6 +372,15 @@ def _wrap_build_api_kwargs(original):
                 # Strip that prefix for matching against our preset, which uses
                 # the canonical (unprefixed) tool names.
                 base_name = _base_tool_name(name)
+                # MCP tools: pass through without narrowing. Tool Search
+                # manages MCP/plugin tool discovery — Tool Belt shapes
+                # built-in tools only. This keeps the two systems on
+                # separate layers and prevents Tool Belt from cutting an
+                # MCP tool that Tool Search's bridge would have served.
+                if _is_mcp_tool(name) or _is_mcp_tool(base_name):
+                    filtered.append(t)
+                    mcp_passthrough_names.append(name)
+                    continue
                 if base_name in allowed_set:
                     filtered.append(t)
                 elif base_name not in known:
@@ -410,6 +420,7 @@ def _wrap_build_api_kwargs(original):
             # would otherwise pollute "initial" with expansion-added tools.
             state.setdefault("initial_allowed_tools", _tool_names(filtered))
             state.setdefault("cut_tools", cut_names)
+            state.setdefault("mcp_passthrough_tools", mcp_passthrough_names)
             state.setdefault("unknown_kept_tools", unknown_kept_names)
 
             # Per-call hash for response-side correlation with
@@ -473,6 +484,27 @@ def _tool_name(tool: Any) -> str:
 def _base_tool_name(name: str) -> str:
     """Strip transport-specific prefixes for preset matching."""
     return name[4:] if name.startswith("mcp_") else name
+
+
+def _is_mcp_tool(name: str) -> bool:
+    """Return True if a tool name belongs to an MCP server.
+
+    Checks the Hermes tool registry for an ``mcp-`` toolset prefix,
+    matching the same logic Tool Search uses in
+    ``tools.tool_search.is_deferrable_tool_name``. Falls back to
+    checking for the ``mcp_`` name prefix used on the Anthropic
+    adapter path. Returns False if the registry is unavailable.
+    """
+    if name.startswith("mcp_"):
+        return True
+    try:
+        from tools.registry import registry
+        entry = registry.get_entry(name)
+        if entry is not None and entry.toolset.startswith("mcp-"):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _tool_names(tools: list) -> list[str]:
@@ -979,6 +1011,7 @@ def _maybe_log_prediction(
             allowed_tools=list(state.get("initial_allowed_tools") or _tool_names(narrowed)),
             cut_tools=list(state.get("cut_tools") or []),
             unknown_kept_tools=list(state.get("unknown_kept_tools") or []),
+            mcp_passthrough_tools=list(state.get("mcp_passthrough_tools") or []),
             always_on_tools=list(state.get("always_on_tools") or []),
             trigger_tools_by_group=dict(state.get("trigger_tools_by_group") or {}),
             expanded_tools=sorted(str(t) for t in (state.get("expansions") or set())),

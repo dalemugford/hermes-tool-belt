@@ -111,6 +111,7 @@ class PredictionRecord:
     allowed_tools: list[str] | None = None
     cut_tools: list[str] | None = None
     unknown_kept_tools: list[str] | None = None
+    mcp_passthrough_tools: list[str] | None = None
     always_on_tools: list[str] | None = None
     trigger_tools_by_group: dict[str, list[str]] | None = None
     expanded_tools: list[str] | None = None
@@ -190,6 +191,7 @@ class PredictionRecord:
             "allowed_tools": self.allowed_tools or [],
             "cut_tools": self.cut_tools or [],
             "unknown_kept_tools": self.unknown_kept_tools or [],
+            "mcp_passthrough_tools": self.mcp_passthrough_tools or [],
             "always_on_tools": self.always_on_tools or [],
             "trigger_tools_by_group": self.trigger_tools_by_group or {},
             "expanded_tools": self.expanded_tools or [],
