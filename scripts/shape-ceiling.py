@@ -316,6 +316,13 @@ def compute_scope_recommendations(
             # Without this, new tools added by upstream (Hermes updates, plugin
             # changes) are invisible to the shaper and never auto-demoted.
             for t in (p.get("unknown_kept_tools") or []):
+                # Skip MCP tools — Tool Belt passes them through without
+                # narrowing. They show up as unknown-kept in historical
+                # predictions (before the mcp__ pass-through fix) but
+                # should never be demote candidates. Tool Search manages
+                # the MCP layer.
+                if t.startswith("mcp__") or t.startswith("mcp_"):
+                    continue
                 always_on_observed.add(str(t))
             pid = p.get("prediction_id", "")
             for tc in calls_by_pred.get(pid, []):
