@@ -212,10 +212,15 @@ def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -
     if not changes:
         return LearnedMergeResult(preset=preset, mode=mode, policy_version=version, learned_scope=matched_scope)
 
+    merged_off = list(getattr(preset, "always_off", []) or [])
+    for tool in sorted(learned_off):
+        if tool not in merged_off:
+            merged_off.append(tool)
     merged = Preset(
         name=f"{preset.name}+learned[{matched_scope or scope}]",
         always_on=always_on,
         triggers=triggers,
+        always_off=merged_off,
     )
     return LearnedMergeResult(
         preset=merged,

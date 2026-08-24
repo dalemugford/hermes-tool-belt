@@ -388,6 +388,18 @@ def _wrap_build_api_kwargs(original):
                     len(filtered), len(cut_names),
                     ceiling_names[:5], cut_names[:5],
                 )
+                # Drift alarm: any ceiling tool not named in the preset is
+                # kept on as an unknown (safe default). That silently defeats
+                # narrowing when upstream adds tools, so surface it loudly —
+                # once per turn — instead of letting it hide in the counts.
+                if unknown_kept_names:
+                    logger.warning(
+                        "tool-belt: %d tools in ceiling not named in preset "
+                        "(kept on as unknown): %s. Run "
+                        "scripts/check-tool-drift.py to update policy.yaml.",
+                        len(unknown_kept_names),
+                        sorted(unknown_kept_names)[:10],
+                    )
 
             kwargs = dict(kwargs)
             kwargs["tools"] = filtered
@@ -1016,6 +1028,9 @@ def _all_known_tool_names(preset) -> set[str]:
         known.update(preset.always_on)
     for group in preset.triggers:
         known.update(group.tools)
+    # always_off tools are "known" too — naming them lets the safe-default
+    # cut them instead of keeping them on as unknowns.
+    known.update(getattr(preset, "always_off", []) or [])
     return known
 
 

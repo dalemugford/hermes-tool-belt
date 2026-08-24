@@ -79,6 +79,11 @@ class Preset:
     name: str
     always_on: list[str] | str  # list of tool names, or WILDCARD_ALWAYS_ON
     triggers: list[TriggerGroup] = field(default_factory=list)
+    # Tools explicitly forced off (deprecated / superseded). These are added
+    # to the "known" set so the unknown-tool safe-default cuts them instead
+    # of silently keeping them on. They are never added to always_on or any
+    # trigger, so they can only re-enter the ceiling via expand_tools.
+    always_off: list[str] = field(default_factory=list)
 
     @property
     def is_wildcard(self) -> bool:
@@ -136,10 +141,17 @@ def load_preset_file(path: Path) -> Preset:
         always_on = [str(t) for t in always_on_raw if isinstance(t, str)]
     else:
         always_on = []
+    always_off_raw = data.get("always_off", [])
+    always_off = (
+        [str(t) for t in always_off_raw if isinstance(t, str)]
+        if isinstance(always_off_raw, list)
+        else []
+    )
     return Preset(
         name=name,
         always_on=always_on,
         triggers=_parse_triggers(data.get("triggers")),
+        always_off=always_off,
     )
 
 
@@ -210,15 +222,24 @@ def _resolve_preset_inner(plugin_config: dict[str, Any], channel: str) -> Preset
         for t in extra:
             if isinstance(t, str) and t not in always_on:
                 always_on.append(t)
+    # Config-level always_off removes a tool from always_on AND names it in
+    # the preset's always_off set so it lands in the "known" bucket and is
+    # cut (not kept as an unknown). Merge with the policy.yaml always_off.
+    always_off = list(preset.always_off)
     for off in (off_global, off_channel):
         for t in off:
+            if not isinstance(t, str):
+                continue
             if t in always_on:
                 always_on.remove(t)
+            if t not in always_off:
+                always_off.append(t)
 
     resolved = Preset(
         name=f"{preset.name}+overrides[{channel}]",
         always_on=always_on,
         triggers=preset.triggers,
+        always_off=always_off,
     )
 
     # Learned state is imported lazily to avoid a module import cycle.

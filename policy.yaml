@@ -42,11 +42,28 @@ always_on:
   - search_files
   - process
 
+  # Core action tools — kept resident so the agent can always act
+  # without needing expand_tools to recover them (which is itself
+  # vulnerable to registration/ceiling issues).
+  - terminal
+  - write_file
+  - patch
+
   # Gateway essentials — ignored on CLI by the plugin
   - send_message
 
   # Always-on meta-tool the plugin itself adds
   - expand_tools
+
+# Tools forced OFF regardless of triggers. Naming a deprecated/superseded
+# tool here adds it to the "known" set so the unknown-tool safe-default
+# CUTS it instead of silently keeping it on. It never joins always_on or a
+# trigger, so it can only come back via an explicit expand_tools call.
+always_off:
+  # Legacy single-purpose memory tool. Superseded by the Mnemosyne surface
+  # (mnemosyne_remember / mnemosyne_recall / …). Kept off so it stops
+  # riding along as an "unknown" on every turn.
+  - memory
 
 # Triggered tool groups. Each group fires when ANY of its signals match.
 # When a group fires, all listed tools are added to the active set.
@@ -171,3 +188,83 @@ triggers:
       - '\bhome assistant\b'
       - '\bHA\b'
       - '\b(dim|brighten) (the )?lights?\b'
+
+  # Deferred-tool machinery — the meta-tools that search, describe, and
+  # invoke tools that aren't resident. Gated so they only load when the
+  # conversation is explicitly about finding/loading a tool.
+  - name: deferred_tools
+    tools: [tool_search, tool_describe, tool_call]
+    keywords:
+      - '\bsearch tool\b'
+      - '\bload tool\b'
+      - '\bexpand\b'
+      - '\bdeferred\b'
+      - '\bavailable tool\b'
+
+  # Conversation-history search — pulling up prior sessions/turns.
+  - name: history_search
+    tools: [session_search]
+    keywords:
+      - '\bprevious conversation\b'
+      - '\bpast session\b'
+      - '\bwhat did we\b'
+      - '\bremember when\b'
+      - '\bsession search\b'
+      - '\bhistory\b'
+
+  # Extended Mnemosyne surface — shared/canonical/triple/graph/sync/persona/
+  # scratchpad/export/import/diagnose/etc. The core loop (remember, recall,
+  # invalidate) is always-on; these specialist/maintenance tools load on
+  # demand so they stop riding along as unknowns on every turn.
+  - name: mnemosyne_extended
+    tools:
+      - mnemosyne_shared_remember
+      - mnemosyne_shared_recall
+      - mnemosyne_shared_forget
+      - mnemosyne_shared_stats
+      - mnemosyne_remember_canonical
+      - mnemosyne_recall_canonical
+      - mnemosyne_forget_canonical
+      - mnemosyne_triple_add
+      - mnemosyne_triple_query
+      - mnemosyne_triple_end
+      - mnemosyne_graph_query
+      - mnemosyne_graph_link
+      - mnemosyne_sync_push
+      - mnemosyne_sync_pull
+      - mnemosyne_sync_status
+      - mnemosyne_persona_promote
+      - mnemosyne_persona_demote
+      - mnemosyne_persona_reinforce
+      - mnemosyne_persona_list
+      - mnemosyne_scratchpad_write
+      - mnemosyne_scratchpad_read
+      - mnemosyne_scratchpad_clear
+      - mnemosyne_export
+      - mnemosyne_import
+      - mnemosyne_diagnose
+      - mnemosyne_batch
+      - mnemosyne_update
+      - mnemosyne_forget
+      - mnemosyne_get
+      - mnemosyne_stats
+      - mnemosyne_sleep
+      - mnemosyne_validate
+      - mnemosyne_task_progress
+      - mnemosyne_model_card
+      - mnemosyne_model_refresh
+      - mnemosyne_apply_pending
+      - mnemosyne_recall_diagnostics
+    keywords:
+      - '\bshared memory\b'
+      - '\bknowledge graph\b'
+      - '\btriple\b'
+      - '\bcanonical\b'
+      - '\bpersona\b'
+      - '\bscratchpad\b'
+      - '\bexport memory\b'
+      - '\bimport memory\b'
+      - '\bsync\b'
+      - '\bdiagnose\b'
+      - '\bbatch\b'
+      - '\bgraph\b'

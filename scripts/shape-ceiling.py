@@ -281,6 +281,11 @@ def compute_scope_recommendations(
         for p in plist:
             for t in (p.get("always_on_tools") or []):
                 always_on_observed.add(str(t))
+            # Also track tools kept on via the unknown-tools safe-default.
+            # Without this, new tools added by upstream (Hermes updates, plugin
+            # changes) are invisible to the shaper and never auto-demoted.
+            for t in (p.get("unknown_kept_tools") or []):
+                always_on_observed.add(str(t))
             pid = p.get("prediction_id", "")
             for tc in calls_by_pred.get(pid, []):
                 name = str(tc.get("tool_name") or "")
