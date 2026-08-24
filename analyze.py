@@ -10,6 +10,7 @@ thresholds as adjustable defaults rather than permanent policy.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import statistics
@@ -878,8 +879,9 @@ def _stability_payload(stat: "ScopeStats") -> dict[str, Any]:
     A high mutation rate in a cache-on environment means narrowing's
     schema savings are partially or fully eaten by re-billing the
     history at full input rate. This payload reports the raw frequency;
-    the cost analysis requires response-time cache_read_tokens which
-    aren't yet captured.
+    the cache-cost analysis uses per-call ``cache_read_tokens`` captured
+    in ``api_calls.jsonl`` and computed by ``scripts/cache-freeze-replay.py``,
+    surfaced in the Cache-Aware Savings section of this report.
 
     Counts exclude turn-1 (always a cold cache by definition) and rows
     missing tool_list_hash (pre-Tier-1 telemetry). hash_missing_turns is
@@ -1591,6 +1593,68 @@ def scope_payload(stat: ScopeStats, args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+_CACHE_FREEZE_MOD = None
+
+
+def _load_cache_freeze_module():
+    """Load scripts/cache-freeze-replay.py via importlib (hyphenated filename)."""
+    global _CACHE_FREEZE_MOD
+    if _CACHE_FREEZE_MOD is not None:
+        return _CACHE_FREEZE_MOD
+    script = Path(__file__).resolve().parent / "scripts" / "cache-freeze-replay.py"
+    if not script.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("cache_freeze_replay", script)
+    if spec is None or spec.loader is None:
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _CACHE_FREEZE_MOD = mod
+    return mod
+
+
+def compute_cache_cost(
+    predictions: list[dict[str, Any]],
+    api_calls: list[dict[str, Any]],
+    tool_calls: list[dict[str, Any]],
+    scopes: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Run the cache-freeze replay per scope and return a scope→result map.
+
+    Each value has:
+      - freeze: freeze_simulation() output
+      - counterfactual: matched_counterfactual() output
+    Returns an empty dict if the module or api_calls are unavailable.
+    """
+    mod = _load_cache_freeze_module()
+    if mod is None or not api_calls:
+        return {}
+    result: dict[str, dict[str, Any]] = {}
+    for scope in scopes:
+        freeze = mod.freeze_simulation(predictions, api_calls, tool_calls=tool_calls, scope_filter=scope)
+        cf = mod.matched_counterfactual(api_calls, scope_filter=scope)
+        result[scope] = {"freeze": freeze, "counterfactual": cf}
+    return result
+
+
+def _cache_cost_total_usd(cache_cost: dict[str, dict[str, Any]]) -> float:
+    """Sum est_usd_lost_upper_bound across all scopes and models."""
+    total = 0.0
+    for scope_data in cache_cost.values():
+        for model_data in scope_data.get("counterfactual", {}).get("per_model", {}).values():
+            total += model_data.get("est_usd_lost_upper_bound", 0.0)
+    return round(total, 4)
+
+
+def _cache_cost_total_tokens_lost(cache_cost: dict[str, dict[str, Any]]) -> int:
+    """Sum cache_read_lost_upper_bound across all scopes and models."""
+    total = 0
+    for scope_data in cache_cost.values():
+        for model_data in scope_data.get("counterfactual", {}).get("per_model", {}).values():
+            total += model_data.get("cache_read_lost_upper_bound", 0)
+    return total
+
+
 def format_summary(
     stats: dict[str, ScopeStats],
     recs: list[dict[str, Any]],
@@ -1645,6 +1709,7 @@ def markdown_report(
     args: argparse.Namespace,
     dampeners: list[dict[str, Any]] | None = None,
     trigger_keywords: list[dict[str, Any]] | None = None,
+    cache_cost: dict[str, dict[str, Any]] | None = None,
 ) -> str:
     generated = time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime())
     payload = summary_payload(stats, recs, args, dampeners, trigger_keywords)
@@ -1674,7 +1739,7 @@ def markdown_report(
         "",
         "A *mutation* is a turn where the wire-level tool schemas differed from the previous turn in the same session. "
         "Provider prefix-caches fingerprint the actual schema bytes, so a mutation invalidates the cache for the tool block AND the conversation history that follows it. "
-        "The savings model above (`logged_first_call_tokens_saved`) does **not** subtract that loss yet — it requires per-turn `cache_read_tokens` from the response, which isn't captured today. ",
+        "The savings model above (`logged_first_call_tokens_saved`) does **not** subtract that loss — see the Cache-Aware Savings section below for the corrected net. "
         "Turn 1 is excluded from comparable-turn counts (always a cold cache by definition). "
         "`hash_missing_turns` flags pre-Tier-1 telemetry or rows where the hash couldn't be computed — when high, the stability figures reflect a narrow recent slice rather than the full archive.",
         "",
@@ -1686,6 +1751,71 @@ def markdown_report(
         f"- Sessions with at least one mutation: **{totals['sessions_with_mutation']:,}** of {totals['sessions_observed']:,} ({totals['sessions_with_mutation_rate'] * 100:.1f}%)",
         "",
         "Per-scope mutation rates appear in the Per-Scope Metrics section below.",
+        "",
+    ]
+
+    # ─── Cache-Aware Savings section ──────────────────────────────────
+    if cache_cost:
+        total_usd_lost = _cache_cost_total_usd(cache_cost)
+        total_tokens_lost = _cache_cost_total_tokens_lost(cache_cost)
+        net_savings = totals["estimated_net_savings_tokens"]
+        lines.extend([
+            "## Cache-Aware Savings (matched counterfactual)",
+            "",
+            "Per-call `cache_read_tokens` are captured in `api_calls.jsonl` on every API response. "
+            "The cache-freeze replay matches each mutated call against the stable cohort at the same "
+            "`api_call_idx` position within the session, computing the counterfactual cache reads "
+            "that were lost to tool-list mutations. Dollar estimates use per-model list prices.",
+            "",
+            f"- Cache read tokens lost to mutations (upper bound): **{total_tokens_lost:,}**",
+            f"- Estimated USD cost of those lost cache reads: **${total_usd_lost:.4f}**",
+            f"- Schema-savings net (from Summary above): **{net_savings:+,}** tokens",
+            f"- Cache-corrected net = schema savings − cache-miss penalty (in tokens, not directly comparable due to different price rates)",
+            "",
+        ])
+        for scope, scope_data in cache_cost.items():
+            freeze = scope_data["freeze"]
+            cf = scope_data["counterfactual"]
+            lines.extend([
+                f"### {scope}",
+                "",
+                f"- Comparable calls: **{freeze['comparable_calls']:,}**",
+                f"- Matches frozen hash: **{freeze['matches_freeze']}** (avg cache_read: {freeze['avg_cache_read_when_matches']:,.0f})",
+                f"- Expand-driven mutations: **{freeze['expand_driven_mutations']}** (accepted — model requested new tools)",
+                f"- Would-break mutations: **{freeze['would_break_mutations']}** (avg cache_read: {freeze['avg_cache_read_when_would_break']:,.0f})",
+                f"- Freeze eliminates **{freeze['freeze_eliminates_pct_of_mutations'] * 100:.1f}%** of observed mutations",
+                "",
+            ])
+            per_model = cf.get("per_model", {})
+            if per_model:
+                lines.extend([
+                    "Per-model cache cost:",
+                    "",
+                    "| model | calls | mut | stable | cache_read_lost | est_usd_lost |",
+                    "|---|---:|---:|---:|---:|---:|",
+                ])
+                for model_name, m in sorted(per_model.items(), key=lambda kv: -int(kv[1]["calls"])):
+                    lines.append(
+                        f"| `{model_name}` | {m['calls']} | {m['mutated']} | {m['stable']} "
+                        f"| {m['cache_read_lost_upper_bound']:,} | ${m['est_usd_lost_upper_bound']:.4f} |"
+                    )
+                lines.extend([
+                    "",
+                    "Numbers are upper bounds (signed). Negative values mean the mutation coincided with a legitimate cache refresh.",
+                    "",
+                ])
+            else:
+                lines.extend(["No mutated calls with position-matched cohort data for this scope.", ""])
+    else:
+        lines.extend([
+            "## Cache-Aware Savings (matched counterfactual)",
+            "",
+            "> ⚠ No `api_calls.jsonl` data available — cache cost not computed. "
+            "The freeze-replay script (`scripts/cache-freeze-replay.py`) can be run manually.",
+            "",
+        ])
+
+    lines.extend([
         "",
         "## Adjustable Defaults Used",
         "",
@@ -1701,7 +1831,7 @@ def markdown_report(
         "",
         "## Per-Scope Metrics",
         "",
-    ]
+    ])
 
     for scope, stat in stats.items():
         used_events = sum(len(event_ids) for event_ids in stat.used_expansion_event_ids_by_category.values())
@@ -2010,6 +2140,11 @@ def main() -> int:
     dampeners = dampener_candidates(stats, args)
     trigger_keywords = trigger_keyword_candidates(stats, args)
 
+    # Load api_calls.jsonl for cache-cost analysis (cache_read_tokens per call)
+    api_calls_paths = telemetry_paths(args.state_dir, "api_calls.jsonl", args.include_archives)
+    api_calls = load_rows(api_calls_paths)
+    cache_cost = compute_cache_cost(predictions, api_calls, tool_calls, list(stats.keys())) if api_calls else None
+
     # Break down tool_calls by source so the headline counts don't conflate
     # narrowed gateway calls with cron / subagent calls that bypass narrowing.
     source_counts = {"gateway": 0, "cron": 0, "subagent": 0}
@@ -2048,7 +2183,7 @@ def main() -> int:
         report_path = reports_dir / f"{stamp}-analysis.md"
         reports_dir.mkdir(parents=True, exist_ok=True)
         report_path.write_text(
-            markdown_report(stats, recs, args, dampeners, trigger_keywords),
+            markdown_report(stats, recs, args, dampeners, trigger_keywords, cache_cost=cache_cost),
             encoding="utf-8",
         )
         print(f"report: {report_path}", file=status_stream)
