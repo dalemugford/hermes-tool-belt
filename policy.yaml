@@ -189,17 +189,12 @@ triggers:
       - '\bHA\b'
       - '\b(dim|brighten) (the )?lights?\b'
 
-  # Deferred-tool machinery — the meta-tools that search, describe, and
-  # invoke tools that aren't resident. Gated so they only load when the
-  # conversation is explicitly about finding/loading a tool.
-  - name: deferred_tools
-    tools: [tool_search, tool_describe, tool_call]
-    keywords:
-      - '\bsearch tool\b'
-      - '\bload tool\b'
-      - '\bexpand\b'
-      - '\bdeferred\b'
-      - '\bavailable tool\b'
+  # Note: tool_search / tool_describe / tool_call (Hermes' native deferred-
+  # loading bridge) are NOT gated here. Tool Search manages its own
+  # activation — it injects the bridge when MCP/plugin tools exist and
+  # stays off when they don't. Gating the bridge behind keyword triggers
+  # fought that logic and required an expand_tools round trip before the
+  # model could discover MCP tools. Let Tool Search handle its own layer.
 
   # Conversation-history search — pulling up prior sessions/turns.
   - name: history_search

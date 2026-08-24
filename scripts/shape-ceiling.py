@@ -63,6 +63,33 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
+# Import the protected-always-on set from analyze.py so the shaper respects
+# the same do-not-demote list the analyzer uses.  This prevents demoting
+# core meta tools (expand_tools, send_message, etc.) that either never
+# appear in tool_calls.jsonl or are structurally required by the plugin.
+_PLUGIN_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PLUGIN_DIR))
+try:
+    from analyze import effective_protected_always_on  # noqa: E402
+except Exception:
+    # Fallback: hard-coded minimum set if analyze.py is unavailable.
+    BASE_PROTECTED_ALWAYS_ON = {
+        "memory",
+        "session_search",
+        "clarify",
+        "skill_view",
+        "skills_list",
+        "todo",
+        "send_message",
+        "expand_tools",
+        "tool_search",
+        "tool_describe",
+        "tool_call",
+    }
+
+    def effective_protected_always_on(plugin_dir: Path | None = None) -> set[str]:  # type: ignore[no-redef]
+        return set(BASE_PROTECTED_ALWAYS_ON)
+
 
 # Thresholds — conservative defaults that won't fire on noise.
 DEFAULTS = {
@@ -298,7 +325,14 @@ def compute_scope_recommendations(
 
     demote: list[dict[str, Any]] = []
     if len(recent_sessions) >= demote_min_sessions_no_use:
+        # Build the protected set once per scope evaluation.  Tools in this
+        # set are structurally required (expand_tools, send_message, etc.)
+        # and must never be demoted even if they don't appear in
+        # tool_calls.jsonl.
+        protected = effective_protected_always_on(_PLUGIN_DIR)
         for tool_name in sorted(always_on_observed - tools_called):
+            if tool_name in protected:
+                continue
             demote.append({
                 "tool": tool_name,
                 "sessions_without_use": len(recent_sessions),

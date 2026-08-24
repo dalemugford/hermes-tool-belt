@@ -52,6 +52,11 @@ BASE_PROTECTED_ALWAYS_ON = {
     "todo",
     "send_message",
     "expand_tools",
+    # Hermes' native deferred-loading bridge tools. Tool Search manages
+    # its own activation; Tool Belt should never gate or demote them.
+    "tool_search",
+    "tool_describe",
+    "tool_call",
 }
 
 
