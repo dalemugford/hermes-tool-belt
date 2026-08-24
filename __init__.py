@@ -813,6 +813,79 @@ def _canonical_session_key(
     return ""
 
 
+def _looks_like_hermes_session_uuid(value: Any) -> bool:
+    """True when *value* looks like a Hermes internal session UUID.
+
+    Hermes' AIAgent session ids are shaped ``YYYYMMDD_HHMMSS_<hex>``
+    (e.g. ``20260823_204133_466974f4``) — the id that rotates on
+    ``/new`` / ``/reset`` / auto-reset. This is distinct from the
+    canonical *session key* (``agent:main:{platform}:{chat_type}:...``)
+    which carries a ``":"`` and stays constant across ``/new``.
+
+    We only need to *exclude* the session key (and blanks): any non-empty
+    string without a ``":"`` is accepted. That keeps us robust to future
+    id-shape tweaks while never mistaking a session key for a UUID — which
+    would defeat the per-session shaper grouping this field exists for.
+    """
+    return isinstance(value, str) and bool(value) and ":" not in value
+
+
+def _hermes_session_uuid(
+    event: Any = None,
+    gateway: Any = None,
+    session_store: Any = None,
+    kwargs: dict[str, Any] | None = None,
+    session_key: str = "",
+) -> str:
+    """Resolve the Hermes internal session UUID for telemetry grouping.
+
+    Telemetry-only. Unlike :func:`_canonical_session_key` (the load-bearing
+    session *key* used for freeze/bypass/sticky/lookback keying), this is the
+    per-session UUID that changes on ``/new``. The shaper groups by it so a
+    single long-lived chat still yields the distinct-session count its demote
+    threshold needs.
+
+    Resolution order (all read-only, no session side effects):
+
+    1. ``session_store._entries[session_key].session_id`` — the live routing
+       entry for this chat. Reflects the current active session and rotates
+       on ``/new``. Preferred because it's guaranteed UUID-shaped and doesn't
+       depend on process-global env state.
+    2. ``HERMES_SESSION_ID`` env var — the id the gateway/CLI binds for the
+       active turn (mirrors how :func:`_canonical_session_key` reads
+       ``HERMES_SESSION_KEY``). May lag by one turn at a ``/new`` boundary,
+       which is harmless for distinct-session counting.
+    3. ``kwargs``/``event`` ``session_id`` — only when UUID-shaped, so we
+       never capture a session key here.
+
+    Returns ``""`` when nothing UUID-shaped is reachable; the shaper falls
+    back to ``session_id`` for such rows.
+    """
+    if session_store is not None and session_key:
+        try:
+            entries = getattr(session_store, "_entries", None)
+            entry = entries.get(session_key) if isinstance(entries, dict) else None
+            sid = getattr(entry, "session_id", "") if entry is not None else ""
+            if _looks_like_hermes_session_uuid(sid):
+                return sid
+        except Exception:
+            pass
+
+    env_sid = os.environ.get("HERMES_SESSION_ID") or ""
+    if _looks_like_hermes_session_uuid(env_sid):
+        return env_sid
+
+    if kwargs:
+        for cand in ("session_id", "session_uuid"):
+            val = kwargs.get(cand)
+            if _looks_like_hermes_session_uuid(val):
+                return str(val)
+    val = getattr(event, "session_id", None) if event is not None else None
+    if _looks_like_hermes_session_uuid(val):
+        return str(val)
+    return ""
+
+
 def _agent_platform_from_context(event: Any = None, kwargs: dict[str, Any] | None = None) -> tuple[str, str, str]:
     """Return ``(agent, platform, scope)`` for the gateway-dispatch path.
 
@@ -886,6 +959,7 @@ def _maybe_log_prediction(
             ts=time.time(),
             prediction_id=state.get("prediction_id", ""),
             session_id=str(state.get("session_id", "")),
+            hermes_session_id=str(state.get("hermes_session_id", "")),
             channel=str(state.get("scope", state.get("channel", ""))),
             agent=str(state.get("agent", "")),
             platform=str(state.get("platform", "")),
@@ -1251,6 +1325,7 @@ def _build_state_from_frozen(
     frozen: dict[str, Any],
     *,
     session_id: str,
+    hermes_session_id: str = "",
     scope: str,
     channel: str,
     agent: str,
@@ -1287,6 +1362,7 @@ def _build_state_from_frozen(
         # to the in-turn ``pending_expansion`` check, which is correct.
         "sticky_key": "",
         "session_id": session_id,
+        "hermes_session_id": hermes_session_id,
         "message_hash": logger_io.hash_message(message),
         "message_preview": logger_io.message_preview(message),
         "preset": frozen["preset_name"],
@@ -1338,6 +1414,17 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         _POLICY_TURN_BY_SCOPE[scope] = _POLICY_TURN_BY_SCOPE.get(scope, 0) + 1
         channel = scope
         session_id = _canonical_session_key(event, session_store, kwargs)
+        # Telemetry-only: the Hermes internal session UUID that rotates on
+        # /new. Distinct from session_id (the session key) — see
+        # _hermes_session_uuid. Flows into the prediction record and the
+        # shaper's per-session grouping; touches nothing load-bearing.
+        hermes_session_id = _hermes_session_uuid(
+            event=event,
+            gateway=gateway,
+            session_store=session_store,
+            kwargs=kwargs,
+            session_key=str(session_id),
+        )
 
         # Record the canonical session_key for this platform so that the
         # next on_session_reset hook (which Hermes fires with only the
@@ -1366,6 +1453,7 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             _PREDICTION_CV.set(_build_state_from_frozen(
                 frozen,
                 session_id=str(session_id),
+                hermes_session_id=hermes_session_id,
                 scope=scope,
                 channel=channel,
                 agent=agent,
@@ -1461,6 +1549,7 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             "scope": scope,
             "sticky_key": sticky_key,
             "session_id": session_id,
+            "hermes_session_id": hermes_session_id,
             "message_hash": logger_io.hash_message(message),
             "message_preview": logger_io.message_preview(message),
             "preset": prediction.preset_name,

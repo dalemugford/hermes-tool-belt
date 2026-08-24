@@ -196,7 +196,11 @@ def group_predictions_by_scope_session(
     out: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     for p in preds:
         scope = str(p.get("scope") or "")
-        sid = str(p.get("session_id") or "")
+        # Group by the Hermes internal session UUID, which rotates on /new,
+        # so a single long-lived chat yields the distinct-session count the
+        # demote threshold needs. Fall back to session_id (the session key)
+        # for older rows written before hermes_session_id existed.
+        sid = str(p.get("hermes_session_id") or p.get("session_id") or "")
         if scope and sid:
             out[scope][sid].append(p)
     for scope, sessions in out.items():

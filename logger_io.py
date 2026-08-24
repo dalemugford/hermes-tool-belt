@@ -94,6 +94,14 @@ class PredictionRecord:
     ceiling_tokens: int
     narrowed_tokens: int
     triggers_suppressed: list[str] | None = None
+    # Hermes internal session UUID (shaped ``YYYYMMDD_HHMMSS_<hex>``) that
+    # rotates on ``/new``/``/reset``, distinct from ``session_id`` (the
+    # session *key*, which is constant per chat). Telemetry-only: the shaper
+    # groups predictions by this so a single long-lived chat still produces
+    # the distinct-session count its demote threshold needs. Blank on older
+    # rows and whenever the UUID isn't reachable — the shaper falls back to
+    # ``session_id`` for those.
+    hermes_session_id: str = ""
     # Flat policy scope for future per-agent/platform learning.
     agent: str = ""
     platform: str = ""
@@ -161,6 +169,7 @@ class PredictionRecord:
             "ts": self.ts,
             "prediction_id": self.prediction_id,
             "session_id": self.session_id,
+            "hermes_session_id": self.hermes_session_id,
             "channel": self.channel,  # legacy alias; prefer scope for new analysis
             "agent": self.agent,
             "platform": self.platform,
