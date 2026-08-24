@@ -27,6 +27,19 @@ _APPLY_MODES = {"auto", "audit"}
 _CACHE: dict[str, Any] = {"path": None, "mtime_ns": None, "state": None, "hash": ""}
 
 
+def _protected_always_on() -> set[str]:
+    """Return the set of tools that learned state must never remove from always_on.
+
+    Mirrors BASE_PROTECTED_ALWAYS_ON in analyze.py — structurally required
+    tools like send_message, expand_tools, and the Tool Search bridge.
+    """
+    try:
+        from .analyze import BASE_PROTECTED_ALWAYS_ON
+        return set(BASE_PROTECTED_ALWAYS_ON)
+    except Exception:
+        return set()
+
+
 @dataclass
 class LearnedMergeResult:
     """Result metadata from applying learned state to a preset."""
@@ -175,6 +188,13 @@ def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -
 
     learned_on = _string_list(scoped.get("always_on"))
     learned_off = set(_string_list(global_cfg.get("always_off"))) | set(_string_list(scoped.get("always_off")))
+
+    # Protected tools (send_message, expand_tools, bridge tools) must never
+    # be removed from always_on by learned state, even if a stale shaper run
+    # demoted them. Filter them out of learned_off before applying.
+    protected = _protected_always_on()
+    if protected and learned_off:
+        learned_off -= protected
 
     for tool in learned_on:
         if tool not in always_on and tool not in learned_off:

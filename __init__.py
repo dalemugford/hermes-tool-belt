@@ -489,13 +489,15 @@ def _base_tool_name(name: str) -> str:
 def _is_mcp_tool(name: str) -> bool:
     """Return True if a tool name belongs to an MCP server.
 
-    Checks the Hermes tool registry for an ``mcp-`` toolset prefix,
-    matching the same logic Tool Search uses in
-    ``tools.tool_search.is_deferrable_tool_name``. Falls back to
-    checking for the ``mcp_`` name prefix used on the Anthropic
-    adapter path. Returns False if the registry is unavailable.
+    Hermes names MCP tools ``mcp__<server>__<tool>`` (see
+    ``mcp_tool.MCP_TOOL_NAME_PREFIX``). The Anthropic adapter path
+    uses ``mcp_<tool>`` (single underscore). Both are checked.
+
+    Also consults the Hermes tool registry for an ``mcp-`` toolset
+    prefix, matching the logic in ``tools.tool_search.is_deferrable_tool_name``.
+    Returns False if the registry is unavailable.
     """
-    if name.startswith("mcp_"):
+    if name.startswith("mcp__") or name.startswith("mcp_"):
         return True
     try:
         from tools.registry import registry
