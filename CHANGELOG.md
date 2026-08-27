@@ -10,6 +10,17 @@ The initial public capabilities of the plugin:
 
 ### Added
 
+- **Guided onboarding (`scripts/configure.py`).** One command from install to a
+  working configuration. Detects the state of every `agent:platform` scope —
+  fresh, observing, ready, or shaped — and offers the step that fits. Two
+  paths: shape now, which analyzes existing history and shows in plain
+  language what becomes always-on and what moves to on-demand before writing
+  anything; or recommend first, which leaves tool loading untouched while
+  telemetry accumulates and reports how many more sessions each scope needs.
+  Configuration is written only through `hermes config set`/`unset`, every
+  write is preceded by a `before → after` diff and an explicit confirmation,
+  and `--status`/`--dry-run` never write. Degrades cleanly to printing
+  hand-run commands when the `hermes` CLI is unavailable.
 - **Cache-aware session freezing.** Under prefix-cache-friendly providers,
   the selected tool set stays stable across normal turns. Model-requested
   expansion is the explicit cache-breaking exception.

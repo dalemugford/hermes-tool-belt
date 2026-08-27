@@ -14,6 +14,7 @@ directory names.
 
 | Script | Purpose | Typical use |
 |---|---|---|
+| [`configure.py`](configure.py) | Guided onboarding. Detects the state of every agent scope, explains what shaping would change, and writes the configuration through `hermes config`. | The first command to run after installing. Re-run any time. |
 | [`bootstrap.py`](bootstrap.py) | Mode-aware first-install warm start. Uses live `expand_tools` evidence for cache-on scopes and session replay for cache-off scopes. | Optional, once after installation. |
 | [`shape-ceiling.py`](shape-ceiling.py) | Builds per-scope promote/demote recommendations from recent sessions and writes the learned overlay. | Run after enough organic sessions; inspect with `--dry-run` first. |
 | [`harvest-replay.py`](harvest-replay.py) | Replays existing Hermes sessions through the per-turn predictor and writes privacy-reduced synthetic telemetry. | Tune trigger coverage for cache-off scopes. |
@@ -29,6 +30,42 @@ Trigger-dampener regression coverage lives in
 with the normal test suite.
 
 ## Common workflows
+
+### Configure the plugin (start here)
+
+```bash
+python3 scripts/configure.py            # interactive
+python3 scripts/configure.py --status   # read-only state report
+```
+
+`configure.py` discovers every `agent:platform` scope from telemetry, reports
+which of four states it is in — `fresh`, `observing`, `ready`, `shaped` — and
+offers the step that fits. Two paths are available on a fresh scope:
+
+- **shape** — analyze the history already on disk, print a plain-language
+  summary of what would become always-on and what would move to on-demand,
+  and on confirmation write the learned overlay and set `learned_mode: apply`
+  for that scope.
+- **recommend** — leave tool loading untouched while telemetry accumulates,
+  then re-run later. The command prints how many more sessions each scope
+  needs; the minimum comes from `policy.yaml` `learning.shape_ceiling`.
+
+Config is written only through `hermes config set` / `hermes config unset`;
+`config.yaml` is never edited directly. Every write is preceded by its
+`before → after` line and requires confirmation. If `hermes` is not on PATH
+the command prints the exact commands to run by hand and exits 0.
+
+Non-interactive flags for scripting and tests:
+
+```bash
+python3 scripts/configure.py --status
+python3 scripts/configure.py --agent default --path recommend --yes
+python3 scripts/configure.py --agent default --path shape --dry-run
+python3 scripts/configure.py --reset default
+```
+
+`--status` never writes. `--dry-run` prints every diff and writes nothing —
+neither files nor `hermes config` calls.
 
 ### Preview or apply between-session shaping
 

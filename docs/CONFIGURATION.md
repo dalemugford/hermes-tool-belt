@@ -32,6 +32,59 @@ See [`presets.py:resolve_preset`](../presets.py) for the resolver.
 
 ---
 
+## Managed configuration (`scripts/configure.py`)
+
+Most users never edit `config.yaml` for this plugin.
+[`scripts/configure.py`](../scripts/configure.py) writes the per-scope keys
+for them, through `hermes config set` / `hermes config unset` — Hermes owns
+`config.yaml`, so the file is never edited directly. Every write is shown as
+a `before → after` line first and requires confirmation.
+
+The command writes exactly two per-scope keys, both of which are ordinary
+documented settings — it introduces no key of its own:
+
+| Key | Written when | Value |
+|---|---|---|
+| `plugins.tool-belt.channels.<scope>.learned_mode` | shape path | `apply` |
+| `plugins.tool-belt.channels.<scope>.learned_mode` | recommend path, reset | `recommend` |
+| `plugins.tool-belt.channels.<scope>.bypass_rate` | recommend path | `1.0` (full observation) |
+| `plugins.tool-belt.channels.<scope>.bypass_rate` | shape path, on acceptance | `0.0` (narrow immediately) |
+| `plugins.tool-belt.channels.<scope>.bypass_rate` | reset | the value observation mode replaced, default `0.0` |
+
+Scope keys are the same `agent:platform` identifiers used by telemetry — see
+[`channels`](#channels).
+
+### Observation mode
+
+The recommend path sets a scope's [`bypass_rate`](#bypass_rate) to `1.0`.
+Every session then ships the untouched tool ceiling while telemetry still
+records what the predictor *would* have selected — so a later shaping run has
+real evidence without any narrowing having happened in the meantime. The
+command reports how many more sessions each scope needs; that minimum is
+derived from [`learning.shape_ceiling`](#learningshape_ceiling) in
+`policy.yaml`, never hardcoded.
+
+### Reset behavior
+
+`configure.py --reset <agent>` returns a shaped scope to its pre-shaping
+state:
+
+1. The scope's entry is removed from [`learned.json`](#learnedjson-reference).
+   Other scopes and the global block are left untouched, and the file itself
+   is preserved.
+2. `channels.<scope>.learned_mode` is set to `recommend`, so the overlay stops
+   being merged even if one is written again later.
+3. `channels.<scope>.bypass_rate` is restored to whatever it was before
+   observation mode replaced it.
+
+Step 3 reads a small sidecar, `configure-state.json`, written next to
+`learned.json` in the scope's state directory when observation mode is
+enabled. It records only the previous `bypass_rate` per scope. It is not part
+of the learned-state schema, nothing at runtime reads it, and deleting it is
+harmless — a reset then restores the shipped default of `0.0`.
+
+---
+
 ## `config.yaml` reference
 
 User config lives under the `plugins.tool-belt` key of Hermes'

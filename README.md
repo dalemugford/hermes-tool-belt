@@ -120,21 +120,46 @@ picks the right cadence on its own.
 
 ## Install
 
+Two commands. Install, then configure.
+
 ```bash
 hermes plugins install dalemugford/hermes-tool-belt
+python3 ~/.hermes/plugins/tool-belt/scripts/configure.py
 ```
 
-Enable in `~/.hermes/config.yaml`:
+`configure.py` is the front door. It finds every agent and platform you
+run, reads the telemetry already on disk, and asks how you want to
+start. It writes configuration only through `hermes config set` — never
+by editing `config.yaml` — shows you a `before → after` line for every
+change, and applies nothing without your explicit confirmation.
 
-```yaml
-plugins:
-  tool-belt:
-    enabled: true
+You pick one of two paths, per agent:
+
+**Shape now** — for when you already have Hermes history. The command
+analyzes it, then shows you in plain language what would change: which
+tools stay loaded on every message, which move to on-demand, and which
+trigger groups still fire. Nothing is written until you say yes. On
+confirmation it writes the learned overlay and turns shaping on for the
+agents you chose.
+
+**Recommend first** — for when you would rather watch before narrowing.
+The command puts the selected agents into observation mode: tool loading
+stays exactly as it is today while telemetry accumulates. It tells you
+how many more sessions each agent needs. Re-run the command later and it
+offers the same review-and-confirm step for whichever agents are ready.
+
+Either way, restart the gateway afterward so Hermes picks up the new
+configuration.
+
+Re-run `configure.py` any time. It always detects the current state and
+offers what fits — shape an agent that just became ready, add agents,
+review what shaping did, or reset an agent back to observation mode.
+
+```bash
+python3 ~/.hermes/plugins/tool-belt/scripts/configure.py --status
 ```
 
-Restart the gateway. From the next message onward, the plugin starts
-adapting tool payloads based on detected intent. Cache-aware mode is
-chosen automatically per scope.
+`--status` is read-only: per-agent state and how much data each has.
 
 ### Optional: real-tokenizer counts
 
@@ -151,7 +176,25 @@ delta is honest either way — both sides use the same estimator — but
 absolute counts are more accurate with `tiktoken`. See
 [docs/SAVINGS.md](docs/SAVINGS.md#which-tokenizer) for the full story.
 
-### Day-one warm start (if you already use Hermes)
+### Advanced: configuring by hand
+
+`configure.py` covers the normal path. The underlying pieces stay
+available for anyone who wants to drive them directly.
+
+Enable the plugin by hand in `~/.hermes/config.yaml`:
+
+```yaml
+plugins:
+  tool-belt:
+    enabled: true
+```
+
+From the next message onward the plugin adapts tool payloads based on
+detected intent. Cache-aware mode is chosen automatically per scope.
+Every knob is documented in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
+Inspect recommendations without configuring anything:
 
 ```bash
 python3 ~/.hermes/plugins/tool-belt/scripts/bootstrap.py
@@ -162,7 +205,10 @@ runs the between-session shaper (`scripts/shape-ceiling.py`) to
 identify per-tool promote/demote candidates from real `expand_tools`
 evidence. Under cache-off scopes, runs harvest-replay + analyzer to
 mine trigger-keyword tweaks. Either path produces a ranked **TOP
-ACTIONS** summary tailored to your usage.
+ACTIONS** summary tailored to your usage. It writes no configuration.
+
+The full operator command set — shaper, analyzer, savings report, drift
+check — is documented in [scripts/README.md](scripts/README.md).
 
 ---
 

@@ -1,0 +1,1132 @@
+#!/usr/bin/env python3
+"""Tool Belt onboarding — one command from install to a working configuration.
+
+Run this after ``hermes plugins install dalemugford/hermes-tool-belt``::
+
+    python3 scripts/configure.py
+
+The command is a conversation, not a form. Every invocation detects the
+current state of each agent/platform scope and offers the right next step:
+
+  fresh      — nothing configured yet; pick a path
+  observing  — the scope is collecting telemetry in recommend mode
+  ready      — enough sessions collected; shaping can be reviewed and applied
+  shaped     — the learned overlay is live for this scope
+
+Two paths are offered on a fresh scope:
+
+  Shape now         Read the history you already have, show exactly what would
+                    change per agent, and — only after you confirm — write the
+                    learned overlay and switch that scope to ``learned_mode:
+                    apply``.
+
+  Recommend first   Leave the tool set untouched while telemetry accumulates
+                    (observation mode). Re-run this command later; it reports
+                    how many more sessions each scope needs and offers the
+                    same review/confirm/apply step once the data is there.
+
+Config is written **only** through ``hermes config set`` / ``hermes config
+unset``. Hermes owns ``config.yaml``; this script never edits it directly.
+Every write is preceded by a ``before → after`` line, and nothing is written
+without explicit confirmation (or ``--yes``).
+
+Usage
+=====
+
+  python3 scripts/configure.py                     # interactive
+  python3 scripts/configure.py --status            # read-only state report
+  python3 scripts/configure.py --agent default --path recommend --yes
+  python3 scripts/configure.py --agent default --path shape --dry-run
+  python3 scripts/configure.py --reset default     # back to recommend mode
+"""
+
+from __future__ import annotations
+
+import argparse
+import importlib
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+HERE = Path(__file__).resolve().parent
+PLUGIN_DIR = HERE.parent
+
+#: Root of the plugin's live config block inside ``~/.hermes/config.yaml``.
+CONFIG_PREFIX = "plugins.tool-belt"
+
+#: Sidecar remembering the per-scope bypass value that observation mode
+#: replaced, so a reset can restore it. Deliberately *not* ``learned.json`` —
+#: that file's shape belongs to the shaper.
+CONFIGURE_STATE_FILE = "configure-state.json"
+
+STATE_FRESH = "fresh"
+STATE_OBSERVING = "observing"
+STATE_READY = "ready"
+STATE_SHAPED = "shaped"
+
+#: Per-scope bypass value that puts a scope into full observation — every
+#: session ships the untouched ceiling while telemetry still records what the
+#: predictor *would* have done.
+OBSERVATION_BYPASS = 1.0
+#: The shipped default: narrow immediately, no observation cohort.
+NARROW_BYPASS = 0.0
+
+
+class Abort(Exception):
+    """Raised when the user ends the conversation (EOF / Ctrl-C)."""
+
+
+# ─────────────────────────── plugin module loading ───────────────────────────
+
+
+def _load_script_module(module_name: str, filename: str):
+    """Load a sibling script by path (filenames contain hyphens)."""
+    cached = sys.modules.get(module_name)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(module_name, HERE / filename)
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise ImportError(f"cannot load {filename}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_plugin_package():
+    """Register the hyphenated plugin directory as an importable package.
+
+    Mirrors ``tests/conftest.py`` so the same module objects are reused when
+    the test suite has already registered them.
+    """
+    name = "tool_belt_plugin"
+    existing = sys.modules.get(name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(
+        name,
+        PLUGIN_DIR / "__init__.py",
+        submodule_search_locations=[str(PLUGIN_DIR)],
+    )
+    if spec is None or spec.loader is None:  # pragma: no cover - defensive
+        raise ImportError("cannot load tool-belt package")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def load_shaper():
+    """The between-session shaper — the single source of shaping math."""
+    return _load_script_module("tool_belt_shape_ceiling", "shape-ceiling.py")
+
+
+def load_learned():
+    """``learned.py`` (mode normalization, learned-state helpers), or None."""
+    try:
+        _load_plugin_package()
+        return importlib.import_module("tool_belt_plugin.learned")
+    except Exception:
+        return None
+
+
+def load_base_preset():
+    """The shipped policy preset, or None if it cannot be read."""
+    try:
+        _load_plugin_package()
+        presets = importlib.import_module("tool_belt_plugin.presets")
+        return presets.load_base_policy()
+    except Exception:
+        return None
+
+
+def normalize_mode(value: Any) -> str:
+    """Resolve a config value to ``recommend`` / ``apply``.
+
+    Delegates to ``learned.normalize_mode`` so legacy aliases stay in one
+    place; falls back to a minimal equivalent when the package is unavailable.
+    """
+    learned = load_learned()
+    if learned is not None:
+        try:
+            return learned.normalize_mode(value)
+        except Exception:
+            pass
+    mode = str(value or "").strip().lower()
+    mode = {"off": "recommend", "auto": "apply", "audit": "apply"}.get(mode, mode)
+    return mode if mode in {"recommend", "apply"} else "recommend"
+
+
+# ──────────────────────────────── discovery ──────────────────────────────────
+
+
+@dataclass
+class ScopeInfo:
+    """One agent/platform scope, with the telemetry we have for it."""
+
+    scope: str
+    agent: str
+    platform: str
+    state_dir: Path
+    sessions: int = 0
+    inferred: bool = False  # no telemetry yet; platform came from the user
+
+    @property
+    def config_prefix(self) -> str:
+        return f"{CONFIG_PREFIX}.channels.{self.scope}"
+
+
+def default_hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+
+
+def discover_state_dirs(
+    hermes_home: Path, profile_filter: str | None = None
+) -> list[tuple[str, Path]]:
+    """Return ``[(agent_label, state_dir), ...]`` for the root and named profiles.
+
+    Same shape and ordering as ``bootstrap._discover_state_dirs``, with one
+    difference: a profile that has ``sessions/`` but no ``state/tool-belt``
+    yet is still surfaced, because onboarding runs *before* the plugin has
+    written any state.
+    """
+    out: list[tuple[str, Path]] = []
+    root_state = hermes_home / "state" / "tool-belt"
+    if not profile_filter or profile_filter == "default":
+        if root_state.is_dir() or (hermes_home / "sessions").is_dir():
+            out.append(("default", root_state))
+    profiles_dir = hermes_home / "profiles"
+    if profiles_dir.is_dir():
+        for child in sorted(profiles_dir.iterdir()):
+            if not child.is_dir() or child.name == "default":
+                continue  # "default" under profiles/ is reserved by Hermes
+            if profile_filter and child.name != profile_filter:
+                continue
+            p_state = child / "state" / "tool-belt"
+            if p_state.is_dir() or (child / "sessions").is_dir():
+                out.append((child.name, p_state))
+    return out
+
+
+def _session_counts_by_scope(state_dir: Path) -> dict[str, int]:
+    """Distinct sessions per scope from ``predictions.jsonl``.
+
+    Grouping is delegated to the shaper so "a session" means exactly what it
+    means everywhere else in the plugin.
+    """
+    shaper = load_shaper()
+    preds = shaper.load_jsonl(state_dir / "predictions.jsonl")
+    if not preds:
+        return {}
+    grouped = shaper.group_predictions_by_scope_session(preds)
+    return {scope: len(sessions) for scope, sessions in grouped.items()}
+
+
+def discover_scopes(
+    hermes_home: Path,
+    profile_filter: str | None = None,
+    platform_hint: Sequence[str] | None = None,
+) -> list[ScopeInfo]:
+    """Discover every ``agent:platform`` scope this install knows about.
+
+    Platforms come from the scopes actually recorded in each profile's
+    ``predictions.jsonl``. A profile with no telemetry yet yields one inferred
+    scope per ``platform_hint`` entry (the caller asks the user), or none.
+    """
+    out: list[ScopeInfo] = []
+    for label, state_dir in discover_state_dirs(hermes_home, profile_filter):
+        counts = _session_counts_by_scope(state_dir) if state_dir.is_dir() else {}
+        seen_any = False
+        for scope, sessions in sorted(counts.items()):
+            agent, _, platform = scope.rpartition(":")
+            if not agent:  # bare-platform scope row (older telemetry)
+                agent, platform = label, scope
+                scope = f"{label}:{platform}"
+            out.append(
+                ScopeInfo(
+                    scope=scope,
+                    agent=agent,
+                    platform=platform,
+                    state_dir=state_dir,
+                    sessions=sessions,
+                )
+            )
+            seen_any = True
+        if not seen_any:
+            for platform in platform_hint or ():
+                platform = str(platform).strip().lower()
+                if not platform:
+                    continue
+                out.append(
+                    ScopeInfo(
+                        scope=f"{label}:{platform}",
+                        agent=label,
+                        platform=platform,
+                        state_dir=state_dir,
+                        sessions=0,
+                        inferred=True,
+                    )
+                )
+    return out
+
+
+# ────────────────────────────── hermes config I/O ────────────────────────────
+
+Runner = Callable[..., Any]
+
+_NOT_SET_PREFIX = "Config key not set"
+
+
+# These indirections exist so the module attribute is resolved at call time.
+# Binding ``subprocess.run`` / ``print`` / ``input`` directly as a default
+# argument would capture the original object, and a test that patches the
+# module attribute would still reach the real one — which means real writes
+# to a real config.
+def _default_runner(argv, capture_output=False, text=False, check=False):
+    return subprocess.run(argv, capture_output=capture_output, text=text, check=check)
+
+
+def _default_which(name: str) -> str | None:
+    return shutil.which(name)
+
+
+def _default_out(message: str) -> None:
+    print(message)
+
+
+def _default_reader(message: str) -> str:
+    return input(message)
+
+
+def hermes_available(which: Callable[[str], str | None] = _default_which) -> bool:
+    return bool(which("hermes"))
+
+
+def _run(runner: Runner, argv: list[str]):
+    return runner(argv, capture_output=True, text=True, check=False)
+
+
+def hermes_config_get(key: str, runner: Runner = _default_runner) -> str | None:
+    """Read a resolved config value. ``None`` means "not set"."""
+    try:
+        result = _run(runner, ["hermes", "config", "get", key])
+    except Exception:
+        return None
+    out = (getattr(result, "stdout", "") or "").strip()
+    if getattr(result, "returncode", 0) != 0:
+        return None
+    if not out or out.startswith(_NOT_SET_PREFIX):
+        return None
+    return out
+
+
+def read_plugin_config(runner: Runner = _default_runner) -> dict[str, Any]:
+    """Read the whole ``plugins.tool-belt`` block as a dict.
+
+    Returns ``{}`` when the block is unset or when PyYAML is unavailable —
+    callers fall back to per-key scalar reads, which need no parser.
+    """
+    raw = hermes_config_get(CONFIG_PREFIX, runner=runner)
+    if not raw:
+        return {}
+    try:
+        import yaml  # type: ignore[import-untyped]
+    except Exception:
+        return {}
+    try:
+        data = yaml.safe_load(raw)
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _to_float(value: Any) -> float | None:
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return None
+
+
+def scope_settings(
+    scope: str,
+    plugin_config: dict[str, Any] | None,
+    runner: Runner = _default_runner,
+) -> dict[str, Any]:
+    """Current per-scope ``learned_mode`` / ``bypass_rate`` (raw, may be None).
+
+    Prefers the parsed config block; falls back to targeted ``hermes config
+    get`` reads when PyYAML is missing or the block could not be parsed.
+    """
+    if plugin_config:
+        channels = plugin_config.get("channels")
+        entry = channels.get(scope) if isinstance(channels, dict) else None
+        entry = entry if isinstance(entry, dict) else {}
+        return {
+            "learned_mode": entry.get("learned_mode", plugin_config.get("learned_mode")),
+            "bypass_rate": _to_float(entry.get("bypass_rate", plugin_config.get("bypass_rate"))),
+            "scope_learned_mode": entry.get("learned_mode"),
+            "scope_bypass_rate": _to_float(entry.get("bypass_rate")),
+            "configured": bool(entry) or bool(plugin_config),
+        }
+    prefix = f"{CONFIG_PREFIX}.channels.{scope}"
+    scope_mode = hermes_config_get(f"{prefix}.learned_mode", runner=runner)
+    scope_bypass = _to_float(hermes_config_get(f"{prefix}.bypass_rate", runner=runner))
+    global_mode = hermes_config_get(f"{CONFIG_PREFIX}.learned_mode", runner=runner)
+    global_bypass = _to_float(hermes_config_get(f"{CONFIG_PREFIX}.bypass_rate", runner=runner))
+    return {
+        "learned_mode": scope_mode if scope_mode is not None else global_mode,
+        "bypass_rate": scope_bypass if scope_bypass is not None else global_bypass,
+        "scope_learned_mode": scope_mode,
+        "scope_bypass_rate": scope_bypass,
+        "configured": any(
+            v is not None for v in (scope_mode, scope_bypass, global_mode, global_bypass)
+        ),
+    }
+
+
+# ──────────────────────────────── state machine ──────────────────────────────
+
+
+def shape_thresholds() -> dict[str, int]:
+    """Shaper minima, straight from ``policy.yaml`` ``learning.shape_ceiling``."""
+    return load_shaper().load_shape_ceiling_defaults()
+
+
+def required_sessions(thresholds: dict[str, int] | None = None) -> int:
+    """Sessions needed before a scope has a complete shaping picture.
+
+    Derived, never hardcoded: promotion needs ``promote_min_sessions`` and
+    demotion needs ``demote_min_sessions_no_use``; the larger of the two is
+    the point at which both halves of the recommendation are available.
+    """
+    thresholds = thresholds or shape_thresholds()
+    return max(
+        int(thresholds.get("promote_min_sessions", 2)),
+        int(thresholds.get("demote_min_sessions_no_use", 20)),
+    )
+
+
+def classify_scope(
+    info: ScopeInfo,
+    settings: dict[str, Any],
+    thresholds: dict[str, int] | None = None,
+) -> str:
+    """Which of the four states this scope is in."""
+    needed = required_sessions(thresholds)
+    if normalize_mode(settings.get("learned_mode")) == "apply":
+        return STATE_SHAPED
+    bypass = settings.get("scope_bypass_rate")
+    if bypass is None:
+        bypass = settings.get("bypass_rate")
+    observing = bypass is not None and float(bypass) >= OBSERVATION_BYPASS
+    if observing:
+        return STATE_READY if info.sessions >= needed else STATE_OBSERVING
+    if not settings.get("configured") and info.sessions < needed:
+        return STATE_FRESH
+    return STATE_READY if info.sessions >= needed else STATE_FRESH
+
+
+def remaining_sessions(info: ScopeInfo, thresholds: dict[str, int] | None = None) -> int:
+    return max(0, required_sessions(thresholds) - info.sessions)
+
+
+# ────────────────────────── configure-state sidecar ──────────────────────────
+
+
+def _configure_state_path(state_dir: Path) -> Path:
+    return state_dir / CONFIGURE_STATE_FILE
+
+
+def read_configure_state(state_dir: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(_configure_state_path(state_dir).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _atomic_write_json(target: Path, payload: dict[str, Any]) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_suffix(target.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(target)
+
+
+def remember_previous_bypass(state_dir: Path, scope: str, value: float | None) -> None:
+    """Record the bypass value observation mode is about to replace."""
+    state = read_configure_state(state_dir)
+    scopes = dict(state.get("scopes") or {})
+    entry = dict(scopes.get(scope) or {})
+    entry["previous_bypass_rate"] = NARROW_BYPASS if value is None else float(value)
+    scopes[scope] = entry
+    state["scopes"] = scopes
+    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _atomic_write_json(_configure_state_path(state_dir), state)
+
+
+def previous_bypass(state_dir: Path, scope: str) -> float:
+    """The bypass value to restore on reset. Defaults to the shipped ``0.0``."""
+    entry = (read_configure_state(state_dir).get("scopes") or {}).get(scope) or {}
+    value = _to_float(entry.get("previous_bypass_rate"))
+    return NARROW_BYPASS if value is None else value
+
+
+# ──────────────────────────────── write planning ─────────────────────────────
+
+
+@dataclass
+class ConfigWrite:
+    """One pending ``hermes config`` mutation, with its before/after."""
+
+    key: str
+    after: str | None
+    before: str | None = None
+    action: str = "set"  # "set" | "unset"
+
+    def argv(self) -> list[str]:
+        if self.action == "unset":
+            return ["hermes", "config", "unset", self.key]
+        return ["hermes", "config", "set", self.key, str(self.after), "--force"]
+
+
+def format_value(value: Any) -> str:
+    return "(not set)" if value is None else str(value)
+
+
+def build_diff(write: ConfigWrite) -> str:
+    """One human-readable ``before → after`` line for a pending write."""
+    after = "(removed)" if write.action == "unset" else format_value(write.after)
+    return f"  {write.key}: {format_value(write.before)} → {after}"
+
+
+def _fmt_rate(value: float) -> str:
+    """Render a bypass rate without rounding it away.
+
+    ``0.05`` is a real A/B cohort value a user may already have set; it must
+    survive a round-trip through observation mode and back.
+    """
+    text = f"{float(value):g}"
+    return f"{text}.0" if "." not in text and "e" not in text else text
+
+
+def plan_shape_writes(info: ScopeInfo, settings: dict[str, Any]) -> list[ConfigWrite]:
+    """Turn shaping on for a scope: apply the overlay, stop observing."""
+    writes = [
+        ConfigWrite(
+            key=f"{info.config_prefix}.learned_mode",
+            after="apply",
+            before=settings.get("scope_learned_mode") or settings.get("learned_mode"),
+        )
+    ]
+    current = settings.get("scope_bypass_rate")
+    if current is not None and float(current) != NARROW_BYPASS:
+        writes.append(
+            ConfigWrite(
+                key=f"{info.config_prefix}.bypass_rate",
+                after=_fmt_rate(NARROW_BYPASS),
+                before=_fmt_rate(current),
+            )
+        )
+    return writes
+
+
+def plan_recommend_writes(info: ScopeInfo, settings: dict[str, Any]) -> list[ConfigWrite]:
+    """Put a scope into observation mode: watch, don't narrow."""
+    return [
+        ConfigWrite(
+            key=f"{info.config_prefix}.learned_mode",
+            after="recommend",
+            before=settings.get("scope_learned_mode") or settings.get("learned_mode"),
+        ),
+        ConfigWrite(
+            key=f"{info.config_prefix}.bypass_rate",
+            after=_fmt_rate(OBSERVATION_BYPASS),
+            before=(
+                None
+                if settings.get("scope_bypass_rate") is None
+                else _fmt_rate(settings["scope_bypass_rate"])
+            ),
+        ),
+    ]
+
+
+def plan_reset_writes(
+    info: ScopeInfo, settings: dict[str, Any], restore_bypass: float
+) -> list[ConfigWrite]:
+    """Return a shaped scope to recommend mode with its old bypass value."""
+    return [
+        ConfigWrite(
+            key=f"{info.config_prefix}.learned_mode",
+            after="recommend",
+            before=settings.get("scope_learned_mode") or settings.get("learned_mode"),
+        ),
+        ConfigWrite(
+            key=f"{info.config_prefix}.bypass_rate",
+            after=_fmt_rate(restore_bypass),
+            before=(
+                None
+                if settings.get("scope_bypass_rate") is None
+                else _fmt_rate(settings["scope_bypass_rate"])
+            ),
+        ),
+    ]
+
+
+def apply_writes(
+    writes: Sequence[ConfigWrite],
+    runner: Runner = _default_runner,
+    dry_run: bool = False,
+    out: Callable[[str], None] = _default_out,
+) -> list[str]:
+    """Execute pending writes. ``dry_run`` runs no subprocess at all."""
+    applied: list[str] = []
+    for write in writes:
+        if dry_run:
+            applied.append(f"[dry-run] {' '.join(write.argv())}")
+            continue
+        try:
+            result = _run(runner, write.argv())
+        except Exception as exc:
+            out(f"  ! {write.key}: {exc}")
+            continue
+        if getattr(result, "returncode", 0) != 0:
+            stderr = (getattr(result, "stderr", "") or "").strip()
+            out(f"  ! {write.key}: hermes config failed — {stderr[:200]}")
+            continue
+        applied.append(" ".join(write.argv()))
+    return applied
+
+
+# ───────────────────────────── learned overlay I/O ───────────────────────────
+
+
+def compute_recommendations(info: ScopeInfo, thresholds: dict[str, int]) -> dict[str, Any] | None:
+    """Run the shaper's own analysis for one scope. No math is reimplemented."""
+    shaper = load_shaper()
+    preds = shaper.load_jsonl(info.state_dir / "predictions.jsonl")
+    if not preds:
+        return None
+    grouped = shaper.group_predictions_by_scope_session(preds)
+    sessions = grouped.get(info.scope)
+    if not sessions:
+        return None
+    calls_by_pred = shaper.index_tool_calls_by_prediction(
+        shaper.load_jsonl(info.state_dir / "tool_calls.jsonl")
+    )
+    return shaper.compute_scope_recommendations(
+        scope=info.scope,
+        sessions=sessions,
+        calls_by_pred=calls_by_pred,
+        window=int(thresholds.get("session_window", 20)),
+        promote_min_sessions=int(thresholds.get("promote_min_sessions", 2)),
+        promote_min_calls=int(thresholds.get("promote_min_calls", 3)),
+        demote_min_sessions_no_use=int(thresholds.get("demote_min_sessions_no_use", 20)),
+    )
+
+
+def write_learned_overlay(
+    info: ScopeInfo, recs: dict[str, Any], dry_run: bool = False
+) -> bool:
+    """Persist the shaper's recommendations via the shaper's own writer."""
+    shaper = load_shaper()
+    _state, changed = shaper.merge_into_learned(
+        info.state_dir, {info.scope: recs}, dry_run
+    )
+    return changed
+
+
+def remove_learned_scope(info: ScopeInfo, dry_run: bool = False) -> bool:
+    """Drop one scope's entry from ``learned.json`` (atomic, file preserved)."""
+    path = info.state_dir / "learned.json"
+    if not path.exists():
+        return False
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(state, dict):
+        return False
+    scopes = state.get("scopes")
+    if not isinstance(scopes, dict) or info.scope not in scopes:
+        return False
+    if dry_run:
+        return True
+    scopes.pop(info.scope, None)
+    state["scopes"] = scopes
+    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _atomic_write_json(path, state)
+    return True
+
+
+# ────────────────────────────────── rendering ────────────────────────────────
+
+
+def render_shaping_summary(
+    info: ScopeInfo,
+    recs: dict[str, Any] | None,
+    preset: Any = None,
+    thresholds: dict[str, int] | None = None,
+) -> list[str]:
+    """Plain-language description of what shaping would do to one scope.
+
+    Never raises on thin or empty input — an unshapeable scope simply says so.
+    """
+    thresholds = thresholds or {}
+    recs = recs or {}
+    promote = [p for p in (recs.get("promote") or []) if isinstance(p, dict)]
+    demote = [d for d in (recs.get("demote") or []) if isinstance(d, dict)]
+    considered = int(recs.get("sessions_considered") or 0)
+
+    lines = [f"{info.scope} — from {considered} recorded session(s)"]
+
+    base_always_on: list[str] = []
+    if preset is not None:
+        raw = getattr(preset, "always_on", None)
+        if isinstance(raw, list):
+            base_always_on = [str(t) for t in raw]
+
+    demoted_names = sorted(str(d.get("tool") or "") for d in demote)
+    demoted_names = [name for name in demoted_names if name]
+    promoted_names = sorted(str(p.get("tool") or "") for p in promote)
+    promoted_names = [name for name in promoted_names if name]
+
+    always_on = [t for t in base_always_on if t not in set(demoted_names)]
+    for name in promoted_names:
+        if name not in always_on:
+            always_on.append(name)
+
+    if always_on:
+        lines.append(f"  Loaded on every message ({len(always_on)}): {', '.join(sorted(always_on))}")
+    elif promoted_names:
+        lines.append(f"  Added to every message ({len(promoted_names)}): {', '.join(promoted_names)}")
+    else:
+        lines.append("  Loaded on every message: unchanged from the shipped policy")
+
+    if promoted_names:
+        detail = ", ".join(
+            f"{p['tool']} (asked for in {p.get('sessions', 0)} session(s))"
+            for p in promote
+            if p.get("tool")
+        )
+        lines.append(f"  Newly always-on because you kept reaching for them: {detail}")
+
+    if demoted_names:
+        lines.append(
+            f"  Moved to on-demand ({len(demoted_names)}): {', '.join(demoted_names)}"
+        )
+        lines.append(
+            "    Still fully available — the agent recovers any of these mid-session "
+            "via expand_tools."
+        )
+    else:
+        min_demote = int(thresholds.get("demote_min_sessions_no_use", 0) or 0)
+        if min_demote and considered < min_demote:
+            lines.append(
+                f"  Moved to on-demand: none yet — needs {min_demote} sessions, "
+                f"has {considered}."
+            )
+        else:
+            lines.append("  Moved to on-demand: none — every always-on tool got used.")
+
+    triggers = list(getattr(preset, "triggers", []) or []) if preset is not None else []
+    if triggers:
+        removed = set(demoted_names)
+        rows = []
+        for group in triggers:
+            tools = [t for t in list(getattr(group, "tools", []) or []) if t not in removed]
+            if tools:
+                rows.append(f"{getattr(group, 'name', '?')} ({len(tools)} tools)")
+        if rows:
+            lines.append(f"  Trigger groups that still fire ({len(rows)}): {', '.join(rows)}")
+
+    return lines
+
+
+def render_status_row(
+    info: ScopeInfo, state: str, thresholds: dict[str, int]
+) -> str:
+    needed = required_sessions(thresholds)
+    if state == STATE_SHAPED:
+        detail = "shaping applied"
+    elif state == STATE_READY:
+        detail = f"ready to shape ({info.sessions}/{needed} sessions)"
+    elif state == STATE_OBSERVING:
+        detail = (
+            f"observing — {info.sessions}/{needed} sessions, "
+            f"{remaining_sessions(info, thresholds)} to go"
+        )
+    else:
+        detail = f"not configured ({info.sessions}/{needed} sessions)"
+    return f"  {info.scope:<28} {state:<10} {detail}"
+
+
+# ────────────────────────────────── prompting ────────────────────────────────
+
+
+def prompt(message: str, reader: Callable[[str], str] = _default_reader) -> str:
+    try:
+        return reader(message).strip()
+    except (EOFError, KeyboardInterrupt):
+        raise Abort()
+
+
+def prompt_choice(
+    message: str, choices: Sequence[str], reader: Callable[[str], str] = _default_reader
+) -> str:
+    """Re-prompt until one of ``choices`` is entered."""
+    valid = {c.lower() for c in choices}
+    while True:
+        answer = prompt(f"{message} [{'/'.join(choices)}]: ", reader).lower()
+        if answer in valid:
+            return answer
+        print(f"  Please answer one of: {', '.join(choices)}")
+
+
+def confirm(message: str, reader: Callable[[str], str] = _default_reader) -> bool:
+    return prompt_choice(message, ("y", "n"), reader) == "y"
+
+
+def prompt_multi_select(
+    infos: Sequence[ScopeInfo], reader: Callable[[str], str] = _default_reader
+) -> list[ScopeInfo]:
+    """Numbered multi-select. ``all`` selects everything; blank aborts nothing."""
+    if len(infos) == 1:
+        return list(infos)
+    print("\n  Which agents should this cover?")
+    for idx, info in enumerate(infos, 1):
+        print(f"    {idx}. {info.scope}  ({info.sessions} session(s) recorded)")
+    while True:
+        answer = prompt("  Numbers (comma-separated) or 'all': ", reader).lower()
+        if answer in {"all", "*"}:
+            return list(infos)
+        picked: list[ScopeInfo] = []
+        ok = True
+        for part in answer.replace(" ", "").split(","):
+            if not part:
+                continue
+            try:
+                index = int(part)
+            except ValueError:
+                ok = False
+                break
+            if not 1 <= index <= len(infos):
+                ok = False
+                break
+            candidate = infos[index - 1]
+            if candidate not in picked:
+                picked.append(candidate)
+        if ok and picked:
+            return picked
+        print("  Please enter numbers from the list, or 'all'.")
+
+
+# ───────────────────────────────── degraded mode ─────────────────────────────
+
+
+def print_manual_commands(writes: Sequence[ConfigWrite], out: Callable[[str], None] = _default_out) -> None:
+    out("\n  `hermes` is not on PATH, so nothing was written.")
+    out("  Run these yourself once the Hermes CLI is available:\n")
+    for write in writes:
+        out(f"    {' '.join(write.argv())}")
+    out("")
+
+
+# ─────────────────────────────────── flows ───────────────────────────────────
+
+
+@dataclass
+class RunContext:
+    hermes_home: Path
+    runner: Runner = _default_runner
+    dry_run: bool = False
+    assume_yes: bool = False
+    reader: Callable[[str], str] = _default_reader
+    out: Callable[[str], None] = _default_out
+    thresholds: dict[str, int] = field(default_factory=dict)
+    plugin_config: dict[str, Any] = field(default_factory=dict)
+    have_hermes: bool = True
+    applied: list[str] = field(default_factory=list)
+
+    def settings(self, scope: str) -> dict[str, Any]:
+        if not self.have_hermes:
+            # Nothing to read from and nothing to read with — don't spawn a
+            # process that cannot exist.
+            return {
+                "learned_mode": None,
+                "bypass_rate": None,
+                "scope_learned_mode": None,
+                "scope_bypass_rate": None,
+                "configured": False,
+            }
+        return scope_settings(scope, self.plugin_config, runner=self.runner)
+
+
+def _confirm_writes(ctx: RunContext, title: str, writes: Sequence[ConfigWrite]) -> bool:
+    """Show the diff, then ask. ``--yes`` skips the ask, never the diff."""
+    ctx.out(f"\n  {title}")
+    for write in writes:
+        ctx.out(build_diff(write))
+    if not ctx.have_hermes:
+        print_manual_commands(writes, ctx.out)
+        return False
+    if ctx.dry_run:
+        ctx.out("  [dry-run] nothing will be written.")
+        return True
+    if ctx.assume_yes:
+        return True
+    return confirm("  Apply these changes?", ctx.reader)
+
+
+def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
+    """Path 1 — read the history, show the shaping, apply on confirmation."""
+    preset = load_base_preset()
+    shaped_any = False
+    for info in infos:
+        recs = compute_recommendations(info, ctx.thresholds)
+        if not recs:
+            ctx.out(f"\n  {info.scope}: no telemetry recorded yet — nothing to shape.")
+            ctx.out("    Choose the 'recommend' path for this agent instead.")
+            continue
+        ctx.out("")
+        for line in render_shaping_summary(info, recs, preset, ctx.thresholds):
+            ctx.out(line)
+
+        writes = plan_shape_writes(info, ctx.settings(info.scope))
+        if not _confirm_writes(ctx, f"Config changes for {info.scope}:", writes):
+            ctx.out(f"  Skipped {info.scope}. Nothing written.")
+            continue
+
+        changed = write_learned_overlay(info, recs, dry_run=ctx.dry_run)
+        target = info.state_dir / "learned.json"
+        if ctx.dry_run:
+            ctx.out(f"  [dry-run] would write shaping overlay to {target}")
+        elif changed:
+            ctx.out(f"  Wrote shaping overlay to {target}")
+        else:
+            ctx.out(f"  Shaping overlay already current at {target}")
+        ctx.applied.extend(apply_writes(writes, ctx.runner, ctx.dry_run, ctx.out))
+        shaped_any = True
+
+    if shaped_any and not ctx.dry_run:
+        ctx.out("\n  What happens next")
+        ctx.out("    · Restart the Hermes gateway to pick up the new configuration.")
+        ctx.out("    · Shaped agents load a tighter tool set from their next session on.")
+        ctx.out("    · Anything moved to on-demand comes back instantly via expand_tools.")
+        ctx.out("    · Re-run this command any time to review or reset an agent.")
+    return 0
+
+
+def flow_recommend(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
+    """Path 2 — observe first, shape later."""
+    needed = required_sessions(ctx.thresholds)
+    for info in infos:
+        settings = ctx.settings(info.scope)
+        writes = plan_recommend_writes(info, settings)
+        if not _confirm_writes(ctx, f"Config changes for {info.scope}:", writes):
+            ctx.out(f"  Skipped {info.scope}. Nothing written.")
+            continue
+        if not ctx.dry_run:
+            remember_previous_bypass(
+                info.state_dir, info.scope, settings.get("scope_bypass_rate")
+            )
+        ctx.applied.extend(apply_writes(writes, ctx.runner, ctx.dry_run, ctx.out))
+        remaining = remaining_sessions(info, ctx.thresholds)
+        ctx.out(
+            f"  {info.scope}: observation mode on — {info.sessions}/{needed} sessions "
+            f"recorded, {remaining} more needed."
+        )
+
+    if not ctx.dry_run:
+        ctx.out("\n  What happens next")
+        ctx.out("    · Restart the Hermes gateway; tool loading is unchanged for now.")
+        ctx.out("    · Keep using your agents normally — every message is recorded.")
+        ctx.out(
+            f"    · Once a scope reaches {needed} sessions, re-run this command; it will "
+            "offer the shaping review."
+        )
+        ctx.out("    · `python3 scripts/configure.py --status` shows progress at any time.")
+    return 0
+
+
+def flow_reset(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
+    """Undo shaping for a scope and return it to recommend mode."""
+    for info in infos:
+        settings = ctx.settings(info.scope)
+        restore = previous_bypass(info.state_dir, info.scope)
+        writes = plan_reset_writes(info, settings, restore)
+        ctx.out(f"\n  Reset {info.scope}:")
+        ctx.out(f"    remove its entry from {info.state_dir / 'learned.json'}")
+        if not _confirm_writes(ctx, f"Config changes for {info.scope}:", writes):
+            ctx.out(f"  Skipped {info.scope}. Nothing written.")
+            continue
+        removed = remove_learned_scope(info, dry_run=ctx.dry_run)
+        if ctx.dry_run:
+            ctx.out("  [dry-run] learned overlay left untouched.")
+        elif removed:
+            ctx.out("  Removed the learned overlay entry.")
+        else:
+            ctx.out("  No learned overlay entry to remove.")
+        ctx.applied.extend(apply_writes(writes, ctx.runner, ctx.dry_run, ctx.out))
+    return 0
+
+
+def flow_status(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
+    """Read-only. Never writes anything, ever."""
+    needed = required_sessions(ctx.thresholds)
+    ctx.out("Tool Belt — configuration status")
+    ctx.out(f"  Hermes home: {ctx.hermes_home}")
+    ctx.out(f"  Sessions needed before shaping: {needed}")
+    if not ctx.have_hermes:
+        ctx.out("  `hermes` not on PATH — config values could not be read.")
+    if not infos:
+        ctx.out("\n  No agent scopes found yet. Send a message through a gateway, then re-run.")
+        return 0
+    ctx.out("")
+    for info in infos:
+        state = classify_scope(info, ctx.settings(info.scope), ctx.thresholds)
+        ctx.out(render_status_row(info, state, ctx.thresholds))
+    return 0
+
+
+def _menu(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
+    """The re-entry state machine: show what's true, offer what fits."""
+    states = {info.scope: classify_scope(info, ctx.settings(info.scope), ctx.thresholds) for info in infos}
+    ready = [i for i in infos if states[i.scope] == STATE_READY]
+    observing = [i for i in infos if states[i.scope] == STATE_OBSERVING]
+    shaped = [i for i in infos if states[i.scope] == STATE_SHAPED]
+    fresh = [i for i in infos if states[i.scope] == STATE_FRESH]
+
+    ctx.out("")
+    for info in infos:
+        ctx.out(render_status_row(info, states[info.scope], ctx.thresholds))
+
+    if shaped and not ready and not fresh and not observing:
+        ctx.out("\n  Every agent is shaped.")
+        choice = prompt_choice("  Review shaping, reset an agent, or quit?", ("review", "reset", "quit"), ctx.reader)
+        if choice == "quit":
+            return 0
+        if choice == "review":
+            preset = load_base_preset()
+            for info in prompt_multi_select(shaped, ctx.reader):
+                recs = compute_recommendations(info, ctx.thresholds)
+                ctx.out("")
+                for line in render_shaping_summary(info, recs, preset, ctx.thresholds):
+                    ctx.out(line)
+            return 0
+        return flow_reset(ctx, prompt_multi_select(shaped, ctx.reader))
+
+    if ready:
+        ctx.out(f"\n  {len(ready)} agent(s) have enough data to shape now.")
+        if confirm("  Review the shaping for them?", ctx.reader):
+            return flow_shape(ctx, prompt_multi_select(ready, ctx.reader))
+
+    if observing:
+        ctx.out("\n  Still collecting for: " + ", ".join(i.scope for i in observing))
+
+    candidates = fresh or infos
+    ctx.out("\n  Two ways to start:")
+    ctx.out("    shape      Use the history you already have and narrow now.")
+    ctx.out("    recommend  Watch first, narrow once there's enough data.")
+    choice = prompt_choice("  Which?", ("shape", "recommend", "quit"), ctx.reader)
+    if choice == "quit":
+        return 0
+    selected = prompt_multi_select(candidates, ctx.reader)
+    if choice == "shape":
+        return flow_shape(ctx, selected)
+    return flow_recommend(ctx, selected)
+
+
+def _ask_platforms(ctx: RunContext) -> list[str]:
+    ctx.out("\n  No telemetry recorded yet, so the platforms you run aren't known.")
+    answer = prompt("  Which platforms do you use? (e.g. telegram, slack, cli): ", ctx.reader)
+    return [p.strip().lower() for p in answer.replace(" ", ",").split(",") if p.strip()]
+
+
+# ──────────────────────────────────── CLI ────────────────────────────────────
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="configure.py",
+        description="Tool Belt onboarding — configure adaptive tool loadouts per agent.",
+    )
+    parser.add_argument("--status", action="store_true", help="print per-scope state and telemetry counts, write nothing")
+    parser.add_argument("--agent", default=None, help="restrict to one agent/profile (skips selection)")
+    parser.add_argument("--path", choices=("shape", "recommend"), default=None, help="skip the path question")
+    parser.add_argument("--reset", metavar="AGENT", default=None, help="return an agent to recommend mode")
+    parser.add_argument("--yes", action="store_true", help="apply without the interactive confirmation")
+    parser.add_argument("--dry-run", action="store_true", help="show every diff, write nothing")
+    parser.add_argument("--platform", action="append", default=None, help="platform to assume when a profile has no telemetry (repeatable)")
+    parser.add_argument("--hermes-home", type=Path, default=None, help="override HERMES_HOME discovery")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(list(argv) if argv is not None else None)
+    hermes_home = args.hermes_home or default_hermes_home()
+
+    ctx = RunContext(
+        hermes_home=hermes_home,
+        dry_run=bool(args.dry_run),
+        assume_yes=bool(args.yes),
+        thresholds=shape_thresholds(),
+        have_hermes=hermes_available(),
+    )
+    if ctx.have_hermes:
+        ctx.plugin_config = read_plugin_config(ctx.runner)
+
+    profile_filter = args.reset or args.agent
+    infos = discover_scopes(hermes_home, profile_filter, args.platform)
+
+    if args.status:
+        return flow_status(ctx, infos)
+
+    ctx.out("=" * 64)
+    ctx.out("  Tool Belt — configure")
+    ctx.out("=" * 64)
+
+    if not ctx.have_hermes:
+        ctx.out("\n  `hermes` is not on PATH. Running in preview mode: every change")
+        ctx.out("  below is printed as a command for you to run by hand.")
+
+    try:
+        if not infos and not args.status:
+            if args.platform or args.yes or profile_filter is None:
+                ctx.out(f"\n  No Hermes profiles found under {hermes_home}.")
+                return 0
+            platforms = _ask_platforms(ctx)
+            infos = discover_scopes(hermes_home, profile_filter, platforms)
+            if not infos:
+                ctx.out("\n  Nothing to configure yet.")
+                return 0
+
+        if args.reset:
+            rc = flow_reset(ctx, infos)
+        elif args.path == "shape":
+            rc = flow_shape(ctx, infos)
+        elif args.path == "recommend":
+            rc = flow_recommend(ctx, infos)
+        else:
+            rc = _menu(ctx, infos)
+    except Abort:
+        ctx.out("\n\n  Stopped. No changes were written.")
+        return 0
+
+    if ctx.applied:
+        ctx.out("\n  Applied:")
+        for line in ctx.applied:
+            ctx.out(f"    {line}")
+    elif not ctx.dry_run:
+        ctx.out("\n  No configuration changes were written.")
+    return rc
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())
