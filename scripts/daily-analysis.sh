@@ -8,8 +8,7 @@
 # line in the consolidated daily-summary.log, prefixed with the source
 # label so a week of runs is still scannable with one `cat`.
 #
-# Designed to be invoked by launchd (see com.dalemugford.hermes.tool-belt-analyzer.plist)
-# but safe to run by hand any time.
+# Safe to run by hand or from the scheduler appropriate to the host.
 set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

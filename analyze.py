@@ -128,7 +128,7 @@ class ScopeStats:
     mutation_turns: int = 0
     stable_turns: int = 0
     first_turns: int = 0
-    hash_missing_turns: int = 0  # pre-Tier-1 rows or rows where hash unavailable
+    hash_missing_turns: int = 0  # rows where tool_list_hash is unavailable
     sessions_with_mutation: set[str] = field(default_factory=set)
     # Per-provider/model rollups for stability. Empty key when the adapter
     # didn't surface the value.
@@ -388,10 +388,8 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
     # an FP — inflating dampener-candidate FP counts by ~30% on file_write
     # and ~50% on shell in observed telemetry.
     #
-    # When session_id is blank (pre-fix telemetry), we fall back to
-    # same-prediction behavior to avoid cross-session leakage from
-    # scope-ordered timeline lookups. Session-aware data was added by
-    # the canonical-session-key fix; rows without it predate that.
+    # Rows without a session identifier fall back to same-prediction behavior
+    # so scope-ordered timeline lookups cannot leak across sessions.
     WINDOW = 3  # matches the default sticky_ttl_turns
     session_ordered_preds: dict[str, list[str]] = defaultdict(list)
     pred_session: dict[str, str] = {}
@@ -451,8 +449,7 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
     #
     # Turn 1 is recorded separately — it's always a cold start and would
     # bias any "did narrowing bust the cache?" comparison. Rows missing
-    # tool_list_hash (pre-Tier-1 telemetry or rows that failed to compute
-    # one) are counted in hash_missing_turns so coverage is visible.
+    # tool_list_hash are counted so measurement coverage remains visible.
     pred_payload: dict[str, dict[str, Any]] = {}
     for row in predictions:
         pid = str(row.get("prediction_id") or "").strip()
@@ -476,9 +473,8 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
                 continue
             if not current_hash:
                 stat.hash_missing_turns += 1
-                # Don't update prev_hash — keep the last good hash as the
-                # baseline so a gap of pre-Tier-1 rows doesn't manufacture
-                # a spurious mutation when newer rows resume.
+                # Keep the last available hash as the baseline so a gap in
+                # hash coverage cannot manufacture a mutation.
                 continue
             if prev_hash is None:
                 # First scorable turn in this session — no baseline to
@@ -891,10 +887,10 @@ def _stability_payload(stat: "ScopeStats") -> dict[str, Any]:
     in ``api_calls.jsonl`` and computed by ``scripts/cache-freeze-replay.py``,
     surfaced in the Cache-Aware Savings section of this report.
 
-    Counts exclude turn-1 (always a cold cache by definition) and rows
-    missing tool_list_hash (pre-Tier-1 telemetry). hash_missing_turns is
-    surfaced as a coverage signal — high values mean the stability
-    figures are based on a narrow recent slice of data.
+    Counts exclude turn 1 (always a cold cache by definition) and rows
+    missing tool_list_hash. hash_missing_turns is surfaced as a coverage
+    signal — high values mean the stability figures reflect a narrower
+    slice than the full telemetry window.
     """
     comparable = stat.mutation_turns + stat.stable_turns
     return {
@@ -1749,7 +1745,7 @@ def markdown_report(
         "Provider prefix-caches fingerprint the actual schema bytes, so a mutation invalidates the cache for the tool block AND the conversation history that follows it. "
         "The savings model above (`logged_first_call_tokens_saved`) does **not** subtract that loss — see the Cache-Aware Savings section below for the corrected net. "
         "Turn 1 is excluded from comparable-turn counts (always a cold cache by definition). "
-        "`hash_missing_turns` flags pre-Tier-1 telemetry or rows where the hash couldn't be computed — when high, the stability figures reflect a narrow recent slice rather than the full archive.",
+        "`hash_missing_turns` flags rows where the hash is unavailable — when high, the stability figures reflect a narrower slice than the full telemetry window.",
         "",
         f"- Comparable turns (turn > 1, hash present): **{totals['comparable_turns']:,}**",
         f"- Mutation turns: **{totals['mutation_turns']:,}** ({totals['mutation_rate'] * 100:.1f}% of comparable)",

@@ -1,6 +1,6 @@
 # Aggressive preset — minimum always-on, heavy trigger gating.
 # Default for messaging channels (Telegram, Slack, Discord, etc.).
-# Expected typical savings: ~8,000 tok per message vs. current behavior.
+# Keeps the resident messaging loadout small; telemetry records actual savings.
 
 name: aggressive
 description: >

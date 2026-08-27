@@ -201,8 +201,8 @@ trigger-gated. Edit the YAML directly to customize, or layer per-scope
 overrides via `always_on_extra` / `always_off` / `channels.<scope>.*` in
 config.
 
-To **disable narrowing on a specific scope** (the old `conservative`
-mode), set `bypass_rate: 1.0` for that scope — see
+To **disable narrowing on a specific scope**, set `bypass_rate: 1.0`
+for that scope — see
 [A/B baseline cohort](#ab-baseline-cohort) below. This routes the scope
 through the predictor for telemetry but ships the full tool ceiling to
 the model.
@@ -224,7 +224,7 @@ plugins:
       bernard:telegram:           # agent-scoped override
         learned_mode: recommend
         always_on_extra: [terminal]
-      slack:                       # legacy platform-only key still works
+      slack:                       # platform-wide fallback
         bypass_rate: 1.0          # disable narrowing on Slack entirely
 ```
 
@@ -330,7 +330,7 @@ plugins:
     # A/B baseline cohort — deterministically bypass narrowing for a
     # fraction of sessions so the analyzer can compare narrowed vs
     # unnarrowed cohorts. Set 1.0 on a scope to fully disable narrowing
-    # there (the old `conservative mode`). Deterministic via
+    # there. Deterministic via
     # hash(scope|session_id).
     bypass_rate: 0.0
 
@@ -343,7 +343,7 @@ plugins:
         learned_mode: recommend
         bypass_rate: 0.05      # 5% baseline cohort on this scope only
         always_on_extra: [terminal]
-      slack:                    # legacy platform-only key still works
+      slack:                    # platform-wide fallback
         bypass_rate: 1.0       # disable narrowing on Slack entirely
 ```
 
@@ -438,10 +438,11 @@ an otherwise-firing trigger, the group name is recorded in
 `predictions.jsonl` under `triggers_suppressed` so you can audit dampener
 effectiveness separately from "no positive match."
 
-Smoke check:
+Regression test:
 
 ```bash
-hermes-agent/venv/bin/python3 plugins/tool-belt/scripts/check_trigger_dampeners.py
+cd ~/.hermes/plugins/tool-belt
+~/.hermes/hermes-agent/venv/bin/python3 -m unittest tests.test_trigger_dampeners -v
 ```
 
 ### Auto-suggesting new dampeners from telemetry
@@ -752,44 +753,17 @@ rm -rf ~/.hermes/plugins/tool-belt
 
 ```
 ~/.hermes/plugins/tool-belt/
-├── plugin.yaml                      # manifest
-├── __init__.py                      # register(); freeze + filter patches; hooks; cache-mode detection
-├── predictor.py                     # regex/keyword classifier (runs on freeze + cache-off dispatches)
-├── presets.py                       # YAML loader + per-scope resolver
-├── learned.py                       # learned.json loader + preset merge (mtime-cached)
-├── expand_tools.py                  # the expand_tools meta-tool
-├── logger_io.py                     # predictions.jsonl, tool_calls.jsonl, api_calls.jsonl
-├── analyze.py                       # deterministic telemetry analyzer
-├── policy.yaml                      # the single shipped tool policy
-├── CLAUDE.md                        # in-dir editing rules
-├── README.md                        # this file
-├── docs/
-│   ├── ARCHITECTURE.md                                   # how the plugin works
-│   ├── CONFIGURATION.md                                  # every config knob, with defaults
-│   └── KNOWN_ISSUES.md                                   # upstream + restart caveats
-├── scripts/
-│   ├── shape-ceiling.py             # cache-on: between-session shaper (per-tool promote/demote)
-│   ├── cache-freeze-replay.py       # cache-on: freeze efficacy + Phase 5 corrected savings
-│   ├── mnemosyne-prefix-check.py    # cache-on: prefix-stability verification
-│   ├── bootstrap.py                 # mode-aware day-one warm start
-│   ├── harvest-replay.py            # cache-off: replay sessions → synthetic telemetry
-│   ├── smoke-test.py                # end-to-end mechanical validation
-│   ├── daily-analysis.sh            # twice-daily analyzer + learned.json shaper cron
-│   ├── rotate-telemetry.sh          # archive live JSONLs (gateway-safe)
-│   ├── check_trigger_dampeners.py   # cache-off: trigger dampener regression guard
-│   └── README.md                    # ops scripts inventory + invocation
-├── tests/
-│   ├── test_cache_aware.py
-│   ├── test_session_attribution.py
-│   ├── test_harvest_privacy.py
-│   └── run_tests.py
-└── reports/                         # analyzer markdown output (dated)
-```
-
-## Review
-
-```
-# one line per run: timestamp, status, prediction count, scopes, expand events,
-# net savings, recommendation count, dampener candidates
-cat ~/.hermes/state/tool-belt/cron-logs/daily-summary.log
+├── plugin.yaml       # Hermes plugin manifest
+├── __init__.py       # runtime hooks, cache-mode detection, frozen loadouts
+├── predictor.py      # deterministic intent matching
+├── presets.py        # policy loading and per-scope resolution
+├── learned.py        # learned overlay loading and merging
+├── expand_tools.py   # dynamic recovery meta-tool
+├── logger_io.py      # telemetry writers
+├── analyze.py        # telemetry analyzer
+├── policy.yaml       # shipped policy and shaping thresholds
+├── AGENTS.md         # repository engineering rules
+├── docs/             # architecture, configuration, savings, known issues
+├── scripts/          # supported operator and verification commands
+└── tests/            # regression and integration tests
 ```

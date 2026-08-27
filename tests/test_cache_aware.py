@@ -1,4 +1,4 @@
-"""Unit tests for the cache-aware refactor (Phases 0-5 of doc 16).
+"""Unit tests for cache-aware Tool Belt behavior.
 
 Companion to scripts/smoke-test.py, which covers integration-level
 behavior. These are focused unit tests for the individual helpers
@@ -13,8 +13,7 @@ that have already been fixed once:
     threshold met/failed, divergence detection
   · _persist_detection_lock / _cached_detection_mode — cross-session
     persistence; provider-blocklist locks not persisted
-  · on_session_end DOES NOT evict freeze (Hermes hook semantics —
-    fires per-turn, the bug we hit during Phase 1 verification)
+  · on_session_end DOES NOT evict freeze because Hermes fires it per turn
   · on_session_reset DOES evict freeze
 """
 from __future__ import annotations
@@ -83,8 +82,8 @@ class ResolveCacheModeTests(unittest.TestCase):
         self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="bernard:telegram"), "on")
 
     def test_auto_defaults_on_when_no_cached_entry(self):
-        # Safe-default per the pivot doc — assume caching is on unless
-        # explicitly known otherwise.
+        # Protect prefix stability unless telemetry has established that
+        # provider-side caching is unavailable.
         plugin._CONFIG["cache_mode"] = "auto"
         self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="bernard:telegram"), "on")
 
@@ -349,12 +348,10 @@ class DetectionCachePersistenceTests(unittest.TestCase):
 
 
 class SessionHookSemanticsTests(unittest.TestCase):
-    """Regression guards for the on_session_end vs on_session_reset bug.
+    """Verify Tool Belt follows Hermes' session-hook contracts.
 
-    During Phase 1 verification we discovered Hermes fires on_session_end
-    at the end of every run_conversation call — once per user message in
-    multi-turn sessions, NOT at actual session end. Evicting the freeze
-    there nukes it between turns and defeats the freeze.
+    Hermes fires on_session_end once per user message. Frozen state therefore
+    survives that hook and is evicted by on_session_reset instead.
     """
 
     def setUp(self):

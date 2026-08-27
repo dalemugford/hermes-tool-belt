@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Between-session shaper — Phase 2 of the cache-aware refactor.
+"""Between-session tool-loadout shaper.
 
 The principle in one line: usage-aware tool loading at per-tool granularity.
 Adjustments happen at session boundaries (free cache moments), not per turn.
@@ -45,7 +45,7 @@ Usage
 
   python3 scripts/shape-ceiling.py
   python3 scripts/shape-ceiling.py --dry-run            # report only
-  python3 scripts/shape-ceiling.py --scope bernard:telegram
+  python3 scripts/shape-ceiling.py --scope assistant-a:telegram
   python3 scripts/shape-ceiling.py --window 50          # consider last 50 sessions per scope
 
 Threshold defaults come from ``policy.yaml`` under
@@ -316,11 +316,8 @@ def compute_scope_recommendations(
             # Without this, new tools added by upstream (Hermes updates, plugin
             # changes) are invisible to the shaper and never auto-demoted.
             for t in (p.get("unknown_kept_tools") or []):
-                # Skip MCP tools — Tool Belt passes them through without
-                # narrowing. They show up as unknown-kept in historical
-                # predictions (before the mcp__ pass-through fix) but
-                # should never be demote candidates. Tool Search manages
-                # the MCP layer.
+                # Skip MCP tools: Tool Belt passes them through without
+                # narrowing, and Tool Search manages their activation layer.
                 if t.startswith("mcp__") or t.startswith("mcp_"):
                     continue
                 always_on_observed.add(str(t))

@@ -18,8 +18,8 @@ without (kimi, gpt-5.4-mini). The plugin runs in one of two modes:
     turns would otherwise bust the provider prefix cache and re-bill the
     conversation history at the full input rate — a cost that dwarfs the
     schema-token savings from per-turn narrowing. The freeze is evicted
-    only at moments that already cost a cache break: session reset, true
-    session end, and compaction (Phase 4 monkey-patches the compressor).
+    only at moments that already cost a cache break: session reset and
+    context compaction.
 
     Sticky residency, lookback, and per-turn predictor execution are all
     skipped on the frozen path — they were per-turn-adjustment mechanisms
@@ -30,8 +30,8 @@ without (kimi, gpt-5.4-mini). The plugin runs in one of two modes:
 
   cache-off (``cache_mode: off`` or auto-detected for known-uncached models)
     Per-turn narrowing with sticky residency carrying expanded tools
-    forward a few turns. This is the original behavior, preserved as a
-    fallback for providers where prefix caching doesn't apply.
+    forward a few turns. This mode serves providers where prefix caching
+    doesn't apply.
 
 See docs/ARCHITECTURE.md for the full design and docs/CONFIGURATION.md
 for every config knob.
@@ -52,7 +52,7 @@ LIFECYCLE
 =========
 
   · register(ctx)
-      - load detection cache (Phase 3 cross-session memory)
+      - load the cross-session cache-mode detection state
       - install monkey-patches
       - register expand_tools meta-tool
       - register hooks: pre_gateway_dispatch, post_tool_call,
@@ -159,16 +159,13 @@ _CONFIG: dict[str, Any] = {
     # allowed_tool_names is set to WILDCARD and policy_source is "bypass".
     # 0.0 disables. Override per scope via channels.<scope>.bypass_rate.
     "bypass_rate": 0.0,
-    # Cache-aware mode (Phase 0 of the cache-aware refactor — observation
-    # only; no behavior change yet). Determines whether tools may be
-    # mutated mid-session.
+    # Determines whether tools may be mutated mid-session.
     #   auto — observe cache_read_tokens for the first few turns and
     #          self-select on|off. Bias the default to "on" once the
     #          empirical window concludes.
     #   on   — assume provider prefix-caching is active; freeze tools at
-    #          session start (Phase 1 will honour this).
-    #   off  — assume caching is inactive; per-turn narrowing (current
-    #          behavior, kept alive for kimi/gpt-5.4-mini class providers).
+    #          session start.
+    #   off  — assume caching is inactive; narrow tools per turn.
     "cache_mode": "auto",
     "cache_auto": {
         # Observe at least this many API calls before locking the mode.
@@ -181,9 +178,7 @@ _CONFIG: dict[str, Any] = {
         # hit-rate denominator — the resulting ratio is noise. Wait
         # until there's enough volume for the signal to be real.
         "detect_min_input_tokens": 5000,
-        # hit_rate ≥ on_threshold → lock "on"; else lock "off". Phase 3
-        # may switch this to a fresh-tokens-per-call quantity (the actual
-        # economic driver) but ratio is sufficient for Phase 0 baseline.
+        # hit_rate ≥ on_threshold → lock "on"; else lock "off".
         "on_threshold": 0.40,
         # Providers/models with known-bad provider-side caching skip the
         # detection window and lock "off" immediately. From the state.db
@@ -207,11 +202,9 @@ _POLICY_TURN_BY_SCOPE: dict[str, int] = {}
 # Keyed by session_id. Cleared on on_session_end.
 _PRIOR_MESSAGES_BY_SESSION: dict[str, list[str]] = {}
 
-# ─── Cache-aware state (Phase 0: observation only, no behavior change) ────
-# Frozen tool-set decisions per canonical session_key. Populated by Phase 1;
-# Phase 0 leaves it empty but reserves the structure + eviction wiring so
-# the test surface stays stable. Eviction: on_session_end, on_session_reset,
-# and (Phase 4) on compaction.
+# ─── Cache-aware state ────────────────────────────────────────────────────
+# Frozen tool-set decisions per canonical session key. Evicted on session
+# reset and context compaction; the per-turn on_session_end hook preserves it.
 _FROZEN_BY_SESSION: dict[str, dict[str, Any]] = {}
 
 # Cross-session detection cache. Persisted JSON at
@@ -235,7 +228,7 @@ _DETECTION_CACHE_LOADED = False
 #     "lock_reason": str,  # "provider_blocklist" | "threshold_met" |
 #                          # "threshold_failed" | "forced_on" | "forced_off"
 #   }
-# Populated by _on_post_api_request; consumed by Phase 1 freeze decision.
+# Populated by _on_post_api_request and consulted by freeze decisions.
 _CACHE_MODE_BY_SESSION: dict[str, dict[str, Any]] = {}
 
 
@@ -431,7 +424,7 @@ def _wrap_build_api_kwargs(original):
             state["last_system_hash"] = _system_message_hash(api_messages)
             state["api_call_idx"] = int(state.get("api_call_idx", 0)) + 1
 
-            # Phase 1: propagate any expansions back to the session's
+            # Propagate any expansions back to the session's
             # frozen snapshot so the next dispatch reuses them. Without
             # this, expand_tools events would only live for one turn and
             # the model would have to re-expand on every subsequent
@@ -1039,7 +1032,7 @@ def _maybe_log_prediction(
 
 
 def _wrap_compress_context(original):
-    """Phase 4: evict the session's frozen snapshot after compaction.
+    """Evict the session's frozen snapshot after compaction.
 
     Compaction rewrites the conversation history — the provider's
     cached prefix becomes worthless because the bytes after the system
@@ -1062,10 +1055,8 @@ def _wrap_compress_context(original):
                 _FROZEN_BY_SESSION.pop(session_key, None)
                 _CACHE_MODE_BY_SESSION.pop(session_key, None)
                 evicted_keys.append(session_key)
-            # Defensive: also try the AIAgent's session_id (uuid). When
-            # the env var isn't set but Phase 1 keyed under the uuid as
-            # a fallback (it doesn't today, but if that changes we want
-            # the patch resilient), the eviction here catches it.
+            # Defensive: also try the AIAgent's session_id (UUID) in case
+            # the canonical environment key is unavailable.
             aid = getattr(self, "session_id", "") or ""
             if aid and aid != session_key and aid in _FROZEN_BY_SESSION:
                 _FROZEN_BY_SESSION.pop(aid, None)
@@ -1112,7 +1103,7 @@ def _install_patches() -> bool:
     _ORIGINAL_BUILD_API_KWARGS = AIAgent._build_api_kwargs
     AIAgent._build_api_kwargs = _wrap_build_api_kwargs(_ORIGINAL_BUILD_API_KWARGS)
 
-    # Phase 4: compaction-driven freeze eviction. No `post_compaction`
+    # Compaction-driven freeze eviction. No `post_compaction`
     # hook exists in Hermes, so we wrap the forwarder method directly.
     # Best-effort — when _compress_context is missing (older Hermes
     # versions, custom builds) the freeze persists across compaction,
@@ -1274,7 +1265,7 @@ def _should_bypass(scope: str, session_id: str) -> bool:
     return bucket < rate
 
 
-# ─── Cache-aware freeze (Phase 1) ──────────────────────────────────────────
+# ─── Cache-aware freeze ────────────────────────────────────────────────────
 
 def _resolve_cache_mode_for_session(session_id: str, scope: str = "") -> str:
     """Decide whether this dispatch should freeze tools at the session level.
@@ -1284,9 +1275,9 @@ def _resolve_cache_mode_for_session(session_id: str, scope: str = "") -> str:
       · Explicit ``cache_mode: off`` → "off" — keep per-turn narrowing.
       · Explicit ``cache_mode: on`` → "on" — freeze.
       · ``cache_mode: auto`` (default) → consult the cross-session
-        detection cache (Phase 3). If a prior session of this scope
-        locked to a definite mode, honor it. Otherwise default to "on"
-        per the pivot doc's safe-default argument.
+        detection cache. If a prior session of this scope locked to a
+        definite mode, honor it. Otherwise default to "on" to protect
+        prefix-cache stability.
 
     Mid-session switching is intentionally not supported — switching
     itself busts the cache. The per-session detection telemetry from
@@ -1326,9 +1317,8 @@ def _freeze_session_snapshot(
     """Persist the first dispatch's tool-set decision for the session.
 
     Captured on the first dispatch under cache-on mode and reused on
-    every subsequent dispatch in the same session. Eviction lives in
-    ``_on_session_end`` and ``_on_session_reset``; Phase 4 adds a
-    compaction-driven eviction.
+    every subsequent dispatch in the same session. Session reset and
+    context compaction evict the snapshot.
 
     ``triggers_fired`` / ``trigger_tools_by_group`` are stored on the
     snapshot so subsequent turns' telemetry rows can describe the
@@ -1478,7 +1468,7 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         if isinstance(message, str) and message.strip().startswith("/"):
             return None
 
-        # Phase 1: cache-on freeze. When this session already has a
+        # Cache-on freeze: when this session already has a
         # frozen tool-set decision, reuse it verbatim and skip the
         # predictor entirely. The frozen path also disables sticky and
         # lookback by construction.
@@ -1606,7 +1596,7 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             "logged": False,
         })
 
-        # Phase 1: on the first dispatch under cache-on mode, freeze the
+        # On the first dispatch under cache-on mode, freeze the
         # decision we just made. Every subsequent dispatch in this
         # session will reuse it via the frozen-path branch above. Skip
         # when there's no usable session_id (out-of-band dispatch can't
@@ -1973,11 +1963,7 @@ def _update_cache_mode_detection(
 ) -> str:
     """Update detection state for a session and return the current mode.
 
-    Phase 0: pure observation. Returns the mode string for the api_calls
-    log line; nothing downstream gates on it yet. Phase 1 will read this
-    state to decide whether to freeze the tool set at session start.
-
-    Decision rules (per the revised plan, doc 16 Phase 3):
+    Decision rules:
       · Forced mode (cache_mode != "auto") locks immediately.
       · Models in cache_auto.providers_off_models lock "off" immediately.
       · "pending" until BOTH `calls_observed >= detect_calls` AND
@@ -2011,8 +1997,8 @@ def _update_cache_mode_detection(
             state["mode"] = "off"
             state["lock_reason"] = "forced_off"
 
-    # Update running stats regardless of lock state — useful for the
-    # divergence detection Phase 3 will add. Cheap.
+    # Update running stats regardless of lock state so post-lock divergence
+    # remains observable.
     state["calls_observed"] += 1
     state["cache_read"] += int(cache_read or 0)
     state["cache_write"] += int(cache_write or 0)
@@ -2058,9 +2044,8 @@ def _update_cache_mode_detection(
             state["mode"] = "off"
             state["lock_reason"] = "threshold_failed"
         state["locked_at_call"] = state["calls_observed"]
-        # Phase 3: persist the lock to the cross-session cache so the
-        # next session of this scope can default correctly without
-        # waiting for the observation window again.
+        # Persist the lock so the next session can choose correctly without
+        # repeating the observation window.
         if scope:
             _persist_detection_lock(scope, state, model)
 
@@ -2097,10 +2082,8 @@ def _on_post_api_request(**kwargs) -> None:
         cache_write = int(usage.get("cache_write_tokens") or 0)
         input_tokens = int(usage.get("input_tokens") or 0)
 
-        # Phase 0/3: detection state machine. Returns the current mode
-        # (pending → on/off once the lock criteria are met). Phase 3
-        # persists locks to the cross-session cache and runs divergence
-        # checks on post-lock calls.
+        # Detection returns pending/on/off, persists settled scope-level
+        # decisions, and checks post-lock divergence.
         cache_mode = _update_cache_mode_detection(
             session_key=session_key,
             model=model,
@@ -2110,7 +2093,7 @@ def _on_post_api_request(**kwargs) -> None:
             scope=str(state.get("scope", "")),
         )
 
-        # Phase 4: cache-TTL expiry detection. A stable-hash call with
+        # Cache-TTL expiry detection. A stable-hash call with
         # zero cache_read after a long idle gap is the signature of
         # provider-side cache eviction (Anthropic's default 5m TTL).
         # The freeze logic did everything right — the TTL just lapsed
@@ -2180,7 +2163,7 @@ def _on_session_end(session_id=None, **kwargs) -> None:
     a session. In particular: ``_FROZEN_BY_SESSION``,
     ``_CACHE_MODE_BY_SESSION``, and any other per-session memory must
     remain. They're cleared by :func:`_on_session_reset` (true /reset or
-    /new) and by the Phase 4 compaction patch only.
+    /new) and by the compaction wrapper only.
 
     What we DO clear here: the contextvar (task-scoped so it auto-cleans,
     but explicit clear keeps state hygiene clean) and the per-turn
@@ -2193,8 +2176,8 @@ def _on_session_end(session_id=None, **kwargs) -> None:
     therefore prefer the canonical key, which is still discoverable
     in-process via either a ``session_key`` kwarg (if Hermes ever passes
     one) or the ``HERMES_SESSION_KEY`` env var the gateway sets for the
-    active dispatch. We evict under both shapes so legacy rows written
-    under the uuid form (pre-fix) also get cleaned up.
+    active dispatch. We evict under both supported key shapes so no
+    session-scoped state survives the per-turn cleanup.
     """
     if not _CONFIG["enabled"]:
         return None
@@ -2230,8 +2213,8 @@ def _on_session_end(session_id=None, **kwargs) -> None:
         # (conversation_loop.py:4680 warns about this explicitly).
         # Evicting the freeze here would nuke it after the first turn,
         # defeating the whole point of session-level freezing.
-        # Eviction lives in _on_session_reset (true /reset, /new) only;
-        # Phase 4 will add a compaction-driven eviction.
+        # Eviction lives in _on_session_reset (true /reset or /new) and
+        # the compaction wrapper.
     return None
 
 
@@ -2245,8 +2228,7 @@ def _on_session_reset(session_id=None, **kwargs) -> None:
     identical to a fresh session. The frozen tool set and the mode
     detection state from the prior conversation must be discarded so the
     next ``pre_gateway_dispatch`` re-freezes against the new (empty)
-    history. Phase 1 will populate these dicts; Phase 0 verifies the
-    eviction path runs correctly even when they're empty.
+    history.
 
     Sticky/lookback state is also evicted by `on_session_end` semantics
     and intentionally cleared here too — `/reset` is a stronger signal
@@ -2301,9 +2283,8 @@ def register(ctx) -> None:
         logger.info("tool-belt: disabled in config")
         return
 
-    # Phase 3: pre-load the cross-session detection cache so the first
-    # dispatch under cache_mode: auto picks up prior-session decisions
-    # instead of defaulting to a 5-call observation window every time.
+    # Pre-load cross-session cache-mode decisions so auto mode need not
+    # repeat the observation window for every session.
     _load_detection_cache()
 
     # Try eager patch install. If it fails (typically a transient circular

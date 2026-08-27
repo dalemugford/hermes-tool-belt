@@ -469,9 +469,9 @@ def run_cache_on_assertions(state_dir: Path, check: Check) -> None:
         f"(found {len(turn3_browser_calls)} — expansion persists)")
 
     # ─── on_session_end did NOT evict the freeze ───
-    # After the multi-turn scenarios, sessions DID complete (each scenario
-    # calls on_session_end). The freeze entries remain because Phase 1
-    # explicitly skips eviction on this hook.
+    # After the multi-turn scenarios, each scenario called on_session_end.
+    # The freeze entries remain because that Hermes hook fires per turn and
+    # must not evict session-scoped state.
     # Confirmed by: frozen_reuse_count > 1 above (which requires the
     # snapshot to have survived intervening on_session_end calls).
 

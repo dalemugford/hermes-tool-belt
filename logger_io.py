@@ -141,7 +141,7 @@ class PredictionRecord:
     provider: str = ""
     model: str = ""
     # True when this turn reused a frozen session snapshot rather than
-    # re-running the predictor (Phase 1 of the cache-aware refactor).
+    # re-running the predictor.
     # frozen_reuse_count is the index within the session — 1 on the
     # second dispatch, 2 on the third, etc. Both blank for cache-off
     # mode and for the first dispatch under cache-on (which freezes).

@@ -355,13 +355,13 @@ class SessionEndCleanupTests(unittest.TestCase):
         self.assertNotIn(sticky_key, plugin._STICKY_BY_KEY)
         self.assertNotIn(REAL_KEY_TELEGRAM, plugin._PRIOR_MESSAGES_BY_SESSION)
 
-    def test_also_evicts_legacy_uuid_keyed_state(self):
-        # Rows written under the uuid form before the fix should also
-        # be cleaned up — covers in-flight upgrade.
-        legacy_sticky = self._seed_state(self.AGENT_SESSION_ID)
+    def test_also_evicts_uuid_keyed_state(self):
+        # UUID-keyed state is a supported defensive fallback and must be
+        # cleaned up alongside canonical-key state.
+        uuid_sticky = self._seed_state(self.AGENT_SESSION_ID)
         with mock.patch.dict(os.environ, {"HERMES_SESSION_KEY": ""}, clear=False):
             plugin._on_session_end(session_id=self.AGENT_SESSION_ID)
-        self.assertNotIn(legacy_sticky, plugin._STICKY_BY_KEY)
+        self.assertNotIn(uuid_sticky, plugin._STICKY_BY_KEY)
         self.assertNotIn(self.AGENT_SESSION_ID, plugin._PRIOR_MESSAGES_BY_SESSION)
 
 
@@ -430,8 +430,8 @@ class TriggerFpLateBoundTpTests(unittest.TestCase):
     "fired here, used three turns later" pattern is correct prediction,
     not a false positive.
 
-    When ``session_id`` is blank (pre-fix telemetry), the analyzer must
-    fall back to same-prediction behavior to avoid cross-session leakage.
+    When ``session_id`` is blank, the analyzer must fall back to
+    same-prediction behavior to avoid cross-session leakage.
     """
 
     def _row_prediction(self, *, pid, sid, trigger, tools_for_trigger, ts):

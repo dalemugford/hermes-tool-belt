@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Replay api_calls.jsonl + predictions.jsonl through the freeze policy
-and report what happened — baseline (Phase 0), pre/post comparison
-(Phase 1+), and savings-ledger correction (Phase 5).
+"""Replay API-call telemetry through the session-freeze policy and estimate
+the cache cost of tool-list mutations.
 
-What this gets right that the legacy savings number didn't
-==========================================================
+Why the matched counterfactual matters
+======================================
 
 The original ``tokens_saved_via_narrowing`` ledger reports schema-token
 savings without netting out the cache-miss penalty that mutation-driven
@@ -21,15 +20,13 @@ The corrected counterfactual:
     at idx=K is compared against the stable cohort at idx=K. Removes
     most of the position bias.
 
-  · We report ``cache_read_tokens_lost_upper_bound`` rather than a
-    point estimate — the floor-at-zero in earlier drafts is a one-sided
-    estimator (would never report a gain even when a mutation happens
-    to coincide with a legitimate cache refresh). Naming the bound
-    keeps the methodology honest.
+  · We report ``cache_read_tokens_lost_upper_bound`` rather than a point
+    estimate. Signed differences preserve legitimate cache refreshes instead
+    of forcing every mutation to look costly.
 
 Usage:
-  python3 scripts/cache-freeze-replay.py                   # baseline + corrected savings
-  python3 scripts/cache-freeze-replay.py --scope bernard:telegram
+  python3 scripts/cache-freeze-replay.py
+  python3 scripts/cache-freeze-replay.py --scope assistant-a:telegram
   python3 scripts/cache-freeze-replay.py --markdown        # markdown for the report dir
 """
 
@@ -49,7 +46,7 @@ def default_state_dir() -> Path:
     return Path(home) / "state" / "tool-belt"
 
 
-# ─── Phase 5: price table + counterfactual ────────────────────────────────
+# ─── Price table and matched counterfactual ──────────────────────────────
 #
 # Single source of truth for per-model token economics. Tokens-per-million
 # costs in USD; ``miss_premium`` is the input/cache_read ratio that drives
@@ -110,11 +107,9 @@ def freeze_simulation(
                             the freeze policy would have prevented this
                             break by holding the tool set steady
 
-    NB: this is a conservative upper bound on accepted-cost. Phase 1's
-    sticky-expansion behavior (expanded tools persist for the session)
-    means many mutations counted here as "expand_driven" today would
-    collapse into a single persistent hash change tomorrow. The Phase 5
-    savings ledger refines this with matched counterfactuals.
+    This is a conservative upper bound: expanded tools persist for the
+    session, so repeated use after the initial expansion does not require
+    repeated mutations.
     """
     if scope_filter:
         preds = [p for p in preds if p.get("scope") == scope_filter]
@@ -221,15 +216,14 @@ def matched_counterfactual(
     calls: list[dict[str, Any]],
     scope_filter: str = "",
 ) -> dict[str, Any]:
-    """Phase 5: position-matched cache savings correction.
+    """Compute a position-matched cache-savings correction.
 
     For each *mutated* call (hash differs from the prior call in the
     same session), compute the counterfactual cache_read_tokens using
     the stable cohort's *position-matched* average for that
     ``api_call_idx`` bucket and model. Difference = lost cache reads,
-    reported as upper bound (signed differences allowed — negative
-    losses indicate gains, which the legacy floor-at-zero estimator
-    couldn't surface).
+    reported as an upper bound. Signed differences allow a mutation to
+    coincide with a legitimate cache refresh.
 
     Per-model dollar estimates use the price table; report token-level
     numbers alongside since the dollar conversion depends on list
@@ -332,7 +326,7 @@ def render_markdown(result: dict[str, Any], cf: dict[str, Any]) -> str:
     out.append(f"- expand-driven mutations: {result['expand_driven_mutations']} (accepted — model-paid)")
     out.append(f"- **would_break mutations: {result['would_break_mutations']}** (avg cache_read: {result['avg_cache_read_when_would_break']:,.0f})")
     out.append(f"- freeze eliminates **{result['freeze_eliminates_pct_of_mutations'] * 100:.1f}%** of currently-observed mutations\n")
-    out.append("## Cache-adjusted savings (Phase 5 — matched counterfactual)\n")
+    out.append("## Cache-adjusted savings (matched counterfactual)\n")
     out.append("Per-model cache_read_tokens lost to mutation, computed against the stable cohort at the same api_call_idx position within session.\n")
     out.append("| model | calls | mut | stable | cache_read_lost_upper_bound | est_usd_lost |")
     out.append("|---|---:|---:|---:|---:|---:|")
@@ -346,7 +340,7 @@ def render_markdown(result: dict[str, Any], cf: dict[str, Any]) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--state-dir", default=str(default_state_dir()))
-    ap.add_argument("--scope", default="", help="filter to a specific scope, e.g. bernard:telegram")
+    ap.add_argument("--scope", default="", help="filter to a specific scope, e.g. assistant-a:telegram")
     ap.add_argument("--markdown", action="store_true", help="emit markdown report")
     args = ap.parse_args()
 
@@ -370,10 +364,10 @@ def main() -> int:
     print(f"  first-call-per-session (excluded): {result['first_calls_per_session']}")
     print(f"  comparable calls: {result['comparable_calls']}")
     print()
-    print(f"  Today's behavior:")
+    print("  Observed behavior:")
     print(f"    mutation rate (any cause): {result['mutation_rate_today'] * 100:.1f}%")
     print()
-    print(f"  Under session-start freeze (Phase 1):")
+    print("  Under session-start freeze:")
     print(f"    matches frozen hash:        {result['matches_freeze']:>4} calls  (cached avg: {result['avg_cache_read_when_matches']:,.0f})")
     print(f"    expand-driven mutations:    {result['expand_driven_mutations']:>4} calls  (accepted — model paid)")
     print(f"    would_break mutations:      {result['would_break_mutations']:>4} calls  (cached avg: {result['avg_cache_read_when_would_break']:,.0f})")
