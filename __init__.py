@@ -2279,9 +2279,15 @@ def _on_session_reset(session_id=None, **kwargs) -> None:
 
 def register(ctx) -> None:
     _load_user_config()
-    if not _CONFIG.get("enabled"):
-        logger.info("tool-belt: disabled in config")
-        return
+
+    # NOTE: registration is unconditional. Hermes' plugin manager already
+    # gates load/no-load via ``plugins.enabled`` in config.yaml, so an
+    # internal ``enabled`` check here would be redundant for load control —
+    # and it blocked Plugin Doctor from validating that the declared tool
+    # and hooks actually register. The plugin stays functionally disable-able
+    # via config: each hook and the narrowing patch guard on
+    # ``_CONFIG["enabled"]`` internally, so with ``enabled: False`` the
+    # registrations exist but do nothing.
 
     # Pre-load cross-session cache-mode decisions so auto mode need not
     # repeat the observation window for every session.

@@ -1,0 +1,6 @@
+# Development / test dependencies for Hermes Tool Belt.
+#
+# The plugin and its tests use only the Python standard library plus PyYAML
+# (policy.yaml parsing). Nothing else is required to run `python
+# tests/run_tests.py` in a clean virtual environment.
+PyYAML>=6.0,<7

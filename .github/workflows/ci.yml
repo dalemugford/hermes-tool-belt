@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The plugin uses `from __future__ import annotations` and PEP 585
+        # `dict[str, Any]` syntax; 3.9 is the syntactic floor, 3.11+ is the
+        # realistic target runtime.
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Create venv and install dev dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: .venv/bin/python tests/run_tests.py
+
+      # NOTE: `hermes plugins doctor --ci .` is intentionally NOT run here.
+      # It requires the full Hermes runtime, which is not installed in CI.
+      # Add a doctor step once a lightweight, dependency-free doctor path
+      # exists that can validate plugin.yaml against the registrations.

@@ -31,3 +31,17 @@ The initial public capabilities of the plugin:
 - **Strict `platform_toolsets` ceiling.** The plugin only narrows within, and
   restores from, the operator's configured ceiling; it never admits
   unsanctioned tools.
+- **Clean native test environment.** A minimal `requirements-dev.txt` (PyYAML
+  only) lets contributors run `python tests/run_tests.py` in a fresh virtual
+  environment without the full Hermes runtime.
+- **Continuous integration.** A GitHub Actions workflow
+  (`.github/workflows/ci.yml`) runs the test suite on Python 3.11 and 3.12 for
+  every push and pull request to `main`.
+
+### Fixed
+
+- **Plugin Doctor registration validation.** `register()` no longer returns
+  early when the plugin is disabled in config, so `hermes plugins doctor`
+  can validate that the declared `expand_tools` tool and all five hooks are
+  actually registered. Functional disabling is unchanged — each hook and the
+  narrowing patch still guard on `enabled` internally.
