@@ -1,0 +1,349 @@
+# Releasing
+
+The checklist a maintainer follows to cut a Tool Belt release. Versions use
+CalVer — `YYYY.M.D`, with an optional prerelease suffix (for example
+`2026.5.17-beta`). The authoritative version is the `version` field in
+[`plugin.yaml`](../plugin.yaml); the release tag is the same string.
+
+Verification conventions are set in [CONTRIBUTING.md](../CONTRIBUTING.md#verification)
+and [AGENTS.md](../AGENTS.md#verification) — this document sequences them for a
+release rather than restating them. Release discipline itself (develop on
+`main`, tag stable snapshots, keep experimental behavior disabled by config)
+comes from [AGENTS.md](../AGENTS.md#branch-and-release-discipline).
+
+Read the output of every command. A zero exit status is not by itself a pass —
+two of the checks below report "nothing to validate" and exit 0.
+
+---
+
+## 1. Pre-release verification
+
+Run this on a **clean clone**, not your working tree, so uncommitted files and
+stale bytecode can't mask a failure.
+
+```bash
+git clone https://github.com/dalemugford/hermes-tool-belt.git /tmp/tool-belt-release
+cd /tmp/tool-belt-release
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+```
+
+Full quality gate:
+
+```bash
+.venv/bin/python tests/run_tests.py
+.venv/bin/python scripts/smoke-test.py
+.venv/bin/python -m compileall -q .
+bash -n scripts/daily-analysis.sh
+```
+
+Expected:
+
+| Command | Expected result |
+| --- | --- |
+| `tests/run_tests.py` | `OK` — 0 failures, 0 errors. The suite declares no conditional skips; a `skipped` line means something changed and needs explaining. |
+| `scripts/smoke-test.py` | Two blocks: `8/8 checks passed` (cache-off / attribution) and `5/5 checks passed` (cache-on freeze). |
+| `compileall -q .` | No output, exit 0. |
+| `bash -n scripts/daily-analysis.sh` | No output, exit 0. |
+
+The smoke test prints `tool-belt: cannot import run_agent` and unknown-tool
+drift warnings from its synthetic fixtures. Those are expected fixture noise,
+not failures — only the `N/N checks passed` lines decide the result.
+
+Then the runtime contract check, which needs the full Hermes runtime:
+
+```bash
+hermes plugins doctor --ci .
+```
+
+Expected — the manifest version, no warnings, and exactly the declared surface:
+
+```
+  OK: runtime discovery, manifest parsing, import, and registration passed
+  registrations: 1 tool(s), 5 hook(s)
+```
+
+`1 tool` is `expand_tools`; the `5 hooks` are the five entries under
+`provides_hooks` in `plugin.yaml`. A count mismatch means a registration
+regressed against the manifest.
+
+### Drift check — run against a real profile
+
+```bash
+.venv/bin/python scripts/check-tool-drift.py
+```
+
+Expected: `check-tool-drift: no drift — every ceiling tool is named in the
+preset. ✓`
+
+This one is **not** a clean-clone check. It derives the live ceiling from
+`~/.hermes/state/tool-belt/predictions.jsonl`; with no telemetry it prints
+`could not determine live ceiling (no toolsets import, no telemetry)` **and
+still exits 0**. Run it from your normal working checkout against a profile
+that has real telemetry, or pass `--state-dir` explicitly. Treat the
+"could not determine" line as a skipped check, not a pass.
+
+---
+
+## 2. Clean-profile install test
+
+> **Hard rule: never run the install test against your live profile.** Point
+> `HERMES_HOME` at a throwaway directory for every command in this section and
+> the next. The Hermes CLI honors `HERMES_HOME` and scaffolds a fresh profile
+> there; installing into your real profile overwrites the plugin you are
+> testing and pollutes the telemetry the drift check reads.
+
+```bash
+export HERMES_HOME=$(mktemp -d)
+echo "$HERMES_HOME"
+```
+
+`hermes plugins install` accepts a Git URL, an `owner/repo` shorthand, or an
+index name — **not a local filesystem path**. Install the pushed commit:
+
+```bash
+hermes plugins install dalemugford/hermes-tool-belt
+```
+
+To test an exact commit before it is tagged, pin it:
+
+```bash
+hermes plugins install dalemugford/hermes-tool-belt --ref <40-char-commit-sha>
+```
+
+To test a local clone that has not been pushed at all, copy it into the temp
+profile instead of using the installer:
+
+```bash
+cp -R /tmp/tool-belt-release "$HERMES_HOME/plugins/tool-belt"
+```
+
+Confirm registration and a fresh read-only state report:
+
+```bash
+hermes plugins list
+hermes plugins doctor --ci "$HERMES_HOME/plugins/tool-belt"
+python3 "$HERMES_HOME/plugins/tool-belt/scripts/configure.py" --status
+```
+
+Expected: `tool-belt` appears in the plugin list at the release version;
+`--status` reports every scope as fresh (no telemetry, sessions still needed)
+and writes nothing. Re-running `--status` must produce identical output — it is
+read-only by contract.
+
+Optionally send one test message through the temp profile and confirm a row
+lands in telemetry:
+
+```bash
+tail -1 "$HERMES_HOME/state/tool-belt/predictions.jsonl" | python3 -m json.tool
+```
+
+---
+
+## 3. Behavioral spot-checks
+
+Still under the temp `HERMES_HOME` from step 2. Each check reads
+`predictions.jsonl`; the field reference is in
+[CONFIGURATION.md](CONFIGURATION.md#telemetry-outputs).
+
+A convenient view of the rows as you go:
+
+```bash
+tail -f "$HERMES_HOME/state/tool-belt/predictions.jsonl" | \
+  jq -c '{scope, frozen_reuse, frozen_reuse_count, tool_list_hash, policy_source, triggers: .triggers_fired}'
+```
+
+1. **Cache-on: frozen loadout is stable across turns.** On a prefix-caching
+   model, send several turns in one session. The first dispatch writes
+   `frozen_reuse: false`; every later dispatch writes `frozen_reuse: true` with
+   `frozen_reuse_count` incrementing, and `tool_list_hash` unchanged.
+
+2. **Cache-off: per-turn narrowing and sticky residency.** On a non-caching
+   model, `tool_list_hash` changes as intent changes. After an `expand_tools`
+   call, the expanded tools persist for the sticky-residency window, then drop.
+
+3. **`/new` or `/reset` evicts the freeze.** Issue `/new`, then send a message.
+   Expect a fresh `frozen_reuse: false` row with `frozen_reuse_count` restarting
+   at 1.
+
+4. **`expand_tools` recovery, both forms.** Confirm the model can recover by
+   category and by individual tool name, and that the recovered tools appear in
+   the next dispatch's tool list:
+
+   ```
+   expand_tools(category="browser")
+   expand_tools(tools=["browser_navigate"])
+   ```
+
+5. **`bypass_rate: 1.0` ships the full ceiling.** Set it on one scope, restart
+   the gateway, send a message. Expect the full configured ceiling in the
+   payload and `policy_source: bypass` in the row. Telemetry keeps flowing.
+
+6. **`enabled: false` turns the plugin fully off.** Restart, send a message,
+   confirm no narrowing and no new telemetry rows.
+
+7. **`log: false` stops telemetry but not narrowing.** Restart, send a message,
+   confirm the tool list is still narrowed and no new row is appended.
+
+8. **Analyzer runs and writes a report.**
+
+   ```bash
+   python3 "$HERMES_HOME/plugins/tool-belt/analyze.py"
+   ```
+
+   Expect a summary on stdout and a new `reports/YYYY-MM-DD-HHMMSS-analysis.md`
+   under the plugin directory.
+
+9. **Shaper dry-run is clean.**
+
+   ```bash
+   python3 "$HERMES_HOME/plugins/tool-belt/scripts/shape-ceiling.py" --dry-run
+   ```
+
+   Expect per-scope promote/demote candidates and the closing line
+   `[dry-run] No changes written to learned.json`.
+
+10. **Disable and uninstall leave nothing behind.** Set `enabled: false`, then
+    remove the directory and confirm Hermes starts clean without it:
+
+    ```bash
+    rm -rf "$HERMES_HOME/plugins/tool-belt"
+    hermes plugins list
+    ```
+
+Tear the temp profile down when finished, and make sure the variable is gone
+before you touch your real profile again:
+
+```bash
+rm -rf "$HERMES_HOME"
+unset HERMES_HOME
+```
+
+---
+
+## 4. Documentation reconciliation
+
+- **Install commands.** The commands in [README.md](../README.md#install-and-configure)
+  still match current Hermes Agent behavior — check them against the
+  [Hermes Agent docs](https://hermes-agent.nousresearch.com/docs) and against
+  `hermes plugins install --help`.
+- **Changelog completeness.** Every user-facing change since the last tag has an
+  `Unreleased` entry. `git log --oneline <last-tag>..HEAD` is the cross-check;
+  CONTRIBUTING.md requires an entry per user-facing change, so an unlisted
+  behavioral commit is a gap.
+- **Companion docs resolve.** Every relative link in the repo's markdown points
+  at a file that exists:
+
+  ```bash
+  python3 - <<'PY'
+  import re, pathlib
+  missing = []
+  for md in pathlib.Path('.').glob('**/*.md'):
+      if '.venv' in md.parts or '.git' in md.parts:
+          continue
+      for target in re.findall(r'\]\(([^)]+)\)', md.read_text()):
+          if target.startswith(('http://', 'https://', 'mailto:')):
+              continue
+          path = target.split('#')[0]
+          if path and not (md.parent / path).exists():
+              missing.append(f"{md}: {target}")
+  print('\n'.join(missing) or 'all relative links resolve')
+  PY
+  ```
+
+- **Configuration defaults.** Defaults in
+  [CONFIGURATION.md](CONFIGURATION.md) match [`policy.yaml`](../policy.yaml) and
+  the constants in the code. `learned_mode` in particular defaults to
+  `recommend`, not `apply`.
+- **Known issues are still true.** Re-read [KNOWN_ISSUES.md](KNOWN_ISSUES.md)
+  against the models and providers you actually run. Remove observations that no
+  longer reproduce — a stale entry blamed on a provider that has since fixed it
+  is worse than no entry.
+
+---
+
+## 5. Version and changelog finalization
+
+1. Bump `version` in [`plugin.yaml`](../plugin.yaml) to the release CalVer —
+   the date you are cutting on, `YYYY.M.D`, with no zero padding
+   (`2026.8.27`, not `2026.08.27`). Add a suffix for a prerelease
+   (`2026.8.27-beta`).
+
+2. In [CHANGELOG.md](../CHANGELOG.md), retitle the `## [Unreleased]` heading to
+   `## [YYYY.M.D] - YYYY-MM-DD` (ISO date, zero-padded) and open a fresh empty
+   `## [Unreleased]` above it:
+
+   ```markdown
+   ## [Unreleased]
+
+   ## [2026.8.27] - 2026-08-27
+   ```
+
+3. Confirm the two agree before committing:
+
+   ```bash
+   grep '^version:' plugin.yaml
+   grep -m1 '^## \[' CHANGELOG.md
+   ```
+
+4. Commit:
+
+   ```bash
+   git commit -am "chore: release 2026.8.27"
+   ```
+
+---
+
+## 6. Tag and publish
+
+The tag string is the `plugin.yaml` version **verbatim — no `v` prefix**. The
+existing `2026.5.17-beta` tag sets this convention, and README's Releases
+section promises a tag matching `plugin.yaml`.
+
+```bash
+git tag -a 2026.8.27 -m "Release 2026.8.27"
+git push origin main
+git push origin 2026.8.27
+```
+
+Create the GitHub Release from that tag and paste the version's CHANGELOG
+section as the release notes. Mark it as a pre-release when the version carries
+a prerelease suffix:
+
+```bash
+awk '/^## \[2026\.8\.27\]/{f=1; next} f && /^## \[/{exit} f' CHANGELOG.md > /tmp/release-notes.md
+gh release create 2026.8.27 --title "2026.8.27" --notes-file /tmp/release-notes.md
+```
+
+Read `/tmp/release-notes.md` before publishing. The `awk` stops at the next
+`## [` heading and handles the case where the new section is the last one in
+the file; a naive `sed` range does not.
+
+Announce per project conventions, if any apply.
+
+---
+
+## 7. Post-release
+
+- **Tag matches the manifest.** The version recorded at the tag is the released
+  version:
+
+  ```bash
+  git show 2026.8.27:plugin.yaml | grep '^version:'
+  ```
+
+- **CI is green on the tagged commit.** [`ci.yml`](../.github/workflows/ci.yml)
+  runs `tests/run_tests.py` on Python 3.11 and 3.12 for pushes to `main`. It
+  does **not** run `hermes plugins doctor` — that check has no CI coverage and
+  only happened because you ran it in step 1.
+
+  ```bash
+  gh run list --branch main --limit 3
+  ```
+
+- **Install the tag from scratch.** Repeat the step 2 clean-profile install
+  against the published tag, confirming the version reported by
+  `hermes plugins list` is the one you just cut.
+
+- **Update external pointers.** Community plugin index entry, marketplace
+  listing, or docs-site references, where those are maintained.

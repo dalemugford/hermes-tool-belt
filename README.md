@@ -365,6 +365,8 @@ The code is the source of truth. The active doc set is intentionally small:
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — every knob in `config.yaml`, `policy.yaml`, and `learned.json`, with defaults; full telemetry field reference.
 - [docs/SAVINGS.md](docs/SAVINGS.md) — how the token-savings numbers are computed and how to verify them on your own data.
 - [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) — behaviors that look like bugs but aren't (Codex reasoning cache, gateway-restart freeze loss, concurrent-chat resets).
+- [docs/PRIVACY.md](docs/PRIVACY.md) — what telemetry records and what it never records, where state lives, and how to disable collection or erase it.
+- [docs/RELEASING.md](docs/RELEASING.md) — the maintainer release checklist: pre-release verification, clean-profile install test, behavioral spot-checks, version and tag steps.
 
 ## License
 

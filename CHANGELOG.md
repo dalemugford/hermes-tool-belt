@@ -54,6 +54,15 @@ The initial public capabilities of the plugin:
 - **Continuous integration.** A GitHub Actions workflow
   (`.github/workflows/ci.yml`) runs the test suite on Python 3.11 and 3.12 for
   every push and pull request to `main`.
+- **Release checklist (`docs/RELEASING.md`).** The reproducible steps for
+  cutting a release: pre-release verification on a clean clone, a
+  clean-profile install test under a throwaway `HERMES_HOME`, behavioral
+  spot-checks, documentation reconciliation, version and changelog
+  finalization, tagging, and post-release confirmation.
+- **Privacy documentation (`docs/PRIVACY.md`).** What telemetry records and
+  what it never records, where state lives and under whose permissions, the
+  append-only retention model, how to disable collection, and how to erase
+  every file the plugin writes.
 
 ### Changed
 
