@@ -64,6 +64,12 @@ always_off:
   # (mnemosyne_remember / mnemosyne_recall / …). Kept off so it stops
   # riding along as an "unknown" on every turn.
   - memory
+  # Tool Search bridge tools. Tool Search manages its own activation logic
+  # (commit 78eef17); these are off by default and loaded on demand via
+  # expand_tools when the agent needs to discover a deferred tool.
+  - tool_search
+  - tool_describe
+  - tool_call
 
 # Triggered tool groups. Each group fires when ANY of its signals match.
 # When a group fires, all listed tools are added to the active set.
