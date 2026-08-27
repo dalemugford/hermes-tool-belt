@@ -63,6 +63,17 @@ The initial public capabilities of the plugin:
   what it never records, where state lives and under whose permissions, the
   append-only retention model, how to disable collection, and how to erase
   every file the plugin writes.
+- **Onboarding test harness (`tests/seed_sessions.py`, `tests/scripts/`,
+  `tests/test_onboarding_e2e.py`).** Scripted conversations are run through the
+  real policy resolver and predictor to synthesise telemetry into a throwaway
+  Hermes home, so the whole onboarding arc — scope discovery, the four-state
+  machine, both paths, the learned-overlay write, and per-scope independence —
+  is exercised end to end with no gateway, no provider, and no messaging
+  platform. Each script declares the trigger groups it expects, so a policy
+  regression fails the seed rather than producing quietly-wrong fixtures, and
+  rows are built through `logger_io.PredictionRecord` so the harness inherits
+  the production schema by construction. The seeder doubles as an operator
+  command for demoing onboarding by hand. Design: `docs/TEST_HARNESS.md`.
 
 ### Changed
 

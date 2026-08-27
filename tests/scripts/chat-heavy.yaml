@@ -1,0 +1,29 @@
+# Demote arm — a conversational agent with almost no tool use.
+#
+# Demotion needs always-on tools that are NOT protected, and
+# `analyze.effective_protected_always_on` shields every name in policy.yaml's
+# always_on list. So the demote targets are pinned by config instead:
+# `always_on_extra` is resolved by the real `presets.resolve_preset`, lands in
+# each row's `always_on_tools`, and — because `calls` never names them —
+# goes 20 sessions without a single use.
+#
+# `image_generate` and `cronjob` are ordinary trigger-gated tools, neither in
+# BASE_PROTECTED_ALWAYS_ON nor in policy.yaml always_on, so both are legal
+# demote candidates.
+name: chat-heavy
+agent: testagent
+platform: slack
+profile: null
+sessions: 20
+config:
+  always_on_extra:
+    - image_generate
+    - cronjob
+turns:
+  - user: "what did we decide about pricing yesterday?"
+    expect_triggers: [history_search]
+    calls:
+      - mnemosyne_recall
+  - user: "draft a reply to that email"
+    expect_triggers: []
+    calls: []

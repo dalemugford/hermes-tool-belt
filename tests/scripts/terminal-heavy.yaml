@@ -1,0 +1,29 @@
+# Promote arm — a terminal-and-git agent that keeps reaching past the
+# baseline loadout for `execute_code`, which policy.yaml gates behind the
+# code_execution trigger. Twenty sessions of `expand_tools` evidence puts it
+# well over promote_min_sessions (2) and promote_min_calls (3).
+#
+# Nothing here drives demotion: every tool in `always_on_tools` comes from
+# policy.yaml's always_on list, and `analyze.effective_protected_always_on`
+# shields all of those. See chat-heavy.yaml for the demote arm.
+name: terminal-heavy
+agent: testagent
+platform: telegram
+profile: null
+sessions: 20
+turns:
+  - user: "run the tests and check git status"
+    expect_triggers: [shell]
+    calls:
+      - read_file
+      - terminal
+      - tool: execute_code
+        expanded: true
+        count: 2
+  - user: "now commit the fix with git"
+    expect_triggers: [file_write, shell]
+    calls:
+      - terminal
+      - write_file
+      - tool: execute_code
+        expanded: true

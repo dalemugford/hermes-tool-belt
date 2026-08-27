@@ -1,0 +1,24 @@
+# A second scope in the same Hermes home, so multi-scope discovery and
+# per-scope independence get exercised: shaping `testagent:telegram` must
+# leave this one untouched.
+#
+# `browser_exec` is trigger-gated (the `browser` group), so the expansion
+# evidence here is the promote signal for this scope.
+name: browser-heavy
+agent: testagent-b
+platform: telegram
+profile: null
+sessions: 20
+turns:
+  - user: "browse to example.com and click on the login button"
+    expect_triggers: [browser]
+    calls:
+      - tool: browser_exec
+        expanded: true
+        count: 2
+  - user: "web scrape the pricing page"
+    expect_triggers: [web_extract, browser]
+    calls:
+      - tool: browser_exec
+        expanded: true
+      - read_file

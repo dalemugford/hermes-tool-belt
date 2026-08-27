@@ -1,7 +1,25 @@
 # Test Harness — Scripted Session Seeding for Onboarding Simulation
 
-**Status:** design proposal (Task 7c). No harness code exists yet; nothing in this
-document has been implemented.
+**Status: implemented.** This document is the design of record; the code that
+implements it is:
+
+| File | Role |
+|---|---|
+| [`tests/seed_sessions.py`](../tests/seed_sessions.py) | The seeder — §C. Importable, plus a `__main__` for populating a scratch home by hand. |
+| [`tests/scripts/*.yaml`](../tests/scripts) | The four scripted conversations — §B. |
+| [`tests/test_onboarding_e2e.py`](../tests/test_onboarding_e2e.py) | The end-to-end onboarding tests — §D. |
+
+Two deviations from the plan below, both recorded in the implementation:
+
+- **The demote arm pins its targets through config, not the shipped policy.**
+  `analyze.effective_protected_always_on` protects *every* name in
+  `policy.yaml`'s `always_on` list, so no baseline tool is demotable.
+  `tests/scripts/chat-heavy.yaml` therefore sets `always_on_extra`, which the
+  real `resolve_preset` merges into `always_on_tools` — a realistic
+  "user pinned it, never used it" shape, and the only one that can demote.
+  This adds a `config:` key to the §B schema.
+- **Scope/tool names differ from the illustrative examples in §B** — see the
+  scripts themselves for what is actually seeded.
 
 **Problem.** `scripts/configure.py` discovers `agent:platform` scopes from
 telemetry that the plugin's runtime hooks write during real gateway sessions.

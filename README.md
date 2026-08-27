@@ -367,6 +367,7 @@ The code is the source of truth. The active doc set is intentionally small:
 - [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) — behaviors that look like bugs but aren't (Codex reasoning cache, gateway-restart freeze loss, concurrent-chat resets).
 - [docs/PRIVACY.md](docs/PRIVACY.md) — what telemetry records and what it never records, where state lives, and how to disable collection or erase it.
 - [docs/RELEASING.md](docs/RELEASING.md) — the maintainer release checklist: pre-release verification, clean-profile install test, behavioral spot-checks, version and tag steps.
+- [docs/TEST_HARNESS.md](docs/TEST_HARNESS.md) — how onboarding is tested end to end from scripted conversations, without a gateway, a provider, or a messaging platform.
 
 ## License
 
