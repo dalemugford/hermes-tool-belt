@@ -285,7 +285,10 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
         scope = normalize_scope(row)
         stat = get(scope)
         stat.predictions += 1
-        session_id = str(row.get("session_id") or "").strip()
+        # Prefer hermes_session_id (rotates on /new) for accurate per-session
+        # grouping; fall back to session_id (the stable chat key) for older
+        # rows written before the UUID was captured.
+        session_id = str(row.get("hermes_session_id") or row.get("session_id") or "").strip()
         if session_id:
             stat.sessions.add(session_id)
         policy_source = str(row.get("policy_source") or "").strip().lower() or "preset"
@@ -394,7 +397,7 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
     pred_session: dict[str, str] = {}
     for row in predictions:
         pid = str(row.get("prediction_id") or "").strip()
-        sid = str(row.get("session_id") or "").strip()
+        sid = str(row.get("hermes_session_id") or row.get("session_id") or "").strip()
         if pid and sid:
             session_ordered_preds[sid].append(pid)
             pred_session[pid] = sid
