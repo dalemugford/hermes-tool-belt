@@ -4,6 +4,12 @@ Supported operator and verification commands shipped with the plugin. Runtime
 state lives under `$HERMES_HOME/state/tool-belt/`; generated reports and logs
 are not tracked by Git.
 
+Examples use `python3`; any Python 3 environment with PyYAML works. Set
+`HERMES_HOME` for a non-default Hermes home. `daily-analysis.sh` also accepts
+`HERMES_PYTHON` when a scheduler does not inherit the intended Python path.
+The root Hermes profile is labelled `default`; named profiles keep their
+directory names.
+
 ## Commands
 
 | Script | Purpose | Typical use |
@@ -95,4 +101,5 @@ Generated output is written to:
 
 Scheduler setup is environment-specific. Invoke `daily-analysis.sh` from the
 scheduler appropriate to the host; no machine-specific scheduler configuration
-is shipped in the repository.
+is shipped in the repository. Set `HERMES_PYTHON` explicitly in sparse
+scheduler environments when `python3` is not the interpreter with PyYAML.

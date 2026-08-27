@@ -51,8 +51,8 @@ Python 3.11+ is the realistic target (the code uses
 Run the full suite and the smoke test for every change:
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python3 tests/run_tests.py
-~/.hermes/hermes-agent/venv/bin/python3 scripts/smoke-test.py
+.venv/bin/python tests/run_tests.py
+.venv/bin/python scripts/smoke-test.py
 ```
 
 `tests/run_tests.py` also runs in the clean venv above; the smoke test and
@@ -61,8 +61,8 @@ diagnostics below exercise the plugin against the full Hermes runtime.
 Run targeted diagnostics when the mechanism they cover changes:
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python3 scripts/check-tool-drift.py
-~/.hermes/hermes-agent/venv/bin/python3 scripts/shape-ceiling.py --dry-run
+.venv/bin/python scripts/check-tool-drift.py
+.venv/bin/python scripts/shape-ceiling.py --dry-run
 ```
 
 Verify results independently — read the output, don't assume a pass. Never

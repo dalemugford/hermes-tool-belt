@@ -211,10 +211,10 @@ the model.
 
 ## Per-channel / per-scope override
 
-The plugin keys policy on `{agent}:{platform}` (e.g. `bernard:telegram`,
-`sue:slack`). Lookups try the full scope first, then fall back to the
-bare platform — so an override on `bernard:telegram` wins over a generic
-`telegram` entry.
+The plugin keys policy on `{agent}:{platform}` (e.g. `default:telegram`,
+`assistant-a:slack`). Hermes calls the root profile `default`. Lookups try the
+full scope first, then fall back to the bare platform — so an override on
+`default:telegram` wins over a generic `telegram` entry.
 
 ```yaml
 plugins:
@@ -223,7 +223,7 @@ plugins:
     channels:
       cli:
         always_on_extra: [terminal, execute_code]
-      bernard:telegram:           # agent-scoped override
+      default:telegram:           # agent-scoped override
         learned_mode: recommend
         always_on_extra: [terminal]
       slack:                       # platform-wide fallback
@@ -341,7 +341,7 @@ plugins:
 
     # Per-scope overrides
     channels:
-      bernard:telegram:        # agent-scoped override
+      default:telegram:        # agent-scoped override
         learned_mode: recommend
         bypass_rate: 0.05      # 5% baseline cohort on this scope only
         always_on_extra: [terminal]
@@ -442,9 +442,10 @@ effectiveness separately from "no positive match."
 
 Regression test:
 
+From the repository root:
+
 ```bash
-cd ~/.hermes/plugins/tool-belt
-~/.hermes/hermes-agent/venv/bin/python3 -m unittest tests.test_trigger_dampeners -v
+.venv/bin/python -m unittest tests.test_trigger_dampeners -v
 ```
 
 ### Auto-suggesting new dampeners from telemetry
@@ -457,7 +458,7 @@ extracts 2–4 word n-grams, and surfaces n-grams that show up frequently
 in false-positive messages but rarely (or never) in true-positive ones.
 
 ```bash
-hermes-agent/venv/bin/python3 plugins/tool-belt/analyze.py \
+python3 analyze.py \
   --suggest-dampeners
 ```
 
@@ -489,7 +490,7 @@ in `~/.hermes/state/tool-belt/learned.json`. Shape:
   "version": 1,
   "updated_at": "...",
   "scopes": {
-    "bernard:telegram": {
+    "default:telegram": {
       "always_on": ["terminal"],
       "always_off": [],
       "trigger_adjustments": {
@@ -535,10 +536,10 @@ prints a summary, writes a dated markdown report under `reports/`, and can
 optionally emit `learned_recommendations.json` for review.
 
 ```bash
-hermes-agent/venv/bin/python3 plugins/tool-belt/analyze.py
-hermes-agent/venv/bin/python3 plugins/tool-belt/analyze.py --format json
-hermes-agent/venv/bin/python3 plugins/tool-belt/analyze.py --write-recommendations
-hermes-agent/venv/bin/python3 plugins/tool-belt/analyze.py --include-archives
+python3 analyze.py
+python3 analyze.py --format json
+python3 analyze.py --write-recommendations
+python3 analyze.py --include-archives
 ```
 
 All thresholds are CLI flags, not hard-coded policy:
@@ -614,7 +615,7 @@ plugins:
   tool-belt:
     bypass_rate: 0.05   # 5% global baseline
     channels:
-      bernard:telegram:
+      default:telegram:
         bypass_rate: 0.1
 ```
 
@@ -624,8 +625,8 @@ run the predictor for telemetry but stamp `policy_source: "bypass"` so the
 analyzer's `cohorts` payload can compare:
 
 ```bash
-hermes-agent/venv/bin/python3 plugins/tool-belt/analyze.py --format json \
-  | jq '.scopes["bernard:telegram"].cohorts'
+python3 analyze.py --format json \
+  | jq '.scopes["default:telegram"].cohorts'
 ```
 
 Each cohort reports `predictions`, `sessions`, `tool_calls`,

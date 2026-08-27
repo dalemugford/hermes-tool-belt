@@ -50,7 +50,7 @@ _harvest_spec.loader.exec_module(harvest_replay)
 SECRET_MESSAGE = (
     "PRIVACY_CANARY_BEGIN this is an extremely distinctive sentence the "
     "harvester must never write to its output files in full because it "
-    "contains sensitive personal information about Dale's medical history "
+    "contains sensitive personal information about a user's medical history "
     "and a password ABC123XYZ789 PRIVACY_CANARY_END"
 )
 
@@ -97,7 +97,7 @@ class HarvestPrivacyTests(unittest.TestCase):
         self.assertIsNotNone(self.session, "test setup: session must parse")
 
         plugin_config = {"enabled": True}
-        preset = presets_mod.resolve_preset(plugin_config, channel="bernard:telegram")
+        preset = presets_mod.resolve_preset(plugin_config, channel="default:telegram")
 
         self.predictions: list[dict] = []
         self.tool_calls: list[dict] = []

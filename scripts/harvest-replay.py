@@ -35,8 +35,8 @@ Privacy invariants (enforced by code, not vibes):
     substring of any input message ever appears in derived files.
 
 Usage:
-  python3 scripts/harvest-replay.py                       # both profiles, all sessions
-  python3 scripts/harvest-replay.py --profile bernard     # one profile
+  python3 scripts/harvest-replay.py                       # all discovered profiles
+  python3 scripts/harvest-replay.py --profile default     # root profile only
   python3 scripts/harvest-replay.py --window-days 60      # last N days only
   python3 scripts/harvest-replay.py --dry-run             # parse + count, no writes
 """
@@ -76,7 +76,7 @@ LOOKAHEAD_TURN_LIMIT = 50
 class HarvestedSession:
     """The parsed shape of one session JSONL relevant to replay."""
     session_file: Path
-    profile_agent: str           # "bernard" or "sue" — derived from path
+    profile_agent: str           # "default" or a named profile, derived from path
     platform: str                # from session_meta
     ceiling_tools: list[str]     # tool names visible to the historical model
     turns: list[dict[str, Any]]  # ordered list of {role, content, tool_calls?, ts}
@@ -85,17 +85,16 @@ class HarvestedSession:
 def _profile_agent_from_path(session_file: Path) -> str:
     """Derive the agent identity from the session file's path.
 
-    ``~/.hermes/sessions/*.jsonl`` belongs to the root profile (Bernard).
+    ``~/.hermes/sessions/*.jsonl`` belongs to the root profile (``default``).
     ``~/.hermes/profiles/<name>/sessions/*.jsonl`` belongs to <name>.
-    Anything else returns ``"unknown"``.
+    Paths outside a named ``profiles/<name>`` directory use ``default``.
     """
     parts = session_file.resolve().parts
     if "profiles" in parts:
-        i = parts.index("profiles")
+        i = len(parts) - 1 - parts[::-1].index("profiles")
         if i + 1 < len(parts):
             return parts[i + 1]
-    # Default Hermes root sessions are Bernard's per this install's setup.
-    return "bernard"
+    return "default"
 
 
 def parse_session(session_file: Path) -> HarvestedSession | None:
@@ -147,8 +146,8 @@ import re as _re
 # context, thread context summaries, speaker attribution. The mining
 # flows (dampener and trigger-keyword) operate on message previews; if
 # the framing eats the 80-char preview window, candidates become noise
-# (matches on "prior messages in this thread", "you are bernard
-# working on dale" — system text, not user intent). Strip the framing
+# (matches on "prior messages in this thread", "you are assistant-a
+# working on a task" — system text, not user intent). Strip the framing
 # BEFORE preview computation so the preview captures actual content.
 _FRAMING_BLOCK = _re.compile(
     r"^\s*\[(?:Replying to:[^\]]*|Thread context[^\]]*)\]\s*",
@@ -344,7 +343,7 @@ def _load_plugin_config(profile_home: Path) -> dict[str, Any]:
     Matters because per-profile ``always_on_extra`` / ``always_off`` /
     ``channels.*`` overrides change the predictor's narrowing behavior.
     Running the harvest with the base policy alone over-cuts profiles
-    that have meaningful custom configuration (e.g. Sue's terminal +
+    that have meaningful custom configuration (e.g. a profile's terminal +
     execute_code + write_file + patch additions).
 
     Returns a config dict shaped exactly like what the plugin's
@@ -378,11 +377,12 @@ def discover_profiles(hermes_home: Path) -> list[tuple[str, Path]]:
     profiles/* dir that has a sessions directory."""
     out: list[tuple[str, Path]] = []
     if (hermes_home / "sessions").is_dir():
-        out.append(("bernard", hermes_home))
+        out.append(("default", hermes_home))
     profiles_dir = hermes_home / "profiles"
     if profiles_dir.is_dir():
         for child in sorted(profiles_dir.iterdir()):
-            if child.is_dir() and (child / "sessions").is_dir():
+            if (child.name != "default" and child.is_dir()
+                    and (child / "sessions").is_dir()):
                 out.append((child.name, child))
     return out
 
@@ -414,7 +414,7 @@ def write_outputs(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--profile", help="restrict to one profile (e.g. bernard or sue)")
+    parser.add_argument("--profile", help="restrict to one profile (e.g. default or assistant-a)")
     parser.add_argument("--window-days", type=int, default=None,
         help="only process sessions modified within the last N days")
     parser.add_argument("--dry-run", action="store_true",

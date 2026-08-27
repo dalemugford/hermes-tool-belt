@@ -38,7 +38,7 @@ def _seed_plugin_config(**overrides) -> None:
     plugin._CONFIG.update({
         "enabled": True,
         "log": False,  # no JSONL writes from unit tests
-        "agent": "bernard",
+        "agent": "assistant-a",
         "bypass_rate": 0.0,
         "cache_mode": "auto",
         "channels": {},
@@ -75,27 +75,27 @@ class ResolveCacheModeTests(unittest.TestCase):
 
     def test_forced_off_returns_off(self):
         plugin._CONFIG["cache_mode"] = "off"
-        self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="bernard:telegram"), "off")
+        self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="assistant-a:telegram"), "off")
 
     def test_forced_on_returns_on(self):
         plugin._CONFIG["cache_mode"] = "on"
-        self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="bernard:telegram"), "on")
+        self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="assistant-a:telegram"), "on")
 
     def test_auto_defaults_on_when_no_cached_entry(self):
         # Protect prefix stability unless telemetry has established that
         # provider-side caching is unavailable.
         plugin._CONFIG["cache_mode"] = "auto"
-        self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="bernard:telegram"), "on")
+        self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="assistant-a:telegram"), "on")
 
     def test_auto_honors_cached_off(self):
         plugin._CONFIG["cache_mode"] = "auto"
-        plugin._DETECTION_CACHE["bernard:telegram"] = {"mode": "off"}
-        self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="bernard:telegram"), "off")
+        plugin._DETECTION_CACHE["assistant-a:telegram"] = {"mode": "off"}
+        self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="assistant-a:telegram"), "off")
 
     def test_auto_honors_cached_on(self):
         plugin._CONFIG["cache_mode"] = "auto"
-        plugin._DETECTION_CACHE["bernard:telegram"] = {"mode": "on"}
-        self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="bernard:telegram"), "on")
+        plugin._DETECTION_CACHE["assistant-a:telegram"] = {"mode": "on"}
+        self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="assistant-a:telegram"), "on")
 
 
 class FreezeSnapshotTests(unittest.TestCase):
@@ -147,16 +147,16 @@ class FreezeSnapshotTests(unittest.TestCase):
         frozen = plugin._FROZEN_BY_SESSION["sid"]
 
         state1 = plugin._build_state_from_frozen(
-            frozen, session_id="sid", scope="bernard:telegram",
-            channel="bernard:telegram", agent="bernard", platform="telegram",
+            frozen, session_id="sid", scope="assistant-a:telegram",
+            channel="assistant-a:telegram", agent="assistant-a", platform="telegram",
             message="first reuse",
         )
         self.assertTrue(state1["frozen_reuse"])
         self.assertEqual(state1["frozen_reuse_count"], 1)
 
         state2 = plugin._build_state_from_frozen(
-            frozen, session_id="sid", scope="bernard:telegram",
-            channel="bernard:telegram", agent="bernard", platform="telegram",
+            frozen, session_id="sid", scope="assistant-a:telegram",
+            channel="assistant-a:telegram", agent="assistant-a", platform="telegram",
             message="second reuse",
         )
         self.assertEqual(state2["frozen_reuse_count"], 2)
@@ -183,8 +183,8 @@ class FreezeSnapshotTests(unittest.TestCase):
 
         state = plugin._build_state_from_frozen(
             plugin._FROZEN_BY_SESSION["sid"],
-            session_id="sid", scope="bernard:telegram",
-            channel="bernard:telegram", agent="bernard", platform="telegram",
+            session_id="sid", scope="assistant-a:telegram",
+            channel="assistant-a:telegram", agent="assistant-a", platform="telegram",
             message="hi",
         )
         self.assertEqual(state["expansions"], {"browser_navigate", "browser_click"})
@@ -209,8 +209,8 @@ class FreezeSnapshotTests(unittest.TestCase):
         )
         state = plugin._build_state_from_frozen(
             plugin._FROZEN_BY_SESSION["sid"],
-            session_id="sid", scope="bernard:telegram",
-            channel="bernard:telegram", agent="bernard", platform="telegram",
+            session_id="sid", scope="assistant-a:telegram",
+            channel="assistant-a:telegram", agent="assistant-a", platform="telegram",
             message="hi",
         )
         self.assertEqual(state["sticky_key"], "")
@@ -231,7 +231,7 @@ class DetectionStateMachineTests(unittest.TestCase):
         mode = plugin._update_cache_mode_detection(
             session_key="sid", model="claude-sonnet-4-6",
             cache_read=0, cache_write=0, input_tokens=100,
-            scope="bernard:telegram",
+            scope="assistant-a:telegram",
         )
         self.assertEqual(mode, "on")
 
@@ -239,7 +239,7 @@ class DetectionStateMachineTests(unittest.TestCase):
         mode = plugin._update_cache_mode_detection(
             session_key="sid", model="kimi-k2.6:cloud",
             cache_read=0, cache_write=0, input_tokens=100,
-            scope="bernard:telegram",
+            scope="assistant-a:telegram",
         )
         self.assertEqual(mode, "off")
         self.assertEqual(
@@ -253,7 +253,7 @@ class DetectionStateMachineTests(unittest.TestCase):
             mode = plugin._update_cache_mode_detection(
                 session_key="sid", model="gpt-5.4",
                 cache_read=100, cache_write=0, input_tokens=100,
-                scope="bernard:telegram",
+                scope="assistant-a:telegram",
             )
             self.assertEqual(mode, "pending")
 
@@ -263,7 +263,7 @@ class DetectionStateMachineTests(unittest.TestCase):
             mode = plugin._update_cache_mode_detection(
                 session_key="sid", model="gpt-5.4",
                 cache_read=8000, cache_write=0, input_tokens=2000,
-                scope="bernard:telegram",
+                scope="assistant-a:telegram",
             )
         self.assertEqual(mode, "on")
         self.assertEqual(
@@ -277,7 +277,7 @@ class DetectionStateMachineTests(unittest.TestCase):
             mode = plugin._update_cache_mode_detection(
                 session_key="sid", model="gpt-5.4",
                 cache_read=100, cache_write=0, input_tokens=10000,
-                scope="bernard:telegram",
+                scope="assistant-a:telegram",
             )
         self.assertEqual(mode, "off")
         self.assertEqual(
@@ -301,10 +301,10 @@ class DetectionCachePersistenceTests(unittest.TestCase):
                     "lock_reason": "threshold_met",
                     "hit_rate_at_lock": 0.85,
                 }
-                plugin._persist_detection_lock("bernard:telegram", state, "claude-sonnet-4-6")
-                self.assertIn("bernard:telegram", plugin._DETECTION_CACHE)
-                self.assertEqual(plugin._DETECTION_CACHE["bernard:telegram"]["mode"], "on")
-                self.assertEqual(plugin._DETECTION_CACHE["bernard:telegram"]["sessions_locked"], 1)
+                plugin._persist_detection_lock("assistant-a:telegram", state, "claude-sonnet-4-6")
+                self.assertIn("assistant-a:telegram", plugin._DETECTION_CACHE)
+                self.assertEqual(plugin._DETECTION_CACHE["assistant-a:telegram"]["mode"], "on")
+                self.assertEqual(plugin._DETECTION_CACHE["assistant-a:telegram"]["sessions_locked"], 1)
 
     def test_does_not_persist_provider_blocklist_lock(self):
         # Blocklist is config, not observation — shouldn't pollute the cache.
@@ -314,36 +314,36 @@ class DetectionCachePersistenceTests(unittest.TestCase):
                     "mode": "off",
                     "lock_reason": "provider_blocklist",
                 }
-                plugin._persist_detection_lock("bernard:telegram", state, "kimi-k2.6:cloud")
-                self.assertNotIn("bernard:telegram", plugin._DETECTION_CACHE)
+                plugin._persist_detection_lock("assistant-a:telegram", state, "kimi-k2.6:cloud")
+                self.assertNotIn("assistant-a:telegram", plugin._DETECTION_CACHE)
 
     def test_consecutive_same_mode_locks_increment_counter(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(os.environ, {"HERMES_HOME": tmp}, clear=False):
                 state = {"mode": "on", "lock_reason": "threshold_met"}
-                plugin._persist_detection_lock("bernard:telegram", state, "model-a")
-                plugin._persist_detection_lock("bernard:telegram", state, "model-a")
-                plugin._persist_detection_lock("bernard:telegram", state, "model-a")
+                plugin._persist_detection_lock("assistant-a:telegram", state, "model-a")
+                plugin._persist_detection_lock("assistant-a:telegram", state, "model-a")
+                plugin._persist_detection_lock("assistant-a:telegram", state, "model-a")
                 self.assertEqual(
-                    plugin._DETECTION_CACHE["bernard:telegram"]["sessions_locked"], 3,
+                    plugin._DETECTION_CACHE["assistant-a:telegram"]["sessions_locked"], 3,
                 )
 
     def test_disagreeing_lock_resets_counter(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(os.environ, {"HERMES_HOME": tmp}, clear=False):
                 plugin._persist_detection_lock(
-                    "bernard:telegram",
+                    "assistant-a:telegram",
                     {"mode": "on", "lock_reason": "threshold_met"},
                     "model-a",
                 )
                 plugin._persist_detection_lock(
-                    "bernard:telegram",
+                    "assistant-a:telegram",
                     {"mode": "off", "lock_reason": "threshold_failed"},
                     "model-a",
                 )
-                self.assertEqual(plugin._DETECTION_CACHE["bernard:telegram"]["mode"], "off")
+                self.assertEqual(plugin._DETECTION_CACHE["assistant-a:telegram"]["mode"], "off")
                 self.assertEqual(
-                    plugin._DETECTION_CACHE["bernard:telegram"]["sessions_locked"], 1,
+                    plugin._DETECTION_CACHE["assistant-a:telegram"]["sessions_locked"], 1,
                 )
 
 
@@ -419,7 +419,7 @@ class SlashCommandBypassTests(unittest.TestCase):
     """
 
     PLATFORM = "telegram"
-    CANONICAL = "agent:main:telegram:dm:8499413300"
+    CANONICAL = "agent:main:telegram:dm:100000001"
 
     def setUp(self):
         _seed_plugin_config()
@@ -431,7 +431,7 @@ class SlashCommandBypassTests(unittest.TestCase):
         # would auto-create infinite-recursion-ready stubs that confuse
         # the platform extractor.
         platform_obj = SimpleNamespace(value=self.PLATFORM)
-        source = SimpleNamespace(platform=platform_obj, chat_id="8499413300", user_id="dale")
+        source = SimpleNamespace(platform=platform_obj, chat_id="100000001", user_id="user-a")
         return SimpleNamespace(text=text, message=text, source=source, platform=None)
 
     def _make_session_store(self):
@@ -515,7 +515,7 @@ class SlashCommandBypassTests(unittest.TestCase):
         # Step 3: Real user message arrives. With cache_mode=on, this
         # should build a fresh freeze (reuses=0), not reuse one.
         plugin._CONFIG["cache_mode"] = "on"
-        plugin._on_pre_gateway_dispatch(event=self._make_event("Hey Bernard, comms test"), session_store=store)
+        plugin._on_pre_gateway_dispatch(event=self._make_event("Run the communication test"), session_store=store)
         frozen = plugin._FROZEN_BY_SESSION.get(self.CANONICAL)
         self.assertIsNotNone(frozen, "real message should build a fresh freeze")
         self.assertEqual(frozen["reuses"], 0,

@@ -761,10 +761,9 @@ def _profile_agent_name() -> str:
     """Derive the agent identity from profile/config context.
 
     Precedence mirrors :func:`_agent_platform_from_context` but stops at
-    the agent slot. Returns ``""`` when no real profile identity is
-    discoverable — callers MUST NOT substitute ``"default"`` for blank
-    telemetry rows (it would conflate true-out-of-band calls with
-    profile-less environments).
+    the agent slot. Hermes reserves ``default`` for the root profile, so a
+    root ``HERMES_HOME`` resolves to that neutral identity. Truly
+    profile-less calls still return ``""`` rather than inventing context.
     """
     agent = str(_CONFIG.get("agent") or "").strip().lower()
     if agent:
@@ -774,6 +773,7 @@ def _profile_agent_name() -> str:
         parent_dir, name = os.path.split(home)
         if os.path.basename(parent_dir) == "profiles" and name:
             return name.strip().lower()
+        return os.environ.get("HERMES_PROFILE", "").strip().lower() or "default"
     return os.environ.get("HERMES_PROFILE", "").strip().lower()
 
 
@@ -1917,15 +1917,15 @@ def _check_divergence(
 
     A session locked "on" with consistently low hit rate post-lock is
     evidence that the freeze is the wrong call for this session —
-    Mnemosyne is busting prefix, a tools mismatch we didn't anticipate,
-    or simply a cold-cache window. We don't switch modes mid-session
+    a changing prompt prefix, a tools mismatch we didn't anticipate, or
+    simply a cold-cache window. We don't switch modes mid-session
     (the switch itself busts cache), but we surface the divergence so
     the analyzer can flag the session for forensic review.
 
     Threshold: 3 consecutive post-lock calls with hit rate below 30%
     when locked "on". 3 is short enough to fire on a real problem
-    without flapping on transient noise; 30% is below the empirical
-    "stable hash" floor (90.6% on Bernard), so true cache breakage
+    without flapping on transient noise; 30% is well below the empirical
+    stable-hash floor on reference installations, so true cache breakage
     sits well clear of it.
     """
     if state.get("mode") != "on" or state.get("locked_at_call") is None:

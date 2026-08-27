@@ -7,7 +7,7 @@ COULD have shipped — vs what Tool Belt actually shipped.
 
 Run:
   python3 scripts/savings-report.py                       # all scopes
-  python3 scripts/savings-report.py --scope bernard:telegram
+  python3 scripts/savings-report.py --scope default:telegram
   python3 scripts/savings-report.py --json                # machine-readable
   python3 scripts/savings-report.py --since 2026-05-15    # time-bounded
 

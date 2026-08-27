@@ -42,18 +42,21 @@ the same change.
 
 ## Verification
 
-Run the complete suite for every code change:
+Create the repository development environment as described in
+`CONTRIBUTING.md`, then run the complete suite for every code change:
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python3 tests/run_tests.py
-~/.hermes/hermes-agent/venv/bin/python3 scripts/smoke-test.py
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python tests/run_tests.py
+.venv/bin/python scripts/smoke-test.py
 ```
 
 Run targeted diagnostics when their mechanism changes:
 
 ```bash
-~/.hermes/hermes-agent/venv/bin/python3 scripts/check-tool-drift.py
-~/.hermes/hermes-agent/venv/bin/python3 scripts/shape-ceiling.py --dry-run
+.venv/bin/python scripts/check-tool-drift.py
+.venv/bin/python scripts/shape-ceiling.py --dry-run
 ```
 
 Never commit generated telemetry, reports, caches, bytecode, learned state, or

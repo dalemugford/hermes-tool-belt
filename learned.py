@@ -69,7 +69,7 @@ def normalize_mode(value: Any) -> str:
 def scope_candidates(scope: str) -> list[str]:
     """Return lookup order for a scope.
 
-    ``bernard:telegram`` should win over ``telegram``. The platform fallback
+    ``assistant-a:telegram`` should win over ``telegram``. The platform fallback
     keeps existing channel-style configs useful while the learned layer
     moves toward agent/platform scopes.
     """

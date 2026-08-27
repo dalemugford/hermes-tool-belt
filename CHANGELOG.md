@@ -45,3 +45,11 @@ The initial public capabilities of the plugin:
   can validate that the declared `expand_tools` tool and all five hooks are
   actually registered. Functional disabling is unchanged — each hook and the
   narrowing patch still guard on `enabled` internally.
+- **Portable profile discovery.** Root-profile telemetry and session harvests
+  now use Hermes' neutral `default` identity instead of an installation-specific
+  agent name. Named profiles, custom `HERMES_HOME` paths (including spaces),
+  and missing state/session directories are covered by regression tests.
+- **Portable Python selection.** Bootstrap child processes reuse the invoking
+  interpreter, while scheduled analysis uses `python3` or an explicit
+  `HERMES_PYTHON` instead of assuming a Hermes source checkout and venv live
+  under the user's home directory.

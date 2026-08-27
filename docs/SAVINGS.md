@@ -192,7 +192,7 @@ into a single command:
 
 ```bash
 python3 scripts/savings-report.py
-python3 scripts/savings-report.py --scope bernard:telegram
+python3 scripts/savings-report.py --scope default:telegram
 python3 scripts/savings-report.py --since 2026-05-15
 python3 scripts/savings-report.py --json   # machine-readable
 ```
@@ -207,7 +207,7 @@ The fields most relevant to savings:
 | `ts` | float | Unix timestamp |
 | `prediction_id` | string | Join key for `tool_calls.jsonl` and `api_calls.jsonl` |
 | `session_id` | string | Canonical Hermes session key (`agent:main:<platform>:...`) |
-| `scope` | string | `<agent>:<platform>` (e.g. `bernard:telegram`) |
+| `scope` | string | `<agent>:<platform>` (e.g. `default:telegram`) |
 | `ceiling_count` | int | Tools in the platform_toolsets ceiling |
 | `narrowed_count` | int | Tools actually shipped |
 | `ceiling_tokens` | int | Tokenized size of the ceiling toolset |

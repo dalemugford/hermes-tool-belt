@@ -24,7 +24,7 @@ without disrupting either.
 
 Usage:
   python3 scripts/bootstrap.py
-  python3 scripts/bootstrap.py --profile sue      # one profile only
+  python3 scripts/bootstrap.py --profile assistant-a  # one profile only
   python3 scripts/bootstrap.py --window-days 60   # harvest window
   python3 scripts/bootstrap.py --skip-harvest     # cache-on path only
   python3 scripts/bootstrap.py --skip-shape       # cache-off path only
@@ -43,19 +43,26 @@ HERE = Path(__file__).resolve().parent
 PLUGIN_DIR = HERE.parent
 
 
+def _default_python() -> str:
+    """Interpreter for child scripts, with an explicit scheduler override."""
+    return os.environ.get("HERMES_PYTHON") or sys.executable
+
+
 def _discover_state_dirs(hermes_home: Path, profile_filter: str | None) -> list[tuple[str, Path]]:
     """Return ``[(label, state_dir), ...]`` for every profile's live state
     directory. Used by the cache-on path (shape-ceiling reads live
     telemetry, not harvest)."""
     out: list[tuple[str, Path]] = []
     root_state = hermes_home / "state" / "tool-belt"
-    if (not profile_filter or profile_filter == "bernard") and root_state.is_dir():
-        out.append(("bernard", root_state))
+    if (not profile_filter or profile_filter == "default") and root_state.is_dir():
+        out.append(("default", root_state))
     profiles_dir = hermes_home / "profiles"
     if profiles_dir.is_dir():
         for child in sorted(profiles_dir.iterdir()):
             if not child.is_dir():
                 continue
+            if child.name == "default":
+                continue  # reserved by Hermes for the root profile
             if profile_filter and child.name != profile_filter:
                 continue
             p_state = child / "state" / "tool-belt"
@@ -85,7 +92,7 @@ def _shape_ceiling_actions(state_dirs: list[tuple[str, Path]], python: str) -> l
                 [python, str(PLUGIN_DIR / "scripts" / "shape-ceiling.py"),
                  "--state-dir", str(sdir),
                  "--dry-run"],
-                capture_output=True, text=True, check=False, env={**os.environ, "HERMES_HOME": str(sdir.parent.parent)},
+                capture_output=True, text=True, check=False,
             )
             # Re-parse: shape-ceiling.py emits human-readable text, but we
             # can re-invoke its inner machinery via JSON-mode if available.
@@ -202,10 +209,8 @@ def main() -> int:
     parser.add_argument("--hermes-home", type=Path,
         default=Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes"))
     parser.add_argument("--python",
-        default=os.environ.get("HERMES_PYTHON")
-                or str(Path.home() / ".hermes/hermes-agent/venv/bin/python3")
-                if (Path.home() / ".hermes/hermes-agent/venv/bin/python3").exists()
-                else sys.executable)
+        default=_default_python(),
+        help="Python interpreter for child scripts (default: HERMES_PYTHON or this interpreter)")
     args = parser.parse_args()
 
     def info(msg: str) -> None:

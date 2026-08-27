@@ -7,7 +7,7 @@ Covers:
      no-op when the field came through empty).
   3. Real Hermes session-key shape parsing — ``agent:main:{platform}:…``,
      where position 1 is the *literal* string ``"main"``, not the agent
-     name. Recovering ``bernard:telegram`` from a real gateway key
+     name. Recovering ``assistant-a:telegram`` from a real gateway key
      requires combining the canonical platform with a profile-derived
      agent.
   4. Blank attribution preserved for genuinely untrackable rows.
@@ -121,11 +121,25 @@ class SessionKeyParsingTests(unittest.TestCase):
 
     def test_profile_agent_from_hermes_home(self):
         with tempfile.TemporaryDirectory() as tmp:
-            profile_dir = _make_profile_dir(tmp, "sue")
+            profile_dir = _make_profile_dir(tmp, "assistant-b")
             with mock.patch.dict(os.environ, {"HERMES_HOME": profile_dir}, clear=False):
                 # Ensure _CONFIG['agent'] doesn't shadow HERMES_HOME for this case.
                 plugin._CONFIG["agent"] = ""
-                self.assertEqual(plugin._profile_agent_name(), "sue")
+                self.assertEqual(plugin._profile_agent_name(), "assistant-b")
+
+    def test_root_home_uses_explicit_profile_env_before_default(self):
+        with mock.patch.dict(
+            os.environ,
+            {"HERMES_HOME": "/tmp/custom hermes root", "HERMES_PROFILE": "operator"},
+            clear=False,
+        ):
+            self.assertEqual(plugin._profile_agent_name(), "operator")
+
+    def test_profileless_context_stays_blank(self):
+        with mock.patch.dict(
+            os.environ, {"HERMES_HOME": "", "HERMES_PROFILE": ""}, clear=False
+        ):
+            self.assertEqual(plugin._profile_agent_name(), "")
 
 
 class PreGatewayDispatchSessionIdTests(unittest.TestCase):
@@ -148,7 +162,7 @@ class PreGatewayDispatchSessionIdTests(unittest.TestCase):
         self._original_config = dict(plugin._CONFIG)
         plugin._CONFIG["enabled"] = True
         plugin._CONFIG["log"] = True
-        plugin._CONFIG["agent"] = "bernard"
+        plugin._CONFIG["agent"] = "assistant-a"
         self.addCleanup(self._restore_config)
 
         plugin._PREDICTION_CV.set(None)
@@ -167,26 +181,26 @@ class PreGatewayDispatchSessionIdTests(unittest.TestCase):
         state = plugin._PREDICTION_CV.get()
         self.assertIsNotNone(state, "pre_gateway_dispatch should set the contextvar")
         self.assertEqual(state["session_id"], REAL_KEY_TELEGRAM)
-        self.assertEqual(state["agent"], "bernard")
+        self.assertEqual(state["agent"], "assistant-a")
         self.assertEqual(state["platform"], "telegram")
-        self.assertEqual(state["scope"], "bernard:telegram")
+        self.assertEqual(state["scope"], "assistant-a:telegram")
         predictions = (Path(self.tmp.name) / "state" / "tool-belt" / "predictions.jsonl")
         plugin._maybe_log_prediction(state, ceiling=[], narrowed=[])
         rows = [json.loads(line) for line in predictions.read_text().splitlines() if line]
         self.assertTrue(rows, "expected at least one prediction row")
         self.assertEqual(rows[-1]["session_id"], REAL_KEY_TELEGRAM)
-        self.assertEqual(rows[-1]["scope"], "bernard:telegram")
+        self.assertEqual(rows[-1]["scope"], "assistant-a:telegram")
 
 
 class BypassEligibilityTests(unittest.TestCase):
     def test_should_bypass_false_when_session_id_blank(self):
-        self.assertFalse(plugin._should_bypass("bernard:telegram", ""))
+        self.assertFalse(plugin._should_bypass("assistant-a:telegram", ""))
 
     def test_should_bypass_can_fire_with_real_session_id(self):
         original_rate = plugin._CONFIG.get("bypass_rate")
         plugin._CONFIG["bypass_rate"] = 1.0
         try:
-            self.assertTrue(plugin._should_bypass("bernard:telegram", REAL_KEY_TELEGRAM))
+            self.assertTrue(plugin._should_bypass("assistant-a:telegram", REAL_KEY_TELEGRAM))
         finally:
             plugin._CONFIG["bypass_rate"] = original_rate
 
@@ -196,9 +210,9 @@ class PostToolCallAttributionRecoveryTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         # Make HERMES_HOME a real profile dir so _profile_agent_name()
-        # resolves to "bernard" — mirrors the live ``hermes -p bernard
+        # resolves to "assistant-a" — mirrors the live ``hermes -p assistant-a
         # gateway`` shape.
-        self.profile_home = _make_profile_dir(self.tmp.name, "bernard")
+        self.profile_home = _make_profile_dir(self.tmp.name, "assistant-a")
         self._env_patch = mock.patch.dict(
             os.environ,
             {"HERMES_HOME": self.profile_home, "HERMES_SESSION_KEY": ""},
@@ -225,16 +239,16 @@ class PostToolCallAttributionRecoveryTests(unittest.TestCase):
         agent, platform, scope = plugin._recover_attribution_without_state(
             REAL_KEY_TELEGRAM, kwargs={}
         )
-        self.assertEqual(agent, "bernard")
+        self.assertEqual(agent, "assistant-a")
         self.assertEqual(platform, "telegram")
-        self.assertEqual(scope, "bernard:telegram")
+        self.assertEqual(scope, "assistant-a:telegram")
 
     def test_recover_from_whatsapp_session_key(self):
         # Confirms the parser works across platforms, not just telegram.
         agent, platform, scope = plugin._recover_attribution_without_state(
             REAL_KEY_WHATSAPP, kwargs={}
         )
-        self.assertEqual((agent, platform, scope), ("bernard", "whatsapp", "bernard:whatsapp"))
+        self.assertEqual((agent, platform, scope), ("assistant-a", "whatsapp", "assistant-a:whatsapp"))
 
     def test_recover_returns_blanks_for_uuid_style_session_id(self):
         # AIAgent.session_id is a uuid/timestamp string. With no env-var
@@ -260,36 +274,34 @@ class PostToolCallAttributionRecoveryTests(unittest.TestCase):
             )
         self.assertEqual((agent, platform, scope), ("", "", ""))
 
-    def test_context_returns_blank_when_agent_unresolved(self):
-        # Regression: a config without `agent:` and HERMES_HOME pointing
-        # at the Hermes root (not a profiles/<name> subdir) used to be
-        # silently labelled "default:telegram", masking the missing
-        # config line for four days in production. Blank attribution is
-        # the honest signal — analyzer's normalize_scope buckets these
-        # as "unknown" so the regression surfaces in reports.
+    def test_context_uses_default_for_root_profile(self):
+        # Hermes reserves "default" for the root profile. A custom root
+        # HERMES_HOME therefore remains attributable without requiring a
+        # private plugin-specific `agent:` setting.
         with mock.patch.dict(
             os.environ,
-            {"HERMES_HOME": "/Users/macmini/.hermes", "HERMES_PROFILE": "",
+            {"HERMES_HOME": "/tmp/custom hermes root", "HERMES_PROFILE": "",
              "HERMES_SESSION_KEY": REAL_KEY_TELEGRAM},
             clear=False,
         ):
             plugin._CONFIG["agent"] = ""
             agent, platform, scope = plugin._agent_platform_from_context(event=None, kwargs={})
-        self.assertEqual((agent, platform, scope), ("", "", ""),
-            "blank agent + real platform must NOT synthesize default:telegram")
+        self.assertEqual((agent, platform, scope),
+                         ("default", "telegram", "default:telegram"))
 
     def test_context_resolves_when_config_agent_set(self):
-        # The supported fix path: explicit `agent: bernard` in plugin
-        # config recovers attribution even when HERMES_HOME is the root.
+        # An explicit agent remains the highest-precedence override even when
+        # HERMES_HOME identifies the root profile.
         with mock.patch.dict(
             os.environ,
-            {"HERMES_HOME": "/Users/macmini/.hermes", "HERMES_PROFILE": "",
+            {"HERMES_HOME": "/tmp/custom hermes root", "HERMES_PROFILE": "",
              "HERMES_SESSION_KEY": REAL_KEY_TELEGRAM},
             clear=False,
         ):
-            plugin._CONFIG["agent"] = "bernard"
+            plugin._CONFIG["agent"] = "assistant-a"
             agent, platform, scope = plugin._agent_platform_from_context(event=None, kwargs={})
-        self.assertEqual((agent, platform, scope), ("bernard", "telegram", "bernard:telegram"))
+        self.assertEqual((agent, platform, scope),
+                         ("assistant-a", "telegram", "assistant-a:telegram"))
 
     def test_post_tool_call_logs_recovered_attribution(self):
         plugin._on_post_tool_call(
@@ -303,9 +315,9 @@ class PostToolCallAttributionRecoveryTests(unittest.TestCase):
         rows = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l]
         self.assertTrue(rows, "expected one tool-call row")
         row = rows[-1]
-        self.assertEqual(row["agent"], "bernard")
+        self.assertEqual(row["agent"], "assistant-a")
         self.assertEqual(row["platform"], "telegram")
-        self.assertEqual(row["scope"], "bernard:telegram")
+        self.assertEqual(row["scope"], "assistant-a:telegram")
 
 
 class SessionEndCleanupTests(unittest.TestCase):
@@ -394,7 +406,7 @@ class AnalyzerExcludesDegradedModeTests(unittest.TestCase):
         self.assertIn("process", tools)
 
     def test_dampener_candidates_emits_warning_when_degraded(self):
-        stat = analyze.ScopeStats(scope="bernard:telegram")
+        stat = analyze.ScopeStats(scope="assistant-a:telegram")
         stat.trigger_fp_previews["browser"] = [
             "please open browser please",
             "please open browser please",
@@ -414,7 +426,7 @@ class AnalyzerExcludesDegradedModeTests(unittest.TestCase):
 
         with mock.patch.object(analyze, "_load_preset_excludes", fake_load_excludes):
             with mock.patch.object(sys, "stderr") as stderr_mock:
-                rows = analyze.dampener_candidates({"bernard:telegram": stat}, args)
+                rows = analyze.dampener_candidates({"assistant-a:telegram": stat}, args)
         printed = "".join(
             call.args[0] for call in stderr_mock.write.call_args_list if call.args
         )
@@ -439,8 +451,8 @@ class TriggerFpLateBoundTpTests(unittest.TestCase):
             "ts": ts,
             "prediction_id": pid,
             "session_id": sid,
-            "scope": "bernard:telegram",
-            "agent": "bernard",
+            "scope": "assistant-a:telegram",
+            "agent": "assistant-a",
             "platform": "telegram",
             "policy_source": "preset",
             "message_preview": f"msg-{pid}",
@@ -465,7 +477,7 @@ class TriggerFpLateBoundTpTests(unittest.TestCase):
         ]
         calls = [self._row_call(pid="p2", tool="terminal")]
         stats = analyze.collect_stats(preds, calls)
-        scope = stats["bernard:telegram"]
+        scope = stats["assistant-a:telegram"]
         self.assertEqual(scope.trigger_hits["shell"], 1,
             "tool called in next prediction (within window) must count as TP")
         self.assertEqual(scope.trigger_false_positives.get("shell", 0), 0)
@@ -486,7 +498,7 @@ class TriggerFpLateBoundTpTests(unittest.TestCase):
         # Window is 3 — p5 is 4 turns out, beyond the window.
         calls = [self._row_call(pid="p5", tool="terminal")]
         stats = analyze.collect_stats(preds, calls)
-        scope = stats["bernard:telegram"]
+        scope = stats["assistant-a:telegram"]
         self.assertEqual(scope.trigger_false_positives.get("shell", 0), 1,
             "tool called beyond window must remain FP")
 
@@ -501,7 +513,7 @@ class TriggerFpLateBoundTpTests(unittest.TestCase):
         ]
         calls = [self._row_call(pid="p2", tool="terminal")]
         stats = analyze.collect_stats(preds, calls)
-        scope = stats["bernard:telegram"]
+        scope = stats["assistant-a:telegram"]
         self.assertEqual(scope.trigger_false_positives.get("shell", 0), 1,
             "different-session tool call must not satisfy the trigger")
 
@@ -517,7 +529,7 @@ class TriggerFpLateBoundTpTests(unittest.TestCase):
         ]
         calls = [self._row_call(pid="p2", tool="terminal")]
         stats = analyze.collect_stats(preds, calls)
-        scope = stats["bernard:telegram"]
+        scope = stats["assistant-a:telegram"]
         self.assertEqual(scope.trigger_false_positives.get("shell", 0), 1,
             "blank session_id must fall back to same-prediction classification")
 
@@ -543,7 +555,7 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
 
-    def _make_stats(self, *, scope="bernard:telegram", cut_previews,
+    def _make_stats(self, *, scope="assistant-a:telegram", cut_previews,
                     all_previews, was_cut_count):
         from collections import Counter
         stat = analyze.ScopeStats(scope=scope)
@@ -695,8 +707,8 @@ class HarvestRecommendationTests(unittest.TestCase):
     def test_net_positive_surfaces_as_promote(self):
         # 100 predictions, 50 was_cut for tool X → cost = 50*1500 = 75k
         # carry = 100*388 = 38.8k → net +36.2k → promote
-        preds = [self._harvest_row(pid=f"p{i:03d}", scope="bernard:telegram") for i in range(100)]
-        calls = [self._harvest_row(pid=f"p{i:03d}", scope="bernard:telegram",
+        preds = [self._harvest_row(pid=f"p{i:03d}", scope="assistant-a:telegram") for i in range(100)]
+        calls = [self._harvest_row(pid=f"p{i:03d}", scope="assistant-a:telegram",
                                    tool="terminal", was_cut=True) for i in range(50)]
         stats = analyze.collect_stats(preds, calls)
         rows = analyze.harvest_recommendation_rows(stats, self._args())
@@ -708,8 +720,8 @@ class HarvestRecommendationTests(unittest.TestCase):
     def test_frequent_but_net_negative_surfaces_as_broaden(self):
         # 1000 predictions (carry = 388k), 150 was_cut for X (rt = 225k)
         # → net -163k but cut_rate = 15% (above 10% threshold) → broaden
-        preds = [self._harvest_row(pid=f"p{i:04d}", scope="bernard:telegram") for i in range(1000)]
-        calls = [self._harvest_row(pid=f"p{i:04d}", scope="bernard:telegram",
+        preds = [self._harvest_row(pid=f"p{i:04d}", scope="assistant-a:telegram") for i in range(1000)]
+        calls = [self._harvest_row(pid=f"p{i:04d}", scope="assistant-a:telegram",
                                    tool="patch", was_cut=True) for i in range(150)]
         stats = analyze.collect_stats(preds, calls)
         rows = analyze.harvest_recommendation_rows(stats, self._args())
@@ -721,8 +733,8 @@ class HarvestRecommendationTests(unittest.TestCase):
     def test_sparse_cuts_keep_gated(self):
         # 1000 predictions, only 5 was_cut → cut_rate 0.5%, net very
         # negative → keep_gated
-        preds = [self._harvest_row(pid=f"p{i:04d}", scope="bernard:telegram") for i in range(1000)]
-        calls = [self._harvest_row(pid=f"p{i:04d}", scope="bernard:telegram",
+        preds = [self._harvest_row(pid=f"p{i:04d}", scope="assistant-a:telegram") for i in range(1000)]
+        calls = [self._harvest_row(pid=f"p{i:04d}", scope="assistant-a:telegram",
                                    tool="browser_vision", was_cut=True) for i in range(5)]
         stats = analyze.collect_stats(preds, calls)
         rows = analyze.harvest_recommendation_rows(stats, self._args())
@@ -732,8 +744,8 @@ class HarvestRecommendationTests(unittest.TestCase):
 
     def test_below_min_cuts_does_not_surface(self):
         # 1 was_cut < harvest_min_cuts=3 → no rec emitted
-        preds = [self._harvest_row(pid="p001", scope="bernard:telegram")]
-        calls = [self._harvest_row(pid="p001", scope="bernard:telegram",
+        preds = [self._harvest_row(pid="p001", scope="assistant-a:telegram")]
+        calls = [self._harvest_row(pid="p001", scope="assistant-a:telegram",
                                    tool="cronjob", was_cut=True)]
         stats = analyze.collect_stats(preds, calls)
         rows = analyze.harvest_recommendation_rows(stats, self._args())
@@ -742,19 +754,19 @@ class HarvestRecommendationTests(unittest.TestCase):
     def test_no_harvest_rows_no_output(self):
         # Live data only (no policy_source=harvest) → empty output
         preds = [{
-            "prediction_id": "p1", "session_id": "live-s1", "scope": "bernard:telegram",
+            "prediction_id": "p1", "session_id": "live-s1", "scope": "assistant-a:telegram",
             "policy_source": "preset", "message_preview": "x",
             "ceiling_count": 1, "narrowed_count": 1, "ceiling_tokens": 1, "narrowed_tokens": 1,
         }]
-        calls = [{"prediction_id": "p1", "session_id": "live-s1", "scope": "bernard:telegram",
+        calls = [{"prediction_id": "p1", "session_id": "live-s1", "scope": "assistant-a:telegram",
                   "tool_name": "terminal", "was_cut": True, "policy_source": "preset"}]
         stats = analyze.collect_stats(preds, calls)
         rows = analyze.harvest_recommendation_rows(stats, self._args())
         self.assertFalse(rows, "live-only telemetry must not produce harvest recs")
 
     def test_harvest_skips_tools_pinned_always_on_by_policy(self):
-        preds = [self._harvest_row(pid=f"p{i:03d}", scope="bernard:telegram") for i in range(100)]
-        calls = [self._harvest_row(pid=f"p{i:03d}", scope="bernard:telegram",
+        preds = [self._harvest_row(pid=f"p{i:03d}", scope="assistant-a:telegram") for i in range(100)]
+        calls = [self._harvest_row(pid=f"p{i:03d}", scope="assistant-a:telegram",
                                    tool="terminal", was_cut=True) for i in range(50)]
         stats = analyze.collect_stats(preds, calls)
         rows = analyze.harvest_recommendation_rows(
@@ -780,11 +792,11 @@ class RecommendationRowProtectionTests(unittest.TestCase):
         return SimpleNamespace(**defaults)
 
     def test_policy_always_on_tool_is_not_flagged_for_demote(self):
-        stat = analyze.ScopeStats(scope="bernard:telegram")
+        stat = analyze.ScopeStats(scope="assistant-a:telegram")
         stat.predictions = 25
         stat.always_on_carry_turns = Counter({"mnemosyne_recall": 25})
         rows = analyze.recommendation_rows(
-            {"bernard:telegram": stat},
+            {"assistant-a:telegram": stat},
             self._args(),
             protected_always_on={"mnemosyne_recall"},
         )
@@ -805,7 +817,7 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.profile_home = _make_profile_dir(self.tmp.name, "bernard")
+        self.profile_home = _make_profile_dir(self.tmp.name, "assistant-a")
         self._env_patch = mock.patch.dict(
             os.environ,
             {"HERMES_HOME": self.profile_home, "HERMES_SESSION_KEY": ""},
@@ -817,7 +829,7 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
         self._original_config = dict(plugin._CONFIG)
         plugin._CONFIG["enabled"] = True
         plugin._CONFIG["log"] = True
-        plugin._CONFIG["agent"] = "bernard"
+        plugin._CONFIG["agent"] = "assistant-a"
         self.addCleanup(self._restore_config)
 
         # Clear the sticky table so prior tests' state can't leak in.
@@ -847,9 +859,9 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
     def _set_prediction_state(self, *, initial_allowed: list[str], sticky_key: str) -> None:
         plugin._PREDICTION_CV.set({
             "prediction_id": "pred-current",
-            "agent": "bernard",
+            "agent": "assistant-a",
             "platform": "telegram",
-            "scope": "bernard:telegram",
+            "scope": "assistant-a:telegram",
             "sticky_key": sticky_key,
             "session_id": REAL_KEY_TELEGRAM,
             "initial_allowed_tools": initial_allowed,
@@ -970,7 +982,7 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.profile_home = _make_profile_dir(self.tmp.name, "bernard")
+        self.profile_home = _make_profile_dir(self.tmp.name, "assistant-a")
         self._env_patch = mock.patch.dict(
             os.environ,
             {"HERMES_HOME": self.profile_home, "HERMES_SESSION_KEY": ""},
@@ -981,7 +993,7 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         self._original_config = dict(plugin._CONFIG)
         plugin._CONFIG["enabled"] = True
         plugin._CONFIG["log"] = False  # disable prediction-log writes
-        plugin._CONFIG["agent"] = "bernard"
+        plugin._CONFIG["agent"] = "assistant-a"
         self.addCleanup(self._restore_config)
         plugin._PREDICTION_CV.set(None)
 
@@ -1003,7 +1015,7 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
             "baseline_allowed_tools": ["memory", "send_message"],
             "known_tool_names": {"memory", "send_message", "terminal", "file_read"},
             "expansions": set(),
-            "agent": "bernard", "platform": "telegram", "scope": "bernard:telegram",
+            "agent": "assistant-a", "platform": "telegram", "scope": "assistant-a:telegram",
             "sticky_key": "k", "session_id": REAL_KEY_TELEGRAM,
             "sticky_tools": [], "sticky_categories": [], "sticky_remaining_turns": {},
         })
@@ -1054,7 +1066,7 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
             "baseline_allowed_tools": ["memory"],           # pre-sticky
             "known_tool_names": {"memory", "terminal"},
             "expansions": set(),
-            "agent": "bernard", "platform": "telegram", "scope": "bernard:telegram",
+            "agent": "assistant-a", "platform": "telegram", "scope": "assistant-a:telegram",
             "sticky_key": sticky_key, "session_id": REAL_KEY_TELEGRAM,
             "sticky_tools": ["terminal"], "sticky_categories": ["terminal"],
             "sticky_remaining_turns": {"terminal": 3},
@@ -1100,7 +1112,7 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
             "baseline_allowed_tools": ["memory", "terminal"],  # terminal IS in baseline
             "known_tool_names": {"memory", "terminal"},
             "expansions": set(),
-            "agent": "bernard", "platform": "telegram", "scope": "bernard:telegram",
+            "agent": "assistant-a", "platform": "telegram", "scope": "assistant-a:telegram",
             "sticky_key": sticky_key, "session_id": REAL_KEY_TELEGRAM,
             "sticky_tools": ["terminal"], "sticky_categories": ["terminal"],
             "sticky_remaining_turns": {"terminal": 3},

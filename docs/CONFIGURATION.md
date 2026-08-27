@@ -240,9 +240,13 @@ observation.
 Type: `dict[str, dict]`. Default: `{}`.
 
 Per-scope overrides. Scope keys are `{agent}:{platform}` (e.g.
-`bernard:telegram`). Lookups try the full scope first, then fall back
-to the bare platform segment — so a `telegram` entry still applies to
-`bernard:telegram` when no more specific entry exists.
+`default:telegram` for the root profile). Lookups try the full scope first, then
+fall back to the bare platform segment — so a `telegram` entry still applies
+to `default:telegram` when no more specific entry exists.
+
+An explicit plugin `agent` value remains the highest-precedence label. Named
+profiles use their directory name, the root profile uses Hermes' reserved
+`default` label, and calls without any profile context remain unattributed.
 
 Each scope value mirrors the top-level shape and may set any of:
 
@@ -255,7 +259,7 @@ Each scope value mirrors the top-level shape and may set any of:
 channels:
   cli:
     always_on_extra: [terminal, execute_code]
-  bernard:telegram:
+  default:telegram:
     learned_mode: recommend
     always_on_extra: [terminal]
   slack:
@@ -390,9 +394,9 @@ unset). Read-mostly: owned by `scripts/shape-ceiling.py`; consumed by
   "version": 1,
   "updated_at": "2026-06-01T00:00:00Z",
   "scopes": {
-    "bernard:telegram": {
+    "default:telegram": {
       "cache_aware": {
-        "scope": "bernard:telegram",
+        "scope": "default:telegram",
         "computed_at": "2026-06-01T00:00:00Z",
         "sessions_considered": 20,
         "window_requested": 20,
@@ -464,7 +468,7 @@ Owned by the runtime; written on every per-session lock event by
 
 ```json
 {
-  "bernard:telegram": {
+  "default:telegram": {
     "mode": "on",
     "locked_at": 1717200000.0,
     "lock_reason": "threshold_met",

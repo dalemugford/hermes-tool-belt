@@ -487,10 +487,10 @@ def _reset_plugin_state() -> None:
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         original_config = dict(plugin._CONFIG)
-        off_home = Path(tmp) / "off" / "profiles" / "bernard"
+        off_home = Path(tmp) / "off" / "profiles" / "assistant-a"
         off_state = off_home / "state" / "tool-belt"
         off_state.mkdir(parents=True, exist_ok=True)
-        on_home = Path(tmp) / "on" / "profiles" / "bernard"
+        on_home = Path(tmp) / "on" / "profiles" / "assistant-a"
         on_state = on_home / "state" / "tool-belt"
         on_state.mkdir(parents=True, exist_ok=True)
 
@@ -501,7 +501,7 @@ def main() -> int:
             plugin._CONFIG.update({
                 "enabled": True,
                 "log": True,
-                "agent": "bernard",
+                "agent": "assistant-a",
                 "bypass_rate": 0.05,
                 "cache_mode": "off",  # exercise the legacy per-turn path
                 "channels": {},

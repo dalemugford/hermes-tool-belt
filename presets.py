@@ -261,7 +261,7 @@ def _channel_config(channels_cfg: Any, channel: str) -> dict[str, Any]:
     """Return config for a scope, falling back to its platform segment.
 
     Existing configs often use ``telegram``; the agent/platform scope is
-    ``bernard:telegram``. Supporting both keeps rollout non-disruptive.
+    ``assistant-a:telegram``. Supporting both keeps rollout non-disruptive.
     """
     if not isinstance(channels_cfg, dict):
         return {}

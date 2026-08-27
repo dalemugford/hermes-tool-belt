@@ -13,7 +13,7 @@ set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-PYTHON="${HERMES_PYTHON:-${HERMES_HOME}/hermes-agent/venv/bin/python3}"
+PYTHON="${HERMES_PYTHON:-python3}"
 
 # Logs are always written to the root state dir, regardless of which
 # source the run is analyzing — keeps the summary log consolidated.
@@ -24,19 +24,22 @@ mkdir -p "${ROOT_LOG_DIR}"
 TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 TS_LOCAL="$(date +%Y-%m-%d-%H%M%S)"
 
-if [[ ! -x "${PYTHON}" ]]; then
-    echo "${TS_UTC}  error  python not executable at ${PYTHON}" \
+if ! command -v "${PYTHON}" >/dev/null 2>&1; then
+    echo "${TS_UTC}  error  python interpreter not found: ${PYTHON}; set HERMES_PYTHON" \
         | tee -a "${SUMMARY_LOG}" >&2
     exit 1
 fi
 
 # Build the list of (label, state_dir) pairs to process.
 SOURCES=()
-SOURCES+=("root:${HERMES_HOME}/state/tool-belt")
+SOURCES+=("default:${HERMES_HOME}/state/tool-belt")
 shopt -s nullglob
 for profile_state in "${HERMES_HOME}"/profiles/*/state/tool-belt; do
     # Extract <name> from <home>/profiles/<name>/state/tool-belt
     profile_name="$(basename "$(dirname "$(dirname "${profile_state}")")")"
+    if [[ "${profile_name}" == "default" ]]; then
+        continue  # reserved by Hermes for the root profile
+    fi
     SOURCES+=("${profile_name}:${profile_state}")
 done
 shopt -u nullglob
