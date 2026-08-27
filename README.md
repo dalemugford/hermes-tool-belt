@@ -168,13 +168,15 @@ ACTIONS** summary tailored to your usage.
 
 ## Releases
 
-This branch (`main`) is the trunk; everything ships from here. Adaptive
-features that aren't ready to be enabled by default are gated behind
-config flags (`enabled: false`, `learned_mode: off`, etc.) so an
-install of `main` is always safe.
+Versions use CalVer: `YYYY.M.D`, with an optional prerelease suffix
+(for example `2026.5.17-beta`). The authoritative version is the one in
+[`plugin.yaml`](plugin.yaml); each stable snapshot is marked with a
+matching release tag. Pin a tag for stability, or track `main` for the
+latest changes. See [CHANGELOG.md](CHANGELOG.md) for what has changed.
 
-Release tags use CalVer (`YYYY.M.D`). For stability, pin a tag. For
-bleeding-edge, track `main`. Current release: **2026.5.17-beta**.
+Adaptive features that aren't enabled by default are gated behind
+configuration flags (`enabled: false`, `learned_mode: off`, and the
+like), so a default install stays safe.
 
 ## How it stays honest
 
@@ -763,7 +765,14 @@ rm -rf ~/.hermes/plugins/tool-belt
 ├── analyze.py        # telemetry analyzer
 ├── policy.yaml       # shipped policy and shaping thresholds
 ├── AGENTS.md         # repository engineering rules
+├── CHANGELOG.md      # unreleased and tagged user-facing changes
+├── CONTRIBUTING.md   # contributor workflow and verification rules
+├── LICENSE           # MIT license
 ├── docs/             # architecture, configuration, savings, known issues
 ├── scripts/          # supported operator and verification commands
 └── tests/            # regression and integration tests
 ```
+
+## License
+
+[MIT](LICENSE) © 2026 Dale Mugford.

@@ -1,12 +1,21 @@
 name: tool-belt
-display_name: Hermes Tool Belt
+label: Hermes Tool Belt
+kind: standalone
 version: 2026.5.17-beta
-description: Adaptive tool loadouts for agents. Carry only what you need, drop the rest. Sharpens with use.
-long_description: Picks the tool set per session under prefix-cache-friendly providers (Anthropic, OpenAI), per turn under cache-off providers. Learns from real expand_tools events what to promote into future sessions. Respects the user's existing platform_toolsets ceiling. Falls back to no-narrowing on any failure.
+manifest_version: 2
+api_version: 1
+description: >
+  Adaptive, cache-aware tool loadouts for Hermes agents. Narrows the configured
+  tool ceiling safely, restores tools on demand, and learns between sessions.
 author: Dale Mugford
+license: MIT
+homepage: https://github.com/dalemugford/hermes-tool-belt
+tags: [tools, prompt-caching, optimization, telemetry]
 provides_tools:
   - expand_tools
 provides_hooks:
   - pre_gateway_dispatch
   - post_tool_call
+  - post_api_request
   - on_session_end
+  - on_session_reset

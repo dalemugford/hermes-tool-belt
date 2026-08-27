@@ -23,8 +23,7 @@ the same change.
 - Use release tags for stable snapshots.
 - Keep incomplete or experimental behavior disabled by configuration rather
   than maintaining a second implementation branch.
-- Update `CHANGELOG.md` under `Unreleased` for user-facing changes once the
-  changelog exists.
+- Update `CHANGELOG.md` under `Unreleased` for every user-facing change.
 
 ## Repository map
 
