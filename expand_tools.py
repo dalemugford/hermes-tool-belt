@@ -33,7 +33,10 @@ SCHEMA = {
         "tools are available on the very next tool call and may remain available "
         "briefly during the same active task. Expanded tools are ephemeral; call "
         "this again if a needed tool is absent later. Cheap and safe to call "
-        "preemptively if you're unsure whether a tool is loaded."
+        "preemptively if you're unsure whether a tool is loaded. "
+        "Accepts a 'category' (toolset name) or a 'tool' (specific tool name). "
+        "If you know the tool name but not its category, pass it as 'tool' and "
+        "the handler will find the right category for you."
     ),
     "parameters": {
         "type": "object",
@@ -46,9 +49,17 @@ SCHEMA = {
                     "file, web, skills, homeassistant. Any toolset name from "
                     "Hermes' toolset table is accepted."
                 ),
-            }
+            },
+            "tool": {
+                "type": "string",
+                "description": (
+                    "A specific tool name to load (e.g. 'mnemosyne_diagnose', 'browser_exec'). "
+                    "If you know the tool name but not its category, use this instead of 'category'. "
+                    "The handler will resolve it to the correct toolset automatically."
+                ),
+            },
         },
-        "required": ["category"],
+        "required": [],
     },
 }
 
@@ -97,6 +108,66 @@ def _resolve_category(category: str) -> tuple[str, list[str], list[str]]:
             break
 
     return category, [], available
+
+
+def _resolve_tool_to_category(tool_name: str) -> str | None:
+    """Reverse-lookup a tool name to its parent toolset category.
+
+    Iterates all toolset names from ``_available_toolset_names()``, calls
+    ``resolve_toolset()`` on each, and returns the first category whose
+    tool list contains the requested ``tool_name`` (case-insensitive).
+    Returns ``None`` if no match.
+    """
+    available = _available_toolset_names()
+    try:
+        from toolsets import resolve_toolset  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    lower = tool_name.lower()
+    for cat in available:
+        try:
+            tools = list(resolve_toolset(cat) or [])
+        except Exception:
+            continue
+        if lower in (t.lower() for t in tools):
+            return cat
+    return None
+
+
+def _tool_not_found_message(tool_name: str, available: list[str]) -> str:
+    """Compose an error for an unresolvable tool name, with fuzzy suggestions.
+
+    Enumerates every (category, tool) pair from the live toolset table and
+    offers the closest tool-name matches, each annotated with its category.
+    """
+    all_tools: list[tuple[str, str]] = []
+    try:
+        from toolsets import resolve_toolset  # type: ignore[import-not-found]
+        for cat in available:
+            try:
+                all_tools.extend((cat, t) for t in (resolve_toolset(cat) or []))
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    suggestions = difflib.get_close_matches(
+        tool_name.lower(), [t.lower() for _, t in all_tools], n=3, cutoff=0.6
+    )
+    parts = [f"tool {tool_name!r} not found in any toolset."]
+    if suggestions:
+        # Map suggestion-lowercase back to canonical tool names + categories.
+        canonical: list[str] = []
+        seen: set[str] = set()
+        for s in suggestions:
+            for cat, t in all_tools:
+                if t.lower() == s and t not in seen:
+                    canonical.append(f"{t} (category: {cat})")
+                    seen.add(t)
+                    break
+        if canonical:
+            parts.append(f"Did you mean: {', '.join(canonical)}?")
+    return " ".join(parts)
 
 
 def _not_found_message(category: str, available: list[str]) -> str:
@@ -151,11 +222,27 @@ def make_handler(prediction_cv, sticky_refresh_fn=None):
 
 def _handle_inner(args: dict, kwargs: dict, prediction_cv, sticky_refresh_fn=None) -> str:
     raw_category = str(args.get("category") or "").strip()
-    if not raw_category:
+    raw_tool = str(args.get("tool") or "").strip()
+
+    if not raw_category and not raw_tool:
         return json.dumps({
             "success": False,
-            "error": "category is required (e.g. 'browser', 'image_gen', 'cronjob')",
+            "error": (
+                "category or tool is required "
+                "(e.g. category='browser' or tool='mnemosyne_diagnose')"
+            ),
         })
+
+    # If only a tool name was given, resolve it to its parent category.
+    # An explicit category always wins — explicit is better than a guess.
+    if not raw_category and raw_tool:
+        resolved_category = _resolve_tool_to_category(raw_tool)
+        if resolved_category is None:
+            return json.dumps({
+                "success": False,
+                "error": _tool_not_found_message(raw_tool, _available_toolset_names()),
+            })
+        raw_category = resolved_category
 
     state = prediction_cv.get()
     if state is None:

@@ -23,6 +23,20 @@ if "tool_belt_plugin" not in sys.modules:
 
 expand_tools = importlib.import_module("tool_belt_plugin.expand_tools")
 
+# The plugin resolves toolsets against Hermes' live ``toolsets`` module. That
+# module isn't importable in a bare test checkout, so ``mock.patch("toolsets.
+# resolve_toolset", ...)`` would fail to import its target. Register a minimal
+# stub with the two attributes the handler touches; the real runtime already
+# ships ``toolsets`` so this only takes effect when it's absent. Tests still
+# patch these attributes per-case to define the fake table.
+if "toolsets" not in sys.modules:
+    import types
+
+    _toolsets_stub = types.ModuleType("toolsets")
+    _toolsets_stub.resolve_toolset = lambda name: []  # type: ignore[attr-defined]
+    _toolsets_stub.get_toolset_names = lambda: []  # type: ignore[attr-defined]
+    sys.modules["toolsets"] = _toolsets_stub
+
 
 def _make_state(*, initial_allowed=(), cut_tools=(), expansions=None):
     return {
@@ -183,6 +197,95 @@ class ResponsePayloadSymmetryTests(unittest.TestCase):
 
         self.assertIn("resolved_tools", payload)
         self.assertEqual(sorted(payload["resolved_tools"]), sorted(resolved))
+
+
+class ToolNameResolutionTests(unittest.TestCase):
+    """The ``tool`` parameter lets the model name a specific tool without
+    knowing its parent toolset; the handler reverse-resolves the category."""
+
+    # A small fake toolset table shared across these cases.
+    _TABLE = {
+        "browser": ["browser_navigate", "browser_exec"],
+        "mnemosyne": ["mnemosyne_diagnose", "mnemosyne_search"],
+        "terminal": ["run_command"],
+    }
+
+    def _patched(self):
+        names = list(self._TABLE)
+
+        def fake_resolve(name):
+            return list(self._TABLE.get(name, []))
+
+        return (
+            mock.patch("toolsets.get_toolset_names", return_value=names, create=True),
+            mock.patch("toolsets.resolve_toolset", side_effect=fake_resolve, create=True),
+        )
+
+    def test_tool_name_resolves_to_parent_category(self):
+        p_names, p_resolve = self._patched()
+        with p_names, p_resolve:
+            payload = _invoke({"tool": "mnemosyne_diagnose"}, _make_state())
+
+        self.assertTrue(payload["success"], payload)
+        self.assertEqual(payload["category"], "mnemosyne",
+                         "tool should reverse-resolve to its toolset category")
+        self.assertEqual(sorted(payload["resolved_tools"]),
+                         sorted(self._TABLE["mnemosyne"]))
+        self.assertIn("mnemosyne_diagnose", payload["tools_added"])
+
+    def test_tool_name_resolution_is_case_insensitive(self):
+        p_names, p_resolve = self._patched()
+        with p_names, p_resolve:
+            payload = _invoke({"tool": "MNEMOSYNE_DIAGNOSE"}, _make_state())
+
+        self.assertTrue(payload["success"], payload)
+        self.assertEqual(payload["category"], "mnemosyne")
+
+    def test_unknown_tool_name_returns_helpful_error(self):
+        p_names, p_resolve = self._patched()
+        with p_names, p_resolve:
+            payload = _invoke({"tool": "nonexistent_tool"}, _make_state())
+
+        self.assertFalse(payload["success"])
+        self.assertIn("not found", payload["error"].lower())
+        self.assertIn("'nonexistent_tool'", payload["error"])
+
+    def test_unknown_tool_offers_fuzzy_suggestion_with_category(self):
+        p_names, p_resolve = self._patched()
+        with p_names, p_resolve:
+            payload = _invoke({"tool": "mnemosyne_diagnos"}, _make_state())
+
+        self.assertFalse(payload["success"])
+        self.assertIn("Did you mean", payload["error"])
+        self.assertIn("mnemosyne_diagnose", payload["error"])
+        self.assertIn("category: mnemosyne", payload["error"])
+
+    def test_category_takes_precedence_over_tool(self):
+        p_names, p_resolve = self._patched()
+        with p_names, p_resolve:
+            payload = _invoke(
+                {"category": "browser", "tool": "mnemosyne_diagnose"},
+                _make_state(),
+            )
+
+        self.assertTrue(payload["success"], payload)
+        self.assertEqual(payload["category"], "browser",
+                         "explicit category must win over tool reverse-lookup")
+        self.assertEqual(sorted(payload["resolved_tools"]),
+                         sorted(self._TABLE["browser"]))
+
+    def test_neither_category_nor_tool_returns_error(self):
+        payload = _invoke({}, _make_state())
+        self.assertFalse(payload["success"])
+        self.assertIn("required", payload["error"].lower())
+        # The error should name both accepted parameters.
+        self.assertIn("category", payload["error"].lower())
+        self.assertIn("tool", payload["error"].lower())
+
+    def test_blank_category_and_tool_returns_error(self):
+        payload = _invoke({"category": "   ", "tool": ""}, _make_state())
+        self.assertFalse(payload["success"])
+        self.assertIn("required", payload["error"].lower())
 
 
 if __name__ == "__main__":
