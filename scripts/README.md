@@ -24,7 +24,7 @@ directory names.
 | [`smoke-test.py`](smoke-test.py) | Exercises cache-on and cache-off behavior in isolated temporary state. | Before committing hook, freeze, expansion, or telemetry changes. |
 | [`rotate-telemetry.sh`](rotate-telemetry.sh) | Moves live JSONL telemetry into a timestamped archive without stopping the gateway. | Start a clean measurement window. |
 | [`daily-analysis.sh`](daily-analysis.sh) | Runs the analyzer and shaper for the root profile and named profiles with telemetry. | Run manually or from a scheduler. |
-| [`../tests/seed_sessions.py`](../tests/seed_sessions.py) | Populates a throwaway Hermes home with telemetry generated from the scripted conversations in `tests/scripts/`, using the real policy resolver and predictor. | Demo or debug onboarding without a live gateway: `python3 tests/seed_sessions.py --home /tmp/demo-home`, then run `configure.py` against it with `HERMES_HOME` set. |
+| [`../tests/seed_sessions.py`](../tests/seed_sessions.py) | Populates a throwaway Hermes home with telemetry generated from the scripted conversations in `tests/scripts/`, using the real policy resolver and predictor. | Demo or debug onboarding without a live gateway: `.venv/bin/python tests/seed_sessions.py --home /tmp/demo-home`, then run `configure.py` against it with `HERMES_HOME` set. Requires the development environment from `CONTRIBUTING.md` (PyYAML). |
 
 Trigger-dampener regression coverage lives in
 [`tests/test_trigger_dampeners.py`](../tests/test_trigger_dampeners.py) and runs

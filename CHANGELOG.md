@@ -87,6 +87,11 @@ The initial public capabilities of the plugin:
 
 ### Fixed
 
+- **Test-harness demo interpreter.** The manual session-seeding command now
+  uses the project development environment (`.venv/bin/python`), where the
+  declared PyYAML dependency is installed, instead of assuming the system
+  Python provides it.
+
 - **Plugin Doctor registration validation.** `register()` no longer returns
   early when the plugin is disabled in config, so `hermes plugins doctor`
   can validate that the declared `expand_tools` tool and all five hooks are
