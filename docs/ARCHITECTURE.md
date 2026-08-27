@@ -269,9 +269,9 @@ CLI flags override per-run. Output is merged into
 and `demote` to `scopes[].always_off` so the existing
 `apply_to_preset` reader picks them up.
 
-The shaper does not write changes when `learned_mode` is `off`; it just
-writes recommendations to `learned.json`. To activate them, set
-`learned_mode: auto` (or `audit`) on the scope.
+The shaper writes recommendations to `learned.json`, but the runtime does
+not merge them under the default `learned_mode: recommend`. To activate
+them, set `learned_mode: apply` on the scope.
 
 ## Patch surface in the request lifecycle
 
@@ -339,7 +339,7 @@ User ceiling (platform_toolsets)
   → Base policy (policy.yaml)
   → Global always_on_extra / always_off
   → Per-scope channels.<scope> overrides
-  → Learned overlay (only when learned_mode ∈ {auto, audit})
+  → Learned overlay (only when learned_mode is apply)
   → expand_tools admissions (per session under cache-on; per turn under cache-off)
   → Sticky residency (cache-off only)
   → A/B bypass (deterministic per (scope, session_id) when bypass_rate > 0)

@@ -26,7 +26,7 @@ Resolution order at dispatch time (later layers override earlier):
 1. `policy.yaml` — base preset (`always_on`, `triggers`).
 2. `config.yaml` global overrides — `always_on_extra`, `always_off`.
 3. `config.yaml` per-scope overrides — `channels.<scope>.*`.
-4. `learned.json` — applied only when `learned_mode` is `auto` or `audit`.
+4. `learned.json` — applied only when `learned_mode` is `apply`.
 
 See [`presets.py:resolve_preset`](../presets.py) for the resolver.
 
@@ -45,7 +45,7 @@ plugins:
     enabled: true
     log: true
     cache_mode: auto
-    learned_mode: off
+    learned_mode: recommend
     bypass_rate: 0.0
     always_on_extra: []
     always_off: []
@@ -97,18 +97,21 @@ Resolved by
 
 ### `learned_mode`
 
-Type: `string`. One of `off`, `recommend`, `audit`, `auto`. Default:
-`off`. Resolved by [`learned.py:learned_mode`](../learned.py).
+Type: `string`. One of `recommend`, `apply`. Default:
+`recommend`. Resolved by [`learned.py:learned_mode`](../learned.py).
 
 Controls whether [`learned.json`](#learnedjson-reference) is applied
 to the active preset:
 
-- `off` — ignore `learned.json` entirely.
-- `recommend` — load but do not apply. Telemetry records the
-  recommended changes; behavior unchanged.
-- `audit` — apply the learned overlay; tag prediction rows so the
-  cohort can be analyzed against an unlearned baseline.
-- `auto` — apply the learned overlay silently. Production mode.
+- `recommend` (default) — the runtime does **not** merge `learned.json`.
+  Recommendations flow through `analyze.py --write-recommendations` and the
+  shaper for human review; behavior is unchanged.
+- `apply` — merge the learned overlay (`always_on` / `always_off` /
+  `trigger_adjustments`) into the preset during resolution. Prediction rows
+  stamp `learned_mode: apply`.
+
+Legacy values normalize at load: `off` → `recommend`, and `auto` /
+`audit` → `apply`.
 
 May be overridden per scope via `channels.<scope>.learned_mode`.
 
@@ -387,7 +390,7 @@ Path: `$HERMES_HOME/state/tool-belt/learned.json` (or
 `~/.hermes/state/tool-belt/learned.json` when `HERMES_HOME` is
 unset). Read-mostly: owned by `scripts/shape-ceiling.py`; consumed by
 [`learned.py:apply_to_preset`](../learned.py) when
-`learned_mode in {auto, audit}`.
+`learned_mode` is `apply`.
 
 ```json
 {

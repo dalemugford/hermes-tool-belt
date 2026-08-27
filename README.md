@@ -175,7 +175,7 @@ matching release tag. Pin a tag for stability, or track `main` for the
 latest changes. See [CHANGELOG.md](CHANGELOG.md) for what has changed.
 
 Adaptive features that aren't enabled by default are gated behind
-configuration flags (`enabled: false`, `learned_mode: off`, and the
+configuration flags (`enabled: false`, `learned_mode: recommend`, and the
 like), so a default install stays safe.
 
 ## How it stays honest
@@ -337,7 +337,7 @@ plugins:
     bypass_rate: 0.0
 
     # Adaptive / learned layer (see "Learned policy" below)
-    learned_mode: off          # off | recommend | auto | audit
+    learned_mode: recommend    # recommend | apply
 
     # Per-scope overrides
     channels:
@@ -507,10 +507,12 @@ in `~/.hermes/state/tool-belt/learned.json`. Shape:
 
 | Mode | Behavior |
 |---|---|
-| `off` (default) | `learned.json` is ignored entirely. Safe default. |
-| `recommend` | Plugin does **not** apply `learned.json`. Use [analyze.py](analyze.py) with `--write-recommendations` to emit `learned_recommendations.json` for human review. |
-| `auto` | Plugin applies `always_on` / `always_off` / `trigger_adjustments` from `learned.json` during preset resolution. |
-| `audit` | Same merge as `auto`. Each prediction row stamps `learned_mode: audit` so audit-mode runs can be greppped or aggregated separately from `auto`. No additional per-decision flag today. |
+| `recommend` (default) | Plugin does **not** apply `learned.json` at runtime. Use [analyze.py](analyze.py) with `--write-recommendations` to emit `learned_recommendations.json` for human review. Safe default. |
+| `apply` | Plugin applies `always_on` / `always_off` / `trigger_adjustments` from `learned.json` during preset resolution. Each prediction row stamps `learned_mode: apply`. |
+
+Legacy config values migrate automatically at load: `off` → `recommend`,
+and `auto` / `audit` → `apply`. No config edit is required, but the
+canonical values are now `recommend` and `apply`.
 
 Resolution order, late-binding wins:
 
@@ -519,7 +521,7 @@ User ceiling (platform_toolsets)
   → Base policy (policy.yaml)
   → Global always_on_extra / always_off
   → Per-scope channels.<scope> overrides
-  → Learned overlay (only when learned_mode ∈ {auto, audit})
+  → Learned overlay (only when learned_mode is apply)
   → expand_tools admissions (per-turn)
   → Sticky residency (per-turn, in-memory)
   → A/B bypass (when bypass_rate fires for this session)
@@ -718,9 +720,9 @@ out of the way of plugin updates.
   busts cache on the next call regardless of what the plugin does.
   Anthropic-side cache is more deterministic. See
   [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
-- **`learned_mode: auto`/`audit` is not the default.** Adaptive promotion
+- **`learned_mode: apply` is not the default.** Adaptive promotion
   is deliberately opt-in until recommendations have been reviewed for a
-  given scope. Start with `recommend`.
+  given scope. The default `recommend` never merges `learned.json`.
 
 ## Failure modes
 

@@ -33,6 +33,8 @@ the same change.
 - Learned overlay: `learned.py`
 - Telemetry writes: `logger_io.py`
 - Telemetry analysis: `analyze.py`
+- Analyzer cache-cost library: `scripts/cache-freeze-replay.py` (imported by
+  `analyze.py`; also a standalone CLI)
 - Supported operator commands: `scripts/`
 - Tests: `tests/`
 - Architecture: `docs/ARCHITECTURE.md`

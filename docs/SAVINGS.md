@@ -165,7 +165,10 @@ don't include those rows.
   computes a per-call counterfactual against the stable-cohort mean at
   the same `api_call_idx` — useful for deep analysis, deliberately not
   the headline number. The headline is the simple, defensible
-  `ceiling - narrowed` calculation.
+  `ceiling - narrowed` calculation. Note that `analyze.py` imports this
+  script as a library (via `importlib`) to produce the cache-aware
+  section of its report, so it is a hard analyzer dependency in addition
+  to being a standalone diagnostic CLI.
 
 ## Reproducing the numbers from raw telemetry
 

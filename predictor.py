@@ -1,4 +1,4 @@
-"""Pass A predictor: regex/keyword classifier with image-attachment signal.
+"""Predictor: regex/keyword classifier with image-attachment signal.
 
 Given a message, returns the set of tool names the model is likely to need
 this turn. The result is the union of:
@@ -58,7 +58,7 @@ def predict(
     attachments: Iterable[str] | None,
     preset: Preset,
 ) -> Prediction:
-    """Run the Pass A classifier. Always returns a Prediction.
+    """Run the classifier. Always returns a Prediction.
 
     ``attachments`` is an iterable of attachment kind strings (e.g. ``"image"``,
     ``"audio"``). Empty / None means no attachments. Used by triggers that key

@@ -120,7 +120,7 @@ class PredictionRecord:
     sticky_remaining_turns: dict[str, int] | None = None
     policy_source: str = "preset"
     policy_version: str = ""
-    learned_mode: str = "off"
+    learned_mode: str = "recommend"
     learned_scope: str = ""
     learned_changes: list[str] | None = None
     # Predictor lookback: how many prior messages were concatenated into the

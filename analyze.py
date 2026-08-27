@@ -44,7 +44,8 @@ DEFAULT_DAMPENER_MAX_N = 4
 DEFAULT_DAMPENER_MAX_CANDIDATES = 10
 
 BASE_PROTECTED_ALWAYS_ON = {
-    "memory",
+    # NOTE: the legacy `memory` tool is intentionally NOT protected here —
+    # policy.yaml always_off forces it off (superseded by Mnemosyne).
     "session_search",
     "clarify",
     "skill_view",
@@ -2069,7 +2070,7 @@ def write_recommendations(
         "safety": {
             "writes_learned_json": False,
             "applies_policy": False,
-            "default_behavior": "safe/off unless learned_mode is explicitly changed elsewhere",
+            "default_behavior": "safe: recommend mode does not merge learned.json; only learned_mode: apply does",
         },
         "thresholds": threshold_payload(args),
         "recommendations": recs,

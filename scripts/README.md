@@ -17,7 +17,7 @@ directory names.
 | [`bootstrap.py`](bootstrap.py) | Mode-aware first-install warm start. Uses live `expand_tools` evidence for cache-on scopes and session replay for cache-off scopes. | Optional, once after installation. |
 | [`shape-ceiling.py`](shape-ceiling.py) | Builds per-scope promote/demote recommendations from recent sessions and writes the learned overlay. | Run after enough organic sessions; inspect with `--dry-run` first. |
 | [`harvest-replay.py`](harvest-replay.py) | Replays existing Hermes sessions through the per-turn predictor and writes privacy-reduced synthetic telemetry. | Tune trigger coverage for cache-off scopes. |
-| [`cache-freeze-replay.py`](cache-freeze-replay.py) | Measures frozen-tool-list efficacy and estimates cache cost from matched API-call positions. | Investigate cache behavior or verify analyzer savings. |
+| [`cache-freeze-replay.py`](cache-freeze-replay.py) | Measures frozen-tool-list efficacy and estimates cache cost from matched API-call positions. **Also a hard library dependency of `analyze.py`**, which imports it via `importlib` for the cache-aware savings section; its CLI is an optional focused diagnostic. | Investigate cache behavior or verify analyzer savings. |
 | [`savings-report.py`](savings-report.py) | Produces the compact, independently checkable token-savings report documented in `docs/SAVINGS.md`. | Inspect all scopes or a selected date/scope window. |
 | [`check-tool-drift.py`](check-tool-drift.py) | Finds tool names present in the observed ceiling but absent from policy. | After Hermes/plugin upgrades or toolset changes. |
 | [`smoke-test.py`](smoke-test.py) | Exercises cache-on and cache-off behavior in isolated temporary state. | Before committing hook, freeze, expansion, or telemetry changes. |
@@ -50,7 +50,10 @@ python3 scripts/savings-report.py --json
 ```
 
 The standard `analyze.py` report already includes cache-aware matched-
-counterfactual figures. Run these scripts directly when you need focused or
+counterfactual figures. It computes them by importing `cache-freeze-replay.py`
+as a library (via `importlib`, because of the hyphenated filename), so the
+script is a hard analyzer dependency, not just a standalone tool — do not move
+or remove it. Run these scripts directly when you need focused or
 machine-readable output.
 
 ### Warm-start an existing installation

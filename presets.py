@@ -184,7 +184,7 @@ def resolve_preset(
          ``plugin_config["always_off"]``
       3. Per-scope: ``plugin_config["channels"][scope]`` may set its own
          ``always_on_extra``, ``always_off``.
-      4. Learned state, when ``learned_mode`` is ``auto`` or ``audit``.
+      4. Learned state, when ``learned_mode`` is ``apply``.
 
     Returns a fully-resolved :class:`Preset`. Never raises; falls back to
     a wildcard (no-narrowing) preset on any failure so sessions don't

@@ -79,3 +79,34 @@ after the restart.
 **Workaround.** Don't restart the gateway mid-session unless you need
 to. Restarts to apply config or code changes are unavoidable; expect to
 pay one cache-miss turn per session that resumes afterward.
+
+---
+
+### Concurrent chats on one platform can leave a freeze un-evicted on `/new`
+
+**Symptom.** With two or more active chats on the same platform, issuing
+`/new` in one chat sometimes fails to evict a sibling chat's frozen tool
+snapshot. The reset clears the intended session but a sibling freeze can
+linger in memory until it ages out or that chat resets.
+
+**Cause.** Hermes core's `on_session_reset` hook does not pass the
+canonical session key (`agent:main:<platform>:...`) on every path — it
+passes the new post-rotation session UUID and the platform string. The
+freeze is keyed by the canonical key, so Tool Belt recovers it from a
+per-platform last-writer-wins back-reference (`_LAST_CANONICAL_BY_PLATFORM`,
+populated in `_on_pre_gateway_dispatch`; see `__init__.py:2255-2266`).
+When several chats share one platform, that single back-reference points
+at whichever chat dispatched most recently, so a `/new` in a different
+chat evicts the wrong canonical key.
+
+**Impact.** A sibling chat's freeze may survive a `/new` it should have
+been cleared by. The tradeoff is deliberate: the fallback recovers the
+common single-chat case cleanly rather than skipping eviction entirely.
+Fail-open and the strict ceiling are unaffected — a stale freeze only
+narrows to a previously-valid tool set, never widens it, and it ages out
+or is replaced on the next reset of the owning chat.
+
+**Workaround.** None owed by this plugin. A durable fix requires a
+Hermes-core hook-contract change so `on_session_reset` passes the
+canonical session key directly; a per-platform heuristic inside the
+plugin cannot disambiguate concurrent chats on the same platform.

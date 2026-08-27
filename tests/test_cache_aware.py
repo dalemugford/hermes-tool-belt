@@ -119,7 +119,7 @@ class FreezeSnapshotTests(unittest.TestCase):
             triggers_suppressed=[],
             policy_source="preset",
             policy_version="v1",
-            learned_mode="off",
+            learned_mode="recommend",
             learned_scope="",
             learned_changes=[],
         )
@@ -140,7 +140,7 @@ class FreezeSnapshotTests(unittest.TestCase):
             triggers_suppressed=[],
             policy_source="preset",
             policy_version="v1",
-            learned_mode="off",
+            learned_mode="recommend",
             learned_scope="",
             learned_changes=[],
         )
@@ -175,7 +175,7 @@ class FreezeSnapshotTests(unittest.TestCase):
             triggers_suppressed=[],
             policy_source="preset",
             policy_version="v1",
-            learned_mode="off",
+            learned_mode="recommend",
             learned_scope="",
             learned_changes=[],
         )
@@ -203,7 +203,7 @@ class FreezeSnapshotTests(unittest.TestCase):
             triggers_suppressed=[],
             policy_source="preset",
             policy_version="v1",
-            learned_mode="off",
+            learned_mode="recommend",
             learned_scope="",
             learned_changes=[],
         )
@@ -371,7 +371,7 @@ class SessionHookSemanticsTests(unittest.TestCase):
             triggers_suppressed=[],
             policy_source="preset",
             policy_version="v1",
-            learned_mode="off",
+            learned_mode="recommend",
             learned_scope="",
             learned_changes=[],
         )
@@ -477,7 +477,7 @@ class SlashCommandBypassTests(unittest.TestCase):
             triggers_suppressed=[],
             policy_source="preset",
             policy_version="v1",
-            learned_mode="off",
+            learned_mode="recommend",
             learned_scope="",
             learned_changes=[],
         )

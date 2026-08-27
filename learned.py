@@ -22,8 +22,15 @@ from .presets import Preset, TriggerGroup
 logger = logging.getLogger(__name__)
 
 LEARNED_VERSION = 1
-_ALLOWED_MODES = {"off", "recommend", "auto", "audit"}
-_APPLY_MODES = {"auto", "audit"}
+# Two effective learned modes:
+#   recommend (default) — runtime does NOT merge learned.json into the preset.
+#                         Recommendations flow through analyze.py
+#                         (--write-recommendations) and the shaper for human review.
+#   apply               — runtime merges learned.json into the preset.
+_ALLOWED_MODES = {"recommend", "apply"}
+# Legacy config values are aliased at load time (clean migration, no shim layer):
+# old "off" behaved like recommend at runtime; old "auto"/"audit" both merged.
+_LEGACY_ALIASES = {"off": "recommend", "auto": "apply", "audit": "apply"}
 _CACHE: dict[str, Any] = {"path": None, "mtime_ns": None, "state": None, "hash": ""}
 
 
@@ -42,10 +49,14 @@ def _protected_always_on() -> set[str]:
 
 @dataclass
 class LearnedMergeResult:
-    """Result metadata from applying learned state to a preset."""
+    """Result metadata from applying learned state to a preset.
+
+    ``mode`` is the resolved learned_mode (``recommend`` or ``apply``). Only
+    ``apply`` merges learned state; ``recommend`` returns the preset unchanged.
+    """
 
     preset: Preset
-    mode: str = "off"
+    mode: str = "recommend"
     policy_source: str = "preset"
     policy_version: str = ""
     learned_changes: list[str] = field(default_factory=list)
@@ -62,8 +73,9 @@ def learned_path() -> Path:
 
 
 def normalize_mode(value: Any) -> str:
-    mode = str(value or "off").strip().lower()
-    return mode if mode in _ALLOWED_MODES else "off"
+    mode = str(value or "").strip().lower()
+    mode = _LEGACY_ALIASES.get(mode, mode)  # migrate off/auto/audit → recommend/apply
+    return mode if mode in _ALLOWED_MODES else "recommend"
 
 
 def scope_candidates(scope: str) -> list[str]:
@@ -86,7 +98,7 @@ def scope_candidates(scope: str) -> list[str]:
 
 def learned_mode(plugin_config: dict[str, Any], scope: str) -> str:
     """Resolve learned_mode with per-scope/per-platform override support."""
-    mode = normalize_mode(plugin_config.get("learned_mode", "off"))
+    mode = normalize_mode(plugin_config.get("learned_mode", "recommend"))
     channels = plugin_config.get("channels") or {}
     if isinstance(channels, dict):
         for key in scope_candidates(scope):
@@ -163,10 +175,14 @@ def scope_state(state: dict[str, Any], scope: str) -> tuple[str, dict[str, Any]]
 
 
 def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -> LearnedMergeResult:
-    """Merge learned state into a resolved preset when learned_mode applies."""
+    """Merge learned state into a resolved preset when learned_mode is ``apply``.
+
+    ``recommend`` (the default) never merges; the recommendation path lives in
+    the analyzer and shaper instead.
+    """
     mode = learned_mode(plugin_config, scope)
     version = f"{preset.name}+learned:{state_hash() or 'none'}"
-    if mode not in _APPLY_MODES or preset.is_wildcard:
+    if mode != "apply" or preset.is_wildcard:
         return LearnedMergeResult(preset=preset, mode=mode, policy_version=version)
 
     state = load_state()

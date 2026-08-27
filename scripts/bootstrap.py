@@ -302,7 +302,7 @@ def main() -> int:
                   f"would have fired for {k['tool']})")
 
     print()
-    print("  To activate cache-on recommendations: set `learned_mode: auto` for the scope in config.yaml,")
+    print("  To activate cache-on recommendations: set `learned_mode: apply` for the scope in config.yaml,")
     print("  then re-run `shape-ceiling.py` (without --dry-run) to write learned.json.")
     print()
     return 0

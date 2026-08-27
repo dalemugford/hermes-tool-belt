@@ -22,7 +22,7 @@ The initial public capabilities of the plugin:
   intent triggers, with no model call in the hot path.
 - **Learned between-session shaping.** An optional overlay promotes and demotes
   tools for future sessions from real `expand_tools` evidence and is applied
-  only when `learned_mode` enables it.
+  only when `learned_mode: apply` is set.
 - **Telemetry, analyzer, and savings reporting.** Append-only telemetry records
   every narrowing decision; the analyzer summarizes usage and reports token
   savings with an optional A/B baseline cohort.
@@ -37,6 +37,16 @@ The initial public capabilities of the plugin:
 - **Continuous integration.** A GitHub Actions workflow
   (`.github/workflows/ci.yml`) runs the test suite on Python 3.11 and 3.12 for
   every push and pull request to `main`.
+
+### Changed
+
+- **Simplified `learned_mode` to two values: `recommend` and `apply`.** The
+  default is `recommend`, which never merges `learned.json` into the live
+  preset (recommendations still flow through the analyzer and shaper for human
+  review). `apply` merges the learned overlay during preset resolution.
+  Existing configs keep working: legacy values migrate automatically at load —
+  `off` → `recommend`, and `auto` / `audit` → `apply`. No config edit is
+  required.
 
 ### Fixed
 

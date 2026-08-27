@@ -8,7 +8,7 @@ This script reads ``predictions.jsonl`` and ``tool_calls.jsonl`` for the
 last N sessions per scope, then writes per-scope promote/demote
 recommendations into ``learned.json``. The plugin's existing
 ``apply_to_preset`` machinery picks them up automatically when
-``learned_mode`` is ``auto`` or ``audit``.
+``learned_mode`` is ``apply``.
 
 What it computes
 ================
@@ -477,7 +477,7 @@ def main() -> int:
         print("\n[dry-run] No changes written to learned.json")
     elif changed:
         print(f"\nWrote updated recommendations to {state_dir / 'learned.json'}")
-        print("To activate the recommendations, set ``learned_mode: auto`` (or ``audit``) for the scope in config.yaml.")
+        print("To activate the recommendations, set ``learned_mode: apply`` for the scope in config.yaml.")
     else:
         print("\nNo changes — recommendations match current learned.json content.")
     return 0

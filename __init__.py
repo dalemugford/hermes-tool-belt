@@ -127,7 +127,7 @@ _CONFIG: dict[str, Any] = {
     "always_on_extra": [],
     "always_off": [],
     "agent": "",
-    "learned_mode": "off",
+    "learned_mode": "recommend",
     # Cache-off mode pipeline — sticky residency + per-turn predictor
     # lookback. Both are inert under cache-on (the default), where the
     # frozen tool set carries forward in-session expansions verbatim
@@ -1015,7 +1015,7 @@ def _maybe_log_prediction(
             sticky_remaining_turns=dict(state.get("sticky_remaining_turns") or {}),
             policy_source=str(state.get("policy_source", "preset")),
             policy_version=str(state.get("policy_version", "")),
-            learned_mode=str(state.get("learned_mode", "off")),
+            learned_mode=str(state.get("learned_mode", "recommend")),
             learned_scope=str(state.get("learned_scope", "")),
             learned_changes=list(state.get("learned_changes") or []),
             lookback_used=int(state.get("lookback_used", 0)),
@@ -1408,7 +1408,7 @@ def _build_state_from_frozen(
         # multiple sources.
         "policy_source": frozen.get("policy_source", "preset"),
         "policy_version": frozen.get("policy_version", ""),
-        "learned_mode": frozen.get("learned_mode", "off"),
+        "learned_mode": frozen.get("learned_mode", "recommend"),
         "learned_scope": frozen.get("learned_scope", ""),
         "learned_changes": list(frozen.get("learned_changes") or []),
         # Lookback disabled under freeze.
@@ -1588,7 +1588,7 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             "sticky_remaining_turns": sticky_remaining,
             "policy_source": policy_source,
             "policy_version": getattr(preset, "policy_version", ""),
-            "learned_mode": getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "off")),
+            "learned_mode": getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "recommend")),
             "learned_scope": getattr(preset, "learned_scope", ""),
             "learned_changes": list(getattr(preset, "learned_changes", []) or []),
             "lookback_used": len(prior_messages),
@@ -1615,7 +1615,7 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
                 triggers_suppressed=prediction.triggers_suppressed,
                 policy_source=policy_source,
                 policy_version=getattr(preset, "policy_version", ""),
-                learned_mode=getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "off")),
+                learned_mode=getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "recommend")),
                 learned_scope=getattr(preset, "learned_scope", ""),
                 learned_changes=list(getattr(preset, "learned_changes", []) or []),
             )

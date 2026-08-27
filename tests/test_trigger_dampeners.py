@@ -70,19 +70,54 @@ class TriggerDampenerTests(unittest.TestCase):
 
                 result = learned.apply_to_preset(
                     preset,
-                    {"learned_mode": "auto"},
+                    {"learned_mode": "apply"},
                     "assistant-a:telegram",
                 )
                 self.assertEqual(result.policy_source, "learned")
                 file_write = next(group for group in result.preset.triggers if group.name == "file_write")
                 self.assertTrue(file_write.exclude_patterns)
                 self.assertFalse(file_write.matches("Should we save this as a file later?", []))
+
+                # recommend (default) must NOT merge learned.json.
+                rec = learned.apply_to_preset(
+                    preset,
+                    {"learned_mode": "recommend"},
+                    "assistant-a:telegram",
+                )
+                self.assertEqual(rec.mode, "recommend")
+                self.assertEqual(rec.policy_source, "preset")
+                self.assertNotIn("browser_navigate", rec.preset.always_on)
+
+                # apply merges the learned always_on tool.
+                self.assertIn("browser_navigate", result.preset.always_on)
             finally:
                 if original_home is None:
                     os.environ.pop("HERMES_HOME", None)
                 else:
                     os.environ["HERMES_HOME"] = original_home
                 learned.load_state(force=True)
+
+
+class LearnedModeNormalizationTests(unittest.TestCase):
+    def test_legacy_values_normalize(self):
+        # Clean migration: old config values map to the two-value model.
+        self.assertEqual(learned.normalize_mode("off"), "recommend")
+        self.assertEqual(learned.normalize_mode("auto"), "apply")
+        self.assertEqual(learned.normalize_mode("audit"), "apply")
+        # Canonical values pass through.
+        self.assertEqual(learned.normalize_mode("recommend"), "recommend")
+        self.assertEqual(learned.normalize_mode("apply"), "apply")
+        # Blank/unknown fall back to the safe default.
+        self.assertEqual(learned.normalize_mode(""), "recommend")
+        self.assertEqual(learned.normalize_mode(None), "recommend")
+        self.assertEqual(learned.normalize_mode("bogus"), "recommend")
+
+    def test_learned_mode_resolution_uses_aliases(self):
+        self.assertEqual(learned.learned_mode({"learned_mode": "auto"}, "telegram"), "apply")
+        self.assertEqual(learned.learned_mode({"learned_mode": "off"}, "telegram"), "recommend")
+        # Per-scope override with a legacy value normalizes too.
+        cfg = {"learned_mode": "recommend", "channels": {"telegram": {"learned_mode": "audit"}}}
+        self.assertEqual(learned.learned_mode(cfg, "telegram"), "apply")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Scheduled twice-daily run of the tool-belt analyzer.
+# Periodic analyzer run (operator-scheduled cadence) of the tool-belt analyzer.
 #
 # Walks every tool-belt telemetry source on this host — the root
 # state dir plus each profile-scoped state dir under HERMES_HOME/profiles/*/
