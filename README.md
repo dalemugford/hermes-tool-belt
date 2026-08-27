@@ -4,26 +4,38 @@
 
 A plugin for [Hermes Agent](https://hermes-agent.nousresearch.com).
 
-## Why
+## What it does
 
-Every message ships tool definitions to the model. For a heavy profile —
-web, terminal, file, browser, MCP servers, custom skills — that's
-8–15k tokens of overhead on a message whose answer is `"yes."` Your
-`"hi"` costs the same as `"deploy the build script"` in tool overhead.
+Tool Belt narrows the tool list shipped on every API call to the tools
+the current message actually needs — and never the other direction.
+Your configured `platform_toolsets` ceiling is the contract: Tool Belt
+may remove tools from a payload and restore them on demand, nothing
+more. Five capabilities:
 
-The naive fix — re-narrow the tool list every turn — fights provider
-prefix-caching: changing the tool block between turns busts the cache
-and re-bills the conversation history at full input rate. On a
-multi-turn session, lost cache costs more than schema savings.
+1. **Adaptive tool narrowing.** Each API call ships only the tools
+   predicted to be relevant. Unfamiliar tools stay available — Tool
+   Belt never silently removes something it doesn't recognize.
 
-Tool Belt resolves the tension. Three features, working together.
+2. **Deterministic intent prediction.** A regex/keyword classifier with
+   dampeners and an attachment check chooses the relevant tool groups.
+   No LLM-as-router, no extra API call, no non-deterministic
+   mis-route — every decision is auditable in telemetry, and the
+   shipped [policy.yaml](policy.yaml) is the truth.
 
-**`expand_tools` — the safety valve that learns.** A meta-tool the model
-calls when it needs something that wasn't loaded. Narrowing never
-strands the agent: it asks, gets it, the conversation continues. Every
-call is logged as evidence the tool was wanted — between sessions, the
-shaper folds repeatedly-reached-for tools into the next session's
-ceiling. **The model's reach IS the promotion vote.**
+3. **Cache-aware session loadouts.** For prefix-caching providers, the
+   tool set freezes at session start and stays stable, so the provider
+   prefix cache keeps hitting. Cache behavior is auto-detected per
+   model and scope; non-caching providers get per-turn narrowing
+   instead. You set nothing.
+
+4. **`expand_tools` recovery.** The model's escape hatch: one call
+   loads a missing category or tool mid-session, and repeated use of a
+   category gets it promoted into future sessions. **The model's reach
+   IS the promotion vote.**
+
+5. **Safety guarantees.** Fails open — any internal error leaves your
+   full tool set untouched. Never widens the ceiling. Keeps unknown
+   tools available. Isolates all state per session.
 
 ```text
 User: "search the docs for X and read me the relevant section"
@@ -33,16 +45,19 @@ User: "search the docs for X and read me the relevant section"
   → next session, browser is pre-loaded (shaper promoted it)
 ```
 
-**Deterministic shaping — rules over routing.** The narrowing decision
-is a regex match on the message, an attachment check, and a YAML
-lookup — **no LLM-as-router.** No extra API call, no non-deterministic
-mis-route. Every decision is auditable in `predictions.jsonl`. The
-shipped [policy.yaml](policy.yaml) is the truth; hand-tune it or layer
-per-scope overrides in config.
+## Why narrow at all
 
-**Cache-aware adaptation — one goal, two cadences.** Same predictor,
-same policy, same `expand_tools`. What changes is *when* narrowing
-happens:
+Every message ships tool definitions to the model. For a heavy profile —
+web, terminal, file, browser, MCP servers, custom skills — that's
+8–15k tokens of overhead on a message whose answer is `"yes."` Your
+`"hi"` costs the same as `"deploy the build script"` in tool overhead.
+
+The naive fix — re-narrow every turn — fights provider
+prefix-caching: changing the tool block between turns busts the cache
+and re-bills the conversation history at full input rate. On a
+multi-turn session, lost cache costs more than schema savings.
+
+Tool Belt resolves the tension by cadence:
 
 - **Cache-on** (Anthropic, OpenAI auto-cache): the tool set freezes at
   session start and is reused verbatim every turn, so the provider
@@ -55,10 +70,9 @@ happens:
 
 The numbers above are illustrative, not measured guarantees — the
 methodology for measuring your own is in
-[docs/SAVINGS.md](docs/SAVINGS.md). Mode is auto-detected per scope
-from observed cache behavior and locked in. You set nothing.
+[docs/SAVINGS.md](docs/SAVINGS.md).
 
-## Three things that make this safe to install
+## What's safe about it
 
 - **Fails invisibly.** Any error — bad YAML, predictor exception, missing lookup — falls through to "no narrowing." Tool Belt can save you tokens; it can never break your agent.
 - **Strict ceiling.** Can only *narrow* what your `platform_toolsets` config already allowed. Never adds a tool you didn't sanction.
