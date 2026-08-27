@@ -53,3 +53,6 @@ The initial public capabilities of the plugin:
   interpreter, while scheduled analysis uses `python3` or an explicit
   `HERMES_PYTHON` instead of assuming a Hermes source checkout and venv live
   under the user's home directory.
+- **Surface audit summary.** `docs/SURFACE_AUDIT.md` documents the audited
+  product surface — core features, secondary capabilities, operator tiers —
+  and the cleanup decisions carried into this release cycle.

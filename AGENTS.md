@@ -39,6 +39,7 @@ the same change.
 - Configuration reference: `docs/CONFIGURATION.md`
 - Savings methodology: `docs/SAVINGS.md`
 - Known limitations: `docs/KNOWN_ISSUES.md`
+- Surface audit summary: `docs/SURFACE_AUDIT.md`
 
 ## Verification
 
