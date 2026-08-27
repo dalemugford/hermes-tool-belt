@@ -37,6 +37,12 @@ The initial public capabilities of the plugin:
 - **Telemetry, analyzer, and savings reporting.** Append-only telemetry records
   every narrowing decision; the analyzer summarizes usage and reports token
   savings with an optional A/B baseline cohort.
+- **Interactive onboarding.** `scripts/configure.py` discovers every agent and
+  platform from telemetry, offers a shape-now path (analyze history, review a
+  plain-language summary, confirm) or an observe-first path (telemetry only,
+  no narrowing, until enough data exists), and reports per-agent state on
+  every re-run. Config writes go only through `hermes config set`/`unset`
+  with a shown diff before each write.
 - **Fail-open behavior.** Any internal failure leaves the original Hermes tool
   set fully available.
 - **Strict `platform_toolsets` ceiling.** The plugin only narrows within, and

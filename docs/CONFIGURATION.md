@@ -640,3 +640,80 @@ Key fields:
 
 Joining `tool_calls.jsonl` and `api_calls.jsonl` to `predictions.jsonl`
 on `prediction_id` is the supported analysis path.
+
+## Analyzing telemetry with `jq`
+
+Quick recipes for spot-checks. For proper per-scope precision/recall and
+promotion candidates, use [`analyze.py`](../analyze.py) — it does the
+joins and applies the thresholds correctly.
+
+**Watch live as messages flow in:**
+
+```bash
+tail -f ~/.hermes/state/tool-belt/predictions.jsonl | \
+  jq -c '{scope, msg: .message_preview, triggers: .triggers_fired, suppressed: .triggers_suppressed, saved: .tokens_saved, pct: .reduction_pct}'
+```
+
+**Spot-check the last 5 predictions:**
+
+```bash
+tail -5 ~/.hermes/state/tool-belt/predictions.jsonl | \
+  jq -c '{scope, msg: .message_preview[:50], triggers: .triggers_fired, ceiling: .ceiling_count, narrowed: .narrowed_count, saved: .tokens_saved, pct: .reduction_pct}'
+```
+
+**Aggregate savings — total and average:**
+
+```bash
+jq -s 'map(.tokens_saved) | {n: length, total_saved: add, avg_saved: (add/length | floor), avg_pct: (map(.reduction_pct) | add/length | (.*10|floor)/10)}' \
+  ~/.hermes/state/tool-belt/predictions.jsonl
+```
+
+**Trigger frequency — which triggers fire most often:**
+
+```bash
+jq -r '.triggers_fired | if length == 0 then "(none)" else join(",") end' \
+  ~/.hermes/state/tool-belt/predictions.jsonl | sort | uniq -c | sort -rn
+```
+
+**Trigger dampener audit — what got suppressed by `exclude_keywords`:**
+
+```bash
+jq -c 'select((.triggers_suppressed // []) | length > 0) | {msg: .message_preview[:60], suppressed: .triggers_suppressed, fired: .triggers_fired}' \
+  ~/.hermes/state/tool-belt/predictions.jsonl | tail -20
+```
+
+**Tool calls per session — what actually got used:**
+
+```bash
+jq -r '.tool_name' ~/.hermes/state/tool-belt/tool_calls.jsonl | sort | uniq -c | sort -rn
+```
+
+**Expansion success rate — when did `expand_tools` lead to a real call?**
+
+```bash
+jq -c 'select(.expand_tools_used == true) | {scope, category: .expand_category, tool: .expanded_tool, turns_until_used}' \
+  ~/.hermes/state/tool-belt/tool_calls.jsonl | tail -20
+```
+
+## Analyzer thresholds (`analyze.py`)
+
+All thresholds are CLI flags, not hard-coded policy. The deterministic
+telemetry pass reads `predictions.jsonl` + `tool_calls.jsonl`, prints a
+summary, writes a dated markdown report under `reports/`, and can
+optionally emit `learned_recommendations.json` for review
+([`scripts/README.md`](../scripts/README.md) has the workflow).
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--per-tool-tokens` | 388 | Estimated tokens per tool per API call (for carrying-cost math) |
+| `--min-expansions` | 2 | Minimum expansion events before a category is eligible for a recommendation |
+| `--promote-expand-rate` | 0.50 | Expand rate above which a category is a promotion candidate |
+| `--promote-use-rate` | 0.80 | Downstream-use share above which a category is a promotion candidate |
+| `--unused-carry-turns` | 10 | Always-on tools carried this many turns with zero calls become demotion candidates |
+| `--trigger-min-fires` | 3 | Minimum fires before a trigger gets a precision/recall recommendation |
+| `--expand-round-trip-tokens` | 1500 | Estimated total cost of one `expand_tools` round-trip (model output + result + extra API call). Folded into per-category net-value math and the headline net-savings number. |
+| `--harvest-min-cuts` | 3 | Minimum was_cut count before a tool surfaces as a harvest-driven promotion candidate. |
+
+Dampener/trigger-keyword suggestion flags (`--suggest-dampeners`,
+`--suggest-trigger-keywords` and their tuning flags) are documented in
+[`scripts/README.md`](../scripts/README.md).

@@ -67,6 +67,30 @@ python3 scripts/configure.py --reset default
 `--status` never writes. `--dry-run` prints every diff and writes nothing —
 neither files nor `hermes config` calls.
 
+### Mine dampener and trigger-keyword candidates
+
+```bash
+python3 analyze.py --suggest-dampeners
+python3 analyze.py --state-dir ~/.hermes/state/tool-belt/harvest \
+    --suggest-trigger-keywords --suggest-dampeners
+```
+
+The analyzer mines 80-char message previews per (scope, trigger), extracts
+2–4 word n-grams, and surfaces n-grams that show up frequently in
+false-positive messages but rarely in true-positive ones (the inverse flow
+mines `was_cut` previews for keyword candidates that would have covered a
+cut tool). Output includes regex-ready patterns plus sample previews;
+candidates already covered by an existing pattern are filtered out.
+Tuning flags:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--dampener-min-support` | 3 | Minimum false-positive occurrences for a candidate |
+| `--dampener-min-precision` | 0.8 | Minimum `fp / (fp + tp)` ratio |
+| `--dampener-min-n` | 2 | Shortest n-gram length (words) |
+| `--dampener-max-n` | 4 | Longest n-gram length (words) |
+| `--dampener-max-candidates` | 10 | Cap on suggestions per (scope, trigger) |
+
 ### Preview or apply between-session shaping
 
 ```bash
