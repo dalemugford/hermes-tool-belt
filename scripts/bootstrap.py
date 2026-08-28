@@ -160,7 +160,7 @@ def _harvest_actions(harvest_dirs: list[tuple[str, Path]], python: str) -> list[
             payload = json.loads(result.stdout)
             for rec in payload.get("recommendations", []):
                 if rec.get("kind") == "harvest_tool_promotion" and rec.get("action") in (
-                    "promote_always_on", "broaden_trigger_recall"
+                    "promote_to_carry", "keep_expand_only"
                 ):
                     actions.append({
                         "kind": "harvest_promotion",
@@ -169,7 +169,7 @@ def _harvest_actions(harvest_dirs: list[tuple[str, Path]], python: str) -> list[
                         "action": rec["action"],
                         "item": rec["item"],
                         "net": rec["metrics"]["net_savings_tokens"],
-                        "cuts": rec["metrics"]["harvest_was_cut"],
+                        "expand_only_calls": rec["metrics"]["harvest_was_expand_only"],
                     })
             for row in payload.get("trigger_keyword_candidates", []):
                 if not row.get("candidates"):
@@ -183,7 +183,7 @@ def _harvest_actions(harvest_dirs: list[tuple[str, Path]], python: str) -> list[
                     "target_trigger": row["target_trigger"],
                     "action": row["action"],
                     "pattern": top["pattern"],
-                    "cuts": row["cut_count"],
+                    "expand_only_calls": row["expand_only_count"],
                     "precision": top["precision"],
                 })
         except subprocess.CalledProcessError as exc:
@@ -275,11 +275,11 @@ def main() -> int:
     shape_promotes = [a for a in shape_actions if a["kind"] == "shape_promote"]
     shape_demotes = [a for a in shape_actions if a["kind"] == "shape_demote"]
     if shape_promotes:
-        print("\n  [cache-on] Promote into the frozen ceiling (from real expand_tools evidence):")
+        print("\n  [cache-on] Promote to carry (from real expand_tools evidence):")
         for i, a in enumerate(shape_promotes, 1):
             print(f"    {i}. {a['scope']:<22} + {a['tool']}    ({a['raw'].split(a['tool'], 1)[-1].strip()})")
     if shape_demotes:
-        print("\n  [cache-on] Demote from always-on (unused across recent sessions):")
+        print("\n  [cache-on] Demote to expand_only (unused across recent sessions):")
         for i, a in enumerate(shape_demotes, 1):
             print(f"    {i}. {a['scope']:<22} − {a['tool']}    ({a['raw'].split(a['tool'], 1)[-1].strip()})")
 
@@ -287,18 +287,18 @@ def main() -> int:
     harvest_promotions = sorted([a for a in harvest_actions if a["kind"] == "harvest_promotion"],
                                 key=lambda a: -a.get("net", 0))
     harvest_keywords = sorted([a for a in harvest_actions if a["kind"] == "harvest_keyword"],
-                              key=lambda a: -a["cuts"])
+                              key=lambda a: -a["expand_only_calls"])
     if harvest_promotions:
-        print("\n  [cache-off / harvest] Tool promotions (edit policy.yaml or channels.<scope>.always_on_extra):")
+        print("\n  [cache-off / harvest] Carry recommendations (review/apply with configure.py or shape-ceiling.py):")
         for i, p in enumerate(harvest_promotions, 1):
-            tag = "PROMOTE" if p["action"] == "promote_always_on" else "BROADEN"
+            tag = "PROMOTE-TO-CARRY" if p["action"] == "promote_to_carry" else "KEEP-EXPAND-ONLY"
             print(f"    {i}. [{tag}] {p['scope']:<22} {p['item']:<20} "
-                  f"cuts={p['cuts']:>4}  net={p['net']:+,} tok")
+                  f"expand_only_calls={p['expand_only_calls']:>4}  net={p['net']:+,} tok")
     if harvest_keywords:
         print("\n  [cache-off / harvest] Trigger keyword candidates (add to the named trigger's `keywords`):")
         for i, k in enumerate(harvest_keywords[:10], 1):
             print(f"    {i}. {k['scope']:<22} {k['target_trigger']:<14} ← \"{k['pattern']}\"")
-            print(f"       (cuts {k['cuts']}, precision {k['precision']:.2f} — "
+            print(f"       (expand_only_calls {k['expand_only_calls']}, precision {k['precision']:.2f} — "
                   f"would have fired for {k['tool']})")
 
     print()

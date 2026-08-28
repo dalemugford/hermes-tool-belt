@@ -399,11 +399,15 @@ class AnalyzerExcludesDegradedModeTests(unittest.TestCase):
         self.assertEqual(out, {})
         self.assertEqual(status, "no_policy")
 
-    def test_load_preset_always_on_falls_back_without_pyyaml(self):
-        tools, status = analyze._load_preset_always_on(Path(plugin.__file__).parent)
+    def test_load_preset_always_carry_falls_back_without_pyyaml(self):
+        tools, status = analyze._load_preset_always_carry(Path(plugin.__file__).parent)
         self.assertEqual(status, "ok")
-        self.assertIn("mnemosyne_recall", tools)
-        self.assertIn("process", tools)
+        # always_carry holds only the immutable residents; adaptive carry tools
+        # (mnemosyne_recall, process) are NOT part of the immutable set.
+        self.assertIn("clarify", tools)
+        self.assertIn("expand_tools", tools)
+        self.assertNotIn("mnemosyne_recall", tools)
+        self.assertNotIn("process", tools)
 
     def test_dampener_candidates_emits_warning_when_degraded(self):
         stat = analyze.ScopeStats(scope="assistant-a:telegram")
@@ -535,8 +539,8 @@ class TriggerFpLateBoundTpTests(unittest.TestCase):
 
 
 class TriggerKeywordSuggesterTests(unittest.TestCase):
-    """The trigger-keyword suggester mines cut-tool message previews
-    for candidate keywords that would have fired a trigger to cover the
+    """The trigger-keyword suggester mines expand_only-tool message previews
+    for candidate keywords that would have fired a trigger to activate the
     tool. Symmetric inverse of dampener mining; must filter the same
     pollution patterns (stop-words, existing-pattern overlap)."""
 
@@ -548,22 +552,22 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
             dampener_max_n=4,
             dampener_min_precision=0.6,
             dampener_max_candidates=5,
-            harvest_min_cuts=2,
+            harvest_min_expand_only_calls=2,
             expand_round_trip_tokens=1500,
             per_tool_tokens=388,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
 
-    def _make_stats(self, *, scope="assistant-a:telegram", cut_previews,
-                    all_previews, was_cut_count):
+    def _make_stats(self, *, scope="assistant-a:telegram", expand_only_previews,
+                    all_previews, was_expand_only_count):
         from collections import Counter
         stat = analyze.ScopeStats(scope=scope)
         stat.harvest_predictions = len(all_previews)
         stat.harvest_all_previews = list(all_previews)
-        for tool, previews in cut_previews.items():
-            stat.harvest_cut_previews[tool] = list(previews)
-            stat.harvest_was_cut[tool] = was_cut_count.get(tool, len(previews))
+        for tool, previews in expand_only_previews.items():
+            stat.harvest_expand_only_previews[tool] = list(previews)
+            stat.harvest_was_expand_only[tool] = was_expand_only_count.get(tool, len(previews))
         return {scope: stat}
 
     def test_surfaces_content_words_filters_stopwords(self):
@@ -585,9 +589,9 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
             "and the next thing is to ask",
         ] * 5
         stats = self._make_stats(
-            cut_previews={"deploy_tool": cut_msgs},
+            expand_only_previews={"deploy_tool": cut_msgs},
             all_previews=cut_msgs + noise,
-            was_cut_count={"deploy_tool": 5},
+            was_expand_only_count={"deploy_tool": 5},
         )
         with mock.patch.object(analyze, "_load_preset_triggers",
                                return_value=({}, "ok")):
@@ -611,9 +615,9 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
             "shell": {"tools": ["terminal"], "keyword_patterns": []},
         }
         stats = self._make_stats(
-            cut_previews={"terminal": cut_msgs},
+            expand_only_previews={"terminal": cut_msgs},
             all_previews=cut_msgs + ["random unrelated message"] * 10,
-            was_cut_count={"terminal": 4},
+            was_expand_only_count={"terminal": 4},
         )
         with mock.patch.object(analyze, "_load_preset_triggers",
                                return_value=(triggers, "ok")):
@@ -627,9 +631,9 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
         # new group, named by the tool's underscore prefix.
         cut_msgs = ["please screenshot the page"] * 4
         stats = self._make_stats(
-            cut_previews={"browser_snapshot": cut_msgs},
+            expand_only_previews={"browser_snapshot": cut_msgs},
             all_previews=cut_msgs + ["chat about lunch"] * 10,
-            was_cut_count={"browser_snapshot": 4},
+            was_expand_only_count={"browser_snapshot": 4},
         )
         with mock.patch.object(analyze, "_load_preset_triggers",
                                return_value=({}, "ok")):
@@ -651,9 +655,9 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
             },
         }
         stats = self._make_stats(
-            cut_previews={"deploy_tool": cut_msgs},
+            expand_only_previews={"deploy_tool": cut_msgs},
             all_previews=cut_msgs + ["random"] * 10,
-            was_cut_count={"deploy_tool": 4},
+            was_expand_only_count={"deploy_tool": 4},
         )
         with mock.patch.object(analyze, "_load_preset_triggers",
                                return_value=(triggers, "ok")):
@@ -669,11 +673,11 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
 
 class HarvestRecommendationTests(unittest.TestCase):
     """The analyzer's harvest-aware recommendation generator should
-    surface per-tool promotion candidates from was_cut signal, with
+    surface per-tool promotion candidates from was_expand_only signal, with
     clear actions for the three regimes (net-positive promote,
-    frequent-but-net-negative broaden, sparse keep)."""
+    frequent-but-net-negative keep-expand-only, sparse keep)."""
 
-    def _harvest_row(self, *, pid, scope, tool=None, was_cut=False):
+    def _harvest_row(self, *, pid, scope, tool=None, was_expand_only=False):
         if tool is None:
             return {
                 "prediction_id": pid,
@@ -691,7 +695,7 @@ class HarvestRecommendationTests(unittest.TestCase):
             "session_id": f"harvest:{pid[:4]}",
             "scope": scope,
             "tool_name": tool,
-            "was_cut": was_cut,
+            "was_expand_only": was_expand_only,
             "policy_source": "harvest",
         }
 
@@ -699,54 +703,54 @@ class HarvestRecommendationTests(unittest.TestCase):
         defaults = dict(
             expand_round_trip_tokens=1500,
             per_tool_tokens=388,
-            harvest_min_cuts=3,
+            harvest_min_expand_only_calls=3,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
 
     def test_net_positive_surfaces_as_promote(self):
-        # 100 predictions, 50 was_cut for tool X → cost = 50*1500 = 75k
+        # 100 predictions, 50 was_expand_only for tool X → cost = 50*1500 = 75k
         # carry = 100*388 = 38.8k → net +36.2k → promote
         preds = [self._harvest_row(pid=f"p{i:03d}", scope="assistant-a:telegram") for i in range(100)]
         calls = [self._harvest_row(pid=f"p{i:03d}", scope="assistant-a:telegram",
-                                   tool="terminal", was_cut=True) for i in range(50)]
+                                   tool="terminal", was_expand_only=True) for i in range(50)]
         stats = analyze.collect_stats(preds, calls)
         rows = analyze.harvest_recommendation_rows(stats, self._args())
         terminal_rec = next((r for r in rows if r["item"] == "terminal"), None)
         self.assertIsNotNone(terminal_rec)
-        self.assertEqual(terminal_rec["action"], "promote_always_on")
+        self.assertEqual(terminal_rec["action"], "promote_to_carry")
         self.assertGreater(terminal_rec["metrics"]["net_savings_tokens"], 0)
 
-    def test_frequent_but_net_negative_surfaces_as_broaden(self):
-        # 1000 predictions (carry = 388k), 150 was_cut for X (rt = 225k)
-        # → net -163k but cut_rate = 15% (above 10% threshold) → broaden
+    def test_frequent_but_net_negative_stays_expand_only(self):
+        # 1000 predictions (carry = 388k), 150 was_expand_only for X (rt = 225k)
+        # → net -163k despite a 15% access rate → keep expand-only
         preds = [self._harvest_row(pid=f"p{i:04d}", scope="assistant-a:telegram") for i in range(1000)]
         calls = [self._harvest_row(pid=f"p{i:04d}", scope="assistant-a:telegram",
-                                   tool="patch", was_cut=True) for i in range(150)]
+                                   tool="patch", was_expand_only=True) for i in range(150)]
         stats = analyze.collect_stats(preds, calls)
         rows = analyze.harvest_recommendation_rows(stats, self._args())
         patch_rec = next((r for r in rows if r["item"] == "patch"), None)
         self.assertIsNotNone(patch_rec)
-        self.assertEqual(patch_rec["action"], "broaden_trigger_recall")
+        self.assertEqual(patch_rec["action"], "keep_expand_only")
         self.assertLess(patch_rec["metrics"]["net_savings_tokens"], 0)
 
-    def test_sparse_cuts_keep_gated(self):
-        # 1000 predictions, only 5 was_cut → cut_rate 0.5%, net very
-        # negative → keep_gated
+    def test_sparse_expand_only_calls_stay_expand_only(self):
+        # 1000 predictions, only 5 expand-only calls → access rate 0.5%, net
+        # very negative → keep expand-only
         preds = [self._harvest_row(pid=f"p{i:04d}", scope="assistant-a:telegram") for i in range(1000)]
         calls = [self._harvest_row(pid=f"p{i:04d}", scope="assistant-a:telegram",
-                                   tool="browser_vision", was_cut=True) for i in range(5)]
+                                   tool="browser_vision", was_expand_only=True) for i in range(5)]
         stats = analyze.collect_stats(preds, calls)
         rows = analyze.harvest_recommendation_rows(stats, self._args())
         rec = next((r for r in rows if r["item"] == "browser_vision"), None)
         self.assertIsNotNone(rec)
-        self.assertEqual(rec["action"], "keep_gated")
+        self.assertEqual(rec["action"], "keep_expand_only")
 
-    def test_below_min_cuts_does_not_surface(self):
-        # 1 was_cut < harvest_min_cuts=3 → no rec emitted
+    def test_below_min_expand_only_calls_does_not_surface(self):
+        # 1 expand-only call < harvest_min_expand_only_calls=3 → no rec emitted
         preds = [self._harvest_row(pid="p001", scope="assistant-a:telegram")]
         calls = [self._harvest_row(pid="p001", scope="assistant-a:telegram",
-                                   tool="cronjob", was_cut=True)]
+                                   tool="cronjob", was_expand_only=True)]
         stats = analyze.collect_stats(preds, calls)
         rows = analyze.harvest_recommendation_rows(stats, self._args())
         self.assertFalse([r for r in rows if r["item"] == "cronjob"])
@@ -759,20 +763,20 @@ class HarvestRecommendationTests(unittest.TestCase):
             "ceiling_count": 1, "narrowed_count": 1, "ceiling_tokens": 1, "narrowed_tokens": 1,
         }]
         calls = [{"prediction_id": "p1", "session_id": "live-s1", "scope": "assistant-a:telegram",
-                  "tool_name": "terminal", "was_cut": True, "policy_source": "preset"}]
+                  "tool_name": "terminal", "was_expand_only": True, "policy_source": "preset"}]
         stats = analyze.collect_stats(preds, calls)
         rows = analyze.harvest_recommendation_rows(stats, self._args())
         self.assertFalse(rows, "live-only telemetry must not produce harvest recs")
 
-    def test_harvest_skips_tools_pinned_always_on_by_policy(self):
+    def test_harvest_skips_immutable_always_carry_tools(self):
         preds = [self._harvest_row(pid=f"p{i:03d}", scope="assistant-a:telegram") for i in range(100)]
         calls = [self._harvest_row(pid=f"p{i:03d}", scope="assistant-a:telegram",
-                                   tool="terminal", was_cut=True) for i in range(50)]
+                                   tool="terminal", was_expand_only=True) for i in range(50)]
         stats = analyze.collect_stats(preds, calls)
         rows = analyze.harvest_recommendation_rows(
             stats,
             self._args(),
-            protected_always_on={"terminal"},
+            immutable_always_carry={"terminal"},
         )
         self.assertFalse([r for r in rows if r["item"] == "terminal"])
 
@@ -791,14 +795,14 @@ class RecommendationRowProtectionTests(unittest.TestCase):
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
 
-    def test_policy_always_on_tool_is_not_flagged_for_demote(self):
+    def test_policy_always_carry_tool_is_not_flagged_for_demote(self):
         stat = analyze.ScopeStats(scope="assistant-a:telegram")
         stat.predictions = 25
-        stat.always_on_carry_turns = Counter({"mnemosyne_recall": 25})
+        stat.carry_turns = Counter({"mnemosyne_recall": 25})
         rows = analyze.recommendation_rows(
             {"assistant-a:telegram": stat},
             self._args(),
-            protected_always_on={"mnemosyne_recall"},
+            immutable_always_carry={"mnemosyne_recall"},
         )
         self.assertFalse([r for r in rows if r.get("item") == "mnemosyne_recall"])
 
@@ -893,14 +897,14 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
         self.assertNotEqual(row.get("expansion_provided_access"), True,
             "tool already in initial allowed set must not be credited as expansion-driven")
 
-    def test_cut_tool_with_active_sticky_credits_expansion(self):
-        # The legitimate case: terminal was cut from the initial allowed
+    def test_expand_only_tool_with_active_sticky_credits_expansion(self):
+        # The legitimate case: terminal was expand-only in the initial active
         # set; sticky residency from a prior expansion is what made it
         # callable. The flag must fire.
         sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
         self._seed_sticky(sticky_key, "terminal", ["terminal"])
         self._set_prediction_state(initial_allowed=["memory"], sticky_key=sticky_key)
-        # Mark the tool as cut so was_cut reflects reality (the predictor
+        # Mark the tool expand-only so the canonical flag reflects reality (the predictor
         # would have set this when narrowing).
         state = plugin._PREDICTION_CV.get()
         state["expand_only_tools"] = ["terminal"]
@@ -913,7 +917,7 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
         row = self._latest_row()
         self.assertFalse(row.get("was_initially_active"))
         self.assertTrue(row.get("expansion_provided_access"),
-            "tool cut from initial allowed set but reachable via sticky must be credited")
+            "expand-only tool reachable via sticky must be credited")
         self.assertEqual(row.get("expand_category"), "terminal")
 
     def test_sticky_carried_tool_in_initial_allowed_still_credits_expansion(self):

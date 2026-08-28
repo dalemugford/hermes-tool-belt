@@ -63,8 +63,8 @@ logger_io = importlib.import_module("tool_belt_plugin.logger_io")
 
 # Minimal but realistic-shaped Hermes tools payload. Each entry is the
 # Anthropic-format dict the plugin sees in kwargs["tools"]. Names cover
-# every category referenced by policy.yaml plus a few "unknown" tools
-# to exercise the unknown_kept path.
+# every category referenced by policy.yaml plus a few unlisted enabled tools
+# to exercise their derived expand-only path.
 SYNTHETIC_TOOLS = [
     # Always-on per policy
     {"name": "session_search", "description": "x", "input_schema": {}},
@@ -127,8 +127,8 @@ TARGETED_SCENARIOS: list[Scenario] = [
     # 3. Already-available tool + sticky context — must NOT be credited
     #    as expansion-driven. This is the item #1 bug guard.
     Scenario("already-available-001", turns=[
-        # terminal is in policy always_on? no — only via shell trigger.
-        # But we'll simulate the case where it ends up in initial_allowed.
+        # terminal is not carried by policy — it activates via the shell trigger.
+        # Simulate a case where it is already in the initial active set.
         # Use write_file: it's trigger-gated, fires on "save". Then we
         # call expand_tools(file) which re-adds the same tool. The
         # post_tool_call for write_file must NOT show expand_tools_used.

@@ -44,6 +44,20 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+# Read telemetry rows through the centralized v1/v2 normalizer so session
+# grouping and any carrying-model fields present one canonical shape. Importing
+# it puts the plugin dir on ``sys.path`` first; the module loads standalone.
+_PLUGIN_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_PLUGIN_DIR))
+from logger_io import normalize_prediction_row, normalize_tool_call_row  # noqa: E402
+
+
+def _session_key(row: dict[str, Any]) -> str:
+    """Distinct-session key matching the shaper/analyzer: prefer the
+    ``/new``-rotating ``hermes_session_id``, fall back to the stable
+    ``session_id`` for normalized historical rows."""
+    return str(row.get("hermes_session_id") or row.get("session_id") or "")
+
 
 def default_state_dir() -> Path:
     home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
@@ -185,7 +199,7 @@ def cohort_stats(predictions: list[dict[str, Any]],
     if not rows:
         return {"n_predictions": 0, "n_sessions": 0}
 
-    sessions = {str(p.get("session_id") or "") for p in rows if p.get("session_id")}
+    sessions = {_session_key(p) for p in rows if _session_key(p)}
     n_predictions = len(rows)
     n_sessions = len(sessions)
     ceiling_total = sum(int(p.get("ceiling_tokens") or 0) for p in rows)
@@ -343,11 +357,14 @@ def main() -> int:
     args = parser.parse_args()
 
     since_ts = parse_since(args.since)
-    predictions = [p for p in load_jsonl(args.state_dir / "predictions.jsonl")
+    # Canonicalize every row through the central adapter before analysis.
+    predictions = [normalize_prediction_row(p)
+                   for p in load_jsonl(args.state_dir / "predictions.jsonl")
                    if float(p.get("ts") or 0) >= since_ts]
     api_calls = [a for a in load_jsonl(args.state_dir / "api_calls.jsonl")
                  if float(a.get("ts") or 0) >= since_ts]
-    tool_calls = [t for t in load_jsonl(args.state_dir / "tool_calls.jsonl")
+    tool_calls = [normalize_tool_call_row(t)
+                  for t in load_jsonl(args.state_dir / "tool_calls.jsonl")
                   if float(t.get("ts") or 0) >= since_ts]
 
     if not predictions:

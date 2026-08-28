@@ -244,25 +244,26 @@ def replay_session(
         prediction = predictor.predict(message, attachments=[], preset=preset)
         prediction_id = logger_io.new_prediction_id()
 
-        # Compute the narrowed view: intersection of predicted-allowed
-        # with the session's ceiling. Unknown-to-policy tools default to
-        # always-on per the live writer's behavior.
+        # Compute the narrowed view: intersection of the resolved active set
+        # with the session's ceiling. Under the 1.0 carrying model an enabled
+        # built-in outside the active set is derived expand_only.
         if prediction.is_wildcard:
             allowed_names = list(session.ceiling_tools)
-            cut_names: list[str] = []
+            expand_only_names: list[str] = []
         else:
             allowed_set = set(prediction.active_tool_names)  # type: ignore[arg-type]
             known = _all_known_tool_names(preset)
             allowed_names = []
-            cut_names = []
+            expand_only_names = []
             for name in session.ceiling_tools:
-                # Under the 1.0 carrying model, an unknown enabled built-in is
-                # expand_only (cut), not resident — it activates only on
-                # trigger/expansion. Only names in the resolved active set stay.
+                # Under the 1.0 carrying model, an enabled built-in outside the
+                # resolved active set is expand_only — it activates only on
+                # trigger activation or explicit expansion. Only names in the
+                # resolved active set stay resident/active.
                 if name in allowed_set:
                     allowed_names.append(name)
                 else:
-                    cut_names.append(name)
+                    expand_only_names.append(name)
 
         narrowed_tokens = logger_io.estimate_tokens([{"name": n} for n in allowed_names])
 
@@ -271,7 +272,7 @@ def replay_session(
 
         # v2 residency split over the active set: the preset's immutable
         # always_carry baseline and adaptive carry loadout classify the
-        # resident tools; ``cut_names`` is the expand_only stratum X.
+        # resident tools; ``expand_only_names`` is the expand_only stratum X.
         ac_base = set(getattr(preset, "always_carry", []) or [])
         c_base = set(getattr(preset, "carry", []) or [])
         always_carry_tools = [t for t in allowed_names if t in ac_base]
@@ -300,7 +301,7 @@ def replay_session(
             narrowed_tokens=narrowed_tokens,
             ceiling_tools=list(session.ceiling_tools),
             active_tools=list(allowed_names),
-            expand_only_tools=list(cut_names),
+            expand_only_tools=list(expand_only_names),
             policy_source="harvest",
             policy_version="harvest-v1",
         )
@@ -319,7 +320,7 @@ def replay_session(
                 "platform": session.platform,
                 "scope": scope,
                 "was_initially_active": tool_name in allowed_names,
-                "was_expand_only": tool_name in cut_names,
+                "was_expand_only": tool_name in expand_only_names,
                 "policy_source": "harvest",
                 # No expansion_provided_access field — counterfactual; analyzer
                 # must not treat absence as False (which the read-side filter
@@ -328,12 +329,12 @@ def replay_session(
 
 
 def _all_known_tool_names(preset: Any) -> set[str]:
-    """All tool names mentioned anywhere in the preset (always_on + every
-    trigger group). Mirrors the helper used inside the plugin's
-    _build_api_kwargs filter."""
+    """All tool names mentioned anywhere in the preset (the resident union
+    ``always_carry`` ∪ ``carry`` plus every trigger group). Mirrors the helper
+    used inside the plugin's _build_api_kwargs filter."""
     known: set[str] = set()
-    if isinstance(preset.always_on, list):
-        known.update(preset.always_on)
+    known.update(getattr(preset, "always_carry", []) or [])
+    known.update(getattr(preset, "carry", []) or [])
     for group in preset.triggers:
         known.update(group.tools)
     return known
@@ -355,11 +356,10 @@ def iter_session_files(root_or_profile_dir: Path, window_days: int | None) -> It
 def _load_plugin_config(profile_home: Path) -> dict[str, Any]:
     """Load the tool-belt section from the profile's config.yaml.
 
-    Matters because per-profile ``always_on_extra`` / ``always_off`` /
-    ``channels.*`` overrides change the predictor's narrowing behavior.
-    Running the harvest with the base policy alone over-cuts profiles
-    that have meaningful custom configuration (e.g. a profile's terminal +
-    execute_code + write_file + patch additions).
+    Matters because per-profile plugin settings and ``channels.*`` overrides
+    change the predictor's carrying behavior. Running the harvest with the base
+    policy alone can misclassify profiles with meaningful scope-specific
+    configuration.
 
     Returns a config dict shaped exactly like what the plugin's
     register() builds from ``cfg_get("plugins.tool-belt.*")``, with

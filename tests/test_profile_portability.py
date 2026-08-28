@@ -36,7 +36,6 @@ def _load_script(module_name: str, filename: str):
 bootstrap = _load_script("tool_belt_bootstrap_portability", "bootstrap.py")
 harvest = _load_script("tool_belt_harvest_portability", "harvest-replay.py")
 cache_replay = _load_script("tool_belt_cache_replay_portability", "cache-freeze-replay.py")
-drift = _load_script("tool_belt_drift_portability", "check-tool-drift.py")
 savings = _load_script("tool_belt_savings_portability", "savings-report.py")
 shape = _load_script("tool_belt_shape_portability", "shape-ceiling.py")
 
@@ -121,7 +120,6 @@ class StatePathPortabilityTests(unittest.TestCase):
                 self.assertEqual(learned.state_dir(), expected)
                 self.assertEqual(logger_io._state_dir(), expected)
                 self.assertEqual(cache_replay.default_state_dir(), expected)
-                self.assertEqual(drift.default_state_dir(), expected)
                 self.assertEqual(savings.default_state_dir(), expected)
                 self.assertEqual(shape.default_state_dir(), expected)
 

@@ -21,6 +21,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+# Canonical telemetry adapter. Every prediction/tool-call row is read through
+# ``logger_io.normalize_prediction_row`` / ``normalize_tool_call_row`` so v1, v2,
+# and mixed streams all present the same carrying-model fields (always_carry /
+# carry / expand_only, was_expand_only, activation_source). Works both as a
+# script (sibling on sys.path) and as the ``tool_belt_plugin.analyze`` module.
+try:  # package / test import
+    from . import logger_io  # type: ignore[import-not-found]
+except ImportError:  # script mode
+    import logger_io  # type: ignore[no-redef]
+
 DEFAULT_PER_TOOL_TOKENS = 388
 DEFAULT_MIN_EXPANSIONS = 2
 DEFAULT_PROMOTE_EXPAND_RATE = 0.50
@@ -43,24 +53,6 @@ DEFAULT_DAMPENER_MIN_N = 2
 DEFAULT_DAMPENER_MAX_N = 4
 DEFAULT_DAMPENER_MAX_CANDIDATES = 10
 
-BASE_PROTECTED_ALWAYS_ON = {
-    # NOTE: the legacy `memory` tool is intentionally NOT protected here —
-    # policy.yaml always_off forces it off (superseded by Mnemosyne).
-    "session_search",
-    "clarify",
-    "skill_view",
-    "skills_list",
-    "todo",
-    "send_message",
-    "expand_tools",
-    # Hermes' native deferred-loading bridge tools. Tool Search manages
-    # its own activation; Tool Belt should never gate or demote them.
-    "tool_search",
-    "tool_describe",
-    "tool_call",
-}
-
-
 @dataclass
 class ScopeStats:
     scope: str
@@ -81,8 +73,12 @@ class ScopeStats:
     expanded_uses_by_tool: Counter[str] = field(default_factory=Counter)
     turns_until_used: list[int] = field(default_factory=list)
     tool_calls: Counter[str] = field(default_factory=Counter)
-    always_on_carry_turns: Counter[str] = field(default_factory=Counter)
-    cut_turns: Counter[str] = field(default_factory=Counter)
+    # Per-tool count of turns a `carry`-class resident was carried. Immutable
+    # `always_carry` residents are excluded (they can never be demoted). Feeds
+    # demote-to-expand_only candidate detection.
+    carry_turns: Counter[str] = field(default_factory=Counter)
+    # Per-tool count of turns a tool sat in the derived `expand_only` class.
+    expand_only_turns: Counter[str] = field(default_factory=Counter)
     trigger_fires: Counter[str] = field(default_factory=Counter)
     trigger_hits: Counter[str] = field(default_factory=Counter)
     trigger_needs: Counter[str] = field(default_factory=Counter)
@@ -104,18 +100,19 @@ class ScopeStats:
     cohort_sessions: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     cohort_tool_calls: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     cohort_expansions: dict[str, int] = field(default_factory=lambda: defaultdict(int))
-    # Harvest-specific signal: per-tool count of historical calls that
-    # WOULD have been cut by current narrowing (was_cut == True on the
-    # tool_call row). Populated only when harvest-source rows are present.
-    # The corresponding `harvest_predictions` is the denominator for
-    # carry-cost math when proposing always-on promotion.
-    harvest_was_cut: Counter[str] = field(default_factory=Counter)
+    # Harvest-specific counterfactual signal: per-tool count of historical
+    # calls the current partition would have left in the derived `expand_only`
+    # class (canonical ``was_expand_only`` on the tool_call row). Populated only
+    # when harvest-source rows are present. The corresponding
+    # `harvest_predictions` is the denominator for carry-cost math when
+    # proposing promote-to-carry.
+    harvest_was_expand_only: Counter[str] = field(default_factory=Counter)
     harvest_predictions: int = 0
     harvest_tool_calls_total: int = 0
-    # Per-tool sample of message previews that led to a was_cut call.
-    # Used by the trigger-keyword suggester to mine candidate keywords
-    # for adding cut tools into existing or new trigger groups.
-    harvest_cut_previews: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
+    # Per-tool sample of message previews that led to a was_expand_only call.
+    # Used by the trigger-keyword suggester to mine candidate keywords for
+    # broadening the trigger groups that would activate those expand_only tools.
+    harvest_expand_only_previews: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
     # All harvest-prediction previews for this scope — the noise denominator
     # for keyword mining precision. Sized cap protects unbounded growth on
     # big harvests; sampling preserves precision math accuracy.
@@ -268,6 +265,12 @@ def trigger_tools(row: dict[str, Any]) -> dict[str, set[str]]:
 
 
 def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, Any]]) -> dict[str, ScopeStats]:
+    # Read every row through the central adapter so v1, v2, and mixed streams
+    # present the same canonical carrying-model fields. Idempotent, so callers
+    # that already normalized (e.g. ``main``) pay only a cheap re-pass.
+    predictions = [logger_io.normalize_prediction_row(r) for r in predictions]
+    tool_calls = [logger_io.normalize_tool_call_row(r) for r in tool_calls]
+
     stats: dict[str, ScopeStats] = {}
 
     def get(scope: str) -> ScopeStats:
@@ -310,10 +313,14 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
         stat.total_tokens_saved += safe_int(row.get("tokens_saved"))
         stat.total_ceiling_tokens += safe_int(row.get("ceiling_tokens"))
         stat.total_narrowed_tokens += safe_int(row.get("narrowed_tokens"))
-        for tool in string_list(row.get("always_on_tools")):
-            stat.always_on_carry_turns[tool] += 1
-        for tool in string_list(row.get("cut_tools")):
-            stat.cut_turns[tool] += 1
+        # Only `carry`-class residents feed demote candidacy; immutable
+        # always_carry residents can never be demoted (filtered later against
+        # the preset always_carry set, which also protects v1 rows whose
+        # residents all normalize into `carry_tools`).
+        for tool in string_list(row.get("carry_tools")):
+            stat.carry_turns[tool] += 1
+        for tool in string_list(row.get("expand_only_tools")):
+            stat.expand_only_turns[tool] += 1
         for trigger in string_list(row.get("triggers_fired")):
             stat.trigger_fires[trigger] += 1
         learned_mode = str(row.get("learned_mode") or "").strip().lower()
@@ -339,14 +346,15 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
                 stat.cohort_tool_calls[cohort] += 1
             if prediction_id:
                 prediction_tools_called[prediction_id].add(tool)
-            # Harvest-source signal: count would-have-been cuts per tool
-            # and capture the prediction's message preview so the trigger-
+            # Harvest-source counterfactual: count calls the current partition
+            # would have left expand_only (canonical ``was_expand_only``) per
+            # tool, and capture the prediction's message preview so the trigger-
             # keyword suggester can mine candidates.
-            if cohort == "harvest" and row.get("was_cut") is True:
-                stat.harvest_was_cut[tool] += 1
+            if cohort == "harvest" and row.get("was_expand_only") is True:
+                stat.harvest_was_expand_only[tool] += 1
                 preview = prediction_preview.get(prediction_id, "")
-                if preview and len(stat.harvest_cut_previews[tool]) < 200:
-                    stat.harvest_cut_previews[tool].append(preview)
+                if preview and len(stat.harvest_expand_only_previews[tool]) < 200:
+                    stat.harvest_expand_only_previews[tool].append(preview)
             if cohort == "harvest":
                 stat.harvest_tool_calls_total += 1
 
@@ -607,13 +615,18 @@ _EXCLUDES_STATUS_MESSAGE = {
 }
 
 
-def _load_preset_always_on(plugin_dir: Path) -> tuple[set[str], str]:
-    """Load the preset always_on tool names from policy.yaml.
+def _load_preset_always_carry(plugin_dir: Path) -> tuple[set[str], str]:
+    """Load the preset's immutable ``always_carry`` tool names from policy.yaml.
+
+    These are the class-A residents that win every conflict and can never be
+    demoted; the analyzer treats them as the do-not-suggest set (an always_carry
+    tool is never a demote candidate, and a v1 row whose residents all normalize
+    into ``carry`` is protected against spurious demotion by this set).
 
     Returns ``(tools, status)`` using the same status enum as
-    :func:`_load_preset_excludes`. When PyYAML is unavailable, fall back
-    to a tiny line-oriented parser for the top-level ``always_on`` list
-    so the analyzer still honors explicit resident tools.
+    :func:`_load_preset_excludes`. When PyYAML is unavailable, fall back to a
+    tiny line-oriented parser for the top-level ``always_carry`` list so the
+    analyzer still honors the immutable residents.
     """
     path = plugin_dir / "policy.yaml"
     if not path.exists():
@@ -621,14 +634,14 @@ def _load_preset_always_on(plugin_dir: Path) -> tuple[set[str], str]:
 
     def fallback_parse() -> set[str]:
         tools: set[str] = set()
-        in_always_on = False
+        in_always_carry = False
         for raw_line in path.read_text(encoding="utf-8").splitlines():
             stripped = raw_line.strip()
             if not stripped or stripped.startswith("#"):
                 continue
-            if not in_always_on:
-                if stripped == "always_on:":
-                    in_always_on = True
+            if not in_always_carry:
+                if stripped == "always_carry:":
+                    in_always_carry = True
                 continue
             if raw_line and not raw_line.startswith((" ", "	")):
                 break
@@ -650,25 +663,24 @@ def _load_preset_always_on(plugin_dir: Path) -> tuple[set[str], str]:
         return tools, "ok" if tools else "parse_error"
     tools = {
         str(tool).strip()
-        for tool in (data.get("always_on") or [])
+        for tool in (data.get("always_carry") or [])
         if str(tool).strip()
     }
     return tools, "ok"
 
 
-def effective_protected_always_on(plugin_dir: Path | None = None) -> set[str]:
-    """Return the analyzer's effective do-not-suggest always-on set.
+def preset_always_carry(plugin_dir: Path | None = None) -> set[str]:
+    """Return the immutable ``always_carry`` set from the resolved preset.
 
-    ``policy.yaml`` is the source of truth. The hard-coded base set is a
-    safe fallback when YAML is unavailable so we still avoid noisy
-    suggestions for core meta tools.
+    ``policy.yaml`` is the single source of truth — no hard-coded protected
+    list. always_carry residents are the tools the adaptive layer must never
+    demote, so the analyzer excludes them from demote-to-expand_only candidacy
+    and from carry-cost accounting.
     """
-    protected = set(BASE_PROTECTED_ALWAYS_ON)
     if plugin_dir is None:
         plugin_dir = Path(__file__).resolve().parent
-    preset_tools, _status = _load_preset_always_on(plugin_dir)
-    protected.update(preset_tools)
-    return protected
+    tools, _status = _load_preset_always_carry(plugin_dir)
+    return tools
 
 
 def _load_preset_triggers(
@@ -680,7 +692,7 @@ def _load_preset_triggers(
     with the same status enum as :func:`_load_preset_excludes`. Used by
     the trigger-keyword suggester to:
       · Decide which group a candidate keyword should join (the one whose
-        ``tools`` already lists the cut tool).
+        ``tools`` already lists the expand_only tool).
       · Avoid re-suggesting keywords that an existing trigger pattern
         already matches.
     """
@@ -728,7 +740,7 @@ def _trigger_group_for_tool(
 
 
 def _suggested_new_trigger_name(tool: str) -> str:
-    """Heuristic group name when no existing group claims a cut tool.
+    """Heuristic group name when no existing group claims an expand_only tool.
 
     Common pattern: ``browser_navigate`` / ``browser_click`` → use the
     underscore prefix (``browser``). Falls back to the bare tool name.
@@ -990,8 +1002,8 @@ def _has_content_word(ngram: str) -> bool:
     return False
 
 
-def _suggest_keywords_for_cut_tool(
-    cut_previews: list[str],
+def _suggest_keywords_for_expand_only_tool(
+    expand_only_previews: list[str],
     noise_previews: list[str],
     existing_patterns: list[re.Pattern[str]],
     *,
@@ -1001,25 +1013,25 @@ def _suggest_keywords_for_cut_tool(
     min_precision: float,
     max_candidates: int,
 ) -> list[dict[str, Any]]:
-    """Mine n-grams that recur in cut-tool messages but rarely elsewhere.
+    """Mine n-grams that recur in expand_only-tool messages but rarely elsewhere.
 
     Mirrors :func:`_suggest_dampeners_for_trigger` with inverted semantics:
-    dampener mining wants n-grams that ONLY appear in FP messages
-    (suppress over-triggering); keyword mining wants n-grams that
-    appear in cut-tool messages but NOT in unrelated noise (surface
-    under-triggering).
+    dampener mining wants n-grams that ONLY appear in FP messages (suppress
+    over-triggering); keyword mining wants n-grams that appear in messages where
+    the model reached for a tool the current partition would have left
+    expand_only, but NOT in unrelated noise (surface under-triggering).
 
     Returns candidate keyword dicts ranked by precision then frequency.
     """
-    if not cut_previews or len(cut_previews) < min_support:
+    if not expand_only_previews or len(expand_only_previews) < min_support:
         return []
 
     raw_candidates: list[dict[str, Any]] = []
-    cut_lower = [p.lower() for p in cut_previews]
+    expand_only_lower = [p.lower() for p in expand_only_previews]
     noise_lower = [p.lower() for p in noise_previews]
 
     seen: set[str] = set()
-    for preview in cut_lower:
+    for preview in expand_only_lower:
         tokens = _tokenize_preview(preview)
         for n in range(min_n, max_n + 1):
             for ngram in _ngrams(tokens, n):
@@ -1028,16 +1040,16 @@ def _suggest_keywords_for_cut_tool(
                 seen.add(ngram)
                 if not _has_content_word(ngram):
                     continue
-                cut_count = sum(1 for p in cut_lower if ngram in p)
-                if cut_count < min_support:
+                support_count = sum(1 for p in expand_only_lower if ngram in p)
+                if support_count < min_support:
                     continue
                 noise_count = sum(1 for p in noise_lower if ngram in p)
-                precision = cut_count / max(1, cut_count + noise_count)
+                precision = support_count / max(1, support_count + noise_count)
                 if precision < min_precision:
                     continue
                 raw_candidates.append({
                     "ngram": ngram,
-                    "cut_count": cut_count,
+                    "support_count": support_count,
                     "noise_count": noise_count,
                     "precision": precision,
                     "length": n,
@@ -1046,7 +1058,7 @@ def _suggest_keywords_for_cut_tool(
     # Dedupe substrings: if "open the page" survives and "open the" also
     # survives with similar precision, prefer the longer (more specific)
     # one. Identical-stats shorter candidates get dropped.
-    raw_candidates.sort(key=lambda c: (-c["precision"], -c["cut_count"], -c["length"]))
+    raw_candidates.sort(key=lambda c: (-c["precision"], -c["support_count"], -c["length"]))
     dropped: set[str] = set()
     kept: list[dict[str, Any]] = []
     for cand in raw_candidates:
@@ -1058,17 +1070,17 @@ def _suggest_keywords_for_cut_tool(
         for other in raw_candidates:
             if (other["ngram"] != cand["ngram"]
                 and other["ngram"] in cand["ngram"]
-                and other["cut_count"] <= cand["cut_count"]):
+                and other["support_count"] <= cand["support_count"]):
                 dropped.add(other["ngram"])
 
     out: list[dict[str, Any]] = []
     for cand in kept[:max_candidates]:
         ngram = cand["ngram"]
-        samples = [p for p in cut_previews if ngram in p.lower()][:3]
+        samples = [p for p in expand_only_previews if ngram in p.lower()][:3]
         out.append({
             "pattern": ngram,
             "suggested_regex": _ngram_to_regex(ngram),
-            "cut_count": cand["cut_count"],
+            "support_count": cand["support_count"],
             "noise_count": cand["noise_count"],
             "precision": round(cand["precision"], 4),
             "sample_previews": samples,
@@ -1083,16 +1095,17 @@ def trigger_keyword_candidates(
 
     The symmetric inversion of :func:`dampener_candidates`. Where the
     dampener flow mines FP messages to suppress over-triggering, this
-    flow mines was_cut messages to surface under-triggering — keywords
-    that would have fired a trigger to cover a tool the historical
-    model called but current narrowing would have cut.
+    flow mines expand_only messages to surface under-triggering — keywords
+    that would have fired a trigger to activate a tool the historical
+    model called but the current partition would have left expand_only.
 
     Auto-detects: returns empty when ``--suggest-trigger-keywords`` is
-    off OR no scope has harvest data with sufficient cut volume per tool.
+    off OR no scope has harvest data with sufficient expand_only volume
+    per tool.
 
-    For each candidate cut tool, decides whether the suggestion should
-    augment an existing trigger group (the one whose ``tools`` already
-    lists this tool) or propose a new group.
+    For each candidate expand_only tool, decides whether the suggestion
+    should augment an existing trigger group (the one whose ``tools``
+    already lists this tool) or propose a new group.
     """
     if not getattr(args, "suggest_trigger_keywords", False):
         return []
@@ -1109,8 +1122,8 @@ def trigger_keyword_candidates(
     # Noise corpus: ALL harvest prediction previews per scope (capped
     # at 2000 during collect_stats). This is the correct denominator —
     # without it, common-everywhere phrases like "for a" appear in
-    # cut_previews but score precision=1.0 because the narrow noise
-    # pool (other-tools' cut_previews only) doesn't happen to contain
+    # expand_only previews but score precision=1.0 because the narrow noise
+    # pool (other-tools' expand_only previews only) doesn't happen to contain
     # them. Using the full prediction corpus puts genuine common-noise
     # phrases out of the running.
     noise_corpus: dict[str, list[str]] = {
@@ -1118,20 +1131,20 @@ def trigger_keyword_candidates(
     }
 
     rows: list[dict[str, Any]] = []
-    min_cuts = max(1, args.harvest_min_cuts)
+    min_calls = max(1, args.harvest_min_expand_only_calls)
     for scope, stat in sorted(stats.items()):
         if stat.harvest_predictions == 0:
             continue
-        for tool, cut_count in stat.harvest_was_cut.most_common():
-            if cut_count < min_cuts:
+        for tool, expand_only_count in stat.harvest_was_expand_only.most_common():
+            if expand_only_count < min_calls:
                 continue
-            cut_previews = stat.harvest_cut_previews.get(tool, [])
-            if not cut_previews:
+            expand_only_previews = stat.harvest_expand_only_previews.get(tool, [])
+            if not expand_only_previews:
                 continue
-            # Noise = harvest previews where THIS tool was NOT cut.
+            # Noise = harvest previews where THIS tool was NOT expand_only.
             other_previews = [
                 p for p in noise_corpus.get(scope, [])
-                if p not in cut_previews
+                if p not in expand_only_previews
             ]
             # Determine target trigger
             target_group = _trigger_group_for_tool(tool, triggers)
@@ -1143,8 +1156,8 @@ def trigger_keyword_candidates(
                 existing_patterns = []
                 action = "create_new_trigger"
 
-            candidates = _suggest_keywords_for_cut_tool(
-                cut_previews=cut_previews,
+            candidates = _suggest_keywords_for_expand_only_tool(
+                expand_only_previews=expand_only_previews,
                 noise_previews=other_previews,
                 existing_patterns=existing_patterns,
                 min_n=args.dampener_min_n,
@@ -1158,7 +1171,7 @@ def trigger_keyword_candidates(
             rows.append({
                 "scope": scope,
                 "tool": tool,
-                "cut_count": cut_count,
+                "expand_only_count": expand_only_count,
                 "target_trigger": target_group,
                 "action": action,
                 "existing_keyword_pattern_count": len(existing_patterns),
@@ -1218,60 +1231,61 @@ def dampener_candidates(stats: dict[str, ScopeStats], args: argparse.Namespace) 
 def harvest_recommendation_rows(
     stats: dict[str, ScopeStats],
     args: argparse.Namespace,
-    protected_always_on: set[str] | None = None,
+    immutable_always_carry: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    """Per-tool promotion candidates derived from harvest telemetry.
+    """Per-tool promote-to-carry candidates derived from harvest telemetry.
 
-    Harvest rows carry ``was_cut: True`` whenever the historical model
-    called a tool that current narrowing would have gated. Each such
-    call represents a counterfactual ``expand_tools`` round-trip. The
-    direct auto-apply signal is:
+    Harvest rows carry ``was_expand_only: True`` whenever the historical model
+    called a tool the current partition would have left expand_only. Each such
+    call represents a counterfactual ``expand_tools`` round-trip. The direct
+    auto-apply signal is:
 
-        net_savings = cuts × expand_round_trip_tokens
+        net_savings = expand_only_calls × expand_round_trip_tokens
                     − predictions × per_tool_tokens
 
-    Positive net favors always-on promotion; negative favors keeping
-    the tool trigger-gated (or improving trigger recall to cover its
-    use cases). Auto-detected — emits nothing when no harvest rows are
-    present, so the function is safe to call unconditionally.
+    Positive net favors promote-to-carry; negative favors keeping the tool
+    expand_only (relying on trigger activation / explicit expansion to cover its
+    use cases). Auto-detected — emits nothing when no harvest rows are present,
+    so the function is safe to call unconditionally.
 
-    Note this is a per-tool recommendation alongside the existing
-    per-category recommendations from ``recommendation_rows`` — the
-    two views answer different questions. Per-tool ("promote terminal
-    to always_on?") is what harvest data can answer directly. Per-
-    category ("is the browser expand round-trip net-positive?") needs
-    live expand_tools events with success-rate signal, which harvest
-    can't produce.
+    Note this is a per-tool recommendation alongside the existing per-category
+    recommendations from ``recommendation_rows`` — the two views answer
+    different questions. Per-tool ("promote terminal to carry?") is what harvest
+    data can answer directly. Per-category ("is the browser expand round-trip
+    net-positive?") needs live expand_tools events with success-rate signal,
+    which harvest can't produce.
     """
     rows: list[dict[str, Any]] = []
-    protected = set(protected_always_on or BASE_PROTECTED_ALWAYS_ON)
-    min_cuts = max(1, args.harvest_min_cuts)
+    immutable = set(immutable_always_carry if immutable_always_carry is not None
+                    else preset_always_carry())
+    min_calls = max(1, args.harvest_min_expand_only_calls)
     for scope, stat in sorted(stats.items()):
         if stat.harvest_predictions == 0:
             continue
         denom = max(stat.harvest_predictions, 1)
-        for tool, cuts in stat.harvest_was_cut.most_common():
-            if tool in protected:
+        for tool, expand_only_calls in stat.harvest_was_expand_only.most_common():
+            if tool in immutable:
                 continue
-            if cuts < min_cuts:
+            if expand_only_calls < min_calls:
                 continue
-            round_trip_cost = cuts * args.expand_round_trip_tokens
+            round_trip_cost = expand_only_calls * args.expand_round_trip_tokens
             carry_cost = denom * args.per_tool_tokens
             net = round_trip_cost - carry_cost
-            cut_rate = cuts / denom
+            expand_only_rate = expand_only_calls / denom
             if net > 0:
-                action = "promote_always_on"
+                action = "promote_to_carry"
                 status = "review"
-                confidence = "medium" if cuts >= min_cuts * 3 else "low"
-            elif cut_rate >= 0.10:
-                # Frequently cut but carry cost outweighs round-trip.
-                # The right move is usually trigger broadening, not
-                # promotion. Flag it for human review.
-                action = "broaden_trigger_recall"
+                confidence = "medium" if expand_only_calls >= min_calls * 3 else "low"
+            elif expand_only_rate >= 0.10:
+                # Frequently reached for but carry cost outweighs the round-trip.
+                # The right move is usually broadening the trigger that would
+                # activate it, not making it resident. Keep it expand_only and
+                # flag for human review.
+                action = "keep_expand_only"
                 status = "review"
                 confidence = "medium"
             else:
-                action = "keep_gated"
+                action = "keep_expand_only"
                 status = "watch"
                 confidence = "medium"
             rows.append({
@@ -1283,8 +1297,8 @@ def harvest_recommendation_rows(
                 "confidence": confidence,
                 "metrics": {
                     "harvest_predictions": stat.harvest_predictions,
-                    "harvest_was_cut": cuts,
-                    "cut_rate": round(cut_rate, 4),
+                    "harvest_was_expand_only": expand_only_calls,
+                    "expand_only_rate": round(expand_only_rate, 4),
                     "round_trip_cost_tokens": round_trip_cost,
                     "carry_cost_tokens": carry_cost,
                     "net_savings_tokens": net,
@@ -1292,20 +1306,21 @@ def harvest_recommendation_rows(
                 "defaults": {
                     "expand_round_trip_tokens": args.expand_round_trip_tokens,
                     "per_tool_tokens": args.per_tool_tokens,
-                    "harvest_min_cuts": min_cuts,
+                    "harvest_min_expand_only_calls": min_calls,
                 },
                 "proposed_learned_patch": {
                     "scopes": {
                         scope: {
-                            "always_on": [tool] if action == "promote_always_on" else [],
+                            "carry": [tool] if action == "promote_to_carry" else [],
                         }
                     }
                 },
                 "reason": (
-                    f"historical sessions called {tool} {cuts} time(s) "
-                    f"({cut_rate:.1%} of predictions) where current policy "
-                    f"would have cut it; round-trip cost {round_trip_cost:,} tok "
-                    f"vs carry cost {carry_cost:,} tok → net {net:+,} tok"
+                    f"historical sessions called {tool} {expand_only_calls} time(s) "
+                    f"({expand_only_rate:.1%} of predictions) where the current "
+                    f"partition would have left it expand_only; round-trip cost "
+                    f"{round_trip_cost:,} tok vs carry cost {carry_cost:,} tok → "
+                    f"net {net:+,} tok"
                 ),
             })
     return rows
@@ -1314,10 +1329,11 @@ def harvest_recommendation_rows(
 def recommendation_rows(
     stats: dict[str, ScopeStats],
     args: argparse.Namespace,
-    protected_always_on: set[str] | None = None,
+    immutable_always_carry: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    protected = set(protected_always_on or BASE_PROTECTED_ALWAYS_ON)
+    immutable = set(immutable_always_carry if immutable_always_carry is not None
+                    else preset_always_carry())
     for scope, stat in stats.items():
         denominator = max(stat.predictions, 1)
         for category, count in stat.expansions_by_category.most_common():
@@ -1345,7 +1361,7 @@ def recommendation_rows(
                     action = "review_net_negative"
                     confidence = "low"
                 else:
-                    action = "promote_candidate"
+                    action = "promote_to_carry"
                     confidence = "medium"
                 status = "review"
             elif success_rate >= args.promote_use_rate:
@@ -1353,7 +1369,7 @@ def recommendation_rows(
                 confidence = "medium"
                 status = "watch"
             else:
-                action = "keep_gated"
+                action = "keep_expand_only"
                 confidence = "medium"
                 status = "review"
             rows.append({
@@ -1386,7 +1402,7 @@ def recommendation_rows(
                 "proposed_learned_patch": {
                     "scopes": {
                         scope: {
-                            "always_on": [category] if action == "promote_candidate" else [],
+                            "carry": [category] if action == "promote_to_carry" else [],
                         }
                     }
                 },
@@ -1400,16 +1416,16 @@ def recommendation_rows(
                 ),
             })
 
-        for tool, carried in stat.always_on_carry_turns.most_common():
-            if tool in protected:
+        for tool, carried in stat.carry_turns.most_common():
+            if tool in immutable:
                 continue
             calls = stat.tool_calls.get(tool, 0)
             if carried >= args.unused_carry_turns and calls == 0:
                 rows.append({
                     "scope": scope,
-                    "kind": "always_on_tool",
+                    "kind": "carry_tool",
                     "item": tool,
-                    "action": "demote_candidate",
+                    "action": "demote_to_expand_only",
                     "status": "review",
                     "confidence": "low",
                     "metrics": {
@@ -1424,12 +1440,12 @@ def recommendation_rows(
                     "proposed_learned_patch": {
                         "scopes": {
                             scope: {
-                                "always_off": [tool],
+                                "expand_only": [tool],
                             }
                         }
                     },
                     "reason": (
-                        f"carried as always-on for {carried} prediction turn(s) with no logged calls; "
+                        f"carried as a resident for {carried} prediction turn(s) with no logged calls; "
                         f"default review floor is {args.unused_carry_turns} turns"
                     ),
                 })
@@ -1462,7 +1478,11 @@ def recommendation_rows(
                 "defaults": {
                     "trigger_min_fires": args.trigger_min_fires,
                 },
-                "proposed_learned_patch": {"scopes": {scope: {"trigger_adjustments": {}}}},
+                # Trigger quality is advisory only. The analyzer never edits
+                # trigger groups or writes trigger adjustments into learned
+                # state (trigger definitions are immutable under the carrying
+                # model), so this recommendation proposes no learned patch.
+                "proposed_learned_patch": {"scopes": {}},
                 "reason": (
                     f"trigger fired {fires} time(s); same-prediction precision estimate {precision:.2f}; "
                     f"same-scope recall estimate {recall:.2f}. "
@@ -1547,7 +1567,7 @@ def threshold_payload(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def scope_payload(stat: ScopeStats, args: argparse.Namespace) -> dict[str, Any]:
-    protected = effective_protected_always_on(Path(__file__).resolve().parent)
+    immutable = preset_always_carry(Path(__file__).resolve().parent)
     used_events = sum(len(event_ids) for event_ids in stat.used_expansion_event_ids_by_category.values())
     expand_round_trip_total = stat.expansion_events * args.expand_round_trip_tokens
     net_savings = stat.total_tokens_saved - expand_round_trip_total
@@ -1576,10 +1596,10 @@ def scope_payload(stat: ScopeStats, args: argparse.Namespace) -> dict[str, Any]:
             for category, event_ids in stat.used_expansion_event_ids_by_category.items()
         },
         "top_tool_calls": dict(stat.tool_calls.most_common(20)),
-        "estimated_always_on_carrying_cost_tokens": {
+        "estimated_carry_cost_tokens": {
             tool: carrying_cost(turns, args.per_tool_tokens)
-            for tool, turns in stat.always_on_carry_turns.items()
-            if tool not in protected
+            for tool, turns in stat.carry_turns.items()
+            if tool not in immutable
         },
         "cohorts": _cohort_payload(stat),
         "tool_list_stability": _stability_payload(stat),
@@ -1668,7 +1688,6 @@ def format_summary(
 ) -> str:
     payload = summary_payload(stats, recs, args, dampeners)
     totals = payload["totals"]
-    protected = effective_protected_always_on(Path(__file__).resolve().parent)
     lines = [
         "tool-belt analyzer",
         f"scopes: {totals['scopes']}",
@@ -1719,7 +1738,7 @@ def markdown_report(
     generated = time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime())
     payload = summary_payload(stats, recs, args, dampeners, trigger_keywords)
     totals = payload["totals"]
-    protected = effective_protected_always_on(Path(__file__).resolve().parent)
+    immutable = preset_always_carry(Path(__file__).resolve().parent)
 
     lines = [
         "# tool-belt Analyzer Report",
@@ -1928,11 +1947,11 @@ def markdown_report(
                 )
         else:
             lines.append("- none supported by current rows")
-        lines.extend(["", "Always-on carrying cost / unused candidates:"])
+        lines.extend(["", "Carry-cost / unused demote-to-expand_only candidates:"])
         unused = [
             (tool, carried)
-            for tool, carried in stat.always_on_carry_turns.most_common()
-            if tool not in protected and stat.tool_calls.get(tool, 0) == 0 and carried >= args.unused_carry_turns
+            for tool, carried in stat.carry_turns.most_common()
+            if tool not in immutable and stat.tool_calls.get(tool, 0) == 0 and carried >= args.unused_carry_turns
         ]
         if unused:
             for tool, carried in unused[:10]:
@@ -2006,21 +2025,23 @@ def markdown_report(
     # ─── Harvest-driven sections (only present when harvest data is loaded) ───
     harvest_recs = [r for r in (recs or []) if r.get("kind") == "harvest_tool_promotion"]
     if harvest_recs:
-        lines.extend(["", "## Harvest-Driven Per-Tool Promotion Candidates", ""])
+        lines.extend(["", "## Harvest-Driven Per-Tool Promote-to-Carry Candidates", ""])
         lines.append(
             "Derived from `policy_source: harvest` rows where the historical "
-            "model called a tool that current narrowing would have cut. Each "
-            "such call is a counterfactual `expand_tools` round-trip. Action "
-            "values: `promote_always_on` (net token savings positive), "
-            "`broaden_trigger_recall` (frequent demand but per-tool carry "
-            "would lose net — fix the trigger instead), `keep_gated` (sparse)."
+            "model called a tool the current partition would have left "
+            "expand_only. Each such call is a counterfactual `expand_tools` "
+            "round-trip. Action values: `promote_to_carry` (net token savings "
+            "positive), `keep_expand_only` (either frequently reached for but "
+            "per-tool carry would lose net — broaden the activating trigger "
+            "instead — or sparse)."
         )
         lines.append("")
         for r in harvest_recs:
             m = r["metrics"]
             lines.append(
                 f"### {r['scope']} / `{r['item']}` — **{r['action']}** "
-                f"(cuts={m['harvest_was_cut']}, cut_rate={m['cut_rate']:.1%}, "
+                f"(expand_only_calls={m['harvest_was_expand_only']}, "
+                f"expand_only_rate={m['expand_only_rate']:.1%}, "
                 f"net={m['net_savings_tokens']:+,} tok)"
             )
             lines.append("")
@@ -2030,8 +2051,8 @@ def markdown_report(
     if trigger_keywords:
         lines.extend(["", "## Suggested Trigger-Keyword Candidates", ""])
         lines.append(
-            "Mined from harvest messages where the model called a tool that "
-            "would have been cut by current narrowing. Symmetric inverse of "
+            "Mined from harvest messages where the model called a tool the "
+            "current partition would have left expand_only. Symmetric inverse of "
             "the dampener flow — these add coverage, dampeners remove false "
             "fires. Review high-precision candidates before pasting into "
             "the target trigger group's `keywords` list."
@@ -2040,7 +2061,7 @@ def markdown_report(
         for row in trigger_keywords:
             lines.append(
                 f"### {row['scope']} / `{row['tool']}` → **{row['action']}** "
-                f"`{row['target_trigger']}` (cuts={row['cut_count']}, "
+                f"`{row['target_trigger']}` (expand_only_calls={row['expand_only_count']}, "
                 f"existing patterns={row['existing_keyword_pattern_count']})"
             )
             lines.append("")
@@ -2048,7 +2069,7 @@ def markdown_report(
                 lines.append(
                     f"- pattern `{cand['pattern']}` → regex `{cand['suggested_regex']}`  "
                     f"(precision {cand['precision']:.2f}, "
-                    f"cut={cand['cut_count']}, noise={cand['noise_count']})"
+                    f"support={cand['support_count']}, noise={cand['noise_count']})"
                 )
                 for sample in cand.get("sample_previews", []):
                     lines.append(f"    - {sample}")
@@ -2122,12 +2143,14 @@ def parse_args() -> argparse.Namespace:
                         help="Shortest n-gram length to consider (default 2)")
     parser.add_argument("--dampener-max-n", type=int, default=DEFAULT_DAMPENER_MAX_N,
                         help="Longest n-gram length to consider (default 4)")
-    parser.add_argument("--harvest-min-cuts", type=int, default=3,
-        help="Minimum was_cut count before a tool surfaces as a harvest-driven "
-             "promotion candidate. Filters thin-signal noise. (default: 3)")
+    parser.add_argument("--harvest-min-expand-only-calls", type=int, default=3,
+        help="Minimum was_expand_only call count before a tool surfaces as a "
+             "harvest-driven promote-to-carry candidate. Filters thin-signal "
+             "noise. (default: 3)")
     parser.add_argument("--suggest-trigger-keywords", action="store_true",
-        help="Mine cut-tool message previews for candidate trigger keywords. "
-             "Symmetric inverse of --suggest-dampeners. Requires harvest data.")
+        help="Mine expand_only-tool message previews for candidate trigger "
+             "keywords. Symmetric inverse of --suggest-dampeners. Requires "
+             "harvest data.")
     parser.add_argument("--dampener-max-candidates", type=int, default=DEFAULT_DAMPENER_MAX_CANDIDATES,
                         help="Max candidates surfaced per (scope, trigger)")
     return parser.parse_args()
@@ -2137,11 +2160,14 @@ def main() -> int:
     args = parse_args()
     predictions_paths = telemetry_paths(args.state_dir, "predictions.jsonl", args.include_archives)
     tool_calls_paths = telemetry_paths(args.state_dir, "tool_calls.jsonl", args.include_archives)
-    predictions = load_rows(predictions_paths)
-    tool_calls = load_rows(tool_calls_paths)
+    # Read every row through the central adapter so all downstream consumers
+    # (collect_stats, cache-cost, source counts) see canonical carrying-model
+    # fields regardless of the on-disk schema version.
+    predictions = [logger_io.normalize_prediction_row(r) for r in load_rows(predictions_paths)]
+    tool_calls = [logger_io.normalize_tool_call_row(r) for r in load_rows(tool_calls_paths)]
     stats = collect_stats(predictions, tool_calls)
-    protected_always_on = effective_protected_always_on(Path(__file__).resolve().parent)
-    recs = recommendation_rows(stats, args, protected_always_on) + harvest_recommendation_rows(stats, args, protected_always_on)
+    immutable_always_carry = preset_always_carry(Path(__file__).resolve().parent)
+    recs = recommendation_rows(stats, args, immutable_always_carry) + harvest_recommendation_rows(stats, args, immutable_always_carry)
     dampeners = dampener_candidates(stats, args)
     trigger_keywords = trigger_keyword_candidates(stats, args)
 

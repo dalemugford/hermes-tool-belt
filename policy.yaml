@@ -60,36 +60,12 @@ carry:
   - write_file
   - patch
 
-# always_on — TRANSITIONAL COMPAT MIRROR of (always_carry ∪ carry). The 1.0
-# resolver (presets.py) does NOT read this; it parses always_carry/carry above.
-# It is retained ONLY so the not-yet-migrated analyzer
-# (analyze.py:_load_preset_always_on → effective_protected_always_on) and the
-# drift check (scripts/check-tool-drift.py) still see the full resident set.
-# Keep it in sync with always_carry+carry until those readers learn the v2
-# schema, then delete this block.
-always_on:
-  - clarify
-  - skill_view
-  - skills_list
-  - todo
-  - send_message
-  - expand_tools
-  - mnemosyne_remember
-  - mnemosyne_recall
-  - mnemosyne_invalidate
-  - web_search
-  - read_file
-  - search_files
-  - process
-  - terminal
-  - write_file
-  - patch
-
 # NOTE — no always_off under the 1.0 model. The pre-1.0 always_off tools
 # (memory, tool_search, tool_describe, tool_call) are now ordinary derived
 # expand_only whenever Hermes includes them in E; Tool Search still manages its
-# own bridge activation. BASE_PROTECTED_ALWAYS_ON (analyze.py) still shields the
-# bridge tools from demotion suggestions.
+# own bridge activation. The analyzer never demotes an immutable always_carry
+# resident, and an enabled tool outside always_carry/carry is simply expand_only
+# — so no separate demotion shield is needed.
 
 # Triggered tool groups. Each group fires when ANY of its signals match.
 # When a group fires, all listed tools are added to the active set.
