@@ -82,7 +82,7 @@ methodology for measuring your own is in
 
 Two commands. Install, then configure. The examples assume the launcher is
 installed (onboarding offers this after your first apply; or link it by hand:
-`mkdir -p ~/.hermes/bin && ln -s ~/.hermes/plugins/tool-belt/tool-belt ~/.hermes/bin/tool-belt`).
+`mkdir -p ~/.local/bin && ln -s ~/.hermes/plugins/tool-belt/tool-belt ~/.local/bin/tool-belt`).
 
 ```bash
 hermes plugins install dalemugford/hermes-tool-belt

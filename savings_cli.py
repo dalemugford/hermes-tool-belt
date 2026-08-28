@@ -156,17 +156,35 @@ exec {executable} "$@"
 """
 
 
-def launcher_path(hermes_home: Path) -> Path:
+def user_local_bin() -> Path:
+    """The user-level bin dir the Hermes installer guarantees is on PATH."""
+    return Path.home() / ".local" / "bin"
+
+
+def launcher_path(hermes_home: Path, *, user_home: Path | None = None) -> Path:
+    """Where the ``tool-belt`` command launcher should live.
+
+    Prefers ``~/.local/bin`` — the directory the Hermes installer itself
+    guarantees is on PATH (it links ``hermes`` there and appends it to the
+    shell profile). Falls back to ``$HERMES_HOME/bin`` only when
+    ``~/.local/bin`` does not exist (headless/CI homes, custom installs);
+    that directory is deliberately NOT on PATH by Hermes convention.
+    """
+    home = user_home or Path.home()
+    local_bin = home / ".local" / "bin"
+    if local_bin.is_dir():
+        return local_bin / "tool-belt"
     return Path(hermes_home) / "bin" / "tool-belt"
 
 
 def path_guidance(hermes_home: Path) -> str:
-    bin_dir = Path(hermes_home) / "bin"
+    target = launcher_path(hermes_home)
     return (
-        f"Add {bin_dir} to your PATH to run `tool-belt savings` directly:\n"
-        f'  export PATH="{bin_dir}:$PATH"\n'
+        f"`tool-belt` is not on your PATH yet. Open a new terminal, or add its"
+        f" directory now:\n"
+        f'  export PATH="{target.parent}:$PATH"\n'
         f"Until then, run it by full path:\n"
-        f"  {launcher_path(hermes_home)} savings"
+        f"  {target} savings"
     )
 
 
@@ -177,15 +195,18 @@ def ensure_launcher(
     confirm: Callable[[str], bool],
     python: str | None = None,
     out: Callable[[str], None] = print,
+    user_home: Path | None = None,
 ) -> bool:
-    """Idempotently offer to create ``$HERMES_HOME/bin/tool-belt``.
+    """Idempotently offer to install the ``tool-belt`` command launcher.
 
-    Never writes silently: ``confirm`` must return True. Returns True if the
-    launcher exists (already present, or created now). Prints PATH guidance when
-    ``$HERMES_HOME/bin`` is not on PATH. Intended for Phase 8 onboarding — this
-    function is the *only* writing surface in the CLI module.
+    Prefers ``~/.local/bin`` (on PATH for standard Hermes installs); falls
+    back to ``$HERMES_HOME/bin`` when ``~/.local/bin`` does not exist. Never
+    writes silently: ``confirm`` must return True. Returns True if the
+    launcher exists (already present, or created now). Prints PATH guidance
+    when the launcher's directory is not on PATH. Intended for onboarding —
+    this function is the *only* writing surface in the CLI module.
     """
-    target = launcher_path(hermes_home)
+    target = launcher_path(hermes_home, user_home=user_home)
     if target.exists():
         out(f"Launcher already present: {target}")
         _maybe_path_note(hermes_home, out)
@@ -207,7 +228,7 @@ def ensure_launcher(
 
 
 def _maybe_path_note(hermes_home: Path, out: Callable[[str], None]) -> None:
-    bin_dir = str(Path(hermes_home) / "bin")
+    bin_dir = str(launcher_path(hermes_home).parent)
     path_entries = os.environ.get("PATH", "").split(os.pathsep)
     if bin_dir not in path_entries:
         out(path_guidance(hermes_home))

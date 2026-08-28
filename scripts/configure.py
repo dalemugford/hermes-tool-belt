@@ -1089,7 +1089,7 @@ def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
 
 
 def _offer_launcher(ctx: RunContext) -> None:
-    """Offer the ``$HERMES_HOME/bin/tool-belt`` launcher after a confirmed apply.
+    """Offer the ``tool-belt`` command launcher after a confirmed apply.
 
     Only after a confirmed apply, only via the CLI module's confirmed helper —
     never as a side effect of a report or a dry run.

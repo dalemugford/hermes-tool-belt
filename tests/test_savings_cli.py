@@ -645,19 +645,21 @@ class LauncherHelperTests(_HomeCase):
 
     def test_launcher_requires_confirmation(self):
         msgs = []
+        user_home = Path(self.tmp.name) / "barehome"  # no ~/.local/bin → fallback
         created = savings_cli.ensure_launcher(
             self.home, PLUGIN_DIR / "tool-belt",
-            confirm=lambda _p: False, out=msgs.append)
+            confirm=lambda _p: False, out=msgs.append, user_home=user_home)
         self.assertFalse(created)
-        self.assertFalse(savings_cli.launcher_path(self.home).exists())
+        self.assertFalse(savings_cli.launcher_path(self.home, user_home=user_home).exists())
 
     def test_launcher_created_on_confirmation(self):
         msgs = []
+        user_home = Path(self.tmp.name) / "barehome"  # no ~/.local/bin → fallback
         created = savings_cli.ensure_launcher(
             self.home, PLUGIN_DIR / "tool-belt",
-            confirm=lambda _p: True, out=msgs.append)
+            confirm=lambda _p: True, out=msgs.append, user_home=user_home)
         self.assertTrue(created)
-        launcher = savings_cli.launcher_path(self.home)
+        launcher = savings_cli.launcher_path(self.home, user_home=user_home)
         self.assertTrue(launcher.exists())
         self.assertTrue(os.access(launcher, os.X_OK))
 
@@ -677,10 +679,46 @@ class LauncherHelperTests(_HomeCase):
         savings_cli.ensure_launcher(
             self.home, repo, confirm=lambda _p: True,
             python="/python env/bin/python3", out=lambda _m: None,
+            user_home=self.home,
         )
-        content = savings_cli.launcher_path(self.home).read_text(encoding="utf-8")
+        content = savings_cli.launcher_path(self.home, user_home=self.home).read_text(
+            encoding="utf-8")
         self.assertIn("HERMES_PYTHON='/python env/bin/python3'", content)
         self.assertIn("exec '" + str(repo) + "' \"$@\"", content)
+
+    def test_launcher_prefers_user_local_bin(self):
+        """A standard install gets ~/.local/bin — the dir the Hermes installer
+        guarantees is on PATH. $HERMES_HOME/bin is never on PATH by design."""
+        user_home = Path(self.tmp.name) / "userhome"
+        (user_home / ".local" / "bin").mkdir(parents=True)
+        target = savings_cli.launcher_path(self.home, user_home=user_home)
+        self.assertEqual(target.parent, user_home / ".local" / "bin")
+        created = savings_cli.ensure_launcher(
+            self.home, PLUGIN_DIR / "tool-belt",
+            confirm=lambda _p: True, out=lambda _m: None,
+            user_home=user_home,
+        )
+        self.assertTrue(created)
+        self.assertTrue(target.exists())
+        self.assertTrue(os.access(target, os.X_OK))
+
+    def test_launcher_falls_back_when_no_user_local_bin(self):
+        """Homes without ~/.local/bin (headless/CI) fall back to
+        $HERMES_HOME/bin and receive PATH guidance for it."""
+        user_home = Path(self.tmp.name) / "barehome"  # exists, no .local/bin
+        msgs = []
+        created = savings_cli.ensure_launcher(
+            self.home, PLUGIN_DIR / "tool-belt",
+            confirm=lambda _p: True, out=msgs.append,
+            user_home=user_home,
+        )
+        self.assertTrue(created)
+        target = self.home / "bin" / "tool-belt"
+        self.assertTrue(target.exists())
+        self.assertTrue(
+            any("$HOME/.hermes" not in m and (str(self.home / "bin") in m
+                or "not on your PATH" in m) for m in msgs),
+            f"expected PATH guidance mentioning the launcher dir, got {msgs}")
 
 
 def _snapshot(root: Path) -> dict:
