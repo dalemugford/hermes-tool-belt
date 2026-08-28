@@ -101,6 +101,7 @@ import os
 import time
 from typing import Any
 
+from . import carrying as carrying_mod
 from . import expand_tools as expand_tools_mod
 from . import logger_io
 from . import predictor as predictor_mod
@@ -315,106 +316,112 @@ def _wrap_build_api_kwargs(original):
                 str(getattr(self, "provider", "") or kwargs.get("provider", "") or ""),
             )
 
-            allowed = state.get("allowed_tool_names")
+            active_names = state.get("active_tool_names")
             expansions = state.get("expansions") or set()
-            known = state.get("known_tool_names") or set()
 
-            # Wildcard: don't narrow, but still log on first call
-            if allowed == WILDCARD_ALWAYS_ON or allowed is None:
-                names = _tool_names(tools)
-                state["ceiling_tools"] = names
+            # Snapshot the live enabled ceiling once per turn. Split into the
+            # built-in ceiling ``E`` (the partition domain) and MCP/plugin
+            # passthrough names (outside the built-in partition). Captured here
+            # — the first _build_api_kwargs call — so expand_tools has the
+            # enabled ceiling recorded before it can report any activation.
+            ceiling_names = _tool_names(tools)
+            state["ceiling_tools"] = ceiling_names
+            builtin_ceiling: set[str] = set()
+            mcp_passthrough_names: list[str] = []
+            for name in ceiling_names:
+                base_name = _base_tool_name(name)
+                # Hermes prefixes tool names with "mcp_" on the Claude Code
+                # OAuth path (anthropic_adapter.py). Strip it before matching.
+                if _is_mcp_tool(name) or _is_mcp_tool(base_name):
+                    mcp_passthrough_names.append(name)
+                else:
+                    builtin_ceiling.add(base_name)
+            state.setdefault("enabled_ceiling", sorted(builtin_ceiling))
+            state.setdefault("mcp_passthrough_tools", mcp_passthrough_names)
+
+            # Wildcard / no-narrowing (preset wildcard or A/B bypass): don't
+            # narrow, but still log on the first call.
+            if active_names == WILDCARD_ALWAYS_ON or active_names is None:
                 # Snapshot once per prediction. Subsequent _build_api_kwargs
                 # calls within the same turn (after the model used a tool
                 # like expand_tools) must not overwrite the "what the model
-                # initially saw" record — otherwise expansion-driven calls
-                # look like they were available from the start.
-                state.setdefault("initial_allowed_tools", names)
-                state.setdefault("cut_tools", [])
-                state.setdefault("unknown_kept_tools", [])
+                # initially saw" record.
+                state.setdefault("initial_active_tools", ceiling_names)
+                state.setdefault("expand_only_tools", [])
                 state["last_tool_list_hash"] = _tool_list_hash(tools)
                 state["last_system_hash"] = _system_message_hash(api_messages)
                 state["api_call_idx"] = int(state.get("api_call_idx", 0)) + 1
                 _maybe_log_prediction(state, ceiling=tools, narrowed=tools)
                 return kwargs
 
-            allowed_set = set(allowed) if isinstance(allowed, list) else set()
-            allowed_set |= expansions  # user-expanded categories add tools
+            # Resolve explicit expansions (expand_tools) — a category name
+            # resolves through Hermes' toolset table to its member tool names.
+            # Sticky residency (cache-off) is an activation source too, never a
+            # residency change, so it joins the expanded set.
+            expanded_names: set[str] = set(expansions)
+            for item in expansions:
+                expanded_names |= _resolve_category_to_tools(item)
+            expanded_names |= set(state.get("sticky_tools") or [])
 
-            # When expansions name a CATEGORY (toolset name) rather than tool
-            # names directly, resolve them through Hermes' toolset table.
-            for cat in expansions:
-                allowed_set |= _resolve_category_to_tools(cat)
+            triggered_names = set(state.get("triggered_tools") or [])
 
-            # Apply safe-default for unknown tools: if a tool in the ceiling
-            # is not mentioned anywhere in the preset, keep it on
+            # Finalize the three strata (A/C/X) and the per-message active set
+            # against the LIVE enabled ceiling. No selection source can add a
+            # tool absent from ``E``; unknown enabled built-ins fall to
+            # expand_only and are cut unless triggered/expanded.
+            model = carrying_mod.resolve(
+                enabled=builtin_ceiling,
+                always_carry=set(state.get("resolved_always_carry") or []),
+                carry=set(state.get("resolved_carry") or []),
+                triggered=triggered_names,
+                expanded=expanded_names,
+                passthrough=set(),  # passthrough handled directly on the tool list
+                demoted=set(state.get("demoted_tools") or []),
+                prior_active=set(state.get("prior_active_tools") or []),
+            )
+            active_set = model.active
+
             filtered = []
-            ceiling_names = []
-            cut_names = []
-            unknown_kept_names = []
-            mcp_passthrough_names = []
+            expand_only_names = []
             for t in tools:
                 if not isinstance(t, dict):
                     continue
-                # Anthropic format: top-level "name". OpenAI format: function.name.
                 name = _tool_name(t)
                 if not name:
                     continue
-                ceiling_names.append(name)
-                # Hermes prefixes tool names with "mcp_" when sending to Anthropic
-                # via the Claude Code OAuth path (anthropic_adapter.py:1774-1778).
-                # Strip that prefix for matching against our preset, which uses
-                # the canonical (unprefixed) tool names.
                 base_name = _base_tool_name(name)
-                # MCP tools: pass through without narrowing. Tool Search
-                # manages MCP/plugin tool discovery — Tool Belt shapes
-                # built-in tools only. This keeps the two systems on
-                # separate layers and prevents Tool Belt from cutting an
-                # MCP tool that Tool Search's bridge would have served.
+                # MCP/plugin tools pass through without narrowing — Tool Search
+                # owns their discovery; Tool Belt shapes built-in tools only.
                 if _is_mcp_tool(name) or _is_mcp_tool(base_name):
                     filtered.append(t)
-                    mcp_passthrough_names.append(name)
                     continue
-                if base_name in allowed_set:
+                if base_name in active_set:
                     filtered.append(t)
-                elif base_name not in known:
-                    filtered.append(t)
-                    unknown_kept_names.append(name)
                 else:
-                    cut_names.append(name)
+                    expand_only_names.append(name)
 
             # Diagnostic: log what's happening on the FIRST call per turn.
             if not state.get("logged"):
                 logger.info(
-                    "tool-belt: filter input tools=%d allowed_set=%d known=%d "
-                    "→ kept=%d cut=%d (sample_names=%s, sample_cut=%s)",
-                    len(tools), len(allowed_set), len(known),
-                    len(filtered), len(cut_names),
-                    ceiling_names[:5], cut_names[:5],
+                    "tool-belt: filter input tools=%d active=%d → kept=%d "
+                    "expand_only=%d (sample_names=%s, sample_expand_only=%s)",
+                    len(tools), len(active_set),
+                    len(filtered), len(expand_only_names),
+                    ceiling_names[:5], expand_only_names[:5],
                 )
-                # Drift alarm: any ceiling tool not named in the preset is
-                # kept on as an unknown (safe default). That silently defeats
-                # narrowing when upstream adds tools, so surface it loudly —
-                # once per turn — instead of letting it hide in the counts.
-                if unknown_kept_names:
-                    logger.warning(
-                        "tool-belt: %d tools in ceiling not named in preset "
-                        "(kept on as unknown): %s. Run "
-                        "scripts/check-tool-drift.py to update policy.yaml.",
-                        len(unknown_kept_names),
-                        sorted(unknown_kept_names)[:10],
-                    )
 
             kwargs = dict(kwargs)
             kwargs["tools"] = filtered
 
-            state["ceiling_tools"] = ceiling_names
-            # Snapshot once per prediction — see wildcard branch above. The
-            # filtered list on later calls reflects post-expansion state and
-            # would otherwise pollute "initial" with expansion-added tools.
-            state.setdefault("initial_allowed_tools", _tool_names(filtered))
-            state.setdefault("cut_tools", cut_names)
-            state.setdefault("mcp_passthrough_tools", mcp_passthrough_names)
-            state.setdefault("unknown_kept_tools", unknown_kept_names)
+            # Snapshot once per prediction — the filtered list on later calls
+            # reflects post-expansion state and would otherwise pollute
+            # "initial" with expansion-added tools.
+            state.setdefault("initial_active_tools", _tool_names(filtered))
+            state.setdefault("expand_only_tools", expand_only_names)
+            # Record the resolved partition for telemetry / attribution.
+            state["carry_always_carry"] = sorted(model.always_carry)
+            state["carry_carry"] = sorted(model.carry)
+            state["carry_expand_only"] = sorted(model.expand_only)
 
             # Per-call hash for response-side correlation with
             # cache_read_tokens. Updated every API call so intra-turn
@@ -1003,9 +1010,12 @@ def _maybe_log_prediction(
             narrowed_tokens=logger_io.estimate_tokens(narrowed),
             tokens_estimator=logger_io.token_estimator_name(),
             ceiling_tools=list(state.get("ceiling_tools") or _tool_names(ceiling)),
-            allowed_tools=list(state.get("initial_allowed_tools") or _tool_names(narrowed)),
-            cut_tools=list(state.get("cut_tools") or []),
-            unknown_kept_tools=list(state.get("unknown_kept_tools") or []),
+            allowed_tools=list(state.get("initial_active_tools") or _tool_names(narrowed)),
+            cut_tools=list(state.get("expand_only_tools") or []),
+            # Unknown-kept behavior was removed in Tool Belt 1.0 (unknown
+            # enabled built-ins now fall to expand_only). Field retained empty
+            # as a temporary telemetry adapter until the Phase 5 schema cutover.
+            unknown_kept_tools=[],
             mcp_passthrough_tools=list(state.get("mcp_passthrough_tools") or []),
             always_on_tools=list(state.get("always_on_tools") or []),
             trigger_tools_by_group=dict(state.get("trigger_tools_by_group") or {}),
@@ -1121,18 +1131,6 @@ def _install_patches() -> bool:
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
-
-def _all_known_tool_names(preset) -> set[str]:
-    known: set[str] = set()
-    if isinstance(preset.always_on, list):
-        known.update(preset.always_on)
-    for group in preset.triggers:
-        known.update(group.tools)
-    # always_off tools are "known" too — naming them lets the safe-default
-    # cut them instead of keeping them on as unknowns.
-    known.update(getattr(preset, "always_off", []) or [])
-    return known
-
 
 def _attachments_from_event(event: Any) -> list[str]:
     out: list[str] = []
@@ -1299,9 +1297,8 @@ def _resolve_cache_mode_for_session(session_id: str, scope: str = "") -> str:
 def _freeze_session_snapshot(
     session_id: str,
     *,
-    allowed_tool_names: Any,
-    baseline_allowed_tools: Any,
-    known_tool_names: set[str],
+    active_tool_names: Any,
+    baseline_active_tools: Any,
     preset_name: str,
     always_on_count: int,
     always_on_tools: list[str],
@@ -1313,22 +1310,32 @@ def _freeze_session_snapshot(
     learned_mode: str,
     learned_scope: str,
     learned_changes: list[str],
+    resolved_always_carry: list[str] | None = None,
+    resolved_carry: list[str] | None = None,
+    triggered_tools: list[str] | None = None,
 ) -> None:
-    """Persist the first dispatch's tool-set decision for the session.
+    """Persist the first dispatch's carrying decision for the session.
 
-    Captured on the first dispatch under cache-on mode and reused on
-    every subsequent dispatch in the same session. Session reset and
+    Captured on the first dispatch under cache-on mode. The residency
+    assignment (``resolved_always_carry`` / ``resolved_carry``) freezes here;
+    trigger matching still runs on every later message and monotonically
+    unions newly triggered tools into ``triggered_tools`` (see
+    ``_on_pre_gateway_dispatch``'s frozen-reuse branch). Session reset and
     context compaction evict the snapshot.
 
-    ``triggers_fired`` / ``trigger_tools_by_group`` are stored on the
-    snapshot so subsequent turns' telemetry rows can describe the
-    decision honestly (this is what was triggered when we froze) rather
-    than blanking out as if the predictor never ran.
+    ``triggers_fired`` / ``trigger_tools_by_group`` are stored so subsequent
+    turns' telemetry rows can describe the decision honestly rather than
+    blanking out as if the predictor never ran.
     """
     _FROZEN_BY_SESSION[session_id] = {
-        "allowed_tool_names": allowed_tool_names,
-        "baseline_allowed_tools": baseline_allowed_tools,
-        "known_tool_names": known_tool_names,
+        "active_tool_names": active_tool_names,
+        "baseline_active_tools": baseline_active_tools,
+        # Frozen residency strata — the A/C loadout does not change in-session.
+        "resolved_always_carry": list(resolved_always_carry or []),
+        "resolved_carry": list(resolved_carry or []),
+        # Monotonic accumulator of trigger-activated (expand_only) tool names.
+        # Grows at most once per newly firing trigger group across the session.
+        "triggered_tools": list(triggered_tools or []),
         "expansions": set(),  # grown by expand_tools mid-session
         "preset_name": preset_name,
         "always_on_count": always_on_count,
@@ -1372,9 +1379,18 @@ def _build_state_from_frozen(
     frozen["reuses"] = int(frozen.get("reuses", 0)) + 1
     return {
         "prediction_id": logger_io.new_prediction_id(),
-        "allowed_tool_names": frozen["allowed_tool_names"],
-        "baseline_allowed_tools": frozen["baseline_allowed_tools"],
-        "known_tool_names": frozen["known_tool_names"],
+        "active_tool_names": frozen["active_tool_names"],
+        "baseline_active_tools": frozen["baseline_active_tools"],
+        # Frozen residency strata — the A/C loadout is fixed per session.
+        "resolved_always_carry": list(frozen.get("resolved_always_carry") or []),
+        "resolved_carry": list(frozen.get("resolved_carry") or []),
+        # Trigger matching still runs each message under freeze; the caller
+        # merges newly fired trigger tools into ``frozen["triggered_tools"]``
+        # before this state is built, so the accumulated set is authoritative.
+        "triggered_tools": list(frozen.get("triggered_tools") or []),
+        # Accumulation lives in triggered_tools + expansions; no extra prior
+        # carry-forward is needed to keep the active set monotonic.
+        "prior_active_tools": [],
         # Carry expansions forward in-session — this is the core of the
         # "stay frozen, including prior expansions" behavior.
         "expansions": set(frozen.get("expansions") or set()),
@@ -1468,14 +1484,45 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         if isinstance(message, str) and message.strip().startswith("/"):
             return None
 
-        # Cache-on freeze: when this session already has a
-        # frozen tool-set decision, reuse it verbatim and skip the
-        # predictor entirely. The frozen path also disables sticky and
-        # lookback by construction.
+        # Cache-on freeze: when this session already has a frozen carrying
+        # decision, reuse the frozen residency. Residency stays fixed, but
+        # trigger matching still runs on every inbound message: a lightweight
+        # prediction on this message can activate a new expand_only tool. Newly
+        # fired trigger tools are monotonically unioned into the frozen active
+        # set (recorded distinctly from explicit expansion) and remain until
+        # session reset. Sticky/lookback stay disabled by construction.
         cache_decision = _resolve_cache_mode_for_session(str(session_id), scope=scope)
         if cache_decision == "on" and session_id and session_id in _FROZEN_BY_SESSION:
             frozen = _FROZEN_BY_SESSION[session_id]
-            _PREDICTION_CV.set(_build_state_from_frozen(
+            try:
+                preset = presets_mod.resolve_preset(_CONFIG, scope)
+                reprediction = predictor_mod.predict(message, attachments, preset)
+                new_trigger_tools = _trigger_tools_by_group(preset, reprediction.triggers_fired)
+                prior_triggered = set(frozen.get("triggered_tools") or [])
+                fresh_tools: set[str] = set()
+                for tools_list in new_trigger_tools.values():
+                    fresh_tools |= set(tools_list)
+                added = fresh_tools - prior_triggered
+                if added:
+                    # A new trigger group fired — grow the frozen active set
+                    # once. Record the trigger-driven mutation separately from
+                    # explicit expansion so attribution never confuses the two.
+                    frozen["triggered_tools"] = sorted(prior_triggered | fresh_tools)
+                    merged_groups = dict(frozen.get("trigger_tools_by_group") or {})
+                    merged_groups.update(new_trigger_tools)
+                    frozen["trigger_tools_by_group"] = merged_groups
+                    frozen["triggers_fired_at_freeze"] = sorted(
+                        set(frozen.get("triggers_fired_at_freeze") or [])
+                        | set(reprediction.triggers_fired)
+                    )
+                    frozen["last_trigger_mutation"] = {
+                        "tools_added": sorted(added),
+                        "groups": sorted(new_trigger_tools.keys()),
+                    }
+            except Exception as exc:
+                logger.debug("tool-belt: cache-on re-trigger failed: %s", exc)
+                added = set()
+            built = _build_state_from_frozen(
                 frozen,
                 session_id=str(session_id),
                 hermes_session_id=hermes_session_id,
@@ -1484,7 +1531,10 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
                 agent=agent,
                 platform=platform,
                 message=message,
-            ))
+            )
+            if added:
+                built["trigger_driven_mutation"] = True
+            _PREDICTION_CV.set(built)
             return None
 
         # Under cache-on, the freeze about to happen makes sticky residency
@@ -1512,9 +1562,11 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
 
         preset = presets_mod.resolve_preset(_CONFIG, scope)
         prediction = predictor_mod.predict(predictor_input, attachments, preset)
-        known = _all_known_tool_names(preset)
         always_on_tools = list(preset.always_on) if isinstance(preset.always_on, list) else []
+        resolved_always_carry = list(getattr(preset, "always_carry", []) or [])
+        resolved_carry = list(getattr(preset, "carry", []) or [])
         trigger_tools = _trigger_tools_by_group(preset, prediction.triggers_fired)
+        triggered_tool_names = sorted({t for tools in trigger_tools.values() for t in tools})
 
         if cache_on:
             sticky_tools: list[str] = []
@@ -1527,7 +1579,7 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             _decay_sticky(sticky_key)
             sticky_tools, sticky_categories, sticky_remaining = _live_sticky(sticky_key)
 
-        allowed_tool_names = prediction.allowed_tool_names
+        active_tool_names = prediction.active_tool_names
         # Capture the pre-sticky baseline. This is the set the model would
         # see *without* any prior expansion (sticky carries tools forward
         # only because a prior turn ran expand_tools). The credit decision
@@ -1536,22 +1588,22 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         # expand". WILDCARD is preserved (bypass cohort / wildcard always_on
         # already see every tool — nothing to attribute to expansion).
         # Under cache-on, sticky_tools is empty so the merge is a no-op.
-        if allowed_tool_names == WILDCARD_ALWAYS_ON or allowed_tool_names is None:
-            baseline_allowed_tools: Any = WILDCARD_ALWAYS_ON
+        if active_tool_names == WILDCARD_ALWAYS_ON or active_tool_names is None:
+            baseline_active_tools: Any = WILDCARD_ALWAYS_ON
         else:
-            baseline_allowed_tools = sorted(set(allowed_tool_names))
+            baseline_active_tools = sorted(set(active_tool_names))
             if sticky_tools:
-                allowed_tool_names = sorted(set(allowed_tool_names) | set(sticky_tools))
+                active_tool_names = sorted(set(active_tool_names) | set(sticky_tools))
 
         # A/B baseline: deterministically bypass narrowing for a fraction of
         # sessions. The predictor still ran so we keep telemetry, but the
-        # allowed set widens to the full ceiling and the policy_source is
+        # active set widens to the full ceiling and the policy_source is
         # stamped so the analyzer can compare cohorts. Under cache-on this
         # is decided once and frozen for the session's life — no per-turn
         # flap risk.
         bypassed = _should_bypass(scope, str(session_id))
         if bypassed:
-            allowed_tool_names = WILDCARD_ALWAYS_ON
+            active_tool_names = WILDCARD_ALWAYS_ON
             # Bypass means WILDCARD — sticky/lookback aren't narrowing
             # anything, so their telemetry fields would falsely imply
             # narrowing signal in the bypass cohort. Zero them out for
@@ -1564,9 +1616,14 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
 
         _PREDICTION_CV.set({
             "prediction_id": logger_io.new_prediction_id(),
-            "allowed_tool_names": allowed_tool_names,
-            "baseline_allowed_tools": baseline_allowed_tools,
-            "known_tool_names": known,
+            "active_tool_names": active_tool_names,
+            "baseline_active_tools": baseline_active_tools,
+            # Residency strata carried separately so the partition can be
+            # finalized against the live enabled ceiling in _build_api_kwargs.
+            "resolved_always_carry": resolved_always_carry,
+            "resolved_carry": resolved_carry,
+            "triggered_tools": triggered_tool_names,
+            "prior_active_tools": [],
             "expansions": set(),
             "channel": channel,
             "agent": agent,
@@ -1580,7 +1637,10 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             "preset": prediction.preset_name,
             "triggers_fired": prediction.triggers_fired,
             "triggers_suppressed": prediction.triggers_suppressed,
-            "always_on_count": prediction.always_on_count,
+            # Temporary telemetry adapter: the writer still emits a single
+            # ``always_on_count`` (residents = always_carry + carry) until the
+            # Phase 5 schema cutover splits it into per-class counts.
+            "always_on_count": prediction.always_carry_count + prediction.carry_count,
             "always_on_tools": always_on_tools,
             "trigger_tools_by_group": trigger_tools,
             "sticky_tools": sticky_tools,
@@ -1604,11 +1664,10 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         if cache_decision == "on" and session_id:
             _freeze_session_snapshot(
                 str(session_id),
-                allowed_tool_names=allowed_tool_names,
-                baseline_allowed_tools=baseline_allowed_tools,
-                known_tool_names=known,
+                active_tool_names=active_tool_names,
+                baseline_active_tools=baseline_active_tools,
                 preset_name=prediction.preset_name,
-                always_on_count=prediction.always_on_count,
+                always_on_count=prediction.always_carry_count + prediction.carry_count,
                 always_on_tools=always_on_tools,
                 trigger_tools_by_group=trigger_tools,
                 triggers_fired=prediction.triggers_fired,
@@ -1618,6 +1677,9 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
                 learned_mode=getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "recommend")),
                 learned_scope=getattr(preset, "learned_scope", ""),
                 learned_changes=list(getattr(preset, "learned_changes", []) or []),
+                resolved_always_carry=resolved_always_carry,
+                resolved_carry=resolved_carry,
+                triggered_tools=triggered_tool_names,
             )
     except Exception as exc:
         logger.warning("tool-belt: pre_gateway_dispatch failed: %s", exc)
@@ -1674,22 +1736,22 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
         session_id = kwargs.get("session_id") or task_id or ""
         if tool_name:
             tool = str(tool_name)
-            initial_allowed = set(state.get("initial_allowed_tools") or []) if state else set()
-            # Baseline = the allowed set *before* sticky carry-over merged in.
+            initial_allowed = set(state.get("initial_active_tools") or []) if state else set()
+            # Baseline = the active set *before* sticky carry-over merged in.
             # Used for credit attribution: a tool only sticky-carries because
             # a prior expand_tools ran — those calls should be credited to
             # expansion, not classified as "initially available."
             # Falls back to initial_allowed for rows written before this
             # field existed; WILDCARD means "no narrowing", every tool is
             # initially available.
-            baseline_raw = state.get("baseline_allowed_tools") if state else None
+            baseline_raw = state.get("baseline_active_tools") if state else None
             if baseline_raw == WILDCARD_ALWAYS_ON:
                 baseline_allowed: set[str] | None = None  # None means "everything"
             elif baseline_raw is None:
                 baseline_allowed = set(initial_allowed)
             else:
                 baseline_allowed = set(baseline_raw)
-            cut_tools = set(state.get("cut_tools") or []) if state else set()
+            cut_tools = set(state.get("expand_only_tools") or []) if state else set()
             expanded = set(state.get("expansions") or set()) if state else set()
             pending_expansion = dict(state.get("pending_expansion") or {}) if state else {}
             if state:

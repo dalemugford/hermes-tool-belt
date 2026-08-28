@@ -623,5 +623,42 @@ class CacheOnFrozenActiveSetContract(_CarryingContract):
                          "re-trigger does not regrow the frozen active set")
 
 
+# ─── 16. cache-off trigger activation is per-turn (no carry-forward) ────────
+
+class CacheOffTriggerEphemeralContract(_CarryingContract):
+    def test_cache_off_trigger_activation_disappears_on_next_turn(self):
+        E = {"clarify", "send_message", "web_extract"}
+
+        # Turn 1: web_extract triggers. Cache-off recomputes per turn, so no
+        # prior_active is carried forward.
+        m1 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
+                          triggered={"web_extract"})
+        self.assertIn("web_extract", m1.active, "trigger activates the tool this turn")
+
+        # Turn 2: an unrelated message — nothing triggers, nothing carried.
+        m2 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
+                          triggered=set())
+        self.assertNotIn("web_extract", m2.active,
+                         "cache-off trigger activation does not persist to the next turn")
+        self.assertEqual(m2.active, m2.A | m2.C, "turn 2 active is residents-only")
+
+
+# ─── 17. sticky/category expansions never escape the enabled ceiling ────────
+
+class ExpansionCeilingContract(_CarryingContract):
+    def test_expanded_and_sticky_names_cannot_escape_ceiling(self):
+        E = {"clarify", "send_message", "read_file"}
+        # ``expanded`` here stands in for sticky/category expansion tool names.
+        # A ceiling-absent name must never activate; a ceiling-present one does.
+        m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
+                         expanded={"ghost_sticky_tool", "read_file"})
+        self.assertNotIn("ghost_sticky_tool", m.active,
+                         "an expansion cannot add a tool absent from E")
+        self.assertNotIn("ghost_sticky_tool", m.X)
+        self.assertIn("read_file", m.active,
+                      "a ceiling-present expand_only tool activates via expansion")
+        self.assertIn("read_file", m.X, "activation does not change residency")
+
+
 if __name__ == "__main__":
     unittest.main()

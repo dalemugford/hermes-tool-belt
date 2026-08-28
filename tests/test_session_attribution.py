@@ -864,12 +864,11 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
             "scope": "assistant-a:telegram",
             "sticky_key": sticky_key,
             "session_id": REAL_KEY_TELEGRAM,
-            "initial_allowed_tools": initial_allowed,
-            "cut_tools": [],
+            "initial_active_tools": initial_allowed,
+            "expand_only_tools": [],
             "expansions": set(),
             "pending_expansion": None,
             "ceiling_tools": list(initial_allowed),
-            "unknown_kept_tools": [],
         })
 
     def _latest_row(self) -> dict:
@@ -904,7 +903,7 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
         # Mark the tool as cut so was_cut reflects reality (the predictor
         # would have set this when narrowing).
         state = plugin._PREDICTION_CV.get()
-        state["cut_tools"] = ["terminal"]
+        state["expand_only_tools"] = ["terminal"]
         plugin._PREDICTION_CV.set(state)
 
         plugin._on_post_tool_call(
@@ -919,8 +918,8 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
 
     def test_sticky_carried_tool_in_initial_allowed_still_credits_expansion(self):
         # Regression: in production, sticky_tools get merged into the
-        # narrowed allowed set BEFORE filtering, so a sticky-carried tool
-        # ends up in initial_allowed_tools. Without a pre-sticky baseline,
+        # narrowed active set BEFORE filtering, so a sticky-carried tool
+        # ends up in initial_active_tools. Without a pre-sticky baseline,
         # the credit decision saw was_initially_available=True and skipped
         # the sticky-expansion branch, zeroing out expand_tools_used.
         sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
@@ -929,7 +928,7 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
         self._set_prediction_state(initial_allowed=["terminal", "memory"], sticky_key=sticky_key)
         # …but the pre-sticky baseline does NOT include it.
         state = plugin._PREDICTION_CV.get()
-        state["baseline_allowed_tools"] = ["memory"]
+        state["baseline_active_tools"] = ["memory"]
         plugin._PREDICTION_CV.set(state)
 
         plugin._on_post_tool_call(
@@ -971,7 +970,7 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
 
 
 class BuildApiKwargsSnapshotTests(unittest.TestCase):
-    """``initial_allowed_tools`` must be a *snapshot* captured on the first
+    """``initial_active_tools`` must be a *snapshot* captured on the first
     ``_build_api_kwargs`` call of a prediction, NOT a moving window that
     follows post-expansion state. If it moves, expansion-driven tool calls
     later in the same turn look like they were initially available, which
@@ -1011,9 +1010,11 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         # Predictor narrowed to {memory, send_message}; terminal was cut.
         plugin._PREDICTION_CV.set({
             "prediction_id": "pred-1",
-            "allowed_tool_names": ["memory", "send_message"],
-            "baseline_allowed_tools": ["memory", "send_message"],
-            "known_tool_names": {"memory", "send_message", "terminal", "file_read"},
+            "active_tool_names": ["memory", "send_message"],
+            "baseline_active_tools": ["memory", "send_message"],
+            "resolved_always_carry": [],
+            "resolved_carry": ["memory", "send_message"],
+            "triggered_tools": [],
             "expansions": set(),
             "agent": "assistant-a", "platform": "telegram", "scope": "assistant-a:telegram",
             "sticky_key": "k", "session_id": REAL_KEY_TELEGRAM,
@@ -1023,7 +1024,7 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         # First call: model sees the narrowed view.
         kwargs1 = self._run_wrapper_with_tools(["memory", "send_message", "terminal", "file_read"])
         state = plugin._PREDICTION_CV.get()
-        snapshot = list(state["initial_allowed_tools"])
+        snapshot = list(state["initial_active_tools"])
         self.assertEqual(sorted(snapshot), ["memory", "send_message"])
         self.assertEqual(sorted(_tool_names_in(kwargs1["tools"])), ["memory", "send_message"])
 
@@ -1039,8 +1040,8 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         self.assertIn("terminal", _tool_names_in(kwargs2["tools"]))
         # …but the snapshot must NOT have moved.
         self.assertEqual(
-            sorted(state["initial_allowed_tools"]), sorted(snapshot),
-            "initial_allowed_tools must be a one-time snapshot per prediction",
+            sorted(state["initial_active_tools"]), sorted(snapshot),
+            "initial_active_tools must be a one-time snapshot per prediction",
         )
 
     def test_end_to_end_recovered_tool_credits_expand_tools_used(self):
@@ -1062,18 +1063,20 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         plugin._CONFIG["log"] = True  # need writes to verify the row
         plugin._PREDICTION_CV.set({
             "prediction_id": "pred-current",
-            "allowed_tool_names": ["memory", "terminal"],  # post-sticky merge
-            "baseline_allowed_tools": ["memory"],           # pre-sticky
-            "known_tool_names": {"memory", "terminal"},
+            "active_tool_names": ["memory", "terminal"],  # post-sticky merge
+            "baseline_active_tools": ["memory"],           # pre-sticky
+            "resolved_always_carry": [],
+            "resolved_carry": ["memory"],
+            "triggered_tools": [],
             "expansions": set(),
             "agent": "assistant-a", "platform": "telegram", "scope": "assistant-a:telegram",
             "sticky_key": sticky_key, "session_id": REAL_KEY_TELEGRAM,
             "sticky_tools": ["terminal"], "sticky_categories": ["terminal"],
             "sticky_remaining_turns": {"terminal": 3},
-            "cut_tools": ["terminal"], "pending_expansion": None,
+            "expand_only_tools": ["terminal"], "pending_expansion": None,
         })
 
-        # First _build_api_kwargs call — establishes initial_allowed_tools.
+        # First _build_api_kwargs call — establishes initial_active_tools.
         self._run_wrapper_with_tools(["memory", "terminal"])
 
         # Model calls terminal.
@@ -1108,15 +1111,17 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         plugin._CONFIG["log"] = True
         plugin._PREDICTION_CV.set({
             "prediction_id": "pred-current",
-            "allowed_tool_names": ["memory", "terminal"],
-            "baseline_allowed_tools": ["memory", "terminal"],  # terminal IS in baseline
-            "known_tool_names": {"memory", "terminal"},
+            "active_tool_names": ["memory", "terminal"],
+            "baseline_active_tools": ["memory", "terminal"],  # terminal IS in baseline
+            "resolved_always_carry": [],
+            "resolved_carry": ["memory", "terminal"],
+            "triggered_tools": [],
             "expansions": set(),
             "agent": "assistant-a", "platform": "telegram", "scope": "assistant-a:telegram",
             "sticky_key": sticky_key, "session_id": REAL_KEY_TELEGRAM,
             "sticky_tools": ["terminal"], "sticky_categories": ["terminal"],
             "sticky_remaining_turns": {"terminal": 3},
-            "cut_tools": [], "pending_expansion": None,
+            "expand_only_tools": [], "pending_expansion": None,
         })
 
         self._run_wrapper_with_tools(["memory", "terminal"])

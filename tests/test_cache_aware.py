@@ -108,9 +108,8 @@ class FreezeSnapshotTests(unittest.TestCase):
     def test_snapshot_starts_with_zero_reuses(self):
         plugin._freeze_session_snapshot(
             "sid",
-            allowed_tool_names=["read_file"],
-            baseline_allowed_tools=["read_file"],
-            known_tool_names={"read_file", "write_file"},
+            active_tool_names=["read_file"],
+            baseline_active_tools=["read_file"],
             preset_name="aggressive",
             always_on_count=1,
             always_on_tools=["read_file"],
@@ -129,9 +128,8 @@ class FreezeSnapshotTests(unittest.TestCase):
     def test_build_from_frozen_increments_reuses(self):
         plugin._freeze_session_snapshot(
             "sid",
-            allowed_tool_names=["read_file"],
-            baseline_allowed_tools=["read_file"],
-            known_tool_names={"read_file"},
+            active_tool_names=["read_file"],
+            baseline_active_tools=["read_file"],
             preset_name="aggressive",
             always_on_count=1,
             always_on_tools=["read_file"],
@@ -164,9 +162,8 @@ class FreezeSnapshotTests(unittest.TestCase):
     def test_build_from_frozen_carries_expansions(self):
         plugin._freeze_session_snapshot(
             "sid",
-            allowed_tool_names=["read_file"],
-            baseline_allowed_tools=["read_file"],
-            known_tool_names={"read_file"},
+            active_tool_names=["read_file"],
+            baseline_active_tools=["read_file"],
             preset_name="aggressive",
             always_on_count=1,
             always_on_tools=["read_file"],
@@ -192,9 +189,8 @@ class FreezeSnapshotTests(unittest.TestCase):
     def test_build_from_frozen_disables_sticky_and_lookback(self):
         plugin._freeze_session_snapshot(
             "sid",
-            allowed_tool_names=["read_file"],
-            baseline_allowed_tools=["read_file"],
-            known_tool_names={"read_file"},
+            active_tool_names=["read_file"],
+            baseline_active_tools=["read_file"],
             preset_name="aggressive",
             always_on_count=1,
             always_on_tools=["read_file"],
@@ -360,9 +356,8 @@ class SessionHookSemanticsTests(unittest.TestCase):
         # Seed a frozen snapshot.
         plugin._freeze_session_snapshot(
             "sid",
-            allowed_tool_names=["read_file"],
-            baseline_allowed_tools=["read_file"],
-            known_tool_names={"read_file"},
+            active_tool_names=["read_file"],
+            baseline_active_tools=["read_file"],
             preset_name="aggressive",
             always_on_count=1,
             always_on_tools=["read_file"],
@@ -466,9 +461,8 @@ class SlashCommandBypassTests(unittest.TestCase):
         # Seed: a freeze under the canonical key, with the platform back-ref
         plugin._freeze_session_snapshot(
             self.CANONICAL,
-            allowed_tool_names=["read_file"],
-            baseline_allowed_tools=["read_file"],
-            known_tool_names={"read_file"},
+            active_tool_names=["read_file"],
+            baseline_active_tools=["read_file"],
             preset_name="aggressive",
             always_on_count=1,
             always_on_tools=["read_file"],
@@ -595,6 +589,159 @@ class BypassCohortTests(unittest.TestCase):
         # honestly (no narrowing happened by design).
         self.assertEqual(bypass_stats["saved_tokens_total"], 0)
         self.assertEqual(bypass_stats["ceiling_tokens_total"], 12521)
+
+
+class EnabledCeilingCaptureTests(unittest.TestCase):
+    """The first request of a turn captures the enabled built-in ceiling into
+    prediction state — before expand_tools can report any activation — and the
+    partition filter cuts untriggered expand_only tools while passing MCP
+    tools through untouched."""
+
+    def setUp(self):
+        _seed_plugin_config()
+        _reset_plugin_state()
+
+    def test_first_request_captures_ceiling_and_partitions(self):
+        state = {
+            "active_tool_names": ["clarify"],
+            "resolved_always_carry": ["clarify"],
+            "resolved_carry": [],
+            "triggered_tools": [],
+            "expansions": set(),
+            "logged": False,
+            "session_id": "",
+        }
+        token = plugin._PREDICTION_CV.set(state)
+        try:
+            def original(self_, msgs):
+                return {
+                    "tools": [
+                        {"name": "clarify"},
+                        {"name": "read_file"},
+                        {"name": "mcp__github__create_issue"},
+                    ],
+                    "model": "claude-test",
+                }
+            wrapped = plugin._wrap_build_api_kwargs(original)
+            with mock.patch.dict(plugin._CONFIG, {"enabled": True}), \
+                    mock.patch.object(plugin, "_maybe_log_prediction", lambda *a, **k: None):
+                result = wrapped(object(), [])
+        finally:
+            plugin._PREDICTION_CV.reset(token)
+
+        # Ceiling captured, MCP excluded from the built-in partition domain.
+        self.assertIn("clarify", state["enabled_ceiling"])
+        self.assertIn("read_file", state["enabled_ceiling"])
+        self.assertNotIn("mcp__github__create_issue", state["enabled_ceiling"])
+        self.assertIn("mcp__github__create_issue", state["mcp_passthrough_tools"])
+
+        kept = [plugin._tool_name(t) for t in result["tools"]]
+        self.assertIn("clarify", kept, "resident stays active")
+        self.assertNotIn("read_file", kept,
+                         "untriggered expand_only tool is cut")
+        self.assertIn("mcp__github__create_issue", kept,
+                      "MCP tool passes through untouched")
+
+
+class CacheOnRetriggerAttributionTests(unittest.TestCase):
+    """Under cache-on, a later trigger grows the frozen active set exactly once
+    and is attributed distinctly from an explicit expand_tools expansion."""
+
+    PLATFORM = "telegram"
+    CANONICAL = "agent:main:telegram:dm:200000002"
+
+    def setUp(self):
+        _seed_plugin_config()
+        _reset_plugin_state()
+        plugin._CONFIG["cache_mode"] = "on"
+
+    def _event(self, text: str):
+        from types import SimpleNamespace
+        platform_obj = SimpleNamespace(value=self.PLATFORM)
+        source = SimpleNamespace(platform=platform_obj, chat_id="200000002", user_id="user-b")
+        return SimpleNamespace(text=text, message=text, source=source, platform=None)
+
+    def _store(self):
+        store = mock.MagicMock()
+        store._generate_session_key.return_value = self.CANONICAL
+        return store
+
+    def _preset(self):
+        import re
+        presets = importlib.import_module("tool_belt_plugin.presets")
+        return presets.Preset(
+            name="t",
+            always_carry=["clarify"],
+            carry=[],
+            triggers=[presets.TriggerGroup(
+                name="web",
+                tools=["web_extract"],
+                keyword_patterns=[re.compile(r"https?://", re.IGNORECASE)],
+                exclude_patterns=[],
+                has_attachment=None,
+            )],
+        )
+
+    def _seed_freeze(self):
+        plugin._freeze_session_snapshot(
+            self.CANONICAL,
+            active_tool_names=["clarify"],
+            baseline_active_tools=["clarify"],
+            preset_name="t",
+            always_on_count=1,
+            always_on_tools=["clarify"],
+            trigger_tools_by_group={},
+            triggers_fired=[],
+            triggers_suppressed=[],
+            policy_source="preset",
+            policy_version="",
+            learned_mode="recommend",
+            learned_scope="",
+            learned_changes=[],
+            resolved_always_carry=["clarify"],
+            resolved_carry=[],
+            triggered_tools=[],
+        )
+
+    def test_later_trigger_mutation_is_distinct_from_explicit_expansion(self):
+        self._seed_freeze()
+
+        # A later message triggers web_extract for the first time.
+        with mock.patch.object(plugin.presets_mod, "resolve_preset",
+                               return_value=self._preset()):
+            plugin._on_pre_gateway_dispatch(
+                event=self._event("please read https://example.com"),
+                session_store=self._store(),
+            )
+        state = plugin._PREDICTION_CV.get()
+        self.assertTrue(state.get("trigger_driven_mutation"),
+                        "a newly fired trigger records a trigger-driven mutation")
+        self.assertIn("web_extract", set(state.get("triggered_tools") or []))
+        # The mutation is a trigger activation, NOT an explicit expansion.
+        self.assertEqual(state.get("expansions"), set(),
+                         "trigger activation is never recorded as an explicit expansion")
+        self.assertIn("web_extract",
+                      set(plugin._FROZEN_BY_SESSION[self.CANONICAL]["triggered_tools"]),
+                      "frozen accumulator grows with the new trigger tool")
+
+    def test_same_trigger_next_turn_does_not_remutate(self):
+        self._seed_freeze()
+        with mock.patch.object(plugin.presets_mod, "resolve_preset",
+                               return_value=self._preset()):
+            plugin._on_pre_gateway_dispatch(
+                event=self._event("read https://example.com"),
+                session_store=self._store(),
+            )
+            # Second turn, same trigger — the enlarged set is reused, no new mutation.
+            plugin._on_pre_gateway_dispatch(
+                event=self._event("also https://example.org"),
+                session_store=self._store(),
+            )
+        state2 = plugin._PREDICTION_CV.get()
+        self.assertFalse(state2.get("trigger_driven_mutation"),
+                         "re-firing the same trigger does not grow the set again")
+        self.assertIn("web_extract", set(state2.get("triggered_tools") or []),
+                      "the previously triggered tool remains active")
 
 
 class TokenEstimatorTests(unittest.TestCase):

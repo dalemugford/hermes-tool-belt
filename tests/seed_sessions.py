@@ -245,7 +245,7 @@ def build_prediction_row(
     what makes the harness inherit the production schema — see the module
     docstring.
     """
-    allowed = prediction.allowed_tool_names
+    allowed = prediction.active_tool_names
     narrowed = [] if allowed == presets.WILDCARD_ALWAYS_ON else [str(t) for t in allowed]
     always_on = list(preset.always_on) if isinstance(preset.always_on, list) else []
     fired = set(prediction.triggers_fired)
@@ -270,7 +270,7 @@ def build_prediction_row(
         preset=prediction.preset_name,
         triggers_fired=list(prediction.triggers_fired),
         triggers_suppressed=list(prediction.triggers_suppressed),
-        always_on_count=prediction.always_on_count,
+        always_on_count=prediction.always_carry_count + prediction.carry_count,
         always_on_tools=always_on,
         ceiling_count=len(ceiling),
         narrowed_count=len(narrowed),

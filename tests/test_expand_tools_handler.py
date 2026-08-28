@@ -38,15 +38,21 @@ if "toolsets" not in sys.modules:
     sys.modules["toolsets"] = _toolsets_stub
 
 
-def _make_state(*, initial_allowed=(), cut_tools=(), expansions=None):
-    return {
-        "initial_allowed_tools": list(initial_allowed),
-        "cut_tools": list(cut_tools),
+def _make_state(*, initial_allowed=(), cut_tools=(), expansions=None, enabled_ceiling=None):
+    state = {
+        "initial_active_tools": list(initial_allowed),
+        "expand_only_tools": list(cut_tools),
         "expansions": set(expansions or set()),
         "sticky_key": "",
         "scope": "test:cli",
         "triggers_fired": [],
     }
+    # Only attach the enabled ceiling when a test opts in — leaving it absent
+    # exercises the "ceiling not captured yet" path where every resolved tool
+    # is treated as activatable (backward-compatible).
+    if enabled_ceiling is not None:
+        state["enabled_ceiling"] = list(enabled_ceiling)
+    return state
 
 
 def _invoke(args, state):
@@ -286,6 +292,49 @@ class ToolNameResolutionTests(unittest.TestCase):
         payload = _invoke({"category": "   ", "tool": ""}, _make_state())
         self.assertFalse(payload["success"])
         self.assertIn("required", payload["error"].lower())
+
+
+class CeilingGateTests(unittest.TestCase):
+    """A globally resolvable but ceiling-absent tool is reported unavailable
+    for this scope, never 'added'."""
+
+    def test_ceiling_absent_tool_reported_unavailable_not_added(self):
+        resolved = ["browser_navigate", "browser_click"]
+        # Only browser_navigate is enabled in this scope's ceiling.
+        state = _make_state(enabled_ceiling=["browser_navigate"])
+        with mock.patch.object(expand_tools, "_resolve_category",
+                               return_value=("browser", list(resolved), ["browser"])):
+            payload = _invoke({"category": "browser"}, state)
+
+        self.assertTrue(payload["success"], payload)
+        self.assertEqual(payload["tools_added"], ["browser_navigate"],
+                         "only ceiling-present tools may be added")
+        self.assertEqual(payload["unavailable_tools"], ["browser_click"],
+                         "ceiling-absent tool is reported unavailable, never added")
+        self.assertNotIn("browser_click", state["expansions"],
+                         "ceiling-absent tool must not leak into the active set")
+        self.assertIn("browser_navigate", state["expansions"])
+
+    def test_whole_category_absent_from_ceiling_adds_nothing(self):
+        resolved = ["image_generate"]
+        state = _make_state(enabled_ceiling=["read_file", "write_file"])
+        with mock.patch.object(expand_tools, "_resolve_category",
+                               return_value=("image_gen", list(resolved), ["image_gen"])):
+            payload = _invoke({"category": "image_gen"}, state)
+
+        self.assertEqual(payload["tools_added"], [])
+        self.assertEqual(payload["unavailable_tools"], ["image_generate"])
+        self.assertIn("not enabled for this scope", payload["message"].lower())
+
+    def test_no_ceiling_captured_treats_all_as_activatable(self):
+        # Backward-compatible path: state without enabled_ceiling gates nothing.
+        resolved = ["browser_navigate", "browser_click"]
+        state = _make_state()  # no enabled_ceiling
+        with mock.patch.object(expand_tools, "_resolve_category",
+                               return_value=("browser", list(resolved), ["browser"])):
+            payload = _invoke({"category": "browser"}, state)
+        self.assertEqual(sorted(payload["tools_added"]), sorted(resolved))
+        self.assertEqual(payload["unavailable_tools"], [])
 
 
 if __name__ == "__main__":

@@ -267,29 +267,43 @@ def _handle_inner(args: dict, kwargs: dict, prediction_cv, sticky_refresh_fn=Non
             "error": _not_found_message(raw_category, available),
         })
 
-    initial_allowed = set(state.get("initial_allowed_tools") or [])
-    cut_tools = set(state.get("cut_tools") or [])
+    initial_active = set(state.get("initial_active_tools") or [])
+    expand_only = set(state.get("expand_only_tools") or [])
 
-    # Append to the contextvar's expansions set — mutable in place
+    # Ceiling gate: the enabled built-in ceiling ``E`` is captured on the first
+    # request of the turn (state["enabled_ceiling"]). A tool that resolves
+    # globally but is absent from ``E`` is not enabled for THIS scope — it can
+    # never be activated here, so it is reported "unavailable", never "added".
+    # When the ceiling hasn't been captured (e.g. no prediction/narrowing path
+    # ran), we can't gate — treat every resolved tool as activatable.
+    enabled_ceiling = state.get("enabled_ceiling")
+    if enabled_ceiling is None:
+        activatable = list(resolved)
+        unavailable_tools: list[str] = []
+    else:
+        ceiling_set = set(enabled_ceiling)
+        activatable = [t for t in resolved if t in ceiling_set]
+        unavailable_tools = [t for t in resolved if t not in ceiling_set]
+
+    # Append to the contextvar's expansions set — mutable in place. Only
+    # ceiling-present (activatable) tools are added; a ceiling-absent tool
+    # must not leak into the active set on the next request.
     expansions = state.setdefault("expansions", set())
     if not isinstance(expansions, set):
         expansions = set(expansions or [])
         state["expansions"] = expansions
 
     # Honest accounting: a tool counts as "newly added by this call" only
-    # if it wasn't already on the model's initial allowed list and wasn't
-    # already carried in from a prior expand_tools invocation. The previous
-    # logic only checked the second condition, so re-expanding a category
-    # that overlapped the initial allowed set would falsely report the
-    # overlap as "added".
-    already_available_tools = [t for t in resolved if t in initial_allowed]
-    recovered_cut_tools = [t for t in resolved if t in cut_tools]
+    # if it's activatable here, wasn't already on the model's initial active
+    # list, and wasn't already carried in from a prior expand_tools call.
+    already_available_tools = [t for t in activatable if t in initial_active]
+    recovered_cut_tools = [t for t in activatable if t in expand_only]
     new_additions = [
-        t for t in resolved
-        if t not in initial_allowed and t not in expansions
+        t for t in activatable
+        if t not in initial_active and t not in expansions
     ]
     expansions.add(category)  # also store the category name itself
-    expansions.update(resolved)
+    expansions.update(activatable)
 
     expand_event = {
         "category": category,
@@ -297,6 +311,7 @@ def _handle_inner(args: dict, kwargs: dict, prediction_cv, sticky_refresh_fn=Non
         "tools_added": new_additions,
         "recovered_cut_tools": recovered_cut_tools,
         "already_available_tools": already_available_tools,
+        "unavailable_tools": unavailable_tools,
         "triggers_fired": list(state.get("triggers_fired") or []),
     }
     sticky_event = None
@@ -321,8 +336,9 @@ def _handle_inner(args: dict, kwargs: dict, prediction_cv, sticky_refresh_fn=Non
     state["pending_expansion"] = expand_event
 
     logger.info(
-        "expand_tools: category=%s added=%d already=%d (expansions size=%d)",
-        category, len(new_additions), len(already_available_tools), len(expansions),
+        "expand_tools: category=%s added=%d already=%d unavailable=%d (expansions size=%d)",
+        category, len(new_additions), len(already_available_tools),
+        len(unavailable_tools), len(expansions),
     )
     response = {
         "success": True,
@@ -331,28 +347,48 @@ def _handle_inner(args: dict, kwargs: dict, prediction_cv, sticky_refresh_fn=Non
         "tools_added": new_additions,
         "recovered_cut_tools": recovered_cut_tools,
         "already_available_tools": already_available_tools,
-        "message": _success_message(category, new_additions, already_available_tools),
+        "unavailable_tools": unavailable_tools,
+        "message": _success_message(
+            category, new_additions, already_available_tools, unavailable_tools
+        ),
     }
     if sticky_event is not None:
         response["sticky"] = sticky_event
     return json.dumps(response)
 
 
-def _success_message(category: str, new_additions: list[str], already_available: list[str]) -> str:
+def _success_message(
+    category: str,
+    new_additions: list[str],
+    already_available: list[str],
+    unavailable: list[str] | None = None,
+) -> str:
     """Compose a message that matches what actually happened."""
+    unavailable = unavailable or []
+    unavailable_note = ""
+    if unavailable:
+        unavailable_note = (
+            f" {len(unavailable)} tool(s) in {category!r} are not enabled for "
+            "this scope and could not be loaded."
+        )
     if not new_additions and already_available:
         return (
             f"Category {category!r} was already loaded "
-            f"({len(already_available)} tool(s)); no new tools added. "
+            f"({len(already_available)} tool(s)); no new tools added.{unavailable_note} "
             "Make the call you wanted to make."
+        )
+    if not new_additions and unavailable:
+        return (
+            f"No tools from category {category!r} could be loaded — "
+            f"{len(unavailable)} resolved tool(s) are not enabled for this scope."
         )
     if new_additions and already_available:
         return (
             f"Loaded {len(new_additions)} new tool(s) from category {category!r} "
-            f"({len(already_available)} were already available). "
+            f"({len(already_available)} were already available).{unavailable_note} "
             "They're available on the next tool call."
         )
     return (
-        f"Loaded {len(new_additions)} tool(s) from category {category!r}. "
+        f"Loaded {len(new_additions)} tool(s) from category {category!r}.{unavailable_note} "
         "They're available on the next tool call."
     )

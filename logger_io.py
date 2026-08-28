@@ -268,6 +268,49 @@ def estimate_tokens(payload: Any) -> int:
     return max(0, len(text) // 4)
 
 
+def normalize_prediction_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a v1 prediction telemetry row into the v2 shape, in memory.
+
+    Pure and non-mutating: returns a new dict, never rewrites any file. Used by
+    the analyzer/reporter to read historical (v1) rows through the v2 carrying
+    lens without a read-time migration.
+
+    Residency is reconstructed only when the row carries *complete* membership
+    — the enabled ceiling plus the resident set — because the A/C/X partition
+    is unknowable otherwise. When it can be reconstructed, ``residency_inferred``
+    is set truthy and a ``residency`` mapping is attached mapping the v1
+    ``always_on`` residents onto the v2 ``carry`` class (v1 had no immutable
+    ``always_carry`` split, so class A is empty); everything in the ceiling
+    outside the residents becomes ``expand_only``. When membership is
+    incomplete, ``residency_inferred`` is falsey and no residency is inferred.
+    """
+    out = dict(row or {})
+
+    ceiling = out.get("ceiling_tools")
+    residents = out.get("always_on_tools")
+    if residents is None:
+        residents = out.get("carry")
+    active = out.get("allowed_tools")
+    if active is None:
+        active = out.get("active_tools")
+
+    complete = bool(ceiling) and residents is not None and active is not None
+    if complete:
+        ceiling_set = [str(t) for t in ceiling]
+        resident_set = {str(t) for t in residents} & set(ceiling_set)
+        expand_only = [t for t in ceiling_set if t not in resident_set]
+        out["residency_inferred"] = True
+        out["residency"] = {
+            "always_carry": [],
+            "carry": sorted(resident_set),
+            "expand_only": sorted(expand_only),
+        }
+    else:
+        out["residency_inferred"] = False
+        out.setdefault("residency", None)
+    return out
+
+
 def log_prediction(record: PredictionRecord) -> None:
     """Append a prediction row. Errors are swallowed."""
     try:

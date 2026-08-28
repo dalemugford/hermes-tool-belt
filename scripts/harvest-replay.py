@@ -251,7 +251,7 @@ def replay_session(
             allowed_names = list(session.ceiling_tools)
             cut_names: list[str] = []
         else:
-            allowed_set = set(prediction.allowed_tool_names)  # type: ignore[arg-type]
+            allowed_set = set(prediction.active_tool_names)  # type: ignore[arg-type]
             known = _all_known_tool_names(preset)
             allowed_names = []
             cut_names = []
@@ -279,7 +279,7 @@ def replay_session(
             preset=prediction.preset_name,
             triggers_fired=prediction.triggers_fired,
             triggers_suppressed=prediction.triggers_suppressed,
-            always_on_count=prediction.always_on_count,
+            always_on_count=prediction.always_carry_count + prediction.carry_count,
             ceiling_count=ceiling_count,
             narrowed_count=len(allowed_names),
             ceiling_tokens=ceiling_tokens,
