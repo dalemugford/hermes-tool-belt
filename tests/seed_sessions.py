@@ -122,6 +122,7 @@ class SeedResult:
     sessions: int
     predictions: int
     tool_calls: int
+    sessions_written: int = 0
 
 
 # ────────────────────────────── script loading ───────────────────────────────
@@ -322,6 +323,98 @@ def build_prediction_row(
     return record.to_dict()
 
 
+def _full_tool_def(name: str) -> dict[str, Any]:
+    """A COMPLETE OpenAI-shape tool definition (description + parameters).
+
+    The Phase 7B savings engine tokenizes the recorded definition verbatim;
+    names-only placeholders cannot back a release-quality projection.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": (
+                f"The {name} tool. It performs the {name} operation against the "
+                f"user's environment and returns a structured result describing "
+                f"what changed, including any diagnostics the caller may need."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": f"What {name} acts on."},
+                    "options": {
+                        "type": "object",
+                        "description": "Free-form options bag.",
+                        "properties": {
+                            "verbose": {"type": "boolean", "description": "Chatty output."},
+                            "dry_run": {"type": "boolean", "description": "Preview only."},
+                        },
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+    }
+
+
+def write_session_jsonl(
+    hermes_home: str | Path,
+    *,
+    agent: str,
+    platform: str,
+    scope: str,
+    script_name: str,
+    sessions: int,
+    turns: Sequence[dict[str, Any]],
+    ceiling: Sequence[str],
+    session_uid_for,
+) -> int:
+    """Write one ``sessions/<uuid>.jsonl`` per seeded session, schemas complete.
+
+    The Phase 8 savings preview replays these files through the canonical
+    engine, so each file carries a ``session_meta`` row with the FULL tool
+    definitions for the scope's ceiling plus the user turns in order. Returns
+    the number of session files written.
+    """
+    home = Path(hermes_home)
+    sessions_dir = home / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    tool_defs = [_full_tool_def(t) for t in ceiling]
+    written = 0
+    for i in range(sessions):
+        uid = session_uid_for(script_name, i)
+        rows: list[dict[str, Any]] = [
+            {
+                "role": "session_meta",
+                "platform": platform,
+                "model": "seeded-model",
+                "provider": "seeded",
+                "api_mode": "seeded",
+                "hermes_session_id": uid,
+                "scope": scope,
+                "tools": tool_defs,
+            }
+        ]
+        for t, turn in enumerate(turns):
+            rows.append({"role": "user", "content": str(turn.get("user") or "")})
+            for call in _normalize_calls(turn.get("calls")):
+                for _ in range(call["count"]):
+                    rows.append({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {"function": {"name": call["tool"]}}
+                        ],
+                    })
+        path = sessions_dir / f"{uid}.jsonl"
+        path.write_text(
+            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+            encoding="utf-8",
+        )
+        written += 1
+    return written
+
+
 def build_tool_call_row(
     *,
     prediction_id: str,
@@ -471,6 +564,17 @@ def seed(
 
     _append_jsonl(state_dir / "predictions.jsonl", pred_rows)
     _append_jsonl(state_dir / "tool_calls.jsonl", call_rows)
+    sessions_written = write_session_jsonl(
+        hermes_home,
+        agent=agent,
+        platform=platform,
+        scope=scope,
+        script_name=name,
+        sessions=sessions,
+        turns=turns,
+        ceiling=ceiling,
+        session_uid_for=_session_uid,
+    )
 
     return SeedResult(
         name=name,
@@ -480,6 +584,7 @@ def seed(
         sessions=sessions,
         predictions=len(pred_rows),
         tool_calls=len(call_rows),
+        sessions_written=sessions_written,
     )
 
 

@@ -265,18 +265,24 @@ class ShapingSummaryTests(TempHomeTestCase):
         blob = "\n".join(lines)
         self.assertIn("24 recorded session(s)", blob)
         self.assertIn("terminal", blob)
-        self.assertIn("Moved to on-demand", blob)
+        self.assertIn("Proposed demotions into expand-only", blob)
         self.assertIn("web_search", blob)
         self.assertIn("expand_tools", blob)
-        self.assertIn("Trigger groups that still fire", blob)
-        # A demoted tool must not also be advertised as always-on.
-        always_on_line = next(l for l in lines if "Loaded on every message" in l)
-        self.assertNotIn("web_search", always_on_line)
+        self.assertIn("Trigger groups unchanged by these transitions", blob)
+        # The immutable baseline is never advertised as demotable, and the
+        # adaptive-residents line excludes the demoted tool.
+        baseline_line = next(l for l in lines if "Always carried" in l)
+        self.assertNotIn("web_search", baseline_line)
+        carried_line = next(l for l in lines if l.startswith("  Carried"))
+        self.assertNotIn("web_search", carried_line)
+        # The 1.0 vocabulary never leaks the retired words.
+        self.assertNotIn("always-on", blob.lower())
+        self.assertNotIn("Moved to on-demand", blob)
 
     def test_empty_demote_list_renders_without_crashing(self) -> None:
         recs = {"sessions_considered": 30, "promote": [], "demote": []}
         lines = configure.render_shaping_summary(self._info(), recs, None, self.thresholds)
-        self.assertIn("Moved to on-demand: none", "\n".join(lines))
+        self.assertIn("Proposed demotions: none", "\n".join(lines))
 
     def test_thin_sample_explains_why_nothing_was_demoted(self) -> None:
         recs = {"sessions_considered": 2, "promote": [], "demote": []}
@@ -412,11 +418,11 @@ class ApplyFlowTests(TempHomeTestCase):
                 "plugins.tool-belt.channels.default:telegram.bypass_rate": "1.0",
             },
         )
-        self.assertEqual(configure.previous_bypass(self.root_state, "default:telegram"), 0.05)
+        self.assertEqual(configure.previous_full_ceiling_rate(self.root_state, "default:telegram"), 0.05)
 
     def test_previous_bypass_defaults_to_narrow_immediately(self) -> None:
         self.assertEqual(
-            configure.previous_bypass(self.root_state, "never:seen"), configure.NARROW_BYPASS
+            configure.previous_full_ceiling_rate(self.root_state, "never:seen"), configure.NARROW_BYPASS
         )
 
     def test_writes_are_skipped_when_confirmation_is_declined(self) -> None:
@@ -448,7 +454,7 @@ class ResetFlowTests(TempHomeTestCase):
 
     def test_reset_removes_overlay_restores_mode_and_bypass(self) -> None:
         info = self._shaped_scope()
-        configure.remember_previous_bypass(self.root_state, info.scope, 0.05)
+        configure.remember_previous_full_ceiling_rate(self.root_state, info.scope, 0.05)
         runner = FakeRunner()
         ctx = make_ctx(
             self.home,

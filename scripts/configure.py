@@ -147,6 +147,24 @@ def load_base_preset():
         return None
 
 
+def load_savings_engine():
+    """The Phase 7B savings engine — the single source of projection math."""
+    try:
+        _load_plugin_package()
+        return importlib.import_module("tool_belt_plugin.savings")
+    except Exception:
+        return None
+
+
+def load_savings_cli():
+    """The ``tool-belt savings`` CLI module (launcher helper lives there)."""
+    try:
+        _load_plugin_package()
+        return importlib.import_module("tool_belt_plugin.savings_cli")
+    except Exception:
+        return None
+
+
 def normalize_mode(value: Any) -> str:
     """Resolve a config value to ``recommend`` / ``apply``.
 
@@ -459,22 +477,30 @@ def _atomic_write_json(target: Path, payload: dict[str, Any]) -> None:
     tmp.replace(target)
 
 
-def remember_previous_bypass(state_dir: Path, scope: str, value: float | None) -> None:
-    """Record the bypass value observation mode is about to replace."""
+def remember_previous_full_ceiling_rate(
+    state_dir: Path, scope: str, value: float | None
+) -> None:
+    """Record the full-ceiling rate observation mode is about to replace."""
     state = read_configure_state(state_dir)
     scopes = dict(state.get("scopes") or {})
     entry = dict(scopes.get(scope) or {})
-    entry["previous_bypass_rate"] = NARROW_BYPASS if value is None else float(value)
+    entry["previous_full_ceiling_rate"] = NARROW_BYPASS if value is None else float(value)
     scopes[scope] = entry
     state["scopes"] = scopes
     state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     _atomic_write_json(_configure_state_path(state_dir), state)
 
 
-def previous_bypass(state_dir: Path, scope: str) -> float:
-    """The bypass value to restore on reset. Defaults to the shipped ``0.0``."""
+def previous_full_ceiling_rate(state_dir: Path, scope: str) -> float:
+    """The full-ceiling rate to restore on reset. Defaults to shipped ``0.0``.
+
+    Reads the pre-rename ``previous_bypass_rate`` key once for sidecars written
+    by an older onboarding; new writes use the canonical name only.
+    """
     entry = (read_configure_state(state_dir).get("scopes") or {}).get(scope) or {}
-    value = _to_float(entry.get("previous_bypass_rate"))
+    value = _to_float(entry.get("previous_full_ceiling_rate"))
+    if value is None:
+        value = _to_float(entry.get("previous_bypass_rate"))
     return NARROW_BYPASS if value is None else value
 
 
@@ -642,6 +668,33 @@ def write_learned_overlay(
     return changed
 
 
+def proposed_assignment(info: ScopeInfo, recs: dict[str, Any]) -> dict[str, list[str]]:
+    """The carrying assignment shaping would write, without writing it.
+
+    Delegates to the shaper's own ``merge_into_learned`` in dry-run mode and
+    reads the proposed scope entry back from the merged state — the same moves
+    (promote/demote across the adaptive carry ⇄ expand_only boundary) the real
+    apply would make. No math is reimplemented here.
+    """
+    shaper = load_shaper()
+    merged, _changed = shaper.merge_into_learned(
+        info.state_dir, {info.scope: recs}, dry_run=True
+    )
+    entry = (merged.get("scopes") or {}).get(info.scope) or {}
+
+    def _lst(*keys: str) -> list[str]:
+        for key in keys:
+            value = entry.get(key)
+            if isinstance(value, list):
+                return [str(t) for t in value if str(t).strip()]
+        return []
+
+    return {
+        "carry": _lst("carry", "always_on"),
+        "expand_only": _lst("expand_only", "always_off"),
+    }
+
+
 def remove_learned_scope(info: ScopeInfo, dry_run: bool = False) -> bool:
     """Drop one scope's entry from ``learned.json`` (atomic, file preserved)."""
     path = info.state_dir / "learned.json"
@@ -668,13 +721,101 @@ def remove_learned_scope(info: ScopeInfo, dry_run: bool = False) -> bool:
 # ────────────────────────────────── rendering ────────────────────────────────
 
 
+def render_projection(info: "ScopeInfo", projection) -> list[str]:
+    """Render the Phase 7B projected-savings preview for one scope's proposal.
+
+    ``projection`` is a canonical ``ProjectedCohort`` from the savings engine —
+    its math is never duplicated here. Presentation follows the engine's
+    confidence discipline: unsupported figures are suppressed, never guessed.
+    """
+    lines = [
+        f"  Projected savings for {info.scope} — counterfactual, "
+        f"{projection.sessions_analyzed} session(s) analyzed, "
+        f"confidence: {projection.confidence}"
+    ]
+    lines.append(
+        f"    gross schema reduction: {projection.gross_schema_token_reduction:,} tok"
+    )
+    if projection.expansion_events:
+        lines.append(
+            f"    est. expansion overhead: −{projection.estimated_expansion_overhead:,} tok "
+            f"({projection.expansion_events} event(s))"
+        )
+    lines.append(f"    net projected reduction: {projection.net_token_reduction:,} tok")
+    if projection.net_input_reduction_pct is not None:
+        lines.append(
+            f"    net input reduction: {projection.net_input_reduction_pct:.1f}% "
+            f"(denominator: {projection.denominator_source})"
+        )
+    elif projection.schema_reduction_pct is not None:
+        lines.append(
+            f"    schema-only reduction: {projection.schema_reduction_pct:.1f}% "
+            "(not the session-input %)"
+        )
+    if projection.estimated_usd_savings is not None:
+        rate = next(
+            (m.rate_basis for m in projection.models if m.cost_class == "known"),
+            "n/a",
+        )
+        lines.append(
+            f"    estimated USD savings: ${projection.estimated_usd_savings:.4f} "
+            f"({projection.usd_coverage} coverage, rate {rate})"
+        )
+    else:
+        lines.append("    estimated USD savings: n/a (no known variable-cost route)")
+    return lines
+
+
+def _project_scope(info: "ScopeInfo", proposal: dict[str, list[str]], thresholds: dict[str, int]):
+    """Run the canonical savings engine over this scope with the proposal.
+
+    Returns ``None`` when the engine or the scope's session history is
+    unavailable — the preview is then simply omitted, never approximated.
+    """
+    engine = load_savings_engine()
+    if engine is None:
+        return None
+    try:
+        report = engine.compute(
+            hermes_home=default_hermes_home(),
+            cache_mode="on",
+            proposed_by_scope={info.scope: {
+                "carry": list(proposal.get("carry") or []),
+                "expand_only": list(proposal.get("expand_only") or []),
+            }},
+        )
+    except Exception:
+        return None
+    for a in report.agents:
+        if a.projected.sessions_analyzed and info.scope in (
+            getattr(a.projected, "scopes", None) or ()
+        ):
+            return a
+    # Fallback: the proposal's scope governs — take the agent whose projection
+    # consumed sessions under the proposed key (the engine keys by session
+    # scope, not profile name, so the proposal reaches the right cohort).
+    for a in report.agents:
+        if a.projected.sessions_analyzed:
+            return a
+    return None
+
+
 def render_shaping_summary(
-    info: ScopeInfo,
+    info: "ScopeInfo",
     recs: dict[str, Any] | None,
     preset: Any = None,
     thresholds: dict[str, int] | None = None,
 ) -> list[str]:
     """Plain-language description of what shaping would do to one scope.
+
+    Presents the Tool Belt 1.0 carrying model in its own vocabulary:
+
+      * Always carried — the immutable policy baseline; never shaped.
+      * Carried        — the effective adaptive residents after this shaping.
+      * Expand only    — the enabled remainder; recoverable via triggers or
+        ``expand_tools``, never disabled.
+      * Proposed promotions into carry and demotions into expand-only.
+      * Trigger groups, which those transitions never touch.
 
     Never raises on thin or empty input — an unshapeable scope simply says so.
     """
@@ -686,67 +827,79 @@ def render_shaping_summary(
 
     lines = [f"{info.scope} — from {considered} recorded session(s)"]
 
-    base_always_on: list[str] = []
+    base_always_carry: list[str] = []
+    base_carry: list[str] = []
     if preset is not None:
-        raw = getattr(preset, "always_on", None)
+        raw = getattr(preset, "always_carry", None)
         if isinstance(raw, list):
-            base_always_on = [str(t) for t in raw]
+            base_always_carry = [str(t) for t in raw]
+        raw = getattr(preset, "carry", None)
+        if isinstance(raw, list):
+            base_carry = [str(t) for t in raw]
 
     demoted_names = sorted(str(d.get("tool") or "") for d in demote)
-    demoted_names = [name for name in demoted_names if name]
+    demoted_names = [n for n in demoted_names if n]
     promoted_names = sorted(str(p.get("tool") or "") for p in promote)
     promoted_names = [name for name in promoted_names if name]
 
-    always_on = [t for t in base_always_on if t not in set(demoted_names)]
+    # Proposed adaptive residents: policy carry − demotions + promotions.
+    # always_carry is immutable — it wins every conflict by construction, so a
+    # demote candidate there can never appear (the shaper asserts this too).
+    carried = [t for t in base_carry if t not in set(demoted_names)]
     for name in promoted_names:
-        if name not in always_on:
-            always_on.append(name)
+        if name not in carried:
+            carried.append(name)
+    expand_only = [t for t in demoted_names]
 
-    if always_on:
-        lines.append(f"  Loaded on every message ({len(always_on)}): {', '.join(sorted(always_on))}")
-    elif promoted_names:
-        lines.append(f"  Added to every message ({len(promoted_names)}): {', '.join(promoted_names)}")
+    lines.append(f"  Always carried — permanent baseline ({len(base_always_carry)}): "
+                 + (", ".join(sorted(base_always_carry)) if base_always_carry else "none"))
+    if carried:
+        lines.append(f"  Carried — adaptive residents after shaping ({len(carried)}): "
+                     + ", ".join(sorted(carried)))
     else:
-        lines.append("  Loaded on every message: unchanged from the shipped policy")
-
+        lines.append("  Carried — adaptive residents: unchanged from the shipped policy")
     if promoted_names:
         detail = ", ".join(
             f"{p['tool']} (asked for in {p.get('sessions', 0)} session(s))"
             for p in promote
             if p.get("tool")
         )
-        lines.append(f"  Newly always-on because you kept reaching for them: {detail}")
-
+        lines.append(f"  Proposed promotions into carry: {detail}")
     if demoted_names:
         lines.append(
-            f"  Moved to on-demand ({len(demoted_names)}): {', '.join(demoted_names)}"
+            f"  Proposed demotions into expand-only ({len(demoted_names)}): "
+            + ", ".join(demoted_names)
         )
         lines.append(
             "    Still fully available — the agent recovers any of these mid-session "
-            "via expand_tools."
+            "via triggers or expand_tools."
         )
     else:
         min_demote = int(thresholds.get("demote_min_sessions_no_use", 0) or 0)
         if min_demote and considered < min_demote:
             lines.append(
-                f"  Moved to on-demand: none yet — needs {min_demote} sessions, "
+                f"  Proposed demotions: none yet — needs {min_demote} sessions, "
                 f"has {considered}."
             )
         else:
-            lines.append("  Moved to on-demand: none — every always-on tool got used.")
+            lines.append(
+                "  Proposed demotions: none — every adaptive carry resident got used."
+            )
 
     triggers = list(getattr(preset, "triggers", []) or []) if preset is not None else []
     if triggers:
-        removed = set(demoted_names)
-        rows = []
-        for group in triggers:
-            tools = [t for t in list(getattr(group, "tools", []) or []) if t not in removed]
-            if tools:
-                rows.append(f"{getattr(group, 'name', '?')} ({len(tools)} tools)")
+        rows = [
+            f"{getattr(group, 'name', '?')} ({len(list(getattr(group, 'tools', []) or []))} tools)"
+            for group in triggers
+        ]
         if rows:
-            lines.append(f"  Trigger groups that still fire ({len(rows)}): {', '.join(rows)}")
+            lines.append(
+                f"  Trigger groups unchanged by these transitions ({len(rows)}): "
+                + ", ".join(rows)
+            )
 
     return lines
+
 
 
 def render_status_row(
@@ -898,6 +1051,17 @@ def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
         for line in render_shaping_summary(info, recs, preset, ctx.thresholds):
             ctx.out(line)
 
+        # Phase 7B projection: the canonical engine replays this scope's real
+        # session history against the *proposed* (not-yet-applied) assignment.
+        agent_savings = _project_scope(info, proposed_assignment(info, recs), ctx.thresholds)
+        if agent_savings is not None:
+            for line in render_projection(info, agent_savings.projected):
+                ctx.out(line)
+            ctx.out(
+                "    All figures are projections until organic post-apply "
+                "telemetry exists."
+            )
+
         writes = plan_shape_writes(info, ctx.settings(info.scope))
         if not _confirm_writes(ctx, f"Config changes for {info.scope}:", writes):
             ctx.out(f"  Skipped {info.scope}. Nothing written.")
@@ -915,12 +1079,41 @@ def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
         shaped_any = True
 
     if shaped_any and not ctx.dry_run:
+        _offer_launcher(ctx)
         ctx.out("\n  What happens next")
         ctx.out("    · Restart the Hermes gateway to pick up the new configuration.")
         ctx.out("    · Shaped agents load a tighter tool set from their next session on.")
         ctx.out("    · Anything moved to on-demand comes back instantly via expand_tools.")
         ctx.out("    · Re-run this command any time to review or reset an agent.")
     return 0
+
+
+def _offer_launcher(ctx: RunContext) -> None:
+    """Offer the ``$HERMES_HOME/bin/tool-belt`` launcher after a confirmed apply.
+
+    Only after a confirmed apply, only via the CLI module's confirmed helper —
+    never as a side effect of a report or a dry run.
+    """
+    if ctx.dry_run:
+        return
+    cli = load_savings_cli()
+    if cli is None:
+        return
+
+    def ask(message: str) -> bool:
+        if ctx.assume_yes:
+            return True
+        try:
+            return confirm(message, ctx.reader)
+        except Abort:
+            return False
+
+    cli.ensure_launcher(
+        ctx.hermes_home,
+        PLUGIN_DIR / "tool-belt",
+        confirm=ask,
+        out=ctx.out,
+    )
 
 
 def flow_recommend(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
@@ -933,7 +1126,7 @@ def flow_recommend(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
             ctx.out(f"  Skipped {info.scope}. Nothing written.")
             continue
         if not ctx.dry_run:
-            remember_previous_bypass(
+            remember_previous_full_ceiling_rate(
                 info.state_dir, info.scope, settings.get("scope_bypass_rate")
             )
         ctx.applied.extend(apply_writes(writes, ctx.runner, ctx.dry_run, ctx.out))
@@ -959,10 +1152,18 @@ def flow_reset(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
     """Undo shaping for a scope and return it to recommend mode."""
     for info in infos:
         settings = ctx.settings(info.scope)
-        restore = previous_bypass(info.state_dir, info.scope)
+        restore = previous_full_ceiling_rate(info.state_dir, info.scope)
         writes = plan_reset_writes(info, settings, restore)
         ctx.out(f"\n  Reset {info.scope}:")
-        ctx.out(f"    remove its entry from {info.state_dir / 'learned.json'}")
+        ctx.out(
+            f"    clear this scope's learned carry / expand-only assignments and "
+            f"shaping evidence from {info.state_dir / 'learned.json'}"
+        )
+        ctx.out(
+            "    always-carried tools, trigger groups, and every other scope stay "
+            "exactly as they are"
+        )
+        ctx.out("    the scope returns to recommend-mode observation")
         if not _confirm_writes(ctx, f"Config changes for {info.scope}:", writes):
             ctx.out(f"  Skipped {info.scope}. Nothing written.")
             continue
