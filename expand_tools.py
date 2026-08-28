@@ -1,16 +1,11 @@
 """The ``expand_tools`` meta-tool — model's recourse when a category was
 gated out of the current turn.
 
-NEW DESIGN (post-cached-agent fix):
-  expand_tools no longer mutates ``agent.tools`` directly. Instead it
-  appends a category to the prediction state's ``expansions`` set
-  (stored in a ContextVar, mutable in place). The patched
-  ``_build_api_kwargs`` reads this set on the next API call and unions
-  the category's tools into the allowed set.
-
-  This works regardless of whether the AIAgent was freshly constructed
-  or pulled from the gateway's per-session cache — narrowing happens at
-  request-build time, not at agent construction time.
+Appends the requested category to the prediction state's ``expansions`` set (a
+ContextVar mutated in place). ``_build_api_kwargs`` unions that set into the
+allowed tools on the next API call, so expansion works whether the AIAgent was
+freshly constructed or served from the gateway's per-session cache — narrowing
+happens at request-build time, not at agent construction time.
 """
 
 from __future__ import annotations
@@ -18,6 +13,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +69,7 @@ def _available_toolset_names() -> list[str]:
         return []
 
 
-# ─── Expand-only discoverability manifest (Phase 4) ─────────────────────────
+# ─── Expand-only discoverability manifest ───────────────────────────────────
 #
 # Lets the model *discover* which enabled built-in tools live in the
 # ``expand_only`` stratum ``X`` without carrying their full schemas. A compact,
@@ -115,7 +111,11 @@ def _build_category_index() -> dict[str, set[str]]:
     return index
 
 
-def build_expand_only_manifest(expand_only_names, *, category_index=None) -> str:
+def build_expand_only_manifest(
+    expand_only_names: Iterable[Any] | None,
+    *,
+    category_index: dict[str, set[str]] | None = None,
+) -> str:
     """Compose the compact, deterministic expand-only manifest text.
 
     ``expand_only_names`` is the effective stratum ``X = E − (always_carry ∪
@@ -160,7 +160,7 @@ def build_expand_only_manifest(expand_only_names, *, category_index=None) -> str
     return "\n".join(lines)
 
 
-def augment_schema_with_manifest(schema, manifest_text):
+def augment_schema_with_manifest(schema: Any, manifest_text: str) -> Any:
     """Return a per-request CLONE of ``schema`` with ``manifest_text`` appended
     to its description. The input schema object is never mutated.
 
@@ -307,7 +307,7 @@ def _not_found_message(category: str, available: list[str]) -> str:
     return " ".join(parts)
 
 
-def make_handler(prediction_cv, sticky_refresh_fn=None):
+def make_handler(prediction_cv: Any, sticky_refresh_fn: Any = None):
     """Build the handler closure with access to the prediction ContextVar.
 
     The handler appends the requested category to the contextvar's
@@ -317,9 +317,9 @@ def make_handler(prediction_cv, sticky_refresh_fn=None):
     in-memory residency for the active scope.
     """
 
-    def handle(args: dict, **kwargs) -> str:
+    def handle(args: dict, **_kwargs) -> str:
         try:
-            return _handle_inner(args, kwargs, prediction_cv, sticky_refresh_fn)
+            return _handle_inner(args, prediction_cv, sticky_refresh_fn)
         except Exception as exc:
             logger.warning("expand_tools handler error: %s", exc)
             return json.dumps({
@@ -330,7 +330,7 @@ def make_handler(prediction_cv, sticky_refresh_fn=None):
     return handle
 
 
-def _handle_inner(args: dict, kwargs: dict, prediction_cv, sticky_refresh_fn=None) -> str:
+def _handle_inner(args: dict, prediction_cv: Any, sticky_refresh_fn: Any = None) -> str:
     raw_category = str(args.get("category") or "").strip()
     raw_tool = str(args.get("tool") or "").strip()
 

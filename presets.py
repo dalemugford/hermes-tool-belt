@@ -17,11 +17,11 @@ carrying model it declares a two-way resident partition plus trigger groups:
 time. Tool Belt has no disabling semantics: absent/disabled tools are owned by
 Hermes's ceiling, not by policy.
 
-Legacy compatibility (transitional — removed by the Phase 3 runtime rewire):
-``Preset`` still accepts ``always_on=`` / ``always_off=`` at construction and
-exposes ``.always_on`` / ``.always_off`` / ``.is_wildcard`` as read-only views,
-so the not-yet-rewired runtime filter (``predictor.py``, ``__init__.py``) and
-its tests keep working. ``.always_on`` is the resident union
+Legacy compatibility: ``Preset`` also accepts ``always_on=`` / ``always_off=``
+at construction and exposes ``.always_on`` / ``.always_off`` / ``.is_wildcard``
+as read-only views. The runtime filter (``predictor.py``, ``__init__.py``)
+still consumes ``.always_on`` / ``.is_wildcard``; these views are derived from
+the canonical fields, never authoritative. ``.always_on`` is the resident union
 ``always_carry ∪ carry`` — precisely "what loads on every message".
 
 Per-scope narrowing is driven by the learned overlay (``learned.py``). The old
@@ -49,9 +49,7 @@ _POLICY_FILE = Path(__file__).parent / "policy.yaml"
 # a *Prediction* (``predictor.py``) stamps onto ``allowed_tool_names`` on the
 # fail-open / bypass path, and ``__init__.py`` compares against it. It is NOT
 # part of the Preset domain model — a no-narrowing Preset is expressed by the
-# ``no_narrowing`` flag below. It stays here because predictor.py/__init__.py
-# import it; relocating it would touch runtime-filtering files that are out of
-# scope for the domain/state phase.
+# ``no_narrowing`` flag below.
 WILDCARD_ALWAYS_ON = "*"
 
 
@@ -280,13 +278,10 @@ def load_base_policy() -> Preset:
             "tool-belt: failed to load policy.yaml (%s) — falling back to no-narrowing",
             exc,
         )
-        return Preset(name="wildcard-fallback", no_narrowing=True)
+        return Preset(name="no-narrowing-fallback", no_narrowing=True)
 
 
-def resolve_preset(
-    plugin_config: dict[str, Any],
-    channel: str,
-) -> Preset:
+def resolve_preset(plugin_config: dict[str, Any], channel: str) -> Preset:
     """Resolve the effective policy for a given scope.
 
     Resolution order (later overrides earlier):
@@ -310,7 +305,7 @@ def resolve_preset(
             "tool-belt: policy resolution failed for scope=%r, falling back to no-narrowing: %s",
             channel, exc,
         )
-        return Preset(name="wildcard-fallback", no_narrowing=True)
+        return Preset(name="no-narrowing-fallback", no_narrowing=True)
 
 
 def _resolve_preset_inner(plugin_config: dict[str, Any], channel: str) -> Preset:
@@ -374,8 +369,8 @@ def _warn_legacy_disable_inputs(
 def _channel_config(channels_cfg: Any, channel: str) -> dict[str, Any]:
     """Return config for a scope, falling back to its platform segment.
 
-    Existing configs often use ``telegram``; the agent/platform scope is
-    ``assistant-a:telegram``. Supporting both keeps rollout non-disruptive.
+    A scope key may be given either fully qualified (``agent:platform``) or as
+    a bare platform segment; the qualified key wins.
     """
     if not isinstance(channels_cfg, dict):
         return {}

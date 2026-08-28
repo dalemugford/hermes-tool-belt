@@ -10,7 +10,7 @@ Schema (v2)::
       "version": 2,
       "updated_at": "...",
       "scopes": {
-        "default:telegram": {
+        "assistant-a:telegram": {
           "carry": [],         # tools to promote into adaptive residency
           "expand_only": [],   # tools to demote out of residency
           "shaping": {}        # cache-aware shaping metadata (opaque here)
@@ -49,9 +49,10 @@ LEARNED_VERSION = 2
 #                         (--write-recommendations) and the shaper for human review.
 #   apply               — runtime merges learned.json into the preset.
 _ALLOWED_MODES = {"recommend", "apply"}
-# Legacy config values are aliased at load time (clean migration, no shim layer):
-# old "off" behaved like recommend at runtime; old "auto"/"audit" both merged.
-# This is the unrelated learned_mode setting — its aliases are preserved.
+# ``learned_mode`` accepts the pre-1.0 spellings "off"/"auto"/"audit" as aliases
+# for "recommend"/"apply" ("off" behaved like recommend at runtime; "auto" and
+# "audit" both merged). Unrelated to the v1→v2 learned-state field migration
+# below.
 _LEGACY_ALIASES = {"off": "recommend", "auto": "apply", "audit": "apply"}
 _CACHE: dict[str, Any] = {"path": None, "mtime_ns": None, "state": None, "hash": ""}
 
@@ -156,18 +157,12 @@ def _reconcile_overlap(
     overlap = sorted({t for t in expand_only if t in carry_set})
     if not overlap:
         return expand_only
-    if scope:
-        logger.warning(
-            "tool-belt: learned scope %r names %d tool(s) in both carry and "
-            "expand_only; resolving toward carry: %s",
-            scope, len(overlap), ", ".join(overlap),
-        )
-    else:
-        logger.warning(
-            "tool-belt: learned scope names %d tool(s) in both carry and "
-            "expand_only; resolving toward carry: %s",
-            len(overlap), ", ".join(overlap),
-        )
+    where = f" {scope!r}" if scope else ""
+    logger.warning(
+        "tool-belt: learned scope%s names %d tool(s) in both carry and "
+        "expand_only; resolving toward carry: %s",
+        where, len(overlap), ", ".join(overlap),
+    )
     return [t for t in expand_only if t not in carry_set]
 
 

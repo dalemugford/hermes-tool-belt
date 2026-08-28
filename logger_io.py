@@ -3,11 +3,8 @@
 Two log files at ``~/.hermes/state/tool-belt/``:
 
   predictions.jsonl
-    One row per inbound gateway message (canonical schema v2):
-      {schema_version, ts, prediction_id, channel, message_hash,
-       message_preview, preset, triggers_fired, always_carry_count,
-       carry_count, ceiling_count, narrowed_count, active_tools,
-       expand_only_tools, always_carry_tools, carry_tools, …}
+    One row per inbound gateway message (canonical schema v2). See
+    ``PredictionRecord.to_dict`` for the full field set.
 
   tool_calls.jsonl
     One row per actual tool call during a session:
@@ -126,7 +123,6 @@ class PredictionRecord:
     # Carrying residency counts, split by class (Tool Belt 1.0 carrying model):
     #   always_carry_count — immutable residents (partition class A ∩ E)
     #   carry_count        — adaptive residents  (partition class C)
-    # These replace the v1 single ``always_on_count`` (which conflated the two).
     always_carry_count: int
     carry_count: int
     # Counts of tools sent to the model
@@ -152,15 +148,15 @@ class PredictionRecord:
     scope: str = ""
     # Tool-name sets for heuristic analysis (Tool Belt 1.0 carrying model).
     ceiling_tools: list[str] | None = None
-    # active_tools replaces the v1 ``allowed_tools`` — the per-message active
-    # set A ∪ C ∪ T ∪ R (what the model actually sees this turn).
+    # active_tools — the per-message active set A ∪ C ∪ T ∪ R (what the
+    # model actually sees this turn).
     active_tools: list[str] | None = None
-    # expand_only_tools replaces the v1 ``cut_tools`` — the residency stratum X
-    # (E − (A ∪ C)). These describe carrying *assignment*, not activation: a
-    # tool here may still be active this turn via trigger (T) or expansion (R).
+    # expand_only_tools — the residency stratum X (E − (A ∪ C)). These describe
+    # carrying *assignment*, not activation: a tool here may still be active
+    # this turn via trigger (T) or expansion (R).
     expand_only_tools: list[str] | None = None
     mcp_passthrough_tools: list[str] | None = None
-    # Residency split (replaces the v1 single ``always_on_tools`` resident list).
+    # Resident tool names, split by class.
     always_carry_tools: list[str] | None = None   # class A ∩ E
     carry_tools: list[str] | None = None           # class C
     trigger_tools_by_group: dict[str, list[str]] | None = None
@@ -312,7 +308,6 @@ def estimate_tokens(payload: Any) -> int:
     report cites against the user's config-allowed ceiling.
     """
     try:
-        import json
         text = json.dumps(payload, ensure_ascii=False)
     except Exception:
         return 0
@@ -440,9 +435,7 @@ def normalize_prediction_row(row: dict[str, Any]) -> dict[str, Any]:
     out["cut_tools"] = expand_only or []
 
     # ── Residency reconstruction (complete membership only). ──────────────
-    residents_known = bool(out.get("always_on_tools") is not None
-                           and (always_carry_tools or carry_tools or
-                                out.get("always_on_tools")))
+    residents_known = bool(residents)
     complete = bool(ceiling) and residents_known and (active is not None)
     if complete:
         ceiling_set = [str(t) for t in ceiling]
@@ -519,16 +512,20 @@ def normalize_tool_call_row(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def log_prediction(record: PredictionRecord) -> None:
-    """Append a prediction row. Errors are swallowed."""
+def _append_jsonl(path: Path, row: dict[str, Any], what: str) -> None:
+    """Append one JSON line to ``path``, creating its directory. Never raises."""
     try:
-        path = predictions_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(record.to_dict(), ensure_ascii=False) + "\n"
+        line = json.dumps(row, ensure_ascii=False) + "\n"
         with path.open("a", encoding="utf-8") as f:
             f.write(line)
     except Exception as exc:
-        logger.debug("tool-belt: log_prediction failed: %s", exc)
+        logger.debug("tool-belt: %s failed: %s", what, exc)
+
+
+def log_prediction(record: PredictionRecord) -> None:
+    """Append a prediction row. Errors are swallowed."""
+    _append_jsonl(predictions_path(), record.to_dict(), "log_prediction")
 
 
 def log_api_call(row: dict[str, Any]) -> None:
@@ -541,14 +538,7 @@ def log_api_call(row: dict[str, Any]) -> None:
     input_tokens, output_tokens, tool_list_hash. Analysis joins to
     predictions.jsonl on prediction_id.
     """
-    try:
-        path = api_calls_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        line = json.dumps(row, ensure_ascii=False) + "\n"
-        with path.open("a", encoding="utf-8") as f:
-            f.write(line)
-    except Exception as exc:
-        logger.debug("tool-belt: log_api_call failed: %s", exc)
+    _append_jsonl(api_calls_path(), row, "log_api_call")
 
 
 def log_tool_call(
@@ -560,30 +550,23 @@ def log_tool_call(
     extra: dict[str, Any] | None = None,
 ) -> None:
     """Append a tool-call row. Errors are swallowed."""
-    try:
-        path = tool_calls_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        row: dict[str, Any] = {
-            "schema_version": SCHEMA_VERSION,
-            "ts": time.time(),
-            "prediction_id": prediction_id,
-            "session_id": session_id,
-            "tool_name": tool_name,
-        }
-        if extra:
-            row.update(extra)
-        if args is not None:
-            row["args"] = args
-        if result is not None:
-            # result may arrive as a raw JSON string from the tool handler
-            if isinstance(result, str):
-                try:
-                    result = json.loads(result)
-                except Exception:
-                    pass
-            row["result"] = result
-        line = json.dumps(row, ensure_ascii=False) + "\n"
-        with path.open("a", encoding="utf-8") as f:
-            f.write(line)
-    except Exception as exc:
-        logger.debug("tool-belt: log_tool_call failed: %s", exc)
+    row: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "ts": time.time(),
+        "prediction_id": prediction_id,
+        "session_id": session_id,
+        "tool_name": tool_name,
+    }
+    if extra:
+        row.update(extra)
+    if args is not None:
+        row["args"] = args
+    if result is not None:
+        # result may arrive as a raw JSON string from the tool handler
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                pass
+        row["result"] = result
+    _append_jsonl(tool_calls_path(), row, "log_tool_call")

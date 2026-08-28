@@ -3,6 +3,8 @@
 # Keeps the resident messaging loadout small; telemetry records actual savings.
 
 name: aggressive
+# Documentation only — nothing reads `description`; the loader consumes
+# `name`, `always_carry`, `carry`, and `triggers`.
 description: >
   Minimum always-on; everything else trigger-gated. Best for short conversational
   channels. The model can call `expand_tools(category=...)` if it needs something
@@ -45,7 +47,7 @@ always_carry:
 carry:
   # Core Mnemosyne loop: recall first, remember what matters, invalidate stale
   # memories. session_search and the specialist/maintenance Mnemosyne surface
-  # stay expand_only (see the mnemosyne_extended trigger).
+  # stay expand_only (see the history_search and mnemosyne_extended triggers).
   - mnemosyne_remember
   - mnemosyne_recall
   - mnemosyne_invalidate
@@ -60,19 +62,17 @@ carry:
   - write_file
   - patch
 
-# NOTE — no always_off under the 1.0 model. The pre-1.0 always_off tools
-# (memory, tool_search, tool_describe, tool_call) are now ordinary derived
-# expand_only whenever Hermes includes them in E; Tool Search still manages its
-# own bridge activation. The analyzer never demotes an immutable always_carry
-# resident, and an enabled tool outside always_carry/carry is simply expand_only
-# — so no separate demotion shield is needed.
+# NOTE — no always_off key. Tool Belt has no disabling semantics. Any enabled
+# tool outside always_carry/carry is expand_only; disabling is owned by Hermes's
+# ceiling.
 
 # Triggered tool groups. Each group fires when ANY of its signals match.
 # When a group fires, all listed tools are added to the active set.
 # Multiple groups can fire on the same message (additive).
 triggers:
 
-  # File modifications — read is always-on, write is gated
+  # File modifications — re-activates the write surface when it has been
+  # demoted to expand_only; harmless while it is still resident (see `carry`).
   - name: file_write
     tools: [write_file, patch]
     keywords:
@@ -87,7 +87,8 @@ triggers:
       - '^\s*>'
       - '```'
 
-  # Shell — heavy tool, only loads when shell-y intent appears
+  # Shell — re-activates `terminal` when it has been demoted to expand_only;
+  # harmless while it is still resident (see `carry`).
   - name: shell
     tools: [terminal]
     keywords:
@@ -154,9 +155,8 @@ triggers:
       - '\b(read (this )?(aloud|out loud)|say this|speak (this|it)|read it out|TTS|out loud)\b'
       - '\bvoice (over|this)\b'
 
-  # Browser automation — Browser Use CLI mode (the Hermes default as of
-  # 2026-07-17) exposes the whole browser_* surface as one consolidated
-  # tool, browser_exec, instead of the old 12-tool atomic family.
+  # Browser automation — Browser Use CLI mode exposes the browser surface as a
+  # single `browser_exec` tool.
   - name: browser
     tools:
       - browser_exec
@@ -194,9 +194,7 @@ triggers:
   # Note: tool_search / tool_describe / tool_call (Hermes' native deferred-
   # loading bridge) are NOT gated here. Tool Search manages its own
   # activation — it injects the bridge when MCP/plugin tools exist and
-  # stays off when they don't. Gating the bridge behind keyword triggers
-  # fought that logic and required an expand_tools round trip before the
-  # model could discover MCP tools. Let Tool Search handle its own layer.
+  # stays off when they don't.
 
   # Conversation-history search — pulling up prior sessions/turns.
   - name: history_search
