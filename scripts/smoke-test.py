@@ -515,7 +515,7 @@ def main() -> int:
             # ──────── Block 2: cache-on (session-boundary freeze) ────────
             _reset_plugin_state()
             plugin._CONFIG["cache_mode"] = "on"
-            plugin._CONFIG["bypass_rate"] = 0.0  # bypass would freeze WILDCARD; not what we test here
+            plugin._CONFIG["bypass_rate"] = 0.0  # bypass would freeze the no-narrowing sentinel; not what we test here
 
             print(f"\n[cache-on] Running {len(CACHE_ON_SCENARIOS)} multi-turn scenarios in {on_state}...")
             for sc in CACHE_ON_SCENARIOS:

@@ -210,7 +210,11 @@ def main() -> int:
     print("note: `savings-report.py` is deprecated; prefer `tool-belt savings`.",
           file=sys.stderr)
 
-    since_ts = parse_since(args.since)
+    try:
+        since_ts = parse_since(args.since)
+    except _engine.InvalidSinceError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     predictions = [normalize_prediction_row(p)
                    for p in load_jsonl(args.state_dir / "predictions.jsonl")
                    if float(p.get("ts") or 0) >= since_ts]

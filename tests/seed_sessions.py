@@ -41,8 +41,8 @@ would write, and each is a determinism trade made knowingly:
 * **``provider`` / ``model`` are left blank** — no API call happens, so
   there is nothing honest to record.
 
-Everything else — ``triggers_fired``, ``triggers_suppressed``,
-``always_on_tools``, the narrowed tool set — comes from real policy
+Everything else — ``triggers_fired``, ``triggers_suppressed``, the
+residency split, the narrowed tool set — comes from real policy
 evaluation against ``policy.yaml``, so a policy regression fails the seed
 instead of being papered over by hardcoded fixture values.
 
@@ -183,18 +183,17 @@ def _hermes_home(home: Path) -> Iterator[None]:
 
 
 def _ceiling_tools(preset: Any) -> list[str]:
-    """A plausible user ceiling: always-on ∪ every trigger's tools ∪ always-off."""
+    """A plausible user ceiling: residents (A ∪ C) ∪ every trigger's tools."""
     out: list[str] = []
-    for tool in list(getattr(preset, "always_on", []) or []):
+    residents = [*(getattr(preset, "always_carry", []) or []),
+                 *(getattr(preset, "carry", []) or [])]
+    for tool in residents:
         if tool not in out:
             out.append(str(tool))
     for group in getattr(preset, "triggers", []) or []:
         for tool in getattr(group, "tools", []) or []:
             if tool not in out:
                 out.append(str(tool))
-    for tool in getattr(preset, "always_off", []) or []:
-        if tool not in out:
-            out.append(str(tool))
     return out
 
 
@@ -244,16 +243,15 @@ def build_prediction_row(
     what makes the harness inherit the production schema — see the module
     docstring.
     """
-    allowed = prediction.active_tool_names
-    narrowed = [] if allowed == presets.WILDCARD_ALWAYS_ON else [str(t) for t in allowed]
-    always_on = list(preset.always_on) if isinstance(preset.always_on, list) else []
-    # v2 residency split: the preset's own immutable always_carry baseline
-    # partitions the resident set into class A (always_carry) and class C
-    # (carry). Unknown enabled built-ins fall to expand_only under the 1.0
-    # carrying model — they ride in the ceiling but are never resident.
-    baseline = set(getattr(preset, "always_carry", []) or [])
-    always_carry_tools = [t for t in always_on if t in baseline]
-    carry_tools = [t for t in always_on if t not in baseline]
+    active_names = prediction.active_tool_names
+    narrowed = ([] if active_names == presets.NO_NARROWING
+                else [str(t) for t in active_names])
+    # v2 residency split, straight from the canonical preset fields: class A
+    # (always_carry) and class C (carry). Unknown enabled built-ins fall to
+    # expand_only under the 1.0 carrying model — they ride in the ceiling but
+    # are never resident.
+    always_carry_tools = list(getattr(preset, "always_carry", []) or [])
+    carry_tools = list(getattr(preset, "carry", []) or [])
     # Fixture-injected adaptive residents (the demote arm): resident every turn
     # but never called, so after enough sessions the shaper demotes an unused
     # one. v2 models these as ``carry`` — the demotable resident class (the
@@ -501,11 +499,11 @@ def seed(
 
     with _hermes_home(hermes_home):
         # Load the base policy once so a broken policy.yaml surfaces here and
-        # not as a confusing per-turn wildcard fallback.
+        # not as a confusing per-turn no-narrowing fallback.
         base = presets.load_base_policy()
-        if base.is_wildcard:
+        if base.no_narrowing:
             raise ScriptMismatch(
-                "policy.yaml did not load — the predictor would fall back to wildcard"
+                "policy.yaml did not load — the predictor would fall back to no-narrowing"
             )
         # resolve_preset is constant for a (plugin_config, scope) pair; hoisting
         # it out of the turn loop removes most of the per-turn cost.

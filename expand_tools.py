@@ -378,7 +378,6 @@ def _handle_inner(args: dict, prediction_cv: Any, sticky_refresh_fn: Any = None)
         })
 
     initial_active = set(state.get("initial_active_tools") or [])
-    expand_only = set(state.get("expand_only_tools") or [])
 
     # Ceiling gate: the enabled built-in ceiling ``E`` is captured on the first
     # request of the turn (state["enabled_ceiling"]). A tool that resolves
@@ -407,7 +406,6 @@ def _handle_inner(args: dict, prediction_cv: Any, sticky_refresh_fn: Any = None)
     # if it's activatable here, wasn't already on the model's initial active
     # list, and wasn't already carried in from a prior expand_tools call.
     already_available_tools = [t for t in activatable if t in initial_active]
-    recovered_cut_tools = [t for t in activatable if t in expand_only]
     new_additions = [
         t for t in activatable
         if t not in initial_active and t not in expansions
@@ -419,7 +417,6 @@ def _handle_inner(args: dict, prediction_cv: Any, sticky_refresh_fn: Any = None)
         "category": category,
         "resolved_tools": resolved,
         "tools_added": new_additions,
-        "recovered_cut_tools": recovered_cut_tools,
         "already_available_tools": already_available_tools,
         "unavailable_tools": unavailable_tools,
         "triggers_fired": list(state.get("triggers_fired") or []),
@@ -455,7 +452,6 @@ def _handle_inner(args: dict, prediction_cv: Any, sticky_refresh_fn: Any = None)
         "category": category,
         "resolved_tools": resolved,
         "tools_added": new_additions,
-        "recovered_cut_tools": recovered_cut_tools,
         "already_available_tools": already_available_tools,
         "unavailable_tools": unavailable_tools,
         "message": _success_message(

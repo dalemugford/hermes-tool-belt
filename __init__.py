@@ -107,7 +107,7 @@ from . import expand_tools as expand_tools_mod
 from . import logger_io
 from . import predictor as predictor_mod
 from . import presets as presets_mod
-from .presets import WILDCARD_ALWAYS_ON
+from .presets import NO_NARROWING
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +156,7 @@ _CONFIG: dict[str, Any] = {
     # Fraction of sessions (deterministic by session_id hash) to bypass
     # narrowing entirely, providing an A/B baseline cohort. Bypassed
     # predictions still run for telemetry (triggers_fired, etc.) but
-    # allowed_tool_names is set to WILDCARD and policy_source is "bypass".
+    # active_tool_names is set to NO_NARROWING and policy_source is "bypass".
     # 0.0 disables. Override per scope via channels.<scope>.bypass_rate.
     "bypass_rate": 0.0,
     # Determines whether tools may be mutated mid-session.
@@ -263,6 +263,9 @@ def _load_user_config() -> None:
         for key in ("enabled", "log", "agent", "learned_mode", "bypass_rate", "cache_mode"):
             if key in plugin_cfg:
                 _CONFIG[key] = plugin_cfg[key]
+        # "always_on_extra"/"always_off" are REMOVED pre-1.0 knobs: copied
+        # only so presets._warn_legacy_disable_inputs can surface a stale
+        # value in user config. They are never applied.
         for key in ("channels", "always_on_extra", "always_off"):
             if key in plugin_cfg and plugin_cfg[key] is not None:
                 _CONFIG[key] = plugin_cfg[key]
@@ -337,9 +340,9 @@ def _wrap_build_api_kwargs(original):
             state.setdefault("enabled_ceiling", sorted(builtin_ceiling))
             state.setdefault("mcp_passthrough_tools", mcp_passthrough_names)
 
-            # Wildcard / no-narrowing (preset wildcard or A/B bypass): don't
+            # No-narrowing (no-narrowing preset or A/B bypass): don't
             # narrow, but still log on the first call.
-            if active_names == WILDCARD_ALWAYS_ON or active_names is None:
+            if active_names == NO_NARROWING or active_names is None:
                 # Snapshot once per prediction. Subsequent _build_api_kwargs
                 # calls within the same turn (after the model used a tool
                 # like expand_tools) must not overwrite the "what the model
@@ -1012,7 +1015,7 @@ def _maybe_log_prediction(
         return
     try:
         # Residency partition finalized against the live enabled ceiling in
-        # _build_api_kwargs (carrying.resolve). Empty on the wildcard/bypass
+        # _build_api_kwargs (carrying.resolve). Empty on the no-narrowing/bypass
         # path (no narrowing ran) — counts derive from the actual A/C/X sets so
         # telemetry reflects the schema the model really saw, never the preset's
         # pre-ceiling loadout.
@@ -1332,8 +1335,6 @@ def _freeze_session_snapshot(
     active_tool_names: Any,
     baseline_active_tools: Any,
     preset_name: str,
-    always_on_count: int,
-    always_on_tools: list[str],
     trigger_tools_by_group: dict[str, list[str]],
     triggers_fired: list[str],
     triggers_suppressed: list[str],
@@ -1370,8 +1371,6 @@ def _freeze_session_snapshot(
         "triggered_tools": list(triggered_tools or []),
         "expansions": set(),  # grown by expand_tools mid-session
         "preset_name": preset_name,
-        "always_on_count": always_on_count,
-        "always_on_tools": list(always_on_tools or []),
         "trigger_tools_by_group": dict(trigger_tools_by_group or {}),
         "triggers_fired_at_freeze": list(triggers_fired or []),
         "triggers_suppressed_at_freeze": list(triggers_suppressed or []),
@@ -1444,8 +1443,6 @@ def _build_state_from_frozen(
         # ("this is what we froze on").
         "triggers_fired": list(frozen.get("triggers_fired_at_freeze") or []),
         "triggers_suppressed": list(frozen.get("triggers_suppressed_at_freeze") or []),
-        "always_on_count": int(frozen.get("always_on_count", 0)),
-        "always_on_tools": list(frozen.get("always_on_tools") or []),
         "trigger_tools_by_group": dict(frozen.get("trigger_tools_by_group") or {}),
         "sticky_tools": [],
         "sticky_categories": [],
@@ -1589,7 +1586,6 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
 
         preset = presets_mod.resolve_preset(_CONFIG, scope)
         prediction = predictor_mod.predict(predictor_input, attachments, preset)
-        always_on_tools = list(preset.always_on) if isinstance(preset.always_on, list) else []
         resolved_always_carry = list(getattr(preset, "always_carry", []) or [])
         resolved_carry = list(getattr(preset, "carry", []) or [])
         trigger_tools = _trigger_tools_by_group(preset, prediction.triggers_fired)
@@ -1612,11 +1608,11 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         # only because a prior turn ran expand_tools). The credit decision
         # in _on_post_tool_call needs this to distinguish "model could have
         # called this anyway" from "this call is the payoff of an earlier
-        # expand". WILDCARD is preserved (bypass cohort / wildcard always_on
-        # already see every tool — nothing to attribute to expansion).
+        # expand". NO_NARROWING is preserved (bypass cohort / no-narrowing
+        # preset already see every tool — nothing to attribute to expansion).
         # Under cache-on, sticky_tools is empty so the merge is a no-op.
-        if active_tool_names == WILDCARD_ALWAYS_ON or active_tool_names is None:
-            baseline_active_tools: Any = WILDCARD_ALWAYS_ON
+        if active_tool_names == NO_NARROWING or active_tool_names is None:
+            baseline_active_tools: Any = NO_NARROWING
         else:
             baseline_active_tools = sorted(set(active_tool_names))
             if sticky_tools:
@@ -1630,8 +1626,8 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         # flap risk.
         bypassed = _should_bypass(scope, str(session_id))
         if bypassed:
-            active_tool_names = WILDCARD_ALWAYS_ON
-            # Bypass means WILDCARD — sticky/lookback aren't narrowing
+            active_tool_names = NO_NARROWING
+            # Bypass means no narrowing — sticky/lookback aren't narrowing
             # anything, so their telemetry fields would falsely imply
             # narrowing signal in the bypass cohort. Zero them out for
             # cohort-comparison cleanliness.
@@ -1664,11 +1660,6 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             "preset": prediction.preset_name,
             "triggers_fired": prediction.triggers_fired,
             "triggers_suppressed": prediction.triggers_suppressed,
-            # Temporary telemetry adapter: the writer still emits a single
-            # ``always_on_count`` (residents = always_carry + carry) until the
-            # Phase 5 schema cutover splits it into per-class counts.
-            "always_on_count": prediction.always_carry_count + prediction.carry_count,
-            "always_on_tools": always_on_tools,
             "trigger_tools_by_group": trigger_tools,
             "sticky_tools": sticky_tools,
             "sticky_categories": sticky_categories,
@@ -1694,8 +1685,6 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
                 active_tool_names=active_tool_names,
                 baseline_active_tools=baseline_active_tools,
                 preset_name=prediction.preset_name,
-                always_on_count=prediction.always_carry_count + prediction.carry_count,
-                always_on_tools=always_on_tools,
                 trigger_tools_by_group=trigger_tools,
                 triggers_fired=prediction.triggers_fired,
                 triggers_suppressed=prediction.triggers_suppressed,
@@ -1769,10 +1758,10 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
             # a prior expand_tools ran — those calls should be credited to
             # expansion, not classified as "initially available."
             # Falls back to initial_allowed when no prediction state is
-            # attached; WILDCARD means "no narrowing", every tool is
-            # initially available.
+            # attached; NO_NARROWING means every tool is initially
+            # available.
             baseline_raw = state.get("baseline_active_tools") if state else None
-            if baseline_raw == WILDCARD_ALWAYS_ON:
+            if baseline_raw == NO_NARROWING:
                 baseline_allowed: set[str] | None = None  # None means "everything"
             elif baseline_raw is None:
                 baseline_allowed = set(initial_allowed)
@@ -1825,7 +1814,7 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
             # when the credit logic confirms an expand-driven call. MCP/plugin
             # pass-through and out-of-band (cron/subagent) calls resolve to
             # ``external`` — outside the built-in partition, never shaping
-            # evidence. A wildcard/bypass turn (no narrowing) is ``full_ceiling``.
+            # evidence. A no-narrowing/bypass turn is ``full_ceiling``.
             partition_ac = set(state.get("carry_always_carry") or []) if state else set()
             partition_c = set(state.get("carry_carry") or []) if state else set()
             triggered_set = set(state.get("triggered_tools") or []) if state else set()

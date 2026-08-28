@@ -370,9 +370,9 @@ triggers:
 - `name` (`string`) — preset identifier; surfaces in `predictions.jsonl`.
 - `description` (`string`) — free text, ignored by the loader.
 - `always_on` (`list[str]` or `"*"`) — tools loaded on every message in
-  this scope, regardless of message content. The literal `"*"`
-  (`WILDCARD_ALWAYS_ON`) means "load everything in the user's
-  `platform_toolsets` ceiling" and disables narrowing.
+  this scope, regardless of message content. The literal `"*"` means
+  "no narrowing — load everything in the user's `platform_toolsets`
+  ceiling".
 - `triggers` (`list[dict]`) — trigger groups, evaluated against each
   inbound message. Multiple groups may fire on one message (additive).
 - `learning.shape_ceiling` (`dict`) — default thresholds for the

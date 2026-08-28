@@ -824,7 +824,7 @@ def _resolve_effective_preset(
     if proposed is None:
         return base
 
-    if base.is_wildcard:
+    if base.no_narrowing:
         return base
     always_carry = list(base.always_carry)
     always_carry_set = set(always_carry)
@@ -882,7 +882,7 @@ def _replay_active_names(
             continue
         prediction = predictor.predict(message, None, preset)
 
-        if prediction.is_wildcard:
+        if prediction.no_narrowing:
             per_turn = set(ceiling_names)
         else:
             resolved = set(prediction.active_tool_names) & ceiling_set

@@ -1,7 +1,8 @@
 """Unit tests for the central v1→v2 telemetry normalizer (``logger_io``).
 
-Phase 5 centralizes historical (v1) normalization so every downstream consumer
-reads the same canonical v2 row shape. These tests pin that normalizer against
+The centralized normalizer maps historical (v1) rows forward so every
+downstream consumer reads the same canonical v2 row shape — and emits ONLY
+that canonical surface. These tests pin the normalizer against
 the stream shapes it must survive: malformed, sparse, complete-v1, already-v2,
 and mixed-version streams — for both prediction rows and tool-call rows.
 """
@@ -52,9 +53,10 @@ class PredictionNormalizationTests(unittest.TestCase):
         self.assertEqual(out["active_tools"], ["clarify", "read_file"])
         # v1 residency mapping keeps class A empty (no immutable split existed).
         self.assertEqual(out["residency"]["always_carry"], [])
-        # Legacy aliases retained for not-yet-migrated consumers.
-        self.assertEqual(out["cut_tools"], ["web_extract"])
-        self.assertEqual(sorted(out["always_on_tools"]), ["clarify", "read_file"])
+        # v1 spellings are consumed, not re-emitted: canonical fields only.
+        self.assertNotIn("cut_tools", out)
+        self.assertNotIn("always_on_tools", out)
+        self.assertNotIn("allowed_tools", out)
 
     def test_v1_unknown_kept_folds_into_residents_but_mcp_never_does(self):
         out = logger_io.normalize_prediction_row({
@@ -71,7 +73,7 @@ class PredictionNormalizationTests(unittest.TestCase):
         # The retired field is dropped from the canonical row.
         self.assertNotIn("unknown_kept_tools", out)
 
-    def test_already_v2_row_passes_through_with_aliases(self):
+    def test_already_v2_row_passes_through_canonically(self):
         row = {
             "schema_version": 2,
             "ceiling_tools": ["clarify", "read_file", "web_extract"],
@@ -88,6 +90,10 @@ class PredictionNormalizationTests(unittest.TestCase):
         self.assertEqual(out["residency"]["always_carry"], ["clarify"])
         self.assertEqual(out["residency"]["carry"], ["read_file"])
         self.assertEqual(out["residency"]["expand_only"], ["web_extract"])
+        # No v1 alias is synthesized onto a v2 row.
+        self.assertNotIn("always_on_tools", out)
+        self.assertNotIn("allowed_tools", out)
+        self.assertNotIn("cut_tools", out)
         # Non-mutating: the input dict is untouched.
         self.assertNotIn("always_on_tools", row)
 
@@ -119,7 +125,7 @@ class ToolCallNormalizationTests(unittest.TestCase):
             out = logger_io.normalize_tool_call_row(bad)  # type: ignore[arg-type]
             self.assertEqual(out.get("schema_version"), logger_io.SCHEMA_VERSION)
 
-    def test_v1_flags_map_to_v2_with_aliases(self):
+    def test_v1_flags_map_to_v2_without_aliases(self):
         out = logger_io.normalize_tool_call_row({
             "tool_name": "terminal",
             "was_initially_available": False,
@@ -129,22 +135,26 @@ class ToolCallNormalizationTests(unittest.TestCase):
         })
         self.assertFalse(out["was_initially_active"])
         self.assertTrue(out["was_expand_only"])
+        self.assertFalse(out["activated_by_expansion"])
         self.assertTrue(out["expansion_provided_access"])
-        # Legacy aliases retained for the not-yet-migrated shaper/analyzer.
-        self.assertFalse(out["was_initially_available"])
-        self.assertTrue(out["was_cut"])
-        self.assertTrue(out["expand_tools_used"])
+        # v1 spellings are consumed, not re-emitted: canonical flags only.
+        self.assertNotIn("was_initially_available", out)
+        self.assertNotIn("was_cut", out)
+        self.assertNotIn("was_expanded", out)
+        self.assertNotIn("expand_tools_used", out)
 
-    def test_already_v2_row_backfills_legacy_aliases(self):
+    def test_already_v2_row_gains_no_legacy_aliases(self):
         out = logger_io.normalize_tool_call_row({
             "tool_name": "web_extract",
             "was_initially_active": True,
             "was_expand_only": False,
             "activation_source": "carry",
         })
-        self.assertTrue(out["was_initially_available"])
-        self.assertFalse(out["was_cut"])
+        self.assertTrue(out["was_initially_active"])
+        self.assertFalse(out["was_expand_only"])
         self.assertEqual(out["activation_source"], "carry")
+        self.assertNotIn("was_initially_available", out)
+        self.assertNotIn("was_cut", out)
 
     def test_counterfactual_row_gains_no_spurious_expansion_flag(self):
         # A harvest row deliberately omits expansion flags — normalization must
@@ -156,6 +166,19 @@ class ToolCallNormalizationTests(unittest.TestCase):
         })
         self.assertNotIn("expansion_provided_access", out)
         self.assertNotIn("expand_tools_used", out)
+
+
+class FallbackBaselineDriftTests(unittest.TestCase):
+    def test_fallback_always_carry_matches_shipped_policy(self):
+        """The normalizer's hardcoded fallback baseline must equal the
+        shipped policy.yaml ``always_carry`` set — a silent divergence would
+        mis-split every historical v1 row."""
+        presets = importlib.import_module("tool_belt_plugin.presets")
+        base = presets.load_preset_file(presets._POLICY_FILE)
+        self.assertEqual(
+            logger_io._FALLBACK_ALWAYS_CARRY,
+            frozenset(base.always_carry),
+        )
 
 
 if __name__ == "__main__":

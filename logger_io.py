@@ -36,10 +36,9 @@ logger = logging.getLogger(__name__)
 # 2 for the Tool Belt 1.0 carrying model: predictions split residency into
 # always_carry/carry, rename allowed/cut to active/expand_only, and drop the
 # retired unknown_kept concept; tool-call rows rename availability/cut flags and
-# add an explicit ``activation_source``. See ``normalize_prediction_row`` /
-# ``normalize_tool_call_row`` for the in-memory v1→v2 canonicalization that
-# downstream consumers will read through once they migrate onto it (a later
-# phase; today's consumers still read raw rows).
+# add an explicit ``activation_source``. All telemetry consumers read rows
+# through ``normalize_prediction_row`` / ``normalize_tool_call_row``, so v1,
+# v2, and mixed streams present the same canonical fields.
 SCHEMA_VERSION = 2
 
 # Fallback immutable-resident baseline used by the v1 normalizer to split a
@@ -349,11 +348,10 @@ def normalize_prediction_row(row: dict[str, Any]) -> dict[str, Any]:
     """Normalize any prediction telemetry row into the canonical v2 shape.
 
     Pure, non-mutating, and non-raising: returns a new dict, never rewrites any
-    file. Intended to become the shared choke point downstream consumers read
-    through so v1, v2, and mixed-version streams all present the same canonical
-    fields; consumer migration onto it lands in a later phase (today
-    ``shape-ceiling.py`` and friends still read raw rows). Handles malformed
-    input by returning a best-effort dict.
+    file. This IS the shared choke point every downstream consumer (analyzer,
+    savings engine, shaper, operator scripts) reads through, so v1, v2, and
+    mixed-version streams all present the same canonical fields. Handles
+    malformed input by returning a best-effort dict.
 
     Canonical v2 fields (always present on the returned row): ``schema_version``,
     ``always_carry_tools``, ``carry_tools``, ``active_tools``,
@@ -375,9 +373,9 @@ def normalize_prediction_row(row: dict[str, Any]) -> dict[str, Any]:
     to ``carry``); a v2 row's mapping reflects its authoritative A/C/X.
 
     Legacy v1 field names (``always_on_tools`` / ``allowed_tools`` /
-    ``cut_tools`` / ``always_on_count``) are retained as computed aliases only
-    while the not-yet-migrated analyzer/shaper still read them; they are not the
-    canonical surface and will be dropped once those consumers move to v2.
+    ``cut_tools`` / ``unknown_kept_tools``) are consumed here and removed from
+    the returned row: the canonical v2 fields are the only surface a
+    normalized row presents.
     """
     try:
         out = dict(row or {})
@@ -427,12 +425,10 @@ def normalize_prediction_row(row: dict[str, Any]) -> dict[str, Any]:
     out["carry_count"] = out.get("carry_count", len(carry_tools))
     out.setdefault("trigger_activated_tools",
                    _string_list(out.get("trigger_activated_tools")) or [])
-    out.pop("unknown_kept_tools", None)
-
-    # ── Transitional legacy aliases for not-yet-migrated consumers. ───────
-    out["always_on_tools"] = residents
-    out["allowed_tools"] = active or []
-    out["cut_tools"] = expand_only or []
+    # v1 spellings are consumed above — drop them from the canonical row.
+    for legacy_key in ("unknown_kept_tools", "always_on_tools", "allowed_tools",
+                       "cut_tools", "always_on_count"):
+        out.pop(legacy_key, None)
 
     # ── Residency reconstruction (complete membership only). ──────────────
     residents_known = bool(residents)
@@ -469,9 +465,9 @@ def normalize_tool_call_row(row: dict[str, Any]) -> dict[str, Any]:
     ``was_initially_active`` / ``was_expand_only`` / ``activated_by_expansion``
     / ``expansion_provided_access`` and adds an explicit ``activation_source``.
 
-    Both directions of the availability/cut/expansion flags are retained as
-    aliases so a not-yet-migrated reader sees consistent values regardless of
-    the on-disk version. ``activation_source`` is only set when present (v2) or
+    v1 spellings are consumed and removed from the returned row: the
+    canonical v2 flags are the only surface a normalized row presents.
+    ``activation_source`` is only set when present (v2) or
     confidently derivable; a v1 row without it keeps it blank rather than
     guessing a residency class the old schema never recorded.
     """
@@ -498,17 +494,17 @@ def normalize_tool_call_row(row: dict[str, Any]) -> dict[str, Any]:
     # not gain a spurious ``False``).
     if was_initially_active is not None:
         out["was_initially_active"] = bool(was_initially_active)
-        out["was_initially_available"] = bool(was_initially_active)  # legacy alias
     if was_expand_only is not None:
         out["was_expand_only"] = bool(was_expand_only)
-        out["was_cut"] = bool(was_expand_only)  # legacy alias
     if activated_by_expansion is not None:
         out["activated_by_expansion"] = bool(activated_by_expansion)
-        out["was_expanded"] = bool(activated_by_expansion)  # legacy alias
     if expansion_provided_access is not None:
         out["expansion_provided_access"] = bool(expansion_provided_access)
-        out["expand_tools_used"] = bool(expansion_provided_access)  # legacy alias
     out["activation_source"] = str(activation_source or "")
+    # v1 spellings are consumed above — drop them from the canonical row.
+    for legacy_key in ("was_initially_available", "was_cut", "was_expanded",
+                       "expand_tools_used"):
+        out.pop(legacy_key, None)
     return out
 
 

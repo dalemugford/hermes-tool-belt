@@ -6,8 +6,9 @@ this turn. The result is the union of:
   · The preset's residents (``always_carry`` ∪ ``carry``)
   · Tools from every trigger group whose signals match the message
 
-Always returns a result. Never raises — on any error, falls back to
-WILDCARD_ALWAYS_ON so the gateway behaves as if the plugin weren't installed.
+Always returns a result. Never raises — on any error, falls back to the
+NO_NARROWING sentinel so the gateway behaves as if the plugin weren't
+installed.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from .presets import Preset, WILDCARD_ALWAYS_ON
+from .presets import NO_NARROWING, Preset
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ class Prediction:
 
     # Tool names the model is likely to need this turn — the candidate active
     # set (residents ∪ trigger-activated tools). Either a list, or the
-    # WILDCARD_ALWAYS_ON sentinel meaning "no narrowing — load the whole
+    # NO_NARROWING sentinel meaning "no narrowing — load the whole
     # enabled ceiling". The final partition against the live enabled ceiling
     # ``E`` is computed in ``carrying.resolve`` at request-build time.
     active_tool_names: list[str] | str
@@ -49,8 +50,8 @@ class Prediction:
     carry_count: int = 0
 
     @property
-    def is_wildcard(self) -> bool:
-        return self.active_tool_names == WILDCARD_ALWAYS_ON
+    def no_narrowing(self) -> bool:
+        return self.active_tool_names == NO_NARROWING
 
 
 def predict(
@@ -67,9 +68,9 @@ def predict(
     try:
         return _predict_inner(message, attachments, preset)
     except Exception as exc:
-        logger.warning("tool-belt: predictor failed (%s) — falling back to wildcard", exc)
+        logger.warning("tool-belt: predictor failed (%s) — falling back to no-narrowing", exc)
         return Prediction(
-            active_tool_names=WILDCARD_ALWAYS_ON,
+            active_tool_names=NO_NARROWING,
             triggers_fired=[],
             preset_name=preset.name,
             always_carry_count=0,
@@ -82,9 +83,9 @@ def _predict_inner(
     attachments: Iterable[str] | None,
     preset: Preset,
 ) -> Prediction:
-    if preset.is_wildcard:
+    if preset.no_narrowing:
         return Prediction(
-            active_tool_names=WILDCARD_ALWAYS_ON,
+            active_tool_names=NO_NARROWING,
             triggers_fired=[],
             preset_name=preset.name,
             always_carry_count=len(preset.always_carry),
@@ -106,8 +107,7 @@ def _predict_inner(
     # Start from the residents (always_carry ∪ carry). The final A/C/X split
     # against the live enabled ceiling happens later in carrying.resolve; here
     # we build only the per-turn candidate active set.
-    residents = preset.always_on
-    active: list[str] = list(residents) if isinstance(residents, list) else []
+    active: list[str] = list(dict.fromkeys([*preset.always_carry, *preset.carry]))
     triggers_fired: list[str] = []
     triggers_suppressed: list[str] = []
 

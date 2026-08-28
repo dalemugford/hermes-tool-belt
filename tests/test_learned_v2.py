@@ -65,7 +65,7 @@ class ApplyToPresetImmunityTests(LearnedV2TestCase):
 
         # The tool stays resident on the immutable surface, never demoted.
         self.assertIn("send_message", result.preset.always_carry)
-        self.assertIn("send_message", result.preset.always_on)
+        self.assertNotIn("send_message", result.preset.carry)
         warned = "\n".join(cm.output)
         self.assertIn("always_carry", warned)
         self.assertIn("send_message", warned)

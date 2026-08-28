@@ -252,12 +252,12 @@ class ShapingSummaryTests(TempHomeTestCase):
             state_dir=self.root_state,
         )
 
-    def test_renders_always_on_demoted_and_triggers(self) -> None:
+    def test_renders_promotions_demotions_and_triggers(self) -> None:
         recs = {
             "scope": "default:telegram",
             "sessions_considered": 24,
             "promote": [{"tool": "terminal", "sessions": 4, "calls": 9, "evidence": "expand_tools"}],
-            "demote": [{"tool": "web_search", "sessions_without_use": 24, "evidence": "always_on_unused"}],
+            "demote": [{"tool": "web_search", "sessions_without_use": 24, "evidence": "carry_unused"}],
         }
         preset = configure.load_base_preset()
         self.assertIsNotNone(preset, "shipped policy should load")

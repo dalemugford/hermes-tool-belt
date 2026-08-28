@@ -17,12 +17,10 @@ carrying model it declares a two-way resident partition plus trigger groups:
 time. Tool Belt has no disabling semantics: absent/disabled tools are owned by
 Hermes's ceiling, not by policy.
 
-Legacy compatibility: ``Preset`` also accepts ``always_on=`` / ``always_off=``
-at construction and exposes ``.always_on`` / ``.always_off`` / ``.is_wildcard``
-as read-only views. The runtime filter (``predictor.py``, ``__init__.py``)
-still consumes ``.always_on`` / ``.is_wildcard``; these views are derived from
-the canonical fields, never authoritative. ``.always_on`` is the resident union
-``always_carry ∪ carry`` — precisely "what loads on every message".
+Legacy compatibility lives only in :func:`load_preset_file`, which folds a
+pre-1.0 policy file's single ``always_on`` list (or the ``"*"`` spelling of
+"no narrowing") into the canonical fields at read time. ``Preset`` itself
+carries no v1 vocabulary.
 
 Per-scope narrowing is driven by the learned overlay (``learned.py``). The old
 config-level ``always_on_extra`` / ``always_off`` promote-and-disable knobs are
@@ -45,12 +43,14 @@ logger = logging.getLogger(__name__)
 # Single shipped policy at the plugin root. Hand-curated.
 _POLICY_FILE = Path(__file__).parent / "policy.yaml"
 
-# Runtime "allow everything in the user's ceiling" sentinel. This is the value
-# a *Prediction* (``predictor.py``) stamps onto ``allowed_tool_names`` on the
-# fail-open / bypass path, and ``__init__.py`` compares against it. It is NOT
-# part of the Preset domain model — a no-narrowing Preset is expressed by the
-# ``no_narrowing`` flag below.
-WILDCARD_ALWAYS_ON = "*"
+# Runtime "no narrowing — allow everything in the user's ceiling" sentinel.
+# This is the value a *Prediction* (``predictor.py``) stamps onto
+# ``active_tool_names`` on the fail-open / bypass path, and ``__init__.py``
+# compares against it. The ``"*"`` string is also the on-disk spelling a
+# pre-1.0 policy file may use for its ``always_on`` key (handled in
+# ``load_preset_file``). It is NOT part of the Preset domain model — a
+# no-narrowing Preset is expressed by the ``no_narrowing`` flag.
+NO_NARROWING = "*"
 
 
 @dataclass
@@ -99,13 +99,7 @@ class Preset:
       · ``carry``        — adaptive residents (source of class C). Promotion/
         demotion mutate this loadout; trigger definitions never change.
       · ``triggers``     — trigger groups (``expand_only`` activation).
-      · ``no_narrowing`` — neutral "load the whole ceiling" flag. The model's
-        replacement for the old ``always_on == "*"`` wildcard sentinel.
-
-    Legacy compatibility (transitional; see the module docstring): the
-    constructor still accepts ``always_on=`` / ``always_off=`` and the read
-    views ``.always_on`` / ``.always_off`` / ``.is_wildcard`` are derived from
-    the canonical fields for un-rewired runtime filtering.
+      · ``no_narrowing`` — neutral "load the whole ceiling" flag.
     """
 
     def __init__(
@@ -115,61 +109,12 @@ class Preset:
         carry: list[str] | None = None,
         triggers: list[TriggerGroup] | None = None,
         no_narrowing: bool = False,
-        *,
-        always_on: list[str] | str | None = None,
-        always_off: list[str] | None = None,
     ) -> None:
         self.name = str(name)
         self.triggers: list[TriggerGroup] = list(triggers) if triggers else []
         self.no_narrowing = bool(no_narrowing)
-
-        legacy_off = [str(t) for t in (always_off or []) if isinstance(t, str)]
-
-        if always_on is not None and always_carry is None and carry is None:
-            # Legacy construction: a single "load on every message" list (or the
-            # wildcard sentinel). Fold it into the adaptive ``carry`` loadout —
-            # the immutable split isn't expressible in the pre-1.0 shape.
-            if always_on == WILDCARD_ALWAYS_ON:
-                self.no_narrowing = True
-                self.always_carry: list[str] = []
-                self.carry: list[str] = []
-            elif isinstance(always_on, list):
-                self.always_carry = []
-                self.carry = [str(t) for t in always_on if isinstance(t, str)]
-            else:
-                self.always_carry = []
-                self.carry = []
-        else:
-            self.always_carry = [str(t) for t in (always_carry or []) if isinstance(t, str)]
-            self.carry = [str(t) for t in (carry or []) if isinstance(t, str)]
-
-        # Legacy disable list. Empty under the 1.0 model; a handful of pre-1.0
-        # tests still construct a preset with an explicit ``always_off=``.
-        self._legacy_always_off = legacy_off
-
-    # ─── Legacy read views (transitional) ──────────────────────────────────
-    @property
-    def always_on(self) -> list[str] | str:
-        """Residents loaded on every message: ``always_carry ∪ carry``.
-
-        Returns the wildcard sentinel for a no-narrowing preset, preserving the
-        exact shape the pre-1.0 runtime branched on.
-        """
-        if self.no_narrowing:
-            return WILDCARD_ALWAYS_ON
-        out = list(self.always_carry)
-        for tool in self.carry:
-            if tool not in out:
-                out.append(tool)
-        return out
-
-    @property
-    def always_off(self) -> list[str]:
-        return list(self._legacy_always_off)
-
-    @property
-    def is_wildcard(self) -> bool:
-        return self.no_narrowing
+        self.always_carry = [str(t) for t in (always_carry or []) if isinstance(t, str)]
+        self.carry = [str(t) for t in (carry or []) if isinstance(t, str)]
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return (
@@ -240,14 +185,14 @@ def load_preset_file(path: Path) -> Preset:
     always_carry = _tool_list(data.get("always_carry"))
     carry = _tool_list(data.get("carry"))
 
-    if data.get("always_carry") == WILDCARD_ALWAYS_ON or data.get("carry") == WILDCARD_ALWAYS_ON:
-        # A wildcard carrying baseline means "no narrowing".
+    if data.get("always_carry") == NO_NARROWING or data.get("carry") == NO_NARROWING:
+        # A "*" carrying baseline means "no narrowing".
         no_narrowing = True
         always_carry, carry = [], []
     elif not always_carry and not carry and "always_on" in data:
-        # Pre-1.0 policy: a single always_on list (or wildcard) → adaptive carry.
+        # Pre-1.0 policy: a single always_on list (or "*") → adaptive carry.
         legacy = data.get("always_on")
-        if legacy == WILDCARD_ALWAYS_ON:
+        if legacy == NO_NARROWING:
             no_narrowing = True
         else:
             carry = _tool_list(legacy)

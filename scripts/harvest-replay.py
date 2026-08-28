@@ -267,7 +267,7 @@ def replay_session(
         # Compute the narrowed view: intersection of the resolved active set
         # with the session's ceiling. Under the 1.0 carrying model an enabled
         # built-in outside the active set is derived expand_only.
-        if prediction.is_wildcard:
+        if prediction.no_narrowing:
             allowed_names = list(session.ceiling_tools)
             expand_only_names: list[str] = []
         else:

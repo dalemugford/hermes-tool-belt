@@ -38,10 +38,10 @@ if "toolsets" not in sys.modules:
     sys.modules["toolsets"] = _toolsets_stub
 
 
-def _make_state(*, initial_allowed=(), cut_tools=(), expansions=None, enabled_ceiling=None):
+def _make_state(*, initial_allowed=(), expand_only=(), expansions=None, enabled_ceiling=None):
     state = {
         "initial_active_tools": list(initial_allowed),
-        "expand_only_tools": list(cut_tools),
+        "expand_only_tools": list(expand_only),
         "expansions": set(expansions or set()),
         "sticky_key": "",
         "scope": "test:cli",
