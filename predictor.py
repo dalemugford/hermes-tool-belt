@@ -3,7 +3,7 @@
 Given a message, returns the set of tool names the model is likely to need
 this turn. The result is the union of:
 
-  · The preset's ``always_on`` list
+  · The preset's residents (``always_carry`` ∪ ``carry``)
   · Tools from every trigger group whose signals match the message
 
 Always returns a result. Never raises — on any error, falls back to
@@ -52,12 +52,6 @@ class Prediction:
     def is_wildcard(self) -> bool:
         return self.active_tool_names == WILDCARD_ALWAYS_ON
 
-    def includes(self, tool_name: str) -> bool:
-        """True if ``tool_name`` is in this prediction's candidate active set."""
-        if self.is_wildcard:
-            return True
-        return tool_name in self.active_tool_names  # type: ignore[operator]
-
 
 def predict(
     message: str,
@@ -93,8 +87,8 @@ def _predict_inner(
             active_tool_names=WILDCARD_ALWAYS_ON,
             triggers_fired=[],
             preset_name=preset.name,
-            always_carry_count=len(getattr(preset, "always_carry", []) or []),
-            carry_count=len(getattr(preset, "carry", []) or []),
+            always_carry_count=len(preset.always_carry),
+            carry_count=len(preset.carry),
         )
 
     msg = message or ""
@@ -112,8 +106,8 @@ def _predict_inner(
     # Start from the residents (always_carry ∪ carry). The final A/C/X split
     # against the live enabled ceiling happens later in carrying.resolve; here
     # we build only the per-turn candidate active set.
-    residents = list(preset.always_on) if isinstance(preset.always_on, list) else []
-    active: list[str] = list(residents)
+    residents = preset.always_on
+    active: list[str] = list(residents) if isinstance(residents, list) else []
     triggers_fired: list[str] = []
     triggers_suppressed: list[str] = []
 
@@ -126,7 +120,11 @@ def _predict_inner(
             for tool in group.tools:
                 if tool not in active:
                     active.append(tool)
-        elif group.exclude_patterns and group.is_excluded(msg) and group.would_fire_positive(msg, atts):
+        elif (
+            group.exclude_patterns
+            and group.is_excluded(msg)
+            and group.would_fire_positive(msg, atts)
+        ):
             triggers_suppressed.append(group.name)
 
     return Prediction(
@@ -134,6 +132,6 @@ def _predict_inner(
         triggers_fired=triggers_fired,
         triggers_suppressed=triggers_suppressed,
         preset_name=preset.name,
-        always_carry_count=len(getattr(preset, "always_carry", []) or []),
-        carry_count=len(getattr(preset, "carry", []) or []),
+        always_carry_count=len(preset.always_carry),
+        carry_count=len(preset.carry),
     )

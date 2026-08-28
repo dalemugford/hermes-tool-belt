@@ -18,8 +18,8 @@ Invariants:
   * No selection source (policy, learning, triggers, sticky/prior-active
     carry-forward, or explicit expansion) can add a tool absent from ``E``.
     Disabled/absent tools never re-enter.
-  * ``always_carry`` is immune to a learned ``demoted`` (always_off) signal —
-    the demotion is ignored and a warning is emitted.
+  * ``always_carry`` is immune to a learned ``demoted`` signal — the
+    demotion is ignored and a warning is emitted.
   * A contradictory overlap (a tool both carried and demoted) fails safe
     *toward carrying*: the tool stays resident and a warning is emitted.
   * MCP/plugin ``passthrough`` tools live outside the built-in partition; they
@@ -71,7 +71,8 @@ def _coerce(value) -> set[str]:
     """Coerce a name-collection to a ``set[str]``.
 
     A lone string is treated as a single name. ``None`` becomes the empty set.
-    Any element that raises or isn't string-able is skipped defensively.
+    Non-string elements are coerced with ``str()``; iteration errors propagate
+    to the caller's fail-open handler.
     """
     if value is None:
         return set()
@@ -147,7 +148,7 @@ def _resolve_inner(
 
     # Passthrough (MCP/plugin) tools sit outside the built-in partition. Never
     # let a passthrough name leak into the built-in ceiling accounting.
-    pt_active = set(pt)
+    pt_active = pt
     E_builtin = set(E) - pt_active
 
     # ── Class A: immutable residents (always_carry ∩ E). ──────────────────

@@ -21,12 +21,12 @@ without (kimi, gpt-5.4-mini). The plugin runs in one of two modes:
     only at moments that already cost a cache break: session reset and
     context compaction.
 
-    Sticky residency, lookback, and per-turn predictor execution are all
-    skipped on the frozen path — they were per-turn-adjustment mechanisms
-    that the freeze makes redundant by design. ``expand_tools`` continues
-    to mutate the frozen set in-place; that mutation is model-driven and
-    pays one cache break for the value of getting the tool the model
-    actually wanted.
+    Sticky residency, lookback, and per-turn predictor execution do not
+    apply on the frozen path: the frozen set already carries forward
+    verbatim, so per-turn adjustment has nothing to add. ``expand_tools``
+    continues to mutate the frozen set in-place; that mutation is
+    model-driven and pays one cache break for the value of getting the
+    tool the model actually wanted.
 
   cache-off (``cache_mode: off`` or auto-detected for known-uncached models)
     Per-turn narrowing with sticky residency carrying expanded tools
@@ -96,6 +96,7 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+import json
 import logging
 import os
 import time
@@ -125,8 +126,6 @@ _CONFIG: dict[str, Any] = {
     "enabled": False,
     "log": True,
     "channels": {},
-    "always_on_extra": [],
-    "always_off": [],
     "agent": "",
     "learned_mode": "recommend",
     # Cache-off mode pipeline — sticky residency + per-turn predictor
@@ -181,10 +180,9 @@ _CONFIG: dict[str, Any] = {
         "detect_min_input_tokens": 5000,
         # hit_rate ≥ on_threshold → lock "on"; else lock "off".
         "on_threshold": 0.40,
-        # Providers/models with known-bad provider-side caching skip the
-        # detection window and lock "off" immediately. From the state.db
-        # 14-day rollup: kimi at 2.5%, gpt-5.4-mini at 2.9%. Don't waste
-        # 5 calls of observation to re-derive what we already measured.
+        # Models empirically observed with negligible provider-side cache
+        # hit rates; skip the detection window and lock "off" immediately
+        # rather than spending 5 calls to re-derive a known answer.
         "providers_off_models": ["kimi-k2.6:cloud", "gpt-5.4-mini"],
     },
 }
@@ -532,12 +530,12 @@ def _is_mcp_tool(name: str) -> bool:
     return False
 
 
-def _tool_names(tools: list) -> list[str]:
+def _tool_names(tools: list[dict[str, Any]]) -> list[str]:
     """Return stable tool names from a tool-schema list."""
     return [name for name in (_tool_name(t) for t in tools) if name]
 
 
-def _tool_list_hash(tools: list) -> str:
+def _tool_list_hash(tools: list[dict[str, Any]]) -> str:
     """Truncated sha256 of the narrowed tool list in send-order.
 
     Captures membership, ordering, and schema-content drift — provider
@@ -547,8 +545,7 @@ def _tool_list_hash(tools: list) -> str:
     across consecutive turns in the same session.
     """
     try:
-        import json as _json
-        payload = _json.dumps(tools, sort_keys=False, ensure_ascii=False, separators=(",", ":"))
+        payload = json.dumps(tools, sort_keys=False, ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
     except Exception:
         return ""
@@ -581,8 +578,7 @@ def _system_message_hash(api_messages: Any) -> str:
         content = first.get("content")
         # Content can be str OR list-of-parts (Anthropic multimodal shape).
         if isinstance(content, list):
-            import json as _json
-            payload = _json.dumps(content, sort_keys=False, ensure_ascii=False, separators=(",", ":"))
+            payload = json.dumps(content, sort_keys=False, ensure_ascii=False, separators=(",", ":"))
         elif isinstance(content, str):
             payload = content
         else:
@@ -813,8 +809,7 @@ def _platform_from_session_key(session_key: Any) -> str:
     Hermes' :func:`gateway.session.build_session_key` produces:
         ``agent:main:{platform}:{chat_type}[:...]``
     Position 1 is the *literal* string ``"main"`` — NOT a per-profile
-    agent name (that lived in our imagination, not in the gateway).
-    Position 2 is the platform.
+    agent name. Position 2 is the platform.
 
     Returns ``""`` for anything that doesn't match the canonical shape
     (AIAgent's uuid/timestamp ``session_id``, blank inputs, anything
@@ -889,7 +884,6 @@ def _looks_like_hermes_session_uuid(value: Any) -> bool:
 
 def _hermes_session_uuid(
     event: Any = None,
-    gateway: Any = None,
     session_store: Any = None,
     kwargs: dict[str, Any] | None = None,
     session_key: str = "",
@@ -958,9 +952,9 @@ def _agent_platform_from_context(event: Any = None, kwargs: dict[str, Any] | Non
         we have no context, the first plausible answer wins.
 
     Scope is ``{agent}:{platform}``. Agent comes from profile context
-    (explicit config, HERMES_HOME profile dir, HERMES_PROFILE). Hermes'
-    ``HERMES_SESSION_KEY`` is shaped ``agent:main:{platform}:...`` —
-    position 1 is the literal ``"main"``, never a per-profile agent name.
+    (explicit config, HERMES_HOME profile dir, HERMES_PROFILE); the
+    platform comes from ``HERMES_SESSION_KEY`` — see
+    :func:`_platform_from_session_key` for that key's shape.
     Returns ``("", "", "")`` when either slot can't be filled with real
     data (analyzer buckets blank rows as "unknown").
     """
@@ -1004,8 +998,11 @@ def _maybe_log_prediction(
     ceiling: list,
     narrowed: list,
 ) -> None:
-    """Write the prediction row to predictions.jsonl on the FIRST API call
-    per turn. Subsequent calls in the same turn don't re-log."""
+    """Write the prediction row to predictions.jsonl.
+
+    Runs on the FIRST API call per turn; subsequent calls in the same turn
+    don't re-log.
+    """
     if state.get("logged"):
         return
     state["logged"] = True
@@ -1126,12 +1123,8 @@ def _wrap_compress_context(original):
 def _install_patches() -> bool:
     """Install the AIAgent monkey-patches.
 
-    NOTE on the from-import / class-method situation:
-      AIAgent is a class; ``_build_api_kwargs`` and ``_compress_context``
-      are methods on it. Replacing methods on the class affects ALL
-      instances (existing and new). No from-import binding problem
-      here — methods are looked up via the instance's class at call
-      time.
+    Patching the methods on the ``AIAgent`` class affects all existing and
+    future instances.
     """
     global _ORIGINAL_BUILD_API_KWARGS, _ORIGINAL_COMPRESS_CONTEXT, _PATCHED
     if _PATCHED:
@@ -1403,11 +1396,11 @@ def _build_state_from_frozen(
 ) -> dict[str, Any]:
     """Construct the contextvar state for a dispatch that reuses a frozen snapshot.
 
-    Sticky residency and lookback are *not populated* — both were
-    per-turn-adjustment mechanisms; the freeze makes them redundant by
-    design (see [[tool-belt-design-principle]]). The fields are
-    still present in the state dict with empty values so downstream
-    consumers (telemetry, post_tool_call) don't need conditional reads.
+    Sticky residency and lookback do not apply under the freeze: the frozen
+    set already carries forward verbatim, so neither is populated. The
+    fields are still present in the state dict with empty values so
+    downstream consumers (telemetry, post_tool_call) don't need conditional
+    reads.
 
     The frozen snapshot's ``expansions`` set carries forward — any
     expand_tools tools added in prior turns of this session stay
@@ -1498,7 +1491,6 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         # shaper's per-session grouping; touches nothing load-bearing.
         hermes_session_id = _hermes_session_uuid(
             event=event,
-            gateway=gateway,
             session_store=session_store,
             kwargs=kwargs,
             session_key=str(session_id),
@@ -1552,10 +1544,6 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
                         set(frozen.get("triggers_fired_at_freeze") or [])
                         | set(reprediction.triggers_fired)
                     )
-                    frozen["last_trigger_mutation"] = {
-                        "tools_added": sorted(added),
-                        "groups": sorted(new_trigger_tools.keys()),
-                    }
             except Exception as exc:
                 logger.debug("tool-belt: cache-on re-trigger failed: %s", exc)
                 added = set()
@@ -1778,8 +1766,8 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
             # Used for credit attribution: a tool only sticky-carries because
             # a prior expand_tools ran — those calls should be credited to
             # expansion, not classified as "initially available."
-            # Falls back to initial_allowed for rows written before this
-            # field existed; WILDCARD means "no narrowing", every tool is
+            # Falls back to initial_allowed when no prediction state is
+            # attached; WILDCARD means "no narrowing", every tool is
             # initially available.
             baseline_raw = state.get("baseline_active_tools") if state else None
             if baseline_raw == WILDCARD_ALWAYS_ON:
@@ -1788,7 +1776,7 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                 baseline_allowed = set(initial_allowed)
             else:
                 baseline_allowed = set(baseline_raw)
-            cut_tools = set(state.get("expand_only_tools") or []) if state else set()
+            expand_only = set(state.get("expand_only_tools") or []) if state else set()
             expanded = set(state.get("expansions") or set()) if state else set()
             pending_expansion = dict(state.get("pending_expansion") or {}) if state else {}
             if state:
@@ -1859,7 +1847,7 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                 "scope": attribution_scope,
                 "source": source,
                 "was_initially_active": was_initially_available,
-                "was_expand_only": tool in cut_tools,
+                "was_expand_only": tool in expand_only,
                 "activated_by_expansion": tool in expanded,
                 "activation_source": activation_source,
             }
@@ -1904,15 +1892,8 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                         extra["activation_source"] = "sticky_expansion"
                     else:
                         extra["activation_source"] = "expansion"
-                    if state:
-                        state["expand_tools_used"] = True
-                        state.setdefault("expanded_tools_used", []).append({
-                            "tool": tool,
-                            "category": extra.get("expand_category", ""),
-                            "turns_until_used": extra.get("turns_until_used", 0),
-                        })
-                        if pending_expansion:
-                            state["pending_expansion"] = None
+                    if state and pending_expansion:
+                        state["pending_expansion"] = None
                 elif pending_expansion:
                     extra["expansion_provided_access"] = False
             log_args = args if tool == "expand_tools" else None
@@ -1934,11 +1915,9 @@ def _cache_auto_cfg() -> dict[str, Any]:
 
 
 def _detection_cache_path():
-    """Resolve the persisted detection cache path. Lazy import of os to keep
-    the helper cheap; pathlib.Path import avoided to dodge a circular bind."""
-    import os as _os
-    home = _os.environ.get("HERMES_HOME") or _os.path.expanduser("~/.hermes")
-    return _os.path.join(home, "state", "tool-belt", "cache_mode_detection.json")
+    """Resolve the persisted detection cache path."""
+    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    return os.path.join(home, "state", "tool-belt", "cache_mode_detection.json")
 
 
 def _load_detection_cache() -> None:
@@ -1952,10 +1931,9 @@ def _load_detection_cache() -> None:
     if _DETECTION_CACHE_LOADED:
         return
     _DETECTION_CACHE_LOADED = True
-    import json as _json
     try:
         with open(_detection_cache_path(), "r", encoding="utf-8") as f:
-            data = _json.load(f)
+            data = json.load(f)
         if isinstance(data, dict):
             for scope, entry in data.items():
                 if isinstance(scope, str) and isinstance(entry, dict):
@@ -1968,15 +1946,13 @@ def _load_detection_cache() -> None:
 
 def _save_detection_cache() -> None:
     """Persist the detection cache atomically."""
-    import json as _json
-    import os as _os
     path = _detection_cache_path()
     try:
-        _os.makedirs(_os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            _json.dump(_DETECTION_CACHE, f, ensure_ascii=False, indent=2, sort_keys=True)
-        _os.replace(tmp, path)
+            json.dump(_DETECTION_CACHE, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, path)
     except Exception as exc:
         logger.debug("tool-belt: detection cache save failed: %s", exc)
 
@@ -2054,9 +2030,8 @@ def _check_divergence(
 
     Threshold: 3 consecutive post-lock calls with hit rate below 30%
     when locked "on". 3 is short enough to fire on a real problem
-    without flapping on transient noise; 30% is well below the empirical
-    stable-hash floor on reference installations, so true cache breakage
-    sits well clear of it.
+    without flapping on transient noise; 30% is a deliberately low floor,
+    so true cache breakage sits well clear of it.
     """
     if state.get("mode") != "on" or state.get("locked_at_call") is None:
         return
@@ -2286,8 +2261,8 @@ def _on_session_end(session_id=None, **kwargs) -> None:
 
     ``on_session_end`` is a misleading hook name — Hermes fires it at the
     end of every ``run_conversation`` call, which means once per user
-    message in multi-turn sessions. The Hermes core comment at
-    conversation_loop.py:4680 calls this out explicitly.
+    message in multi-turn sessions. Hermes' own conversation loop calls
+    this out explicitly in a source comment.
 
     DO NOT evict any state here that needs to survive across turns within
     a session. In particular: ``_FROZEN_BY_SESSION``,
@@ -2337,14 +2312,7 @@ def _on_session_end(session_id=None, **kwargs) -> None:
             _STICKY_BY_KEY.pop(sticky_key, None)
         _PRIOR_MESSAGES_BY_SESSION.pop(sid, None)
         # NOTE: do NOT evict _FROZEN_BY_SESSION or _CACHE_MODE_BY_SESSION
-        # here. ``on_session_end`` is a misleading hook name — Hermes
-        # fires it at the end of every ``run_conversation`` call, which
-        # means once per user message in multi-turn sessions
-        # (conversation_loop.py:4680 warns about this explicitly).
-        # Evicting the freeze here would nuke it after the first turn,
-        # defeating the whole point of session-level freezing.
-        # Eviction lives in _on_session_reset (true /reset or /new) and
-        # the compaction wrapper.
+        # here — see this function's docstring for why.
     return None
 
 
