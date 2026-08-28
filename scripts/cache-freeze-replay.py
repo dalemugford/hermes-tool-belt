@@ -134,7 +134,10 @@ def freeze_simulation(
 
     if scope_filter:
         preds = [p for p in preds if p.get("scope") == scope_filter]
-        pred_ids = {p["prediction_id"] for p in preds}
+        # Rows missing ``prediction_id`` are tolerated (older/malformed
+        # telemetry); they simply can't join against calls.
+        pred_ids = {str(p.get("prediction_id") or "") for p in preds}
+        pred_ids.discard("")
         calls = [c for c in calls if c.get("prediction_id") in pred_ids]
         if tool_calls:
             tool_calls = [t for t in tool_calls if t.get("prediction_id") in pred_ids]
@@ -161,13 +164,17 @@ def freeze_simulation(
     for p in preds:
         sess_preds[_session_key(p)].append(p)
     for sid, plist in sess_preds.items():
-        plist.sort(key=lambda p: p.get("ts", 0))
+        plist.sort(key=lambda p: p.get("ts") or 0)
         seen_trigger_tools: set[str] = set()
         for idx, p in enumerate(plist):
-            pid = p["prediction_id"]
+            pid = str(p.get("prediction_id") or "")
             activated = {str(t) for t in (p.get("trigger_activated_tools") or [])}
             new_trigger_tools = activated - seen_trigger_tools
             seen_trigger_tools |= activated
+            if not pid:
+                # Tolerated: the turn still advances the session's trigger
+                # accumulator, but nothing can key off it.
+                continue
             pred_meta[pid] = {
                 "turn_idx": idx,
                 "session_key": sid,
@@ -181,7 +188,7 @@ def freeze_simulation(
     for c in calls:
         sess_calls[_session_key(c)].append(c)
     for sid in sess_calls:
-        sess_calls[sid].sort(key=lambda c: (c.get("ts", 0), c.get("api_call_idx", 0)))
+        sess_calls[sid].sort(key=lambda c: (c.get("ts") or 0, c.get("api_call_idx") or 0))
 
     matches = 0
     expand_driven = 0
@@ -275,7 +282,7 @@ def matched_counterfactual(
     for c in calls:
         sess_calls[_session_key(c)].append(c)
     for sid in sess_calls:
-        sess_calls[sid].sort(key=lambda c: (c.get("ts", 0), c.get("api_call_idx", 0)))
+        sess_calls[sid].sort(key=lambda c: (c.get("ts") or 0, c.get("api_call_idx") or 0))
 
     # Build idx-matched cohorts: (model, api_call_idx) → list of cache_read on stable calls
     stable_cohort: dict[tuple[str, int], list[int]] = defaultdict(list)
@@ -285,8 +292,10 @@ def matched_counterfactual(
         for c in cs:
             h = c.get("tool_list_hash") or ""
             model = c.get("model", "")
-            idx = int(c.get("api_call_idx", 0))
-            cache_read = int(c.get("cache_read_tokens", 0))
+            # ``or 0`` (not a ``get`` default): JSONL telemetry can carry an
+            # explicit null for any of these numeric fields.
+            idx = int(c.get("api_call_idx") or 0)
+            cache_read = int(c.get("cache_read_tokens") or 0)
             if prev_hash is None:
                 kind = "first_call"
             elif h == prev_hash:
@@ -316,21 +325,21 @@ def matched_counterfactual(
         model = c.get("model", "generic")
         m = per_model[model]
         m["calls"] += 1
-        m["cache_read_actual"] += int(c.get("cache_read_tokens", 0))
-        m["input_actual"] += int(c.get("input_tokens", 0))
+        m["cache_read_actual"] += int(c.get("cache_read_tokens") or 0)
+        m["input_actual"] += int(c.get("input_tokens") or 0)
         if kind == "first_call":
             m["first"] += 1
         elif kind == "stable":
             m["stable"] += 1
         else:
             m["mutated"] += 1
-            idx = int(c.get("api_call_idx", 0))
+            idx = int(c.get("api_call_idx") or 0)
             cohort = stable_cohort.get((model, idx)) or []
             if cohort:
                 cohort_mean = sum(cohort) / len(cohort)
                 # Upper bound — signed difference, no floor at zero.
                 # Negative = mutation luck (cache happened to refresh).
-                lost = int(cohort_mean - int(c.get("cache_read_tokens", 0)))
+                lost = int(cohort_mean - int(c.get("cache_read_tokens") or 0))
                 m["cache_read_lost_upper_bound"] += lost
 
     # Dollar-equivalent (best-effort) — per the price table

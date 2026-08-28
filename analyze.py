@@ -65,6 +65,12 @@ DEFAULT_HARVEST_MIN_EXPAND_ONLY_CALLS = 3
 # is an analysis-time approximation of the runtime ``sticky_ttl_turns`` (default
 # 3), which is config-overridable — the two can diverge on a tuned install.
 DEFAULT_STICKY_LOOKAHEAD_TURNS = 3
+# Schema version stamped on every artifact this module emits — the `--format
+# json` summary payload and `learned_recommendations.json`. It tracks the
+# analyzer's *output* layout (key names and nesting), not the telemetry schema
+# and not the learned.json schema, and both artifacts carry the same number
+# because one run produces them from the same structures.
+ANALYZER_PAYLOAD_VERSION = 2
 
 @dataclass
 class ScopeStats:
@@ -116,6 +122,11 @@ class ScopeStats:
     # `harvest_predictions` is the denominator for carry-cost math when
     # proposing promote-to-carry.
     harvest_was_expand_only: Counter[str] = field(default_factory=Counter)
+    # Distinct harvest predictions that made at least one was_expand_only call
+    # for the tool. `harvest_was_expand_only` counts *calls* (several can land
+    # in one turn), so only this set can form a true per-prediction rate.
+    harvest_expand_only_predictions: dict[str, set[str]] = field(
+        default_factory=lambda: defaultdict(set))
     harvest_predictions: int = 0
     # Per-tool sample of message previews that led to a was_expand_only call.
     # Used by the trigger-keyword suggester to mine candidate keywords for
@@ -351,6 +362,8 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
             # keyword suggester can mine candidates.
             if cohort == "harvest" and row.get("was_expand_only") is True:
                 stat.harvest_was_expand_only[tool] += 1
+                if prediction_id:
+                    stat.harvest_expand_only_predictions[tool].add(prediction_id)
                 preview = prediction_preview.get(prediction_id, "")
                 if preview and len(stat.harvest_expand_only_previews[tool]) < 200:
                     stat.harvest_expand_only_previews[tool].append(preview)
@@ -986,6 +999,18 @@ def _has_content_word(ngram: str) -> bool:
     return False
 
 
+def _ngram_contains(longer: str, shorter: str) -> bool:
+    """True when ``shorter`` sits inside ``longer`` on whole-word boundaries.
+
+    Raw substring containment would call ``"pen"`` contained in ``"open the"``
+    and let an unrelated candidate suppress a real one. Padding both sides with
+    spaces makes the test word-wise, matching the dampener miner's dedupe.
+    """
+    if shorter == longer or not shorter:
+        return False
+    return f" {shorter} " in f" {longer} "
+
+
 def _suggest_keywords_for_expand_only_tool(
     expand_only_previews: list[str],
     noise_previews: list[str],
@@ -1052,10 +1077,13 @@ def _suggest_keywords_for_expand_only_tool(
             continue
         kept.append(cand)
         for other in raw_candidates:
-            if (other["ngram"] != cand["ngram"]
-                and other["ngram"] in cand["ngram"]
-                and other["support_count"] <= cand["support_count"]):
+            if (_ngram_contains(cand["ngram"], other["ngram"])
+                    and other["support_count"] <= cand["support_count"]):
                 dropped.add(other["ngram"])
+    # Final re-filter, mirroring _suggest_dampeners_for_trigger: an entry
+    # appended before a later-ranked, longer n-gram subsumed it is still in
+    # `kept`, so drop it here rather than emitting a candidate we discarded.
+    kept = [c for c in kept if c["ngram"] not in dropped]
 
     out: list[dict[str, Any]] = []
     for cand in kept[:max_candidates]:
@@ -1255,7 +1283,19 @@ def harvest_recommendation_rows(
             round_trip_cost = expand_only_calls * args.expand_round_trip_tokens
             carry_cost = denom * args.per_tool_tokens
             net = round_trip_cost - carry_cost
-            expand_only_rate = expand_only_calls / denom
+            # A true rate: the share of harvest *predictions* in which this
+            # tool was reached for at least once. Dividing the call count by
+            # the prediction count is not a rate — one turn can make several
+            # was_expand_only calls, which pushed the old figure over 100%.
+            expand_only_predictions = len(
+                stat.harvest_expand_only_predictions.get(tool, ()))
+            if expand_only_predictions:
+                expand_only_rate = expand_only_predictions / denom
+            else:
+                # Rows without a prediction_id can't be counted distinctly;
+                # fall back to the call-based ratio, capped at a real rate.
+                expand_only_rate = min(1.0, expand_only_calls / denom)
+            calls_per_prediction = expand_only_calls / denom
             if net > 0:
                 action = "promote_to_carry"
                 status = "review"
@@ -1282,7 +1322,9 @@ def harvest_recommendation_rows(
                 "metrics": {
                     "harvest_predictions": stat.harvest_predictions,
                     "harvest_was_expand_only": expand_only_calls,
+                    "harvest_expand_only_predictions": expand_only_predictions,
                     "expand_only_rate": round(expand_only_rate, 4),
+                    "expand_only_calls_per_prediction": round(calls_per_prediction, 4),
                     "round_trip_cost_tokens": round_trip_cost,
                     "carry_cost_tokens": carry_cost,
                     "net_savings_tokens": net,
@@ -1292,16 +1334,17 @@ def harvest_recommendation_rows(
                     "per_tool_tokens": args.per_tool_tokens,
                     "harvest_min_expand_only_calls": min_calls,
                 },
-                "proposed_learned_patch": {
-                    "scopes": {
-                        scope: {
-                            "carry": [tool] if action == "promote_to_carry" else [],
-                        }
-                    }
-                },
+                # Advisory-only rows carry an empty patch, matching the
+                # category/trigger rows: a `keep_expand_only` row proposes no
+                # state change, so it must not name a scope with an empty
+                # carry list (a syntactically valid patch that means nothing).
+                "proposed_learned_patch": (
+                    {"scopes": {scope: {"carry": [tool]}}}
+                    if action == "promote_to_carry" else {"scopes": {}}
+                ),
                 "reason": (
                     f"historical sessions called {tool} {expand_only_calls} time(s) "
-                    f"({expand_only_rate:.1%} of predictions) where the current "
+                    f"(in {expand_only_rate:.1%} of predictions) where the current "
                     f"partition would have left it expand_only; round-trip cost "
                     f"{round_trip_cost:,} tok vs carry cost {carry_cost:,} tok → "
                     f"net {net:+,} tok"
@@ -1482,6 +1525,7 @@ def summary_payload(
     args: argparse.Namespace,
     dampeners: list[dict[str, Any]] | None = None,
     trigger_keywords: list[dict[str, Any]] | None = None,
+    cache_cost: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     total_predictions = sum(stat.predictions for stat in stats.values())
     total_tool_calls = sum(sum(stat.tool_calls.values()) for stat in stats.values())
@@ -1498,12 +1542,18 @@ def summary_payload(
     total_stable_turns = sum(stat.stable_turns for stat in stats.values())
     total_hash_missing = sum(stat.hash_missing_turns for stat in stats.values())
     total_comparable = total_mutation_turns + total_stable_turns
-    total_sessions_with_mutation = sum(
-        len(stat.sessions_with_mutation) for stat in stats.values()
-    )
-    total_sessions = sum(len(stat.sessions) for stat in stats.values())
-    return {
-        "version": 1,
+    # Union before counting: one session can appear under more than one scope
+    # (a cron turn and a gateway turn share a session id), and summing the
+    # per-scope set sizes would count it once per scope.
+    all_sessions: set[str] = set()
+    mutated_sessions: set[str] = set()
+    for stat in stats.values():
+        all_sessions |= stat.sessions
+        mutated_sessions |= stat.sessions_with_mutation
+    total_sessions_with_mutation = len(mutated_sessions)
+    total_sessions = len(all_sessions)
+    payload: dict[str, Any] = {
+        "version": ANALYZER_PAYLOAD_VERSION,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "state_dir": str(args.state_dir),
         "include_archives": args.include_archives,
@@ -1536,6 +1586,19 @@ def summary_payload(
         "dampener_candidates": list(dampeners or []),
         "trigger_keyword_candidates": list(trigger_keywords or []),
     }
+    # Parity with the markdown report's "Cache-Aware Savings" section: machine
+    # consumers get the same corrected net the human report shows.
+    if cache_cost:
+        payload["cache_cost"] = {
+            "totals": {
+                "cache_read_lost_upper_bound": _cache_cost_total(
+                    cache_cost, "cache_read_lost_upper_bound", 0),
+                "est_usd_lost_upper_bound": round(_cache_cost_total(
+                    cache_cost, "est_usd_lost_upper_bound", 0.0), 4),
+            },
+            "scopes": cache_cost,
+        }
+    return payload
 
 
 def threshold_payload(args: argparse.Namespace) -> dict[str, Any]:
@@ -1783,6 +1846,9 @@ def markdown_report(
                 f"- Comparable calls: **{freeze['comparable_calls']:,}**",
                 f"- Matches frozen hash: **{freeze['matches_freeze']}** (avg cache_read: {freeze['avg_cache_read_when_matches']:,.0f})",
                 f"- Expand-driven mutations: **{freeze['expand_driven_mutations']}** (accepted — model requested new tools)",
+                # Printed so matches + the three mutation classes reconcile to
+                # comparable_calls, as the standalone replay report does.
+                f"- Trigger-driven mutations: **{freeze.get('trigger_driven_mutations', 0)}** (accepted — trigger activation)",
                 f"- Would-break mutations: **{freeze['would_break_mutations']}** (avg cache_read: {freeze['avg_cache_read_when_would_break']:,.0f})",
                 f"- Freeze eliminates **{freeze['freeze_eliminates_pct_of_mutations'] * 100:.1f}%** of observed mutations",
                 "",
@@ -2034,12 +2100,24 @@ def markdown_report(
             "fires. Review high-precision candidates before pasting into "
             "the target trigger group's `keywords` list."
         )
+        # Same degraded-mode callout the dampener section renders: without a
+        # YAML loader the existing-pattern count is 0 because nothing could be
+        # read, not because no patterns exist.
+        statuses = {row.get("preset_triggers_status", "ok") for row in trigger_keywords}
+        for status in sorted(s for s in statuses if s and s != "ok"):
+            note = _EXCLUDES_STATUS_MESSAGE.get(
+                status, f"preset triggers unavailable: {status}"
+            )
+            lines.append("")
+            lines.append(f"> ⚠ Degraded mode (`{status}`): {note}")
         lines.append("")
         for row in trigger_keywords:
+            status = row.get("preset_triggers_status", "ok")
+            status_suffix = "" if status == "ok" else f", triggers_status={status}"
             lines.append(
                 f"### {row['scope']} / `{row['tool']}` → **{row['action']}** "
                 f"`{row['target_trigger']}` (expand_only_calls={row['expand_only_count']}, "
-                f"existing patterns={row['existing_keyword_pattern_count']})"
+                f"existing patterns={row['existing_keyword_pattern_count']}{status_suffix})"
             )
             lines.append("")
             for cand in row.get("candidates", []):
@@ -2062,7 +2140,7 @@ def write_recommendations(
     dampeners: list[dict[str, Any]] | None = None,
 ) -> None:
     payload = {
-        "version": 2,
+        "version": ANALYZER_PAYLOAD_VERSION,
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "mode": "recommend",
         "safety": {
@@ -2156,28 +2234,38 @@ def main() -> int:
 
     # Break down tool_calls by source so the headline counts don't conflate
     # narrowed gateway calls with cron / subagent calls that bypass narrowing.
-    source_counts = {"gateway": 0, "cron": 0, "subagent": 0}
+    # A row that carries an unrecognized non-empty `source` (a future writer
+    # value) is bucketed as "other" rather than re-derived — re-deriving would
+    # silently relabel a value the writer actually recorded. Only rows with no
+    # source at all fall through to the session/prediction heuristic.
+    source_counts = {"gateway": 0, "cron": 0, "subagent": 0, "other": 0}
     for row in tool_calls:
-        src = row.get("source")
-        if src not in source_counts:
+        src = str(row.get("source") or "").strip()
+        if not src:
             sid = str(row.get("session_id") or "")
             pid = str(row.get("prediction_id") or "")
             src = "cron" if sid.startswith("cron_") else ("gateway" if pid else "subagent")
+        elif src not in source_counts:
+            src = "other"
         source_counts[src] += 1
 
     if args.format == "json":
-        payload = summary_payload(stats, recs, args, dampeners, trigger_keywords)
+        payload = summary_payload(stats, recs, args, dampeners, trigger_keywords,
+                                  cache_cost=cache_cost)
         payload["totals"]["tool_call_source_counts"] = source_counts
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         print(format_summary(stats, recs, args))
-        excluded = source_counts["cron"] + source_counts["subagent"]
+        excluded = source_counts["cron"] + source_counts["subagent"] + source_counts["other"]
         if excluded:
-            print(
-                f"  └─ {source_counts['gateway']} narrowed (gateway), "
-                f"{source_counts['cron']} excluded (cron), "
-                f"{source_counts['subagent']} excluded (subagent)"
-            )
+            parts = [
+                f"{source_counts['gateway']} narrowed (gateway)",
+                f"{source_counts['cron']} excluded (cron)",
+                f"{source_counts['subagent']} excluded (subagent)",
+            ]
+            if source_counts["other"]:
+                parts.append(f"{source_counts['other']} unclassified (other)")
+            print("  └─ " + ", ".join(parts))
 
     status_stream = sys.stderr if args.format == "json" else sys.stdout
 
