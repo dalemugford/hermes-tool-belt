@@ -3,19 +3,18 @@
 # Demotion needs resident tools that are NOT structurally protected. Under the
 # 1.0 carrying model the config-level `always_on_extra` promote knob is gone
 # (`presets.resolve_preset` only warns about a stale value now), so it can no
-# longer pin demote targets. Instead the fixture models the class that is still
-# legitimately demotable today: enabled built-ins the runtime keeps resident via
-# the unknown-tools safe-default (`unknown_kept_tools`) — new upstream tools that
-# policy.yaml does not classify yet. The v2 "unknowns are expand_only" behavior
-# lands in Phase 3; until then they ride along resident and the shaper demotes an
-# unused one (shape-ceiling.py:318).
+# longer pin demote targets. Instead the fixture models the still-demotable
+# class: adaptive `carry` residents (v2 partition class C) that go unused. The
+# seeder maps these `unknown_kept` fixture tools into `carry_tools` on every
+# prediction row; the shaper demotes an unused one to expand_only
+# (shape-ceiling.py demote path).
 #
 # `weather_lookup` and `unit_convert` are named nowhere in policy.yaml (not in
 # always_carry/carry, not in any trigger group) and are not in
-# BASE_PROTECTED_ALWAYS_ON, so the safe-default keeps them resident and — because
-# `calls` never names them — they go 20 sessions unused and become demote
-# candidates. `analyze.effective_protected_always_on` shields every always_carry
-# tool plus the policy mirror, so nothing structural can be demoted.
+# BASE_PROTECTED_ALWAYS_ON, so nothing shields them and — because `calls` never
+# names them — they go 20 sessions unused and become demote candidates.
+# `analyze.effective_protected_always_on` shields every always_carry tool plus
+# the policy mirror, so nothing structural can be demoted.
 name: chat-heavy
 agent: testagent
 platform: slack

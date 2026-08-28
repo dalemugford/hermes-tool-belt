@@ -280,12 +280,19 @@ def compute_scope_recommendations(
         for p in plist:
             pid = p.get("prediction_id", "")
             for tc in calls_by_pred.get(pid, []):
-                # Treat both was_expanded and expand_tools_used as positive
-                # evidence — was_expanded captures the in-turn expansion,
-                # expand_tools_used captures sticky-carried use across turns.
+                # Positive promote evidence: the model reached for a tool that
+                # wasn't a resident. v2 names ``activated_by_expansion`` (in-turn
+                # expansion) and ``expansion_provided_access`` (sticky-carried
+                # use across turns); the v1 ``was_expanded`` / ``expand_tools_used``
+                # names are still honored for historical rows.
                 if tc.get("tool_name") == "expand_tools":
                     continue
-                evidence = bool(tc.get("was_expanded")) or bool(tc.get("expand_tools_used"))
+                evidence = (
+                    bool(tc.get("activated_by_expansion"))
+                    or bool(tc.get("expansion_provided_access"))
+                    or bool(tc.get("was_expanded"))
+                    or bool(tc.get("expand_tools_used"))
+                )
                 if not evidence:
                     continue
                 tool_name = str(tc.get("tool_name") or "")
@@ -310,14 +317,13 @@ def compute_scope_recommendations(
     tools_called: set[str] = set()
     for sid, plist in recent_sessions.items():
         for p in plist:
-            for t in (p.get("always_on_tools") or []):
+            # v2 adaptive residents (class C) are the demotable set; v1 rows
+            # expose the same residents under ``always_on_tools``. The retired
+            # v1 ``unknown_kept_tools`` safe-default is still read for historical
+            # rows (skipping MCP pass-through, which Tool Search manages).
+            for t in (p.get("carry_tools") or p.get("always_on_tools") or []):
                 always_on_observed.add(str(t))
-            # Also track tools kept on via the unknown-tools safe-default.
-            # Without this, new tools added by upstream (Hermes updates, plugin
-            # changes) are invisible to the shaper and never auto-demoted.
             for t in (p.get("unknown_kept_tools") or []):
-                # Skip MCP tools: Tool Belt passes them through without
-                # narrowing, and Tool Search manages their activation layer.
                 if t.startswith("mcp__") or t.startswith("mcp_"):
                     continue
                 always_on_observed.add(str(t))

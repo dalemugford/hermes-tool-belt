@@ -1012,6 +1012,21 @@ def _maybe_log_prediction(
     if not _CONFIG.get("log", True):
         return
     try:
+        # Residency partition finalized against the live enabled ceiling in
+        # _build_api_kwargs (carrying.resolve). Empty on the wildcard/bypass
+        # path (no narrowing ran) — counts derive from the actual A/C/X sets so
+        # telemetry reflects the schema the model really saw, never the preset's
+        # pre-ceiling loadout.
+        always_carry_tools = list(state.get("carry_always_carry") or [])
+        carry_tools = list(state.get("carry_carry") or [])
+        expand_only_tools = list(
+            state.get("carry_expand_only") or state.get("expand_only_tools") or []
+        )
+        # T = trigger-activated expand_only tools (triggered ∩ X), flattened.
+        expand_only_set = set(expand_only_tools)
+        trigger_activated = sorted(
+            t for t in (state.get("triggered_tools") or []) if t in expand_only_set
+        )
         record = logger_io.PredictionRecord(
             ts=time.time(),
             prediction_id=state.get("prediction_id", ""),
@@ -1026,22 +1041,21 @@ def _maybe_log_prediction(
             preset=str(state.get("preset", "")),
             triggers_fired=list(state.get("triggers_fired", [])),
             triggers_suppressed=list(state.get("triggers_suppressed") or []),
-            always_on_count=int(state.get("always_on_count", 0)),
+            always_carry_count=len(always_carry_tools),
+            carry_count=len(carry_tools),
             ceiling_count=len(ceiling),
             narrowed_count=len(narrowed),
             ceiling_tokens=logger_io.estimate_tokens(ceiling),
             narrowed_tokens=logger_io.estimate_tokens(narrowed),
             tokens_estimator=logger_io.token_estimator_name(),
             ceiling_tools=list(state.get("ceiling_tools") or _tool_names(ceiling)),
-            allowed_tools=list(state.get("initial_active_tools") or _tool_names(narrowed)),
-            cut_tools=list(state.get("expand_only_tools") or []),
-            # Unknown-kept behavior was removed in Tool Belt 1.0 (unknown
-            # enabled built-ins now fall to expand_only). Field retained empty
-            # as a temporary telemetry adapter until the Phase 5 schema cutover.
-            unknown_kept_tools=[],
+            active_tools=list(state.get("initial_active_tools") or _tool_names(narrowed)),
+            expand_only_tools=expand_only_tools,
             mcp_passthrough_tools=list(state.get("mcp_passthrough_tools") or []),
-            always_on_tools=list(state.get("always_on_tools") or []),
+            always_carry_tools=always_carry_tools,
+            carry_tools=carry_tools,
             trigger_tools_by_group=dict(state.get("trigger_tools_by_group") or {}),
+            trigger_activated_tools=trigger_activated,
             expanded_tools=sorted(str(t) for t in (state.get("expansions") or set())),
             sticky_tools=list(state.get("sticky_tools") or []),
             sticky_categories=list(state.get("sticky_categories") or []),
@@ -1815,14 +1829,39 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                 source = "gateway"
             else:
                 source = "subagent"
+            # ``activation_source`` — the carrying class that made this tool
+            # active this turn (v2). Derived from the resolved A/C/X partition
+            # captured in state; refined to expansion/sticky_expansion below
+            # when the credit logic confirms an expand-driven call. MCP/plugin
+            # pass-through and out-of-band (cron/subagent) calls resolve to
+            # ``external`` — outside the built-in partition, never shaping
+            # evidence. A wildcard/bypass turn (no narrowing) is ``full_ceiling``.
+            partition_ac = set(state.get("carry_always_carry") or []) if state else set()
+            partition_c = set(state.get("carry_carry") or []) if state else set()
+            triggered_set = set(state.get("triggered_tools") or []) if state else set()
+            if not state or source in ("cron", "subagent"):
+                activation_source = "external"
+            elif baseline_allowed is None:
+                activation_source = "full_ceiling"
+            elif base_name in partition_ac or tool in partition_ac:
+                activation_source = "always_carry"
+            elif base_name in partition_c or tool in partition_c:
+                activation_source = "carry"
+            elif base_name in triggered_set or tool in triggered_set:
+                activation_source = "trigger"
+            elif tool in expanded or base_name in expanded:
+                activation_source = "expansion"
+            else:
+                activation_source = "external"
             extra = {
                 "agent": attribution_agent,
                 "platform": attribution_platform,
                 "scope": attribution_scope,
                 "source": source,
-                "was_initially_available": was_initially_available,
-                "was_cut": tool in cut_tools,
-                "was_expanded": tool in expanded,
+                "was_initially_active": was_initially_available,
+                "was_expand_only": tool in cut_tools,
+                "activated_by_expansion": tool in expanded,
+                "activation_source": activation_source,
             }
             if tool == "expand_tools":
                 extra["expand_event"] = pending_expansion
@@ -1852,13 +1891,19 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                         tool,
                     )
                 if expand_use:
-                    extra["expand_tools_used"] = True
+                    extra["expansion_provided_access"] = True
                     extra["expanded_tool"] = expand_use.get("expanded_tool", tool)
                     extra["turns_until_used"] = expand_use.get("turns_until_used", 0)
                     extra["expand_category"] = expand_use.get("category", extra.get("expand_category", ""))
                     extra["expansion_prediction_id"] = expand_use.get("expansion_prediction_id", "")
+                    # A prior-turn sticky recovery carries remaining_turns; a
+                    # same-turn expand_tools round-trip does not. Distinguish the
+                    # two activation sources for truthful attribution.
                     if "sticky_remaining_turns" in expand_use:
                         extra["sticky_remaining_turns"] = expand_use.get("sticky_remaining_turns")
+                        extra["activation_source"] = "sticky_expansion"
+                    else:
+                        extra["activation_source"] = "expansion"
                     if state:
                         state["expand_tools_used"] = True
                         state.setdefault("expanded_tools_used", []).append({
@@ -1869,7 +1914,7 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                         if pending_expansion:
                             state["pending_expansion"] = None
                 elif pending_expansion:
-                    extra["expand_tools_used"] = False
+                    extra["expansion_provided_access"] = False
             log_args = args if tool == "expand_tools" else None
             log_result = result if tool == "expand_tools" else None
             logger_io.log_tool_call(

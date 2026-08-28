@@ -112,7 +112,8 @@ class SeederTests(OnboardingTestCase):
             message_preview="",
             preset="",
             triggers_fired=[],
-            always_on_count=0,
+            always_carry_count=0,
+            carry_count=0,
             ceiling_count=0,
             narrowed_count=0,
             ceiling_tokens=0,
@@ -122,7 +123,7 @@ class SeederTests(OnboardingTestCase):
         # …and every field the shaper actually reads is populated, not just present.
         for field in ("scope", "hermes_session_id", "ts", "prediction_id"):
             self.assertTrue(rows[0][field], f"{field} should be non-blank")
-        for field in ("always_on_tools", "unknown_kept_tools"):
+        for field in ("always_carry_tools", "carry_tools", "expand_only_tools"):
             self.assertIn(field, rows[0])
 
     def test_seeding_is_deterministic_and_uses_no_wall_clock(self) -> None:

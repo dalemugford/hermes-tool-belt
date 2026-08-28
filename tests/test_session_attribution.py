@@ -889,8 +889,8 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
             session_id=REAL_KEY_TELEGRAM,
         )
         row = self._latest_row()
-        self.assertTrue(row.get("was_initially_available"))
-        self.assertNotEqual(row.get("expand_tools_used"), True,
+        self.assertTrue(row.get("was_initially_active"))
+        self.assertNotEqual(row.get("expansion_provided_access"), True,
             "tool already in initial allowed set must not be credited as expansion-driven")
 
     def test_cut_tool_with_active_sticky_credits_expansion(self):
@@ -911,8 +911,8 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
             session_id=REAL_KEY_TELEGRAM,
         )
         row = self._latest_row()
-        self.assertFalse(row.get("was_initially_available"))
-        self.assertTrue(row.get("expand_tools_used"),
+        self.assertFalse(row.get("was_initially_active"))
+        self.assertTrue(row.get("expansion_provided_access"),
             "tool cut from initial allowed set but reachable via sticky must be credited")
         self.assertEqual(row.get("expand_category"), "terminal")
 
@@ -936,9 +936,9 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
             session_id=REAL_KEY_TELEGRAM,
         )
         row = self._latest_row()
-        self.assertFalse(row.get("was_initially_available"),
+        self.assertFalse(row.get("was_initially_active"),
             "baseline (pre-sticky) determines was_initially_available")
-        self.assertTrue(row.get("expand_tools_used"),
+        self.assertTrue(row.get("expansion_provided_access"),
             "sticky-carried tool must be credited as expansion-driven")
         self.assertEqual(row.get("expand_category"), "terminal")
 
@@ -962,10 +962,10 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
             session_id=REAL_KEY_TELEGRAM,
         )
         row = self._latest_row()
-        self.assertTrue(row.get("was_initially_available"))
+        self.assertTrue(row.get("was_initially_active"))
         self.assertTrue(row.get("after_expand_tools"),
             "round-trip happened — should still record after_expand_tools")
-        self.assertNotEqual(row.get("expand_tools_used"), True,
+        self.assertNotEqual(row.get("expansion_provided_access"), True,
             "round-trip provided nothing new — must not be credited as expansion-driven")
 
 
@@ -1088,9 +1088,9 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         tool_calls_path = Path(self.profile_home) / "state" / "tool-belt" / "tool_calls.jsonl"
         rows = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l]
         row = rows[-1]
-        self.assertFalse(row.get("was_initially_available"),
+        self.assertFalse(row.get("was_initially_active"),
             "baseline excluded terminal — it was only callable via sticky")
-        self.assertTrue(row.get("expand_tools_used"),
+        self.assertTrue(row.get("expansion_provided_access"),
             "sticky-recovered tool must be credited as expansion-driven")
 
     def test_already_available_tool_never_credits_expansion(self):
@@ -1133,8 +1133,8 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         tool_calls_path = Path(self.profile_home) / "state" / "tool-belt" / "tool_calls.jsonl"
         rows = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l]
         row = rows[-1]
-        self.assertTrue(row.get("was_initially_available"))
-        self.assertNotEqual(row.get("expand_tools_used"), True,
+        self.assertTrue(row.get("was_initially_active"))
+        self.assertNotEqual(row.get("expansion_provided_access"), True,
             "tool in baseline must never be credited as expansion-driven")
 
 

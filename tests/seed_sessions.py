@@ -248,12 +248,36 @@ def build_prediction_row(
     allowed = prediction.active_tool_names
     narrowed = [] if allowed == presets.WILDCARD_ALWAYS_ON else [str(t) for t in allowed]
     always_on = list(preset.always_on) if isinstance(preset.always_on, list) else []
+    # v2 residency split: the preset's own immutable always_carry baseline
+    # partitions the resident set into class A (always_carry) and class C
+    # (carry). Unknown enabled built-ins fall to expand_only under the 1.0
+    # carrying model — they ride in the ceiling but are never resident.
+    baseline = set(getattr(preset, "always_carry", []) or [])
+    always_carry_tools = [t for t in always_on if t in baseline]
+    carry_tools = [t for t in always_on if t not in baseline]
+    # Fixture-injected adaptive residents (the demote arm): resident every turn
+    # but never called, so after enough sessions the shaper demotes an unused
+    # one. v2 models these as ``carry`` — the demotable resident class (the
+    # retired v1 "unknown-kept safe default" no longer keeps them resident).
+    for t in unknown_kept:
+        if t not in carry_tools and t not in always_carry_tools:
+            carry_tools.append(t)
+    residents = always_carry_tools + carry_tools
+    ceiling_full = list(ceiling) + [t for t in unknown_kept if t not in ceiling]
+    # Residents are active every turn; the remainder of the ceiling is X.
+    active = sorted(set(narrowed) | set(residents))
+    active_set = set(active)
+    expand_only = [t for t in ceiling_full if t not in active_set]
     fired = set(prediction.triggers_fired)
     trigger_tools = {
         str(g.name): [str(t) for t in (g.tools or [])]
         for g in (getattr(preset, "triggers", []) or [])
         if str(g.name) in fired
     }
+    expand_only_set = set(expand_only)
+    trigger_activated = sorted(
+        t for tools in trigger_tools.values() for t in tools if t in expand_only_set
+    )
     session_uid = _session_uid(script_name, session_index)
 
     record = logger_io.PredictionRecord(
@@ -270,19 +294,21 @@ def build_prediction_row(
         preset=prediction.preset_name,
         triggers_fired=list(prediction.triggers_fired),
         triggers_suppressed=list(prediction.triggers_suppressed),
-        always_on_count=prediction.always_carry_count + prediction.carry_count,
-        always_on_tools=always_on,
-        ceiling_count=len(ceiling),
+        always_carry_count=len(always_carry_tools),
+        carry_count=len(carry_tools),
+        always_carry_tools=always_carry_tools,
+        carry_tools=carry_tools,
+        ceiling_count=len(ceiling_full),
         narrowed_count=len(narrowed),
         ceiling_tokens=SEEDED_CEILING_TOKENS,
         narrowed_tokens=SEEDED_NARROWED_TOKENS,
         tokens_estimator=SEEDED_TOKENS_ESTIMATOR,
-        ceiling_tools=list(ceiling),
-        allowed_tools=narrowed,
-        cut_tools=[t for t in ceiling if t not in set(narrowed)],
-        unknown_kept_tools=list(unknown_kept),
+        ceiling_tools=list(ceiling_full),
+        active_tools=active,
+        expand_only_tools=expand_only,
         mcp_passthrough_tools=[],
         trigger_tools_by_group=trigger_tools,
+        trigger_activated_tools=trigger_activated,
         expanded_tools=list(expanded_tools),
         policy_source=str(getattr(preset, "policy_source", "preset")),
         policy_version=str(getattr(preset, "policy_version", "")),
@@ -309,10 +335,11 @@ def build_tool_call_row(
 ) -> dict[str, Any]:
     """Build one ``tool_calls.jsonl`` row shaped like ``_on_post_tool_call``.
 
-    ``was_expanded`` / ``expand_tools_used`` are the two flags the shaper
-    accepts as promote evidence (``shape-ceiling.py:286-291``).
+    ``activated_by_expansion`` / ``expansion_provided_access`` are the two v2
+    flags the shaper accepts as promote evidence (``shape-ceiling.py:286-291``).
     """
     row: dict[str, Any] = {
+        "schema_version": logger_io.SCHEMA_VERSION,
         "ts": ts,
         "prediction_id": prediction_id,
         "session_id": session_id,
@@ -321,12 +348,13 @@ def build_tool_call_row(
         "platform": platform,
         "scope": scope,
         "source": "gateway",
-        "was_initially_available": not expanded,
-        "was_cut": expanded,
-        "was_expanded": expanded,
+        "was_initially_active": not expanded,
+        "was_expand_only": expanded,
+        "activated_by_expansion": expanded,
+        "activation_source": "expansion" if expanded else "carry",
     }
     if expanded:
-        row["expand_tools_used"] = True
+        row["expansion_provided_access"] = True
         row["expand_category"] = ""
         row["expanded_tool"] = tool_name
         row["turns_until_used"] = 0

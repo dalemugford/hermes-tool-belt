@@ -256,7 +256,10 @@ def replay_session(
             allowed_names = []
             cut_names = []
             for name in session.ceiling_tools:
-                if name in allowed_set or name not in known:
+                # Under the 1.0 carrying model, an unknown enabled built-in is
+                # expand_only (cut), not resident — it activates only on
+                # trigger/expansion. Only names in the resolved active set stay.
+                if name in allowed_set:
                     allowed_names.append(name)
                 else:
                     cut_names.append(name)
@@ -265,6 +268,14 @@ def replay_session(
 
         # Ground truth: tool names the model actually called responding to this msg
         called_tools = _tool_calls_for_response(session.turns, i)
+
+        # v2 residency split over the active set: the preset's immutable
+        # always_carry baseline and adaptive carry loadout classify the
+        # resident tools; ``cut_names`` is the expand_only stratum X.
+        ac_base = set(getattr(preset, "always_carry", []) or [])
+        c_base = set(getattr(preset, "carry", []) or [])
+        always_carry_tools = [t for t in allowed_names if t in ac_base]
+        carry_tools = [t for t in allowed_names if t in c_base and t not in ac_base]
 
         record = logger_io.PredictionRecord(
             ts=harvest_run_ts,
@@ -279,14 +290,17 @@ def replay_session(
             preset=prediction.preset_name,
             triggers_fired=prediction.triggers_fired,
             triggers_suppressed=prediction.triggers_suppressed,
-            always_on_count=prediction.always_carry_count + prediction.carry_count,
+            always_carry_count=len(always_carry_tools),
+            carry_count=len(carry_tools),
+            always_carry_tools=always_carry_tools,
+            carry_tools=carry_tools,
             ceiling_count=ceiling_count,
             narrowed_count=len(allowed_names),
             ceiling_tokens=ceiling_tokens,
             narrowed_tokens=narrowed_tokens,
             ceiling_tools=list(session.ceiling_tools),
-            allowed_tools=list(allowed_names),
-            cut_tools=list(cut_names),
+            active_tools=list(allowed_names),
+            expand_only_tools=list(cut_names),
             policy_source="harvest",
             policy_version="harvest-v1",
         )
@@ -296,6 +310,7 @@ def replay_session(
         # stripped — privacy invariant.
         for tool_name in called_tools:
             out_tool_calls.append({
+                "schema_version": logger_io.SCHEMA_VERSION,
                 "ts": harvest_run_ts,
                 "prediction_id": prediction_id,
                 "session_id": harvest_session_id,
@@ -303,11 +318,11 @@ def replay_session(
                 "agent": session.profile_agent,
                 "platform": session.platform,
                 "scope": scope,
-                "was_initially_available": tool_name in allowed_names,
-                "was_cut": tool_name in cut_names,
+                "was_initially_active": tool_name in allowed_names,
+                "was_expand_only": tool_name in cut_names,
                 "policy_source": "harvest",
-                # No expand_tools_used field — counterfactual; analyzer must
-                # not treat absence as False (which the read-side filter
+                # No expansion_provided_access field — counterfactual; analyzer
+                # must not treat absence as False (which the read-side filter
                 # already handles via `is True`).
             })
 

@@ -333,16 +333,16 @@ def run_assertions(state_dir: Path, check: Check) -> None:
 
     # ─── #1: expand_tools_used NEVER True when was_initially_available ───
     spurious = [c for c in calls
-                if c.get("expand_tools_used") is True
-                and c.get("was_initially_available") is True]
+                if c.get("expansion_provided_access") is True
+                and c.get("was_initially_active") is True]
     check.assert_(not spurious,
         f"expand_tools_used never credited when was_initially_available "
         f"(spurious: {len(spurious)})")
 
     # ─── #1 sanity: legitimate expansion IS credited ───
     legit = [c for c in calls
-             if c.get("expand_tools_used") is True
-             and c.get("was_initially_available") is False
+             if c.get("expansion_provided_access") is True
+             and c.get("was_initially_active") is False
              and c.get("tool_name") == "browser_navigate"]
     check.assert_(legit,
         f"legitimate post-expand calls ARE credited "
@@ -352,7 +352,7 @@ def run_assertions(state_dir: Path, check: Check) -> None:
     # The "victim" session must have zero expand_tools_used flags despite
     # the prior session having expanded browser on the same scope.
     victim_calls = [c for c in calls if c.get("session_id", "").endswith("isolation-2-victim")]
-    victim_expanded = [c for c in victim_calls if c.get("expand_tools_used") is True]
+    victim_expanded = [c for c in victim_calls if c.get("expansion_provided_access") is True]
     check.assert_(not victim_expanded,
         f"sticky residency does not leak across sessions "
         f"(victim session expansion credits: {len(victim_expanded)})")
