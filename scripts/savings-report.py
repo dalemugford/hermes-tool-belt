@@ -30,6 +30,7 @@ Methodology — see docs/SAVINGS.md.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -39,7 +40,6 @@ from typing import Any
 # hyphen-named script import both ``savings`` and ``logger_io`` standalone.
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PLUGIN_DIR))
-import json  # noqa: E402
 import savings as _engine  # noqa: E402
 from logger_io import normalize_prediction_row, normalize_tool_call_row  # noqa: E402
 
@@ -47,9 +47,7 @@ from logger_io import normalize_prediction_row, normalize_tool_call_row  # noqa:
 default_state_dir = _engine.default_state_dir
 load_jsonl = _engine.load_jsonl
 parse_since = _engine.parse_since
-_session_key = _engine._session_key
 last_api_call_by_prediction = _engine.last_api_call_by_prediction
-aggregate_api_call_totals = _engine.aggregate_api_call_totals
 classify_prediction_mode = _engine.classify_prediction_mode
 cohort_stats = _engine.cohort_stats
 EXPAND_ROUND_TRIP_TOKENS = _engine.EXPAND_ROUND_TRIP_TOKENS
@@ -95,7 +93,7 @@ def print_text_report(scope: str, on_stats: dict[str, Any], off_stats: dict[str,
 
     print()
     print("═" * width)
-    print(f"  Hermes Tool Belt — Savings Report".ljust(width))
+    print("  Hermes Tool Belt — Savings Report".ljust(width))
     print("═" * width)
     print(f"  Scope: {scope}")
     print("  (deprecated wrapper — prefer `tool-belt savings`)")
@@ -111,7 +109,7 @@ def print_text_report(scope: str, on_stats: dict[str, Any], off_stats: dict[str,
             "chars-div-4": "chars/4 (heuristic — install tiktoken for exact counts)",
         }.get(primary, primary)
         print(f"  Token estimator: {est_label}  ({primary_pct:.0f}% of rows)")
-        print(f"  (For provider-billed truth see api_calls.jsonl:input_tokens)")
+        print("  (For provider-billed truth see api_calls.jsonl:input_tokens)")
     print()
 
     # CACHE-ON cohort
@@ -124,12 +122,12 @@ def print_text_report(scope: str, on_stats: dict[str, Any], off_stats: dict[str,
         print(f"  │  Tokens saved:    {on_stats['saved_tokens_per_turn_avg']:>5,.0f}  per turn (avg)".ljust(width + 3) + "│")
         print(f"  │  Tokens saved:    {on_stats['saved_tokens_total']:>5,}  total  (vs ceiling)".ljust(width + 3) + "│")
         print(f"  │{' ' * width}│")
-        print(f"  │  Cache amortization (provider-reported):".ljust(width + 3) + "│")
+        print("  │  Cache amortization (provider-reported):".ljust(width + 3) + "│")
         print(f"  │    Cache hit rate:      {on_stats['cache_hit_rate']:>5.1f}%".ljust(width + 3) + "│")
         print(f"  │    Cache-read tokens:  {on_stats['api_cache_read_tokens']:>10,}  (billed at cache rate)".ljust(width + 3) + "│")
         print(f"  │    Fresh input tokens: {on_stats['api_input_tokens']:>10,}  (billed at full rate)".ljust(width + 3) + "│")
     else:
-        print(f"  │     (no cache-on predictions in window)".ljust(width + 3) + "│")
+        print("  │     (no cache-on predictions in window)".ljust(width + 3) + "│")
     print(f"  └{line}┘")
     print()
 
@@ -144,18 +142,18 @@ def print_text_report(scope: str, on_stats: dict[str, Any], off_stats: dict[str,
         print(f"  │  Tokens saved:    {off_stats['saved_tokens_total']:>5,}  total  (vs ceiling)".ljust(width + 3) + "│")
         if n_expand_events:
             overhead = n_expand_events * EXPAND_ROUND_TRIP_TOKENS
-            net = off_stats["saved_tokens_total"] - overhead
+            net = off_stats.get("saved_tokens_total", 0) - overhead
             print(f"  │  expand_tools overhead: −{overhead:,}  ({n_expand_events} events × {EXPAND_ROUND_TRIP_TOKENS})".ljust(width + 3) + "│")
             print(f"  │  Net savings:           {net:,}".ljust(width + 3) + "│")
     else:
-        print(f"  │     (no cache-off predictions in window)".ljust(width + 3) + "│")
+        print("  │     (no cache-off predictions in window)".ljust(width + 3) + "│")
     print(f"  └{line}┘")
     print()
 
     # Pending cohort
     if pending_stats.get("n_predictions"):
         print(f"  ┌{line}┐")
-        print(f"  │  PENDING (cache-mode detection in progress)".ljust(width + 3) + "│")
+        print("  │  PENDING (cache-mode detection in progress)".ljust(width + 3) + "│")
         print(f"  │     ({pending_stats['n_predictions']} predictions across {pending_stats['n_sessions']} session(s))".ljust(width + 3) + "│")
         print(f"  │{' ' * width}│")
         print(f"  │  Tokens saved:    {pending_stats['saved_tokens_total']:>5,}  total  (will be re-classified once locked)".ljust(width + 3) + "│")
@@ -169,14 +167,14 @@ def print_text_report(scope: str, on_stats: dict[str, Any], off_stats: dict[str,
         ceiling_avg = bypass_stats["ceiling_count_avg"]
         ceiling_total = bypass_stats["ceiling_tokens_total"]
         print(f"  ┌{line}┐")
-        print(f"  │  BYPASS COHORT (A/B baseline — narrowing intentionally off)".ljust(width + 3) + "│")
+        print("  │  BYPASS COHORT (A/B baseline — narrowing intentionally off)".ljust(width + 3) + "│")
         print(f"  │     ({n_pred} prediction(s) across {n_sess} session(s))".ljust(width + 3) + "│")
         print(f"  │{' ' * width}│")
         print(f"  │  Full toolset shipped:  {ceiling_avg:>5.1f} tools per turn".ljust(width + 3) + "│")
         print(f"  │  Tokens shipped:        {ceiling_total:>6,}  total".ljust(width + 3) + "│")
         print(f"  │{' ' * width}│")
-        print(f"  │  Excluded from savings figures above — these sessions are".ljust(width + 3) + "│")
-        print(f"  │  the deterministic A/B control (see bypass_rate in config).".ljust(width + 3) + "│")
+        print("  │  Excluded from savings figures above — these sessions are".ljust(width + 3) + "│")
+        print("  │  the deterministic A/B control (see bypass_rate in config).".ljust(width + 3) + "│")
         print(f"  └{line}┘")
         print()
 
@@ -186,7 +184,7 @@ def print_text_report(scope: str, on_stats: dict[str, Any], off_stats: dict[str,
     gate_n = tool_source_counts.get("gateway", 0)
     if cron_n or sub_n:
         print(f"  ┌{line}┐")
-        print(f"  │  Excluded from savings (not subject to narrowing)".ljust(width + 3) + "│")
+        print("  │  Excluded from savings (not subject to narrowing)".ljust(width + 3) + "│")
         print(f"  │{' ' * width}│")
         if cron_n:
             print(f"  │    Cron tool calls:     {cron_n:>5}  (bypass pre_gateway_dispatch)".ljust(width + 3) + "│")

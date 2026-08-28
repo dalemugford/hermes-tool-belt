@@ -12,10 +12,12 @@ Contract::
     tool-belt savings --agent=alice   # unknown/disabled -> non-zero error
     tool-belt savings --json          # stable machine-readable schema, no prose
     tool-belt savings --since 2026-05-15
+    tool-belt configure               # interactive onboarding (separate module)
 
-The command never writes. The Phase 8 launcher helper (:func:`ensure_launcher`)
-is the only writing surface here and it writes exactly one file — the
-``$HERMES_HOME/bin/tool-belt`` shim — and only when the caller confirms.
+The ``savings`` command never writes. The launcher helper
+(:func:`ensure_launcher`, used by ``tool-belt configure``) is the only writing
+surface here and it writes exactly one file — the ``$HERMES_HOME/bin/tool-belt``
+shim — and only when the caller confirms.
 """
 
 from __future__ import annotations
@@ -52,6 +54,13 @@ def _fmt_int(n: int) -> str:
     return f"{n:,}"
 
 
+def _rate_basis_label(proj: _savings.ProjectedCohort) -> str:
+    for m in proj.models:
+        if m.cost_class == "known":
+            return m.rate_basis or "n/a"
+    return "n/a"
+
+
 def render_text(report: _savings.SavingsReport) -> str:
     width = 74
     line = "─" * width
@@ -80,7 +89,7 @@ def render_text(report: _savings.SavingsReport) -> str:
         out.append(f"│    platforms: {platforms}".ljust(width + 1) + "│")
         out.append(f"├{line}┤")
         # OBSERVED
-        out.append(f"│  OBSERVED (realized — provider usage authoritative)".ljust(width + 1) + "│")
+        out.append("│  OBSERVED (realized — provider usage authoritative)".ljust(width + 1) + "│")
         out.append(
             f"│    schema tokens saved: {_fmt_int(obs.realized_schema_token_reduction)}"
             f"  across {obs.n_predictions} turn(s), {obs.n_sessions} session(s)".ljust(width + 1) + "│"
@@ -90,9 +99,9 @@ def render_text(report: _savings.SavingsReport) -> str:
             f"  ({obs.expansion_events} event(s))".ljust(width + 1) + "│"
         )
         out.append(f"│    net realized savings: {_fmt_int(obs.net_token_reduction)} tok".ljust(width + 1) + "│")
-        out.append(f"│".ljust(width + 1) + "│")
+        out.append("│".ljust(width + 1) + "│")
         # PROJECTED
-        out.append(f"│  PROJECTED (counterfactual — not yet organic)".ljust(width + 1) + "│")
+        out.append("│  PROJECTED (counterfactual — not yet organic)".ljust(width + 1) + "│")
         out.append(
             f"│    sessions/turns analyzed: {proj.sessions_analyzed}/{proj.user_turns_analyzed}"
             f"  · confidence: {proj.confidence}".ljust(width + 1) + "│"
@@ -111,15 +120,15 @@ def render_text(report: _savings.SavingsReport) -> str:
         elif proj.schema_reduction_pct is not None:
             out.append(
                 f"│    schema-only reduction: {proj.schema_reduction_pct:.1f}%"
-                f"  (not the session-input %)".ljust(width + 1) + "│"
+                "  (not the session-input %)".ljust(width + 1) + "│"
             )
         if proj.estimated_usd_savings is not None:
             out.append(
                 f"│    est. USD savings: ${proj.estimated_usd_savings:.4f}"
-                f"  ({proj.usd_coverage} coverage, rate {report_rate(proj)})".ljust(width + 1) + "│"
+                f"  ({proj.usd_coverage} coverage, rate {_rate_basis_label(proj)})".ljust(width + 1) + "│"
             )
         else:
-            out.append(f"│    est. USD savings: n/a (no known variable-cost route)".ljust(width + 1) + "│")
+            out.append("│    est. USD savings: n/a (no known variable-cost route)".ljust(width + 1) + "│")
         out.append(f"└{line}┘")
         out.append("")
 
@@ -139,14 +148,7 @@ def render_text(report: _savings.SavingsReport) -> str:
     return "\n".join(out)
 
 
-def report_rate(proj: _savings.ProjectedCohort) -> str:
-    for m in proj.models:
-        if m.cost_class == "known":
-            return m.rate_basis or "n/a"
-    return "n/a"
-
-
-# ─── Phase 8 launcher helper ──────────────────────────────────────────────────
+# ─── Launcher helper (used by `tool-belt configure`) ──────────────────────────
 
 _LAUNCHER_TEMPLATE = """#!/usr/bin/env sh
 # Hermes Tool Belt launcher — created by onboarding. Delegates to the plugin's
@@ -262,8 +264,13 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def run(argv: list[str] | None = None, *, out: Callable[[str], None] = None) -> int:
-    """Execute the ``savings`` subcommand. Returns a process exit code."""
+def run(argv: list[str] | None = None, *, out: Callable[[str], None] | None = None) -> int:
+    """Execute the ``savings`` subcommand. Returns a process exit code.
+
+    ``out`` is the **stdout** sink only (the report body). Errors are always
+    written straight to ``sys.stderr`` and are not routed through ``out``, so a
+    caller capturing ``out`` must capture stderr separately to see them.
+    """
     args = build_parser().parse_args(argv or [])
     emit = out or (lambda s: print(s))
     try:
@@ -290,6 +297,9 @@ def _run_configure(argv: list[str]) -> int:
 
     script = Path(__file__).resolve().parent / "scripts" / "configure.py"
     spec = importlib.util.spec_from_file_location("tool_belt_configure", script)
+    if spec is None or spec.loader is None:
+        print(f"error: configure script not found at {script}", file=sys.stderr)
+        return 2
     module = importlib.util.module_from_spec(spec)
     # Register in sys.modules *before* exec: dataclasses resolves field types
     # via sys.modules[cls.__module__], which is None until registration.
@@ -299,7 +309,7 @@ def _run_configure(argv: list[str]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Top-level ``tool-belt`` dispatch: currently only ``savings``."""
+    """Top-level ``tool-belt`` dispatch: dispatches ``savings`` and ``configure``."""
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] in ("-h", "--help"):
         print(

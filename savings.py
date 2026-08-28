@@ -8,9 +8,9 @@ One engine, two separately-labeled cohorts that are **never** summed together:
 
   * **Projected** — a counterfactual replay of historical Hermes sessions
     through either the *current effective* carrying assignments or a
-    *caller-supplied proposed* per-scope assignment (Phase 8 onboarding, before
-    anything is applied). Every projected figure is labeled counterfactual until
-    matched by organic post-apply telemetry.
+    *caller-supplied proposed* per-scope assignment (used by ``tool-belt
+    configure`` before anything is applied). Every projected figure is labeled
+    counterfactual until matched by organic post-apply telemetry.
 
 This module is the single home for:
 
@@ -47,7 +47,10 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
+
+if TYPE_CHECKING:  # pragma: no cover - typing only; runtime import stays lazy
+    from . import presets
 
 # The token estimator is single-sourced in logger_io; import it in a way that
 # works whether we were loaded as a package submodule or standalone.
@@ -393,8 +396,9 @@ def cohort_stats(
     ceiling_total = sum(int(p.get("ceiling_tokens") or 0) for p in rows)
     narrowed_total = sum(int(p.get("narrowed_tokens") or 0) for p in rows)
     saved_total = ceiling_total - narrowed_total
-    ceiling_count_avg = (sum(int(p.get("ceiling_count") or 0) for p in rows) / n_predictions) if n_predictions else 0.0
-    narrowed_count_avg = (sum(int(p.get("narrowed_count") or 0) for p in rows) / n_predictions) if n_predictions else 0.0
+    # ``n_predictions`` is provably > 0 here: the empty-``rows`` early return above.
+    ceiling_count_avg = sum(int(p.get("ceiling_count") or 0) for p in rows) / n_predictions
+    narrowed_count_avg = sum(int(p.get("narrowed_count") or 0) for p in rows) / n_predictions
     reduction_pct = (saved_total / ceiling_total * 100) if ceiling_total else 0.0
 
     pred_ids = {str(p.get("prediction_id") or "") for p in rows if p.get("prediction_id")}
@@ -596,7 +600,9 @@ def parse_session_full(session_file: Path, agent: str) -> HistoricalSession | No
     Returns None on an unusable session (no meta, no user turns, bad JSON).
     """
     try:
-        lines = [json.loads(l) for l in session_file.read_text().splitlines() if l.strip()]
+        lines = [json.loads(l)
+                 for l in session_file.read_text(encoding="utf-8").splitlines()
+                 if l.strip()]
     except Exception:
         return None
     meta = next((row for row in lines if row.get("role") == "session_meta"), None)
@@ -776,11 +782,11 @@ def _resolve_effective_preset(
 ):
     """Resolve the carrying preset for a scope, read-only.
 
-    ``proposed`` (Phase 8) is a ``{carry: [...], expand_only: [...]}`` mapping to
-    project *before* it is applied — it is layered onto the base policy without
-    touching ``learned.json``. Without it, the *current effective* assignment is
-    used: ``presets.resolve_preset`` (which honors an applied learned overlay,
-    read-only).
+    ``proposed`` (supplied by the configure flow) is a ``{carry: [...],
+    expand_only: [...]}`` mapping to project *before* it is applied — it is
+    layered onto the base policy without touching ``learned.json``. Without it,
+    the *current effective* assignment is used: ``presets.resolve_preset``
+    (which honors an applied learned overlay, read-only).
     """
     presets = _import_sibling("presets")
     if proposed is None:
@@ -809,14 +815,14 @@ def _resolve_effective_preset(
 
 def _replay_active_names(
     session: HistoricalSession,
-    preset: Any,
+    preset: presets.Preset,
     cache_mode: str,
-) -> tuple[list[list[str]], list[int], int, int]:
+) -> tuple[list[list[str]], list[int], int]:
     """Replay the predictor over each user turn.
 
-    Returns ``(active_per_turn, user_turn_indices, expansion_events,
-    ceiling_tokens_per_turn_denominator)`` where ``active_per_turn[k]`` is the
-    resolved active tool-name list for the k-th user turn.
+    Returns ``(active_per_turn, user_turn_indices, expansion_events)`` where
+    ``active_per_turn[k]`` is the resolved active tool-name list for the k-th
+    user turn.
 
       * cache-off: the active set is resolved fresh every turn.
       * cache-on:  the active set is frozen at the first turn, then grows
@@ -883,7 +889,7 @@ def _replay_active_names(
         active_per_turn.append(sorted(active))
         user_indices.append(i)
 
-    return active_per_turn, user_indices, expansion_events, len(ceiling_names)
+    return active_per_turn, user_indices, expansion_events
 
 
 def _reconstructed_input_denominator(
@@ -918,8 +924,9 @@ def project_sessions(
 ) -> ProjectedCohort:
     """Replay a set of historical sessions into one projected cohort.
 
-    ``proposed_by_scope`` (Phase 8) supplies not-yet-applied assignments per
-    scope; when absent the current effective assignment is used.
+    ``proposed_by_scope`` (supplied by the configure flow) carries
+    not-yet-applied assignments per scope; when absent the current effective
+    assignment is used.
     ``provider_input_by_session`` maps a session key to provider-reported
     ``input_tokens`` — when present for a session it is the authoritative
     denominator and wins over reconstruction.
@@ -955,7 +962,7 @@ def project_sessions(
             incomplete_schema = True
             continue
 
-        active_per_turn, user_indices, exp_events, _ = _replay_active_names(
+        active_per_turn, user_indices, exp_events = _replay_active_names(
             session, preset, cache_mode
         )
         if not user_indices:
@@ -983,8 +990,6 @@ def project_sessions(
         # Denominator: provider-reported wins per session.
         skey = session.session_file.stem
         prov = provider_input_by_session.get(skey)
-        if prov is None:
-            prov = provider_input_by_session.get(session.scope + "|" + skey)
         if prov is not None:
             denom_provider += int(prov)
             have_provider = True
@@ -1018,11 +1023,11 @@ def project_sessions(
         cohort.net_input_reduction_pct = None
         return cohort
 
-    # Denominator discipline (hardened 2026-08-28): the reconstruction models
-    # only tool schemas + conversation text per user turn. It omits the system
-    # prompt, context injections, tool results, and per-API-call accumulation,
-    # so against provider billing it can undercount input by orders of
-    # magnitude. It is therefore NEVER used for the session-input percentage.
+    # Denominator discipline: the reconstruction models only tool schemas +
+    # conversation text per user turn. It omits the system prompt, context
+    # injections, tool results, and per-API-call accumulation, so against
+    # provider billing it can undercount input by orders of magnitude. It is
+    # therefore NEVER used for the session-input percentage.
     #   * provider_reported — the only basis for net_input_reduction_pct.
     #   * partial          — provider data exists but does not cover every
     #                        replayed session; percentage suppressed (mixing
@@ -1295,7 +1300,8 @@ def compute(
 
     ``agent`` restricts to a single enabled agent (raising
     :class:`UnknownAgentError` if it isn't present/enabled). ``proposed_by_scope``
-    lets Phase 8 project a not-yet-applied shape without writing any state.
+    lets the configure flow project a not-yet-applied shape without writing any
+    state.
     """
     home = Path(hermes_home or default_hermes_home())
     since_ts = parse_since(since)

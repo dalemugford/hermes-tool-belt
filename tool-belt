@@ -4,9 +4,16 @@
 set -e
 
 _TOOL_BELT_DIR=$(CDPATH= cd -P "$(dirname "$0")" >/dev/null 2>&1 && pwd)
-_HERMES_HOME=${HERMES_HOME:-${HOME}/.hermes}
 
-if [ -n "${HERMES_PYTHON:-}" ]; then
+if [ -n "${HERMES_PYTHON:-}" ] && [ ! -x "$HERMES_PYTHON" ] \
+   && ! command -v "$HERMES_PYTHON" >/dev/null 2>&1; then
+  printf "%s\n" "tool-belt: HERMES_PYTHON ($HERMES_PYTHON) is not executable; falling back" >&2
+fi
+
+# ${HOME} can be unset (cron, some CI containers); don't collapse to "/.hermes".
+_HERMES_HOME=${HERMES_HOME:-${HOME:-/nonexistent}/.hermes}
+
+if [ -n "${HERMES_PYTHON:-}" ] && { [ -x "$HERMES_PYTHON" ] || command -v "$HERMES_PYTHON" >/dev/null 2>&1; }; then
   _TOOL_BELT_PYTHON=$HERMES_PYTHON
 elif [ -x "$_HERMES_HOME/hermes-agent/venv/bin/python3" ]; then
   _TOOL_BELT_PYTHON=$_HERMES_HOME/hermes-agent/venv/bin/python3
