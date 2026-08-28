@@ -252,7 +252,6 @@ def replay_session(
             expand_only_names: list[str] = []
         else:
             allowed_set = set(prediction.active_tool_names)  # type: ignore[arg-type]
-            known = _all_known_tool_names(preset)
             allowed_names = []
             expand_only_names = []
             for name in session.ceiling_tools:
@@ -326,18 +325,6 @@ def replay_session(
                 # must not treat absence as False (which the read-side filter
                 # already handles via `is True`).
             })
-
-
-def _all_known_tool_names(preset: Any) -> set[str]:
-    """All tool names mentioned anywhere in the preset (the resident union
-    ``always_carry`` ∪ ``carry`` plus every trigger group). Mirrors the helper
-    used inside the plugin's _build_api_kwargs filter."""
-    known: set[str] = set()
-    known.update(getattr(preset, "always_carry", []) or [])
-    known.update(getattr(preset, "carry", []) or [])
-    for group in preset.triggers:
-        known.update(group.tools)
-    return known
 
 
 def iter_session_files(root_or_profile_dir: Path, window_days: int | None) -> Iterator[Path]:

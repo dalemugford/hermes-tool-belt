@@ -199,7 +199,7 @@ def cohort_stats(predictions: list[dict[str, Any]],
     if not rows:
         return {"n_predictions": 0, "n_sessions": 0}
 
-    sessions = {_session_key(p) for p in rows if _session_key(p)}
+    sessions = {k for k in (_session_key(p) for p in rows) if k}
     n_predictions = len(rows)
     n_sessions = len(sessions)
     ceiling_total = sum(int(p.get("ceiling_tokens") or 0) for p in rows)

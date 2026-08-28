@@ -1399,13 +1399,15 @@ def recommendation_rows(
                     "expand_round_trip_tokens": args.expand_round_trip_tokens,
                     "per_tool_tokens": args.per_tool_tokens,
                 },
-                "proposed_learned_patch": {
-                    "scopes": {
-                        scope: {
-                            "carry": [category] if action == "promote_to_carry" else [],
-                        }
-                    }
-                },
+                # Category rows are advisory only. ``item`` is a toolset/category
+                # name, not a per-tool identifier, and the analyzer has no
+                # reliable category→enabled-member map here (``tools_per_category``
+                # is telemetry-observed usage, not the preset's membership), so
+                # writing ``[category]`` into a per-tool ``carry`` list would
+                # violate the Phase-6 invariant "never write a toolset/category
+                # name into a per-tool carry list." The promote signal is carried
+                # by ``action``/``metrics``/``reason``; no learned patch is emitted.
+                "proposed_learned_patch": {"scopes": {}},
                 "reason": (
                     f"expanded {count} time(s), had downstream use on {used_events} expansion event(s), "
                     f"produced {used_rows} expanded-tool call row(s); "

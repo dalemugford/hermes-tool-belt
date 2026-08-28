@@ -806,6 +806,35 @@ class RecommendationRowProtectionTests(unittest.TestCase):
         )
         self.assertFalse([r for r in rows if r.get("item") == "mnemosyne_recall"])
 
+    def test_category_recommendation_never_writes_category_into_carry(self):
+        """An ``expanded_category`` recommendation carries a toolset/category
+        name in ``item`` — never a per-tool identifier — so its proposed learned
+        patch must not inject that category string into a per-tool ``carry`` or
+        ``expand_only`` list (Phase-6 invariant). The row stays advisory-only."""
+        stat = analyze.ScopeStats(scope="assistant-a:telegram")
+        stat.predictions = 10
+        # Strong promote signal: expands often, always used downstream.
+        stat.expansions_by_category = Counter({"filesystem": 8})
+        stat.used_expansion_event_ids_by_category["filesystem"] = {
+            f"e{i}" for i in range(8)
+        }
+        rows = analyze.recommendation_rows(
+            {"assistant-a:telegram": stat},
+            self._args(),
+            immutable_always_carry=set(),
+        )
+        category_rows = [r for r in rows if r.get("kind") == "expanded_category"]
+        self.assertTrue(category_rows, "expected an expanded_category row")
+        row = category_rows[0]
+        self.assertEqual(row["item"], "filesystem")
+        # Verify the promote branch actually fired (the branch that previously
+        # leaked the category string into the carry patch).
+        self.assertEqual(row["action"], "promote_to_carry")
+        scopes = row["proposed_learned_patch"]["scopes"]
+        for scope_patch in scopes.values():
+            self.assertNotIn("filesystem", scope_patch.get("carry", []))
+            self.assertNotIn("filesystem", scope_patch.get("expand_only", []))
+
 
 class ExpandToolsUsedAttributionTests(unittest.TestCase):
     """The ``expand_tools_used`` flag must only fire when expansion
