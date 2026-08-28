@@ -37,10 +37,9 @@ What it does NOT do
   · No clobbering of user-facing config. Hand-tuning happens via
     ``config.yaml`` (existing mechanism); this script owns the adaptive
     ``carry`` / ``expand_only`` assignment for a scope under its own
-    ``shaping`` sub-key of ``learned.json``, writing the canonical v2
-    keys (``carry`` / ``expand_only`` / ``shaping``) plus a transitional
-    v1 mirror (``always_on`` / ``always_off`` / ``cache_aware``) for
-    not-yet-migrated readers of ``apply_to_preset``.
+    ``shaping`` sub-key of ``learned.json``, written in the canonical v2
+    shape (``carry`` / ``expand_only`` / ``shaping``) through
+    ``learned.write_state`` — the sole owner of learned-state writes.
 
 Usage
 =====
@@ -57,11 +56,12 @@ Threshold defaults come from ``policy.yaml`` under
 from __future__ import annotations
 
 import argparse
+import importlib
+import importlib.util
 import json
 import logging
 import os
 import sys
-import tempfile
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -78,6 +78,29 @@ from logger_io import normalize_prediction_row, normalize_tool_call_row  # noqa:
 
 logger = logging.getLogger("tool_belt_plugin.shape_ceiling")
 
+
+def _load_learned():
+    """The plugin's ``learned`` module — sole owner of learned-state I/O.
+
+    ``learned.py`` uses package-relative imports, so the hyphenated plugin
+    directory is registered as the ``tool_belt_plugin`` package first
+    (mirroring ``tests/conftest.py`` / ``configure.py`` so already-registered
+    module objects are reused).
+    """
+    name = "tool_belt_plugin"
+    if name not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            name,
+            _PLUGIN_DIR / "__init__.py",
+            submodule_search_locations=[str(_PLUGIN_DIR)],
+        )
+        if spec is None or spec.loader is None:  # pragma: no cover - defensive
+            raise ImportError("cannot load tool-belt package")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return importlib.import_module(f"{name}.learned")
+
 # The immutable always_carry surface is *never* a shaping target: shaping only
 # moves enabled built-ins between the adaptive ``carry`` and ``expand_only``
 # classes. always_carry is excluded from demotion by construction (candidates
@@ -91,7 +114,6 @@ DEFAULTS = {
     "promote_min_sessions": 2,
     "promote_min_calls": 3,
     "demote_min_sessions_no_use": 20,
-    "version": 2,
 }
 
 _POLICY_PATH = Path(__file__).resolve().parent.parent / "policy.yaml"
@@ -290,10 +312,13 @@ def compute_scope_recommendations(
     recent_session_ids = session_ids_ordered[:window]
     recent_sessions = {sid: sessions[sid] for sid in recent_session_ids}
 
-    # Concrete enabled tool names seen for this scope — the validation domain for
-    # candidate names. Union of every prediction tool list plus every observed
-    # tool-call name. A category/toolset name never appears here (it is a grouping
-    # key, not a concrete tool), so validating against this set rejects one.
+    # Concrete enabled tool names seen for THIS scope — the validation domain
+    # for candidate names. Union of every prediction tool list plus every
+    # tool-call name observed under this scope's own predictions (never the
+    # global call index: another agent's tools must not validate into this
+    # scope's carrying lists). A category/toolset name never appears here (it
+    # is a grouping key, not a concrete tool), so validating against this set
+    # rejects one.
     enabled_names: set[str] = set()
     # always_carry residents observed — the demote assertion's forbidden set.
     always_carry_observed: set[str] = set()
@@ -307,11 +332,10 @@ def compute_scope_recommendations(
                     enabled_names.add(str(t))
             for t in (p.get("always_carry_tools") or []):
                 always_carry_observed.add(str(t))
-    for calls in calls_by_pred.values():
-        for tc in calls:
-            name = str(tc.get("tool_name") or "")
-            if name:
-                enabled_names.add(name)
+            for tc in calls_by_pred.get(p.get("prediction_id", ""), []):
+                name = str(tc.get("tool_name") or "")
+                if name:
+                    enabled_names.add(name)
 
     def _valid(tool_name: str, kind: str) -> bool:
         if tool_name and tool_name in enabled_names:
@@ -410,23 +434,6 @@ def compute_scope_recommendations(
     }
 
 
-def _scope_carrying(entry: dict[str, Any]) -> tuple[set[str], set[str]]:
-    """Read a scope entry's current (carry, expand_only) sets.
-
-    Native v2 keys (``carry`` / ``expand_only``) win; the v1 spellings
-    (``always_on`` / ``always_off``) are read as a fallback for a scope written
-    by an older shaper. Returned as sets for the move algebra.
-    """
-    def _lst(*keys: str) -> set[str]:
-        for key in keys:
-            value = entry.get(key)
-            if isinstance(value, list):
-                return {str(t).strip() for t in value if str(t).strip()}
-        return set()
-
-    return _lst("carry", "always_on"), _lst("expand_only", "always_off")
-
-
 def merge_into_learned(
     state_dir: Path,
     per_scope: dict[str, dict[str, Any]],
@@ -442,16 +449,20 @@ def merge_into_learned(
       · a demotion moves its tool into ``expand_only`` and out of ``carry``.
 
     Promotions are applied after demotions so a tool named by both wins toward
-    carrying, and any residual overlap is reconciled toward carry. Both the v2
-    keys (``carry`` / ``expand_only`` / ``shaping``) and the transitional v1
-    mirror (``always_on`` / ``always_off`` / ``cache_aware``) are written so a
-    not-yet-migrated reader still resolves the same assignment. Every candidate
-    is validated against the scope's concrete enabled tool names — a
-    category/toolset name is never written into a carrying list.
+    carrying, and any residual overlap is reconciled toward carry. The current
+    assignment is read through ``learned.normalize_state`` — the central v1→v2
+    adapter — and only the canonical v2 keys (``carry`` / ``expand_only`` /
+    ``shaping``) are written; all v1 spelling stays inside ``learned.py``.
+    Every candidate is validated against the scope's concrete enabled tool
+    names — a category/toolset name is never written into a carrying list.
 
     Other scopes and all unrelated metadata (top-level and per-scope) are
-    preserved verbatim. Returns the merged state and whether anything changed.
+    preserved, normalized to the v2 shape on write. Persistence goes through
+    ``learned.write_state`` (atomic, fsynced, version-stamped — the single
+    owner of learned-state writes). Returns the merged state and whether
+    anything changed.
     """
+    learned = _load_learned()
     learned_path = state_dir / "learned.json"
     if learned_path.exists():
         try:
@@ -463,8 +474,7 @@ def merge_into_learned(
     else:
         existing = {}
 
-    state = dict(existing)
-    state["version"] = DEFAULTS["version"]  # learned schema v2
+    state = learned.normalize_state(existing)  # central v1→v2 adapter
     scopes = dict(state.get("scopes") or {})
 
     changed = False
@@ -489,7 +499,9 @@ def merge_into_learned(
             )
             return False
 
-        carry_set, expand_set = _scope_carrying(entry)
+        # The entry is already normalized to v2 (carry/expand_only/shaping).
+        carry_set = {str(t) for t in (entry.get("carry") or []) if str(t).strip()}
+        expand_set = {str(t) for t in (entry.get("expand_only") or []) if str(t).strip()}
         prev_carry, prev_expand = set(carry_set), set(expand_set)
 
         demote_tools = [str(d.get("tool") or "") for d in (recs.get("demote") or [])]
@@ -517,9 +529,9 @@ def merge_into_learned(
         prev_sig = (
             sorted(prev_carry), sorted(prev_expand),
             [(p.get("tool"), p.get("sessions"), p.get("calls"))
-             for p in ((entry.get("shaping") or entry.get("cache_aware") or {}).get("promote") or [])],
+             for p in ((entry.get("shaping") or {}).get("promote") or [])],
             [(d.get("tool"), d.get("sessions_without_use"))
-             for d in ((entry.get("shaping") or entry.get("cache_aware") or {}).get("demote") or [])],
+             for d in ((entry.get("shaping") or {}).get("demote") or [])],
         )
         new_sig = (
             new_carry, new_expand,
@@ -530,14 +542,10 @@ def merge_into_learned(
             continue  # no change for this scope
 
         changed = True
-        # v2 canonical fields.
+        # v2 canonical fields only — no v1 mirror; learned.py owns v1 spelling.
         entry["carry"] = new_carry
         entry["expand_only"] = new_expand
         entry["shaping"] = recs
-        # Transitional v1 mirror for not-yet-migrated readers.
-        entry["always_on"] = list(new_carry)
-        entry["always_off"] = list(new_expand)
-        entry["cache_aware"] = recs
         scopes[scope] = entry
 
     state["scopes"] = scopes
@@ -545,24 +553,9 @@ def merge_into_learned(
         state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
     if changed and not dry_run:
-        learned_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
-        # Unique same-directory temp so two concurrent runs can't race on a
-        # fixed name; flush+fsync then atomic replace so a reader always sees a
-        # complete file. Clean up the temp if anything fails before the rename.
-        fd, tmp_name = tempfile.mkstemp(
-            prefix="learned.", suffix=".tmp", dir=str(learned_path.parent)
-        )
-        tmp = Path(tmp_name)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(payload)
-                f.flush()
-                os.fsync(f.fileno())
-            tmp.replace(learned_path)
-        except Exception:
-            tmp.unlink(missing_ok=True)
-            raise
+        # learned.write_state is the single owner of learned-state persistence:
+        # unique-temp atomic write, fsync, normalize-on-write, v2 version stamp.
+        learned.write_state(state, learned_path)
 
     return state, changed
 

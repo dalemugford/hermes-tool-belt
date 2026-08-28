@@ -14,18 +14,23 @@ per-message active set. It is the single authority for the locked algebra::
 Invariants:
 
   * A, C, X are a genuine three-way partition of E (precedence
-    always_carry > carry > expand_only).
+    always_carry > carry > expand_only). The partition itself enforces the
+    always_carry > carry precedence: C is computed minus A.
   * No selection source (policy, learning, triggers, sticky/prior-active
     carry-forward, or explicit expansion) can add a tool absent from ``E``.
     Disabled/absent tools never re-enter.
-  * ``always_carry`` is immune to a learned ``demoted`` signal — the
-    demotion is ignored and a warning is emitted.
-  * A contradictory overlap (a tool both carried and demoted) fails safe
-    *toward carrying*: the tool stays resident and a warning is emitted.
   * MCP/plugin ``passthrough`` tools live outside the built-in partition; they
     are never narrowed and never counted in A/C/X.
   * Any internal failure fails **open** — the returned model's active set is
     the whole enabled ceiling (no narrowing).
+
+Demotion/promotion precedence is applied *upstream*, in
+``learned.apply_to_preset``, before the preset reaches this module: a learned
+demotion moves a tool out of the adaptive ``carry`` loadout there, and the
+always_carry-immunity and carried∧demoted conflict rules (fail safe toward
+carrying, with a warning) live in ``learned.py`` — its single home. By the
+time :func:`resolve` runs, the loadout is already reconciled; this module
+partitions an already-reconciled preset and never sees a demotion signal.
 """
 
 from __future__ import annotations
@@ -88,6 +93,41 @@ def _coerce(value) -> set[str]:
     return out
 
 
+def _salvage_names(value) -> set[str]:
+    """Best-effort name extraction for the fail-open path. Never raises.
+
+    Used only when the strict :func:`_coerce` of the *enabled ceiling itself*
+    fails: keep every readable name so failing open still returns the original
+    ceiling. Returning an empty set here would narrow the model to zero tools —
+    exactly the fail-closed outcome the module's headline invariant forbids.
+    """
+    if value is None:
+        return set()
+    if isinstance(value, str):
+        return {value} if value else set()
+    out: set[str] = set()
+    try:
+        iterator = iter(value)
+    except Exception:
+        return out
+    while True:
+        try:
+            item = next(iterator)
+        except StopIteration:
+            break
+        except Exception:
+            break
+        try:
+            if isinstance(item, str):
+                if item:
+                    out.add(item)
+            elif item is not None:
+                out.add(str(item))
+        except Exception:
+            continue
+    return out
+
+
 def resolve(
     *,
     enabled,
@@ -96,7 +136,6 @@ def resolve(
     triggered=(),
     expanded=(),
     passthrough=(),
-    demoted=(),
     prior_active=(),
 ) -> CarryingModel:
     """Finalize the carrying partition over the live enabled ceiling ``E``.
@@ -104,18 +143,22 @@ def resolve(
     Every argument is a collection of tool names. ``enabled`` is authoritative:
     no other source can introduce a name it doesn't contain. Returns a
     :class:`CarryingModel`. Never raises — an internal failure fails open,
-    returning ``active == enabled`` (no narrowing).
+    returning ``active == enabled`` (no narrowing); this includes a failure
+    while coercing ``enabled`` itself, where every readable ceiling name is
+    salvaged rather than narrowing to the empty set.
     """
+    E: set[str] | None = None
     try:
         E = _coerce(enabled)
-    except Exception:
-        E = set()
-    try:
         return _resolve_inner(
-            E, always_carry, carry, triggered, expanded, passthrough, demoted, prior_active
+            E, always_carry, carry, triggered, expanded, passthrough, prior_active
         )
     except Exception as exc:  # fail OPEN — never narrow on an internal error
         logger.warning("tool-belt: carrying.resolve failed (%s) — failing open", exc)
+        if E is None:
+            # The enabled ceiling itself failed strict coercion. Salvage what
+            # is readable so fail-open returns the original ceiling, not ∅.
+            E = _salvage_names(enabled)
         return CarryingModel(
             always_carry=set(),
             carry=set(),
@@ -133,7 +176,6 @@ def _resolve_inner(
     triggered,
     expanded,
     passthrough,
-    demoted,
     prior_active,
 ) -> CarryingModel:
     ac = _coerce(always_carry)
@@ -141,7 +183,6 @@ def _resolve_inner(
     tr = _coerce(triggered)
     ex = _coerce(expanded)
     pt = _coerce(passthrough)
-    dm = _coerce(demoted)
     pa = _coerce(prior_active)
 
     warnings: list[str] = []
@@ -154,24 +195,11 @@ def _resolve_inner(
     # ── Class A: immutable residents (always_carry ∩ E). ──────────────────
     A = ac & E_builtin
 
-    # A learned demotion naming an always_carry tool is impossible-by-policy;
-    # ignore it and warn (immunity).
-    for name in sorted(dm & A):
-        warnings.append(
-            f"demotion signal names always_carry tool {name!r}; ignored (immune)"
-        )
-
     # ── Class C: adaptive residents (carry ∩ E) − A. ──────────────────────
+    # Subtracting A enforces the always_carry > carry precedence inside the
+    # partition itself; demotion conflicts were already reconciled upstream in
+    # ``learned.apply_to_preset`` (see the module docstring).
     C = (ca & E_builtin) - A
-
-    # Contradictory overlap: a tool that is both a carry resident and named by
-    # a demotion signal. Fail safe *toward carrying* — keep it resident — and
-    # warn so the conflict is auditable rather than silently narrowed away.
-    for name in sorted(dm & C):
-        warnings.append(
-            f"tool {name!r} is both carried and demoted; failing safe toward "
-            "carrying (stays resident)"
-        )
 
     # ── Class X: expand_only — the enabled remainder (incl. unknowns). ─────
     X = E_builtin - (A | C)

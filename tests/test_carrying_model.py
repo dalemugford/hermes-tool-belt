@@ -20,7 +20,9 @@ Key invariants pinned here:
   * A, C, X are a genuine three-way partition of E (precedence
     always_carry > carry > expand_only).
   * Unknown enabled built-ins default to expand_only.
-  * always_carry is immune to learned demotion.
+  * always_carry is immune to learned demotion — proven against
+    ``learned.apply_to_preset``, the single home of demotion precedence
+    (the carrying partition receives an already-reconciled loadout).
   * Promotion (expand_only→carry) and demotion (carry→expand_only) move a tool
     across the C/X boundary via the adaptive ``carry`` loadout and never touch
     trigger definitions.
@@ -48,10 +50,13 @@ produces a clean test *failure*, never an import-time collection error)::
         triggered=(),     # names activated by trigger match this message
         expanded=(),      # names activated by explicit expand_tools
         passthrough=(),   # MCP/plugin names — outside the built-in partition
-        demoted=(),       # learned/adaptive "always_off" signal (fail-safe/immune)
         prior_active=(),  # active names carried from earlier messages (cache-on)
     ) -> model exposing .always_carry(A) .carry(C) .expand_only(X)
                         .active .passthrough .warnings
+
+Learned demotion signals never reach ``resolve``: they are reconciled
+upstream in ``learned.apply_to_preset`` (always_carry immunity, carry-wins
+overlap), and the demotion contracts below exercise that module directly.
 
 Plus, for the persistence/telemetry cases, the real modules are exercised
 directly (``learned``/``analyze``/``logger_io``) with a v2 normalization
@@ -110,7 +115,7 @@ ALWAYS_CARRY = frozenset(
 
 _EXPECTED_SIGNATURE = (
     "carrying.resolve(enabled, always_carry, carry, triggered=(), expanded=(), "
-    "passthrough=(), demoted=(), prior_active=()) -> "
+    "passthrough=(), prior_active=()) -> "
     ".always_carry/.carry/.expand_only/.active/.passthrough/.warnings"
 )
 _MISSING_API_MSG = (
@@ -268,7 +273,7 @@ class _CarryingContract(unittest.TestCase):
             )
 
     def resolve(self, *, enabled, always_carry, carry, triggered=(), expanded=(),
-                passthrough=(), demoted=(), prior_active=()):
+                passthrough=(), prior_active=()):
         raw = self._resolve_raw(
             enabled=set(enabled),
             always_carry=set(always_carry),
@@ -276,7 +281,6 @@ class _CarryingContract(unittest.TestCase):
             triggered=set(triggered),
             expanded=set(expanded),
             passthrough=set(passthrough),
-            demoted=set(demoted),
             prior_active=set(prior_active),
         )
         m = _read_model(raw)
@@ -329,17 +333,42 @@ class UnknownDefaultsContract(_CarryingContract):
 # ─── 3. always_carry immunity from learned demotion ────────────────────────
 
 class AlwaysCarryImmunityContract(_CarryingContract):
+    """Demotion precedence lives in ``learned.apply_to_preset`` — its single
+    home. The contract: a learned ``expand_only`` (demotion) signal naming an
+    always_carry tool is ignored with a warning, and the partition computed
+    from the reconciled preset keeps the tool resident in A."""
+
     def test_always_carry_immune_from_learned_demotion(self):
         E = {"clarify", "send_message", "web_extract"}
-        # The learned/adaptive layer emits a demotion (always_off) signal
-        # naming an always_carry tool. It must be ignored, and warned about.
-        m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
-                         demoted={"clarify"})
+        scope = "assistant-a:telegram"
+        preset = presets_mod.Preset(
+            name="immunity-contract",
+            always_carry=sorted(ALWAYS_CARRY),
+            carry=[],
+            triggers=[],
+        )
+        # The learned layer emits a demotion (expand_only) signal naming an
+        # always_carry tool. It must be ignored, and warned about.
+        doc = {"version": 2,
+               "scopes": {scope: {"carry": ["web_extract"],
+                                  "expand_only": ["clarify"]}}}
+        with _temp_learned_state(doc):
+            with self.assertLogs(_LOGGER_LEARNED, level="WARNING") as cm:
+                merged = learned_mod.apply_to_preset(
+                    preset, {"learned_mode": "apply", "channels": {}}, scope)
 
+        self.assertIn("clarify", merged.preset.always_carry,
+                      "always_carry tool stays on the immutable surface")
+        self.assertNotIn("clarify", merged.preset.carry)
+        warned = "\n".join(cm.output)
+        self.assertIn("clarify", warned, "demoting an always_carry tool must warn")
+
+        # The partition of the reconciled preset keeps the tool resident.
+        m = self.resolve(enabled=E, always_carry=merged.preset.always_carry,
+                         carry=merged.preset.carry)
         self.assertIn("clarify", m.A, "always_carry tool stays resident")
         self.assertIn("clarify", m.active)
         self.assertNotIn("clarify", m.X, "always_carry never falls to expand_only")
-        self.assertTrue(m.warnings, "demoting an always_carry tool must warn")
 
 
 # ─── 4. promotion expand_only -> carry ─────────────────────────────────────
@@ -419,14 +448,39 @@ class DisabledToolContract(_CarryingContract):
 # ─── 9. malformed overlap resolves safely and warns ────────────────────────
 
 class MalformedOverlapContract(_CarryingContract):
+    """The carried∧demoted conflict rule lives in ``learned.py`` — its single
+    home (``_reconcile_overlap``, routed by ``apply_to_preset``). The contract:
+    a tool named both carried and demoted fails safe *toward carrying* with a
+    warning, and the partition keeps it resident."""
+
     def test_malformed_overlap_fails_safe_toward_carrying_and_warns(self):
         E = {"clarify", "send_message", "web_extract"}
-        # web_extract is a carry resident AND named by a demotion signal — a
-        # contradictory overlap. Fail safe toward carrying: keep it resident.
-        m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry={"web_extract"},
-                         demoted={"web_extract"})
+        scope = "assistant-a:telegram"
+        preset = presets_mod.Preset(
+            name="overlap-contract",
+            always_carry=sorted(ALWAYS_CARRY),
+            carry=[],
+            triggers=[],
+        )
+        # web_extract is named carried AND demoted — a contradictory overlap.
+        doc = {"version": 2,
+               "scopes": {scope: {"carry": ["web_extract"],
+                                  "expand_only": ["web_extract"]}}}
+        with _temp_learned_state(doc):
+            with self.assertLogs(_LOGGER_LEARNED, level="WARNING") as cm:
+                # Force a fresh read so the load-time normalization (where the
+                # overlap warning is emitted) runs inside the log capture.
+                learned_mod.load_state(force=True)
+                merged = learned_mod.apply_to_preset(
+                    preset, {"learned_mode": "apply", "channels": {}}, scope)
 
-        self.assertTrue(m.warnings, "malformed overlap must warn")
+        warned = "\n".join(cm.output)
+        self.assertIn("web_extract", warned, "malformed overlap must warn")
+        self.assertIn("web_extract", merged.preset.carry,
+                      "fail safe toward carrying keeps it resident")
+
+        m = self.resolve(enabled=E, always_carry=merged.preset.always_carry,
+                         carry=merged.preset.carry)
         self.assertIn("web_extract", m.C, "fail safe toward carrying keeps it resident")
         self.assertNotIn("web_extract", m.X, "must not be silently narrowed away")
         self.assertIn("web_extract", m.active)
@@ -448,12 +502,35 @@ class FailOpenContract(_CarryingContract):
         raw = self._resolve_raw(
             enabled=set(E), always_carry=_Boom(), carry=set(),
             triggered=set(), expanded=set(), passthrough=set(),
-            demoted=set(), prior_active=set(),
+            prior_active=set(),
         )
         m = _read_model(raw)
         self.assertIsNotNone(m.active, "fail-open must still return an active set")
         self.assertTrue(set(E) <= m.active,
                         "fail-open returns the whole enabled ceiling (no narrowing)")
+
+    def test_failed_enabled_coercion_fails_open_not_closed(self):
+        # Regression: a failure while coercing the ``enabled`` ceiling itself
+        # used to fall through with E=∅ and return active=∅ — the model
+        # narrowed to ZERO tools (fail-closed), outside the fail-open handler.
+        # It must fail OPEN: every readable ceiling name stays active.
+        class _BadName:
+            def __str__(self):
+                raise RuntimeError("boom")
+
+        good = {"clarify", "send_message", "read_file", "web_extract"}
+        enabled = list(good) + [_BadName()]  # strict coercion raises on _BadName
+
+        raw = self._resolve_raw(
+            enabled=enabled, always_carry=set(ALWAYS_CARRY), carry=set(),
+            triggered=set(), expanded=set(), passthrough=set(),
+            prior_active=set(),
+        )
+        m = _read_model(raw)
+        self.assertIsNotNone(m.active, "fail-open must still return an active set")
+        self.assertTrue(good <= m.active,
+                        "a failed enabled coercion fails open — the readable "
+                        "ceiling names stay active (never active == ∅)")
 
 
 # ─── 11. MCP/plugin pass-through outside the built-in partition ────────────
@@ -839,6 +916,33 @@ class ShaperPromotionContract(unittest.TestCase):
                       "an expand_only tool reached via expand_tools promotes to carry")
         self.assertEqual(recs["demote"], [], "no demotion in the promote arm")
 
+    def test_validation_domain_is_scope_local_not_global(self):
+        # Regression: enabled_tool_names (the candidate-validation domain
+        # merge_into_learned's _accept checks against) was built from the
+        # GLOBAL tool-call index, so another agent's tool names could validate
+        # into this scope's carrying lists. It must be built only from this
+        # scope's own predictions and their tool calls.
+        E = ["clarify", "send_message", "web_extract"]
+        preds, calls = [], []
+        for i in range(3):
+            pid = f"p{i}"
+            preds.append(_pred_row(
+                self.SCOPE, f"s{i}", pid,
+                ceiling=E, always_carry=["clarify", "send_message"], carry=[],
+                active=["clarify", "send_message"], ts=i,
+            ))
+            calls.append(_expansion_call(pid, "web_extract"))
+        # A different agent's telemetry shares the tool_calls file: its calls
+        # are indexed under ITS prediction ids, never this scope's.
+        calls.append(_expansion_call("foreign-p0", "foreign_agent_tool"))
+        recs = _compute(self.SCOPE, preds, calls)
+        self.assertNotIn(
+            "foreign_agent_tool", recs["enabled_tool_names"],
+            "another agent's tool must not enter this scope's validation domain",
+        )
+        self.assertIn("web_extract", recs["enabled_tool_names"],
+                      "this scope's own observed tools still validate")
+
     def test_trigger_only_use_does_not_promote(self):
         E = ["clarify", "send_message", "web_extract"]
         preds, calls = [], []
@@ -979,7 +1083,7 @@ class ShaperMergeContract(unittest.TestCase):
                 "provenance": "keep-me",              # unrelated top-level key
                 "scopes": {
                     self.SCOPE: {"notes": "hand-edited"},   # unrelated per-scope key
-                    "other:cli": {"always_on": ["keepme"]},  # unrelated scope
+                    "other:cli": {"always_on": ["keepme"]},  # unrelated scope, v1 keys
                 },
             })
             recs = self._recs(promote=["web_extract"], enabled=["web_extract"])
@@ -987,14 +1091,22 @@ class ShaperMergeContract(unittest.TestCase):
             out = self._read(tmp)
             self.assertEqual(out["version"], 2)
             entry = out["scopes"][self.SCOPE]
-            # v2 fields written …
+            # v2 fields written — and ONLY v2 fields: the transitional v1
+            # mirror (always_on/always_off/cache_aware) is gone for good.
             self.assertEqual(entry["carry"], ["web_extract"])
             self.assertIn("expand_only", entry)
             self.assertEqual(entry["shaping"]["scope"], self.SCOPE)
-            # … unrelated metadata (top-level, per-scope, other scope) preserved.
+            for stale in ("always_on", "always_off", "cache_aware"):
+                self.assertNotIn(stale, entry,
+                                 f"v1 mirror key {stale!r} must never be written")
+            # … unrelated metadata (top-level, per-scope) preserved, and the
+            # untouched scope's assignment survives, normalized to v2 on write.
             self.assertEqual(out["provenance"], "keep-me")
             self.assertEqual(entry["notes"], "hand-edited")
-            self.assertEqual(out["scopes"]["other:cli"], {"always_on": ["keepme"]})
+            other = out["scopes"]["other:cli"]
+            self.assertEqual(other["carry"], ["keepme"],
+                             "an untouched scope's v1 assignment survives as v2 carry")
+            self.assertNotIn("always_on", other)
 
     def test_category_candidate_is_rejected_not_stored(self):
         with tempfile.TemporaryDirectory() as t:

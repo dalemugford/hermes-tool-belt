@@ -368,8 +368,11 @@ class ApplyFlowTests(TempHomeTestCase):
 
         learned = json.loads((self.root_state / "learned.json").read_text())
         entry = learned["scopes"]["default:telegram"]
-        self.assertIn("terminal", entry["always_on"])
-        self.assertEqual(entry["cache_aware"]["scope"], "default:telegram")
+        self.assertIn("terminal", entry["carry"])
+        self.assertEqual(entry["shaping"]["scope"], "default:telegram")
+        # Canonical v2 keys only — the transitional v1 mirror is gone.
+        for stale in ("always_on", "always_off", "cache_aware"):
+            self.assertNotIn(stale, entry)
         # Atomic write leaves no temp file behind.
         self.assertEqual(list(self.root_state.glob("learned*.tmp")), [])
 
@@ -497,7 +500,37 @@ class ResetFlowTests(TempHomeTestCase):
         configure.flow_reset(ctx, [info])
 
         learned = json.loads(path.read_text())
-        self.assertEqual(learned["scopes"]["other:cli"], {"always_on": ["keepme"]})
+        # The untouched scope's assignment survives — normalized to the v2
+        # shape on write (learned.write_state normalizes every persist).
+        other = learned["scopes"]["other:cli"]
+        self.assertEqual(other["carry"], ["keepme"])
+        self.assertNotIn("always_on", other)
+
+    def test_reset_clears_only_adaptive_keys_and_preserves_scope_metadata(self) -> None:
+        # Regression: reset used to pop the whole scope entry, destroying
+        # unrelated per-scope metadata. The single reset semantic
+        # (learned.reset_scope) clears ONLY the adaptive carry/expand_only
+        # assignments and shaping evidence.
+        info = self._shaped_scope()
+        path = self.root_state / "learned.json"
+        state = json.loads(path.read_text())
+        state["scopes"][info.scope]["notes"] = "hand-edited, keep me"
+        path.write_text(json.dumps(state))
+
+        ctx = make_ctx(self.home, FakeRunner(), assume_yes=True, thresholds=self.thresholds)
+        configure.flow_reset(ctx, [info])
+
+        learned = json.loads(path.read_text())
+        entry = learned["scopes"][info.scope]
+        # Adaptive assignments/evidence cleared (normalize-on-write may render
+        # a cleared field as empty rather than absent — both mean cleared).
+        self.assertEqual(entry.get("carry", []), [])
+        self.assertEqual(entry.get("expand_only", []), [])
+        self.assertEqual(entry.get("shaping", {}), {})
+        for stale in ("always_on", "always_off", "cache_aware"):
+            self.assertNotIn(stale, entry)
+        self.assertEqual(entry["notes"], "hand-edited, keep me",
+                         "reset must preserve unrelated per-scope metadata")
 
 
 class DryRunTests(TempHomeTestCase):

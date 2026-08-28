@@ -9,8 +9,10 @@ Exercises ``learned.py`` at the module level (no configure/shaper flow):
   * ``write_state`` round-trip — atomic replace, v1 → v2 normalization on write,
     and preservation of unrelated top-level / per-scope metadata.
 
-``write_state`` has no production caller yet (the shaper rewires it in Phase 6);
-these tests pin the contract Phase 6 will rely on.
+``write_state`` is the single production writer of ``learned.json`` — the
+shaper's ``merge_into_learned`` and configure's flows persist through it —
+so its atomicity contract (unique temp name, fsync, cleanup on failure) is
+pinned here too.
 """
 
 from __future__ import annotations
@@ -146,6 +148,50 @@ class WriteStateRoundTripTests(LearnedV2TestCase):
                 # Unrelated metadata passes through untouched (top-level + per-scope).
                 self.assertEqual(on_disk["provenance"], "seed-run-abc")
                 self.assertEqual(entry["notes"], "hand-edited, keep me")
+
+    def test_unique_temp_name_never_clobbers_a_concurrent_writers_temp(self) -> None:
+        """Regression: the old fixed ``learned.json.tmp`` temp name meant two
+        concurrent writers clobbered each other's temp file. The writer must
+        use a uniquely named temp, so a pre-existing fixed-name temp (standing
+        in for a concurrent writer's file) survives the write untouched."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"HERMES_HOME": tmp}):
+                path = learned.learned_path()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                decoy = path.with_suffix(path.suffix + ".tmp")
+                decoy.write_text("concurrent writer's in-flight temp", encoding="utf-8")
+
+                learned.write_state({"version": 2, "scopes": {"a:slack": {"carry": ["x"]}}})
+
+                self.assertTrue(path.exists())
+                self.assertEqual(decoy.read_text(encoding="utf-8"),
+                                 "concurrent writer's in-flight temp",
+                                 "a concurrent writer's temp file must survive untouched")
+                decoy.unlink()
+                leftovers = [p for p in path.parent.iterdir() if ".tmp" in p.name]
+                self.assertEqual(leftovers, [], "no temp debris after a successful write")
+
+    def test_failed_write_cleans_up_temp_and_preserves_target(self) -> None:
+        """Regression: a failure mid-write (fsync here) must propagate, remove
+        the temp file, and leave the existing target byte-identical."""
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"HERMES_HOME": tmp}):
+                learned.write_state({"version": 2, "scopes": {"a:slack": {"carry": ["x"]}}})
+                path = learned.learned_path()
+                before = path.read_bytes()
+
+                with mock.patch.object(learned.os, "fsync",
+                                       side_effect=OSError("disk full")):
+                    with self.assertRaises(OSError):
+                        learned.write_state(
+                            {"version": 2, "scopes": {"a:slack": {"carry": ["y"]}}}
+                        )
+
+                self.assertEqual(path.read_bytes(), before,
+                                 "a failed write must not touch the target")
+                leftovers = [p for p in path.parent.iterdir() if ".tmp" in p.name]
+                self.assertEqual(leftovers, [],
+                                 "a failed write must clean up its temp file")
 
 
 if __name__ == "__main__":

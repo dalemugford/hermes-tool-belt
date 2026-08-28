@@ -207,8 +207,8 @@ class OnboardingArcTests(OnboardingTestCase):
         self.assertEqual(rc, 0)
 
         entry = self.learned()["scopes"][result.scope]
-        self.assertIn("execute_code", entry["always_on"])
-        self.assertEqual(entry["cache_aware"]["scope"], result.scope)
+        self.assertIn("execute_code", entry["carry"])
+        self.assertEqual(entry["shaping"]["scope"], result.scope)
         self.assertIn("execute_code", output)
 
         # The confirmed-apply epilogue speaks the 1.0 vocabulary: the retired

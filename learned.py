@@ -22,8 +22,13 @@ Reading normalizes an older v1 document into this shape **in memory only** — i
 never rewrites the file. The v1 → v2 field mapping is: ``always_on → carry``,
 ``always_off → expand_only``, ``cache_aware → shaping``. v1
 ``trigger_adjustments`` are dropped with a warning: trigger definitions are
-immutable under the 1.0 model. The next explicit/confirmed writer
-(:func:`write_state`) may persist the normalized v2 shape atomically.
+immutable under the 1.0 model.
+
+This module is the sole owner of learned-state persistence: every writer
+(the shaper, configure flows, the analyzer) routes through :func:`write_state`
+(atomic, normalize-on-write, version-stamped) and every scope reset through
+:func:`reset_scope`. All v1 spelling lives in this module's adapter — no
+script writes or mirrors the v1 keys.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ import hashlib
 import json
 import logging
 import os
+import tempfile
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -311,26 +317,44 @@ def state_hash() -> str:
 
 
 def write_state(state: dict[str, Any], path: Path | None = None) -> None:
-    """Atomically write learned state as v2. Intended for analyzer/manual commands.
+    """Atomically persist learned state as schema v2 — the single writer.
 
-    The write reconciles opposite assignments atomically: normalization ensures
-    no tool remains in both ``carry`` and ``expand_only`` for a scope (a
-    malformed overlap resolves toward carrying). The version is stamped to v2.
+    Every production write of ``learned.json`` (shaper merge, configure flows,
+    analyzer recommendations) routes through here. The document is normalized
+    on write: v1 spellings are renamed to their v2 fields, a ``carry`` ∩
+    ``expand_only`` overlap resolves toward carrying, unrelated scopes and
+    metadata are preserved, and the version is stamped to v2.
+
+    The write is atomic and durable: a uniquely named temp file in the target
+    directory (two concurrent writers can never clobber each other's temp),
+    flushed and fsynced, then renamed over the target. The temp file is
+    removed if anything fails before the rename.
     """
     target = path or learned_path()
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = normalize_state(dict(state or {}))
     payload["version"] = LEARNED_VERSION
     payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    tmp = target.with_suffix(target.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    tmp.replace(target)
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=target.name + ".", suffix=".tmp", dir=str(target.parent)
+    )
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(target)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
     load_state(force=True)
 
 
 #: Adaptive shaping keys a reset clears from a scope — the v2 assignments and
-#: evidence plus their transitional v1 mirror. Everything else in a scope dict
-#: (and every other scope) is unrelated metadata a reset must preserve.
+#: evidence plus their v1 spellings. Everything else in a scope dict (and
+#: every other scope) is unrelated metadata a reset must preserve.
 _ADAPTIVE_SCOPE_KEYS = frozenset(
     {"carry", "expand_only", "shaping", "always_on", "always_off", "cache_aware"}
 )
@@ -339,8 +363,10 @@ _ADAPTIVE_SCOPE_KEYS = frozenset(
 def reset_scope(state: dict[str, Any], scope: str) -> tuple[dict[str, Any], bool]:
     """Drop one scope's adaptive shaping assignments/evidence, in memory.
 
+    The single reset semantic for learned state — configure's reset flow and
+    any other reset path route through here rather than hand-rolling their own.
     Removes only the adaptive carrying keys (``carry`` / ``expand_only`` /
-    ``shaping`` and their v1 mirror) from the named scope. Any other key in that
+    ``shaping`` and their v1 spellings) from the named scope. Any other key in that
     scope's dict is unrelated metadata and is preserved; if the scope becomes
     empty it is dropped entirely. Every *other* scope, the top-level metadata,
     and the always-carry policy / trigger definitions (which live in policy.yaml,

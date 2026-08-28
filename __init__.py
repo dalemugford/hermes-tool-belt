@@ -366,7 +366,10 @@ def _wrap_build_api_kwargs(original):
             # Finalize the three strata (A/C/X) and the per-message active set
             # against the LIVE enabled ceiling. No selection source can add a
             # tool absent from ``E``; unknown enabled built-ins fall to
-            # expand_only and are cut unless triggered/expanded.
+            # expand_only and are cut unless triggered/expanded. Learned
+            # demotions were already applied upstream (learned.apply_to_preset)
+            # before resolved_carry was computed — the loadout arrives here
+            # reconciled.
             model = carrying_mod.resolve(
                 enabled=builtin_ceiling,
                 always_carry=set(state.get("resolved_always_carry") or []),
@@ -374,7 +377,6 @@ def _wrap_build_api_kwargs(original):
                 triggered=triggered_names,
                 expanded=expanded_names,
                 passthrough=set(),  # passthrough handled directly on the tool list
-                demoted=set(state.get("demoted_tools") or []),
                 prior_active=set(state.get("prior_active_tools") or []),
             )
             active_set = model.active

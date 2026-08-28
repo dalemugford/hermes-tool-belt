@@ -660,7 +660,8 @@ def compute_recommendations(info: ScopeInfo, thresholds: dict[str, int]) -> dict
 def write_learned_overlay(
     info: ScopeInfo, recs: dict[str, Any], dry_run: bool = False
 ) -> bool:
-    """Persist the shaper's recommendations via the shaper's own writer."""
+    """Persist the shaper's recommendations via the shaper's merge, which
+    itself persists through ``learned.write_state`` (the single writer)."""
     shaper = load_shaper()
     _state, changed = shaper.merge_into_learned(
         info.state_dir, {info.scope: recs}, dry_run
@@ -696,9 +697,20 @@ def proposed_assignment(info: ScopeInfo, recs: dict[str, Any]) -> dict[str, list
 
 
 def remove_learned_scope(info: ScopeInfo, dry_run: bool = False) -> bool:
-    """Drop one scope's entry from ``learned.json`` (atomic, file preserved)."""
+    """Clear one scope's adaptive assignments from ``learned.json``.
+
+    Routes through ``learned.reset_scope`` — the single reset semantic: only
+    the scope's adaptive ``carry`` / ``expand_only`` assignments and ``shaping``
+    evidence are cleared; unrelated per-scope metadata, every other scope, and
+    top-level metadata are preserved (always_carry policy and trigger
+    definitions live in policy.yaml, never here). Persistence goes through
+    ``learned.write_state`` (atomic, normalize-on-write, v2-stamped).
+    """
     path = info.state_dir / "learned.json"
     if not path.exists():
+        return False
+    learned = load_learned()
+    if learned is None:
         return False
     try:
         state = json.loads(path.read_text(encoding="utf-8"))
@@ -706,15 +718,12 @@ def remove_learned_scope(info: ScopeInfo, dry_run: bool = False) -> bool:
         return False
     if not isinstance(state, dict):
         return False
-    scopes = state.get("scopes")
-    if not isinstance(scopes, dict) or info.scope not in scopes:
+    new_state, changed = learned.reset_scope(state, info.scope)
+    if not changed:
         return False
     if dry_run:
         return True
-    scopes.pop(info.scope, None)
-    state["scopes"] = scopes
-    state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    _atomic_write_json(path, state)
+    learned.write_state(new_state, path)
     return True
 
 
