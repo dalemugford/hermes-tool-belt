@@ -59,6 +59,9 @@ class TriggerDampenerTests(unittest.TestCase):
             try:
                 state_dir = Path(tmpdir) / "state" / "tool-belt"
                 state_dir.mkdir(parents=True)
+                # A v1 learned file (``always_on``) — exercised through the
+                # v1→v2 read normalization: on load it maps to a ``carry``
+                # promotion for the scope.
                 payload = {
                     "version": 1,
                     "updated_at": "2026-01-01T00:00:00Z",
@@ -86,10 +89,12 @@ class TriggerDampenerTests(unittest.TestCase):
                 )
                 self.assertEqual(rec.mode, "recommend")
                 self.assertEqual(rec.policy_source, "preset")
-                self.assertNotIn("browser_navigate", rec.preset.always_on)
+                self.assertNotIn("browser_navigate", rec.preset.carry)
 
-                # apply merges the learned always_on tool.
-                self.assertIn("browser_navigate", result.preset.always_on)
+                # apply promotes the learned tool into adaptive carry residency
+                # (v1 always_on → v2 carry), never into the immutable baseline.
+                self.assertIn("browser_navigate", result.preset.carry)
+                self.assertNotIn("browser_navigate", result.preset.always_carry)
             finally:
                 if original_home is None:
                     os.environ.pop("HERMES_HOME", None)

@@ -17,59 +17,79 @@ learning:
     promote_min_calls: 3
     demote_min_sessions_no_use: 20
 
-# Tools loaded on every message in this mode, regardless of content.
-# Anything in the user's platform_toolsets ceiling but NOT listed here AND
-# NOT named under any trigger below is considered "unknown" and kept on
-# (safe fallback for plugin-provided tools).
-always_on:
-  # Keep the core Mnemosyne loop resident: recall first, remember what
-  # matters, and invalidate stale memories when live verification disproves
-  # them. Leave session_search and specialist/maintenance Mnemosyne tools to
-  # expand on demand.
-  - mnemosyne_remember
-  - mnemosyne_recall
-  - mnemosyne_invalidate
+# ── Resident partition (Tool Belt 1.0 carrying model) ─────────────────────────
+# Hermes supplies the enabled built-in ceiling E each request. Tool Belt splits
+# it into three classes:
+#   A = always_carry ∩ E   immutable residents (win every conflict; never shaped)
+#   C = carry ∩ E          adaptive residents (promotion/demotion move tools here)
+#   X = E − (A ∪ C)        expand_only — the derived enabled remainder
+# Promotion moves expand_only → carry; demotion moves carry → expand_only, and
+# trigger definitions never change during either transition. Tool Belt has no
+# disabling semantics: absent/disabled tools are owned by E, not by policy.
 
-  # Meta tools — discovery, planning, asking for help
+# always_carry — permanent residents. Discovery, planning, asking for help, plus
+# the structural gateway/meta tools the agent must never lose. Immutable: the
+# learned/adaptive layer can never demote these.
+always_carry:
   - clarify
   - skill_view
   - skills_list
   - todo
+  # Gateway essential — ignored on CLI by the plugin.
+  - send_message
+  # Always-on meta-tool the plugin itself adds.
+  - expand_tools
 
-  # Universal cheap tools
+# carry — adaptive residents. Resident by default; the learned overlay may
+# demote a consistently-unused one to expand_only (and promote it back later).
+carry:
+  # Core Mnemosyne loop: recall first, remember what matters, invalidate stale
+  # memories. session_search and the specialist/maintenance Mnemosyne surface
+  # stay expand_only (see the mnemosyne_extended trigger).
+  - mnemosyne_remember
+  - mnemosyne_recall
+  - mnemosyne_invalidate
+  # Universal cheap tools.
   - web_search
   - read_file
   - search_files
   - process
-
-  # Core action tools — kept resident so the agent can always act
-  # without needing expand_tools to recover them (which is itself
-  # vulnerable to registration/ceiling issues).
+  # Core action tools — resident so the agent can always act without an
+  # expand_tools round trip (itself vulnerable to registration/ceiling issues).
   - terminal
   - write_file
   - patch
 
-  # Gateway essentials — ignored on CLI by the plugin
+# always_on — TRANSITIONAL COMPAT MIRROR of (always_carry ∪ carry). The 1.0
+# resolver (presets.py) does NOT read this; it parses always_carry/carry above.
+# It is retained ONLY so the not-yet-migrated analyzer
+# (analyze.py:_load_preset_always_on → effective_protected_always_on) and the
+# drift check (scripts/check-tool-drift.py) still see the full resident set.
+# Keep it in sync with always_carry+carry until those readers learn the v2
+# schema, then delete this block.
+always_on:
+  - clarify
+  - skill_view
+  - skills_list
+  - todo
   - send_message
-
-  # Always-on meta-tool the plugin itself adds
   - expand_tools
+  - mnemosyne_remember
+  - mnemosyne_recall
+  - mnemosyne_invalidate
+  - web_search
+  - read_file
+  - search_files
+  - process
+  - terminal
+  - write_file
+  - patch
 
-# Tools forced OFF regardless of triggers. Naming a deprecated/superseded
-# tool here adds it to the "known" set so the unknown-tool safe-default
-# CUTS it instead of silently keeping it on. It never joins always_on or a
-# trigger, so it can only come back via an explicit expand_tools call.
-always_off:
-  # Legacy single-purpose memory tool. Superseded by the Mnemosyne surface
-  # (mnemosyne_remember / mnemosyne_recall / …). Kept off so it stops
-  # riding along as an "unknown" on every turn.
-  - memory
-  # Tool Search bridge tools. Tool Search manages its own activation logic
-  # (commit 78eef17); these are off by default and loaded on demand via
-  # expand_tools when the agent needs to discover a deferred tool.
-  - tool_search
-  - tool_describe
-  - tool_call
+# NOTE — no always_off under the 1.0 model. The pre-1.0 always_off tools
+# (memory, tool_search, tool_describe, tool_call) are now ordinary derived
+# expand_only whenever Hermes includes them in E; Tool Search still manages its
+# own bridge activation. BASE_PROTECTED_ALWAYS_ON (analyze.py) still shields the
+# bridge tools from demotion suggestions.
 
 # Triggered tool groups. Each group fires when ANY of its signals match.
 # When a group fires, all listed tools are added to the active set.

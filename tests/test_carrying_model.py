@@ -550,9 +550,11 @@ class TriggerImmutabilityContract(unittest.TestCase):
     """
 
     def _base_preset(self):
+        # Phase 2 API alignment: the carrying model renamed the Preset resident
+        # fields to always_carry/carry. ``clarify`` is an immutable resident.
         return presets_mod.Preset(
             name="carrying-contract",
-            always_on=["clarify"],
+            always_carry=["clarify"],
             triggers=[
                 presets_mod.TriggerGroup(
                     name="web_extract",
@@ -562,7 +564,6 @@ class TriggerImmutabilityContract(unittest.TestCase):
                     has_attachment=None,
                 )
             ],
-            always_off=[],
         )
 
     def test_trigger_definitions_unchanged_across_promotion_and_demotion(self):

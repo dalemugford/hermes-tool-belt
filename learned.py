@@ -1,8 +1,29 @@
-"""Persistent learned policy state for tool-belt.
+"""Persistent learned policy state for tool-belt (Tool Belt 1.0 carrying model).
 
 The learned layer is deliberately small and inspectable: a JSON file under
-``$HERMES_HOME/state/tool-belt/learned.json``. Prediction only reads from
-it. Analyzer or explicit user action writes it.
+``$HERMES_HOME/state/tool-belt/learned.json``. Prediction only reads from it;
+the analyzer or an explicit user action writes it.
+
+Schema (v2)::
+
+    {
+      "version": 2,
+      "updated_at": "...",
+      "scopes": {
+        "default:telegram": {
+          "carry": [],         # tools to promote into adaptive residency
+          "expand_only": [],   # tools to demote out of residency
+          "shaping": {}        # cache-aware shaping metadata (opaque here)
+        }
+      }
+    }
+
+Reading normalizes an older v1 document into this shape **in memory only** — it
+never rewrites the file. The v1 → v2 field mapping is: ``always_on → carry``,
+``always_off → expand_only``, ``cache_aware → shaping``. v1
+``trigger_adjustments`` are dropped with a warning: trigger definitions are
+immutable under the 1.0 model. The next explicit/confirmed writer
+(:func:`write_state`) may persist the normalized v2 shape atomically.
 """
 
 from __future__ import annotations
@@ -21,7 +42,7 @@ from .presets import Preset, TriggerGroup
 
 logger = logging.getLogger(__name__)
 
-LEARNED_VERSION = 1
+LEARNED_VERSION = 2
 # Two effective learned modes:
 #   recommend (default) — runtime does NOT merge learned.json into the preset.
 #                         Recommendations flow through analyze.py
@@ -30,21 +51,9 @@ LEARNED_VERSION = 1
 _ALLOWED_MODES = {"recommend", "apply"}
 # Legacy config values are aliased at load time (clean migration, no shim layer):
 # old "off" behaved like recommend at runtime; old "auto"/"audit" both merged.
+# This is the unrelated learned_mode setting — its aliases are preserved.
 _LEGACY_ALIASES = {"off": "recommend", "auto": "apply", "audit": "apply"}
 _CACHE: dict[str, Any] = {"path": None, "mtime_ns": None, "state": None, "hash": ""}
-
-
-def _protected_always_on() -> set[str]:
-    """Return the set of tools that learned state must never remove from always_on.
-
-    Mirrors BASE_PROTECTED_ALWAYS_ON in analyze.py — structurally required
-    tools like send_message, expand_tools, and the Tool Search bridge.
-    """
-    try:
-        from .analyze import BASE_PROTECTED_ALWAYS_ON
-        return set(BASE_PROTECTED_ALWAYS_ON)
-    except Exception:
-        return set()
 
 
 @dataclass
@@ -108,8 +117,98 @@ def learned_mode(plugin_config: dict[str, Any], scope: str) -> str:
     return mode
 
 
+# ─── v1 → v2 normalization (in-memory; no read-time write) ──────────────────
+
+def _empty_v2() -> dict[str, Any]:
+    return {"version": LEARNED_VERSION, "updated_at": "", "scopes": {}}
+
+
+def _normalize_scope_entry(entry: Any, *, warn_trigger_adjustments: bool = True) -> dict[str, Any]:
+    """Map one scope's learned entry to the v2 ``{carry, expand_only, shaping}``.
+
+    Accepts both v1 keys (``always_on`` / ``always_off`` / ``cache_aware`` /
+    ``trigger_adjustments``) and native v2 keys (``carry`` / ``expand_only`` /
+    ``shaping``); native v2 keys win when both are present. A malformed
+    carry/expand_only overlap is resolved toward carrying, with a warning.
+    """
+    if not isinstance(entry, dict):
+        return {"carry": [], "expand_only": [], "shaping": {}}
+
+    # v1 field mapping.
+    carry = _string_list(entry.get("always_on"))
+    expand_only = _string_list(entry.get("always_off"))
+    shaping_raw = entry.get("cache_aware")
+    shaping = dict(shaping_raw) if isinstance(shaping_raw, dict) else {}
+
+    # Native v2 keys take precedence when present.
+    if "carry" in entry:
+        carry = _string_list(entry.get("carry"))
+    if "expand_only" in entry:
+        expand_only = _string_list(entry.get("expand_only"))
+    if isinstance(entry.get("shaping"), dict):
+        shaping = dict(entry["shaping"])
+
+    if warn_trigger_adjustments and entry.get("trigger_adjustments"):
+        adjustments = entry["trigger_adjustments"]
+        count = len(adjustments) if hasattr(adjustments, "__len__") else 1
+        logger.warning(
+            "tool-belt: ignoring v1 learned trigger_adjustments during v2 "
+            "normalization (%d) — trigger definitions are immutable under the "
+            "1.0 carrying model",
+            count,
+        )
+
+    # Reconcile a malformed read overlap safely toward carrying.
+    carry_set = set(carry)
+    overlap = [t for t in expand_only if t in carry_set]
+    if overlap:
+        logger.warning(
+            "tool-belt: learned scope names %d tool(s) in both carry and "
+            "expand_only; resolving toward carry: %s",
+            len(set(overlap)), ", ".join(sorted(set(overlap))),
+        )
+        expand_only = [t for t in expand_only if t not in carry_set]
+
+    return {"carry": carry, "expand_only": expand_only, "shaping": shaping}
+
+
+def normalize_state(doc: Any) -> dict[str, Any]:
+    """Normalize a learned-state document into the v2 shape, in memory.
+
+    v1 → v2 per scope: ``always_on → carry``, ``always_off → expand_only``,
+    ``cache_aware → shaping``. v1 ``trigger_adjustments`` are dropped with a
+    warning. A malformed carry/expand_only overlap resolves toward carrying
+    (warn). No write happens here — the caller decides whether to persist.
+    """
+    if not isinstance(doc, dict):
+        return _empty_v2()
+
+    out: dict[str, Any] = {
+        "version": LEARNED_VERSION,
+        "updated_at": str(doc.get("updated_at") or ""),
+        "scopes": {},
+    }
+    scopes = doc.get("scopes")
+    if isinstance(scopes, dict):
+        for scope, entry in scopes.items():
+            out["scopes"][str(scope)] = _normalize_scope_entry(entry)
+
+    # Preserve a normalized global block only if it carries something.
+    global_raw = doc.get("global")
+    if isinstance(global_raw, dict):
+        g = _normalize_scope_entry(global_raw, warn_trigger_adjustments=False)
+        if g["carry"] or g["expand_only"] or g["shaping"]:
+            out["global"] = g
+
+    return out
+
+
 def load_state(force: bool = False) -> dict[str, Any]:
-    """Load learned.json with mtime caching. Missing/invalid means empty state."""
+    """Load learned.json with mtime caching, normalized to v2 in memory.
+
+    Missing/invalid means empty state. Reading a v1 document normalizes it to
+    the v2 shape in memory and never rewrites the file (no read-time write).
+    """
     path = learned_path()
     try:
         stat = path.stat()
@@ -133,12 +232,24 @@ def load_state(force: bool = False) -> dict[str, Any]:
         data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("learned state root is not an object")
-        if int(data.get("version", LEARNED_VERSION)) != LEARNED_VERSION:
-            logger.warning("tool-belt: unsupported learned state version %r", data.get("version"))
-            data = {}
+        try:
+            version = int(data.get("version", 1))
+        except (TypeError, ValueError):
+            version = 1
+        if version > LEARNED_VERSION:
+            # A newer schema than we understand — fail safe to empty (no merge)
+            # rather than guess. The file is left untouched.
+            logger.warning(
+                "tool-belt: learned state version %r is newer than supported v%d — ignoring",
+                data.get("version"), LEARNED_VERSION,
+            )
+            state: dict[str, Any] = {}
+        else:
+            # Normalize v1 → v2 in memory. The next explicit writer may persist v2.
+            state = normalize_state(data)
         digest = hashlib.sha1(raw.encode("utf-8", errors="replace")).hexdigest()[:12]
-        _CACHE.update({"path": str(path), "mtime_ns": stat.st_mtime_ns, "state": data, "hash": digest})
-        return deepcopy(data)
+        _CACHE.update({"path": str(path), "mtime_ns": stat.st_mtime_ns, "state": state, "hash": digest})
+        return deepcopy(state)
     except Exception as exc:
         logger.warning("tool-belt: failed to load learned state %s: %s", path, exc)
         _CACHE.update({"path": str(path), "mtime_ns": stat.st_mtime_ns, "state": {}, "hash": ""})
@@ -151,11 +262,16 @@ def state_hash() -> str:
 
 
 def write_state(state: dict[str, Any], path: Path | None = None) -> None:
-    """Atomically write learned state. Intended for analyzer/manual commands."""
+    """Atomically write learned state as v2. Intended for analyzer/manual commands.
+
+    The write reconciles opposite assignments atomically: normalization ensures
+    no tool remains in both ``carry`` and ``expand_only`` for a scope (a
+    malformed overlap resolves toward carrying). The version is stamped to v2.
+    """
     target = path or learned_path()
     target.parent.mkdir(parents=True, exist_ok=True)
-    payload = dict(state or {})
-    payload.setdefault("version", LEARNED_VERSION)
+    payload = normalize_state(dict(state or {}))
+    payload["version"] = LEARNED_VERSION
     payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     tmp = target.with_suffix(target.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -175,21 +291,68 @@ def scope_state(state: dict[str, Any], scope: str) -> tuple[str, dict[str, Any]]
 
 
 def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -> LearnedMergeResult:
-    """Merge learned state into a resolved preset when learned_mode is ``apply``.
+    """Merge the learned overlay into a resolved preset when learned_mode is
+    ``apply``.
 
+    Implements the centralized Tool Belt 1.0 precedence::
+
+        effective_always_carry = policy always_carry
+        effective_carry = ((policy carry − learned expand_only)
+                            ∪ learned carry) − always_carry
+
+    ``always_carry`` wins every conflict and is immutable. Trigger definitions
+    are copied byte-for-byte — promotion/demotion move a tool across the
+    ``carry`` ⇄ ``expand_only`` boundary only, never touching a trigger group.
     ``recommend`` (the default) never merges; the recommendation path lives in
     the analyzer and shaper instead.
     """
     mode = learned_mode(plugin_config, scope)
     version = f"{preset.name}+learned:{state_hash() or 'none'}"
-    if mode != "apply" or preset.is_wildcard:
+    if mode != "apply" or preset.no_narrowing:
         return LearnedMergeResult(preset=preset, mode=mode, policy_version=version)
 
     state = load_state()
     matched_scope, scoped = scope_state(state, scope)
-    global_cfg = state.get("global") if isinstance(state.get("global"), dict) else {}
 
-    always_on = list(preset.always_on) if isinstance(preset.always_on, list) else []
+    always_carry = list(preset.always_carry)
+    always_carry_set = set(always_carry)
+    policy_carry = list(preset.carry)
+
+    learned_carry = _string_list(scoped.get("carry"))
+    learned_expand = _string_list(scoped.get("expand_only"))
+
+    # Malformed read overlap (a tool in both learned lists): resolve toward
+    # carrying and warn. (normalize_state already does this at load; this is a
+    # belt-and-braces guard for a hand-built scope dict.)
+    overlap = set(learned_carry) & set(learned_expand)
+    if overlap:
+        logger.warning(
+            "tool-belt: learned scope %r names %d tool(s) in both carry and "
+            "expand_only; resolving toward carry: %s",
+            matched_scope or scope, len(overlap), ", ".join(sorted(overlap)),
+        )
+        learned_expand = [t for t in learned_expand if t not in overlap]
+
+    # always_carry is immutable — a demotion signal naming one is ignored + warned.
+    demoted_always_carry = always_carry_set & set(learned_expand)
+    if demoted_always_carry:
+        logger.warning(
+            "tool-belt: learned expand_only names always_carry tool(s) %s — "
+            "ignored (always_carry is immutable and wins every conflict)",
+            ", ".join(sorted(demoted_always_carry)),
+        )
+
+    # Centralized precedence.
+    expand_set = set(learned_expand)
+    effective_carry = [t for t in policy_carry if t not in expand_set]
+    for tool in learned_carry:
+        if tool not in effective_carry:
+            effective_carry.append(tool)
+    effective_carry = [t for t in effective_carry if t not in always_carry_set]
+
+    # Trigger definitions are immutable across promotion/demotion — copy them
+    # byte-for-byte. Never strip a demoted tool out of its trigger group; an
+    # expand_only tool must stay trigger-activatable.
     triggers = [
         TriggerGroup(
             name=group.name,
@@ -200,63 +363,28 @@ def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -
         )
         for group in preset.triggers
     ]
+
+    # Change log (telemetry): what moved relative to the policy baseline.
+    policy_carry_set = set(policy_carry)
+    effective_set = set(effective_carry)
     changes: list[str] = []
-
-    learned_on = _string_list(scoped.get("always_on"))
-    learned_off = set(_string_list(global_cfg.get("always_off"))) | set(_string_list(scoped.get("always_off")))
-
-    # Protected tools (send_message, expand_tools, bridge tools) must never
-    # be removed from always_on by learned state, even if a stale shaper run
-    # demoted them. Filter them out of learned_off before applying.
-    protected = _protected_always_on()
-    if protected and learned_off:
-        learned_off -= protected
-
-    for tool in learned_on:
-        if tool not in always_on and tool not in learned_off:
-            always_on.append(tool)
-            changes.append(f"{tool}:always_on")
-
-    if learned_off:
-        before = set(always_on)
-        always_on = [tool for tool in always_on if tool not in learned_off]
-        for tool in sorted(before - set(always_on)):
-            changes.append(f"{tool}:always_off")
-        for group in triggers:
-            original = list(group.tools)
-            group.tools = [tool for tool in group.tools if tool not in learned_off]
-            for tool in sorted(set(original) - set(group.tools)):
-                changes.append(f"{tool}:removed_from_trigger:{group.name}")
-
-    adjustments = scoped.get("trigger_adjustments") or {}
-    if isinstance(adjustments, dict):
-        disabled: set[str] = set()
-        for name, adjustment in adjustments.items():
-            action = ""
-            if isinstance(adjustment, dict):
-                action = str(adjustment.get("action") or "").strip().lower()
-            elif isinstance(adjustment, str):
-                action = adjustment.strip().lower()
-            if action in {"demote", "disable"}:
-                disabled.add(str(name))
-        if disabled:
-            before_names = {group.name for group in triggers}
-            triggers = [group for group in triggers if group.name not in disabled]
-            for name in sorted(before_names - {group.name for group in triggers}):
-                changes.append(f"trigger:{name}:disabled")
+    for tool in effective_carry:
+        if tool not in policy_carry_set:
+            changes.append(f"{tool}:carry")
+    for tool in policy_carry:
+        if tool not in effective_set:
+            changes.append(f"{tool}:expand_only")
 
     if not changes:
-        return LearnedMergeResult(preset=preset, mode=mode, policy_version=version, learned_scope=matched_scope)
+        return LearnedMergeResult(
+            preset=preset, mode=mode, policy_version=version, learned_scope=matched_scope,
+        )
 
-    merged_off = list(getattr(preset, "always_off", []) or [])
-    for tool in sorted(learned_off):
-        if tool not in merged_off:
-            merged_off.append(tool)
     merged = Preset(
         name=f"{preset.name}+learned[{matched_scope or scope}]",
-        always_on=always_on,
+        always_carry=always_carry,
+        carry=effective_carry,
         triggers=triggers,
-        always_off=merged_off,
     )
     return LearnedMergeResult(
         preset=merged,
