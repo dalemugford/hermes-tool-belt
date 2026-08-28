@@ -2409,6 +2409,32 @@ def register(ctx) -> None:
     ctx.register_hook("on_session_end", _on_session_end)
     ctx.register_hook("on_session_reset", _on_session_reset)
 
+    # `hermes tool-belt ...` terminal subcommand. Optional and fail-open: a
+    # Hermes without register_cli_command (or a registration that raises) must
+    # never cost the tool/hooks above — the bare `tool-belt` launcher on PATH
+    # remains the guaranteed entry point either way. Imported lazily so plugin
+    # load doesn't pay for a module only the CLI path uses.
+    try:
+        if hasattr(ctx, "register_cli_command"):
+            from . import cli as cli_mod
+
+            ctx.register_cli_command(
+                name="tool-belt",
+                help="Tool Belt savings report and onboarding",
+                setup_fn=cli_mod.register_cli,
+                handler_fn=cli_mod.tool_belt_command,
+                description=(
+                    "Hermes Tool Belt operator CLI. `savings` prints the "
+                    "read-only token-savings report; `configure` runs "
+                    "onboarding. Flags are passed through unchanged to the "
+                    "same CLI the `tool-belt` launcher runs — see "
+                    "`hermes tool-belt savings --help` / "
+                    "`hermes tool-belt configure --help`."
+                ),
+            )
+    except Exception as exc:
+        logger.warning("tool-belt: CLI command registration failed: %s", exc)
+
     logger.info(
         "tool-belt: active (policy=policy.yaml, log=%s, learned_mode=%s, bypass_rate=%s)",
         _CONFIG.get("log"), _CONFIG.get("learned_mode"), _CONFIG.get("bypass_rate"),

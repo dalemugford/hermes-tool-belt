@@ -89,6 +89,12 @@ hermes plugins install dalemugford/hermes-tool-belt
 tool-belt configure
 ```
 
+The plugin also registers itself as a Hermes subcommand, so the same two
+commands are available without the launcher on PATH — `hermes tool-belt
+configure` and `hermes tool-belt savings` take the identical flags and run
+the identical code (e.g. `hermes tool-belt savings --json`, `hermes tool-belt
+configure --status`).
+
 `configure.py` is the front door. It finds every agent and platform you
 run, reads the telemetry already on disk, and asks how you want to
 start. It writes configuration only through `hermes config set` — never
