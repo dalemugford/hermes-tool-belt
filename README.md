@@ -80,11 +80,13 @@ methodology for measuring your own is in
 
 ## Install and configure
 
-Two commands. Install, then configure.
+Two commands. Install, then configure. The examples assume the launcher is
+installed (onboarding offers this after your first apply; or link it by hand:
+`mkdir -p ~/.hermes/bin && ln -s ~/.hermes/plugins/tool-belt/tool-belt ~/.hermes/bin/tool-belt`).
 
 ```bash
 hermes plugins install dalemugford/hermes-tool-belt
-python3 ~/.hermes/plugins/tool-belt/scripts/configure.py
+tool-belt configure
 ```
 
 `configure.py` is the front door. It finds every agent and platform you
@@ -116,7 +118,7 @@ offers what fits — shape an agent that just became ready, add agents,
 review what shaping did, or reset an agent back to observation mode.
 
 ```bash
-python3 ~/.hermes/plugins/tool-belt/scripts/configure.py --status
+tool-belt configure --status
 ```
 
 `--status` is read-only: per-agent state and how much data each has.
@@ -141,7 +143,7 @@ absolute counts are more accurate with `tiktoken`. See
 After restarting the gateway, confirm it's alive:
 
 ```bash
-python3 ~/.hermes/plugins/tool-belt/scripts/configure.py --status
+tool-belt configure --status
 ```
 
 To watch decisions as they happen:

@@ -263,16 +263,38 @@ def run(argv: list[str] | None = None, *, out: Callable[[str], None] = None) -> 
     return 0
 
 
+def _run_configure(argv: list[str]) -> int:
+    """Delegate to scripts/configure.py's main() without importing it eagerly."""
+    import importlib.util
+
+    script = Path(__file__).resolve().parent / "scripts" / "configure.py"
+    spec = importlib.util.spec_from_file_location("tool_belt_configure", script)
+    module = importlib.util.module_from_spec(spec)
+    # Register in sys.modules *before* exec: dataclasses resolves field types
+    # via sys.modules[cls.__module__], which is None until registration.
+    sys.modules["tool_belt_configure"] = module
+    spec.loader.exec_module(module)
+    return module.main(argv)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Top-level ``tool-belt`` dispatch: currently only ``savings``."""
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or argv[0] in ("-h", "--help"):
-        print("usage: tool-belt <command> [options]\n\ncommands:\n  savings   read-only token-savings report")
+        print(
+            "usage: tool-belt <command> [options]\n"
+            "\n"
+            "commands:\n"
+            "  savings     read-only token-savings report\n"
+            "  configure   interactive onboarding (shape/recommend tool loadouts)"
+        )
         return 0 if argv else 1
     command, rest = argv[0], argv[1:]
     if command == "savings":
         return run(rest)
-    print(f"error: unknown command {command!r} (known: savings)", file=sys.stderr)
+    if command == "configure":
+        return _run_configure(rest)
+    print(f"error: unknown command {command!r} (known: savings, configure)", file=sys.stderr)
     return 2
 
 
