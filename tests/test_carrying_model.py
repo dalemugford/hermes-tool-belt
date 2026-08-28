@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import importlib.util
 import json
 import os
 import re
@@ -85,6 +86,22 @@ logger_io_mod = importlib.import_module("tool_belt_plugin.logger_io")
 expand_tools_mod = importlib.import_module("tool_belt_plugin.expand_tools")
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
+
+
+def _load_shaper():
+    """Load ``scripts/shape-ceiling.py`` as an importable module for direct
+    unit exercise of the between-session shaper's contract surface."""
+    spec = importlib.util.spec_from_file_location(
+        "tool_belt_shape_ceiling_contract", PLUGIN_DIR / "scripts" / "shape-ceiling.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+shaper = _load_shaper()
 
 # The immutable always_carry baseline from the locked model.
 ALWAYS_CARRY = frozenset(
@@ -710,6 +727,337 @@ class DiscoverabilityManifestContract(_CarryingContract):
             expand_tools_mod.build_expand_only_manifest(m1.X, category_index=self._INDEX),
             "manifest is stable across trigger activation",
         )
+
+
+# ─── 19. between-session shaper contracts (Phase 6) ────────────────────────
+
+def _pred_row(scope, sid, pid, *, ceiling, always_carry, carry, active, ts=0.0):
+    """A complete canonical v2 prediction row (residency reconstructible)."""
+    expand_only = [t for t in ceiling if t not in set(always_carry) | set(carry)]
+    return {
+        "schema_version": 2,
+        "scope": scope,
+        "hermes_session_id": sid,
+        "prediction_id": pid,
+        "ts": ts,
+        "ceiling_tools": list(ceiling),
+        "always_carry_tools": list(always_carry),
+        "carry_tools": list(carry),
+        "active_tools": list(active),
+        "expand_only_tools": expand_only,
+    }
+
+
+def _sparse_v1_row(scope, sid, pid, *, always_on, ts=0.0):
+    """A sparse v1 prediction row: residents only, no ceiling/active. The
+    normalizer cannot reconstruct residency → ``residency_inferred`` is False."""
+    return {
+        "scope": scope,
+        "hermes_session_id": sid,
+        "prediction_id": pid,
+        "ts": ts,
+        "always_on_tools": list(always_on),
+    }
+
+
+def _expansion_call(pid, tool):
+    """A tool-call row that is direct expansion evidence (expand_only → carry)."""
+    return {
+        "schema_version": 2,
+        "prediction_id": pid,
+        "tool_name": tool,
+        "was_initially_active": False,
+        "was_expand_only": True,
+        "activated_by_expansion": True,
+        "expansion_provided_access": True,
+        "activation_source": "expansion",
+    }
+
+
+def _trigger_call(pid, tool):
+    """A tool-call row activated by a trigger — NOT expansion evidence."""
+    return {
+        "schema_version": 2,
+        "prediction_id": pid,
+        "tool_name": tool,
+        "was_initially_active": True,
+        "was_expand_only": True,
+        "activation_source": "trigger",
+    }
+
+
+def _compute(scope, pred_rows, call_rows, **overrides):
+    grouped = shaper.group_predictions_by_scope_session(pred_rows)
+    calls = shaper.index_tool_calls_by_prediction(call_rows)
+    kwargs = dict(
+        window=20, promote_min_sessions=2, promote_min_calls=3,
+        demote_min_sessions_no_use=20,
+    )
+    kwargs.update(overrides)
+    return shaper.compute_scope_recommendations(
+        scope=scope, sessions=grouped.get(scope, {}), calls_by_pred=calls, **kwargs
+    )
+
+
+class ShaperPromotionContract(unittest.TestCase):
+    SCOPE = "assistant-a:telegram"
+
+    def test_expand_only_tool_promotes_after_qualifying_expansions(self):
+        E = ["clarify", "send_message", "web_extract"]
+        preds, calls = [], []
+        for i in range(3):  # 3 sessions ≥ promote_min_sessions
+            pid = f"p{i}"
+            preds.append(_pred_row(
+                self.SCOPE, f"s{i}", pid,
+                ceiling=E, always_carry=["clarify", "send_message"], carry=[],
+                active=["clarify", "send_message"], ts=i,
+            ))
+            calls.append(_expansion_call(pid, "web_extract"))  # 3 calls ≥ min_calls
+        recs = _compute(self.SCOPE, preds, calls)
+        promoted = {p["tool"] for p in recs["promote"]}
+        self.assertIn("web_extract", promoted,
+                      "an expand_only tool reached via expand_tools promotes to carry")
+        self.assertEqual(recs["demote"], [], "no demotion in the promote arm")
+
+    def test_trigger_only_use_does_not_promote(self):
+        E = ["clarify", "send_message", "web_extract"]
+        preds, calls = [], []
+        for i in range(5):
+            pid = f"p{i}"
+            preds.append(_pred_row(
+                self.SCOPE, f"s{i}", pid,
+                ceiling=E, always_carry=["clarify", "send_message"], carry=[],
+                active=["clarify", "send_message", "web_extract"], ts=i,
+            ))
+            calls.append(_trigger_call(pid, "web_extract"))
+        recs = _compute(self.SCOPE, preds, calls)
+        self.assertEqual(recs["promote"], [],
+                         "trigger activation is never promotion evidence")
+
+
+class ShaperDemotionContract(unittest.TestCase):
+    SCOPE = "assistant-a:telegram"
+
+    def test_adaptive_carry_demotes_after_no_use_window(self):
+        E = ["clarify", "send_message", "read_file"]
+        preds = [
+            _pred_row(self.SCOPE, f"s{i}", f"p{i}",
+                      ceiling=E, always_carry=["clarify", "send_message"],
+                      carry=["read_file"], active=["clarify", "send_message", "read_file"], ts=i)
+            for i in range(20)  # ≥ demote_min_sessions_no_use
+        ]
+        recs = _compute(self.SCOPE, preds, [])
+        demoted = {d["tool"] for d in recs["demote"]}
+        self.assertIn("read_file", demoted,
+                      "an unused adaptive carry resident demotes to expand_only")
+
+    def test_always_carry_never_a_demotion_candidate(self):
+        # clarify/send_message are always_carry, resident every session, never
+        # called — they must never be demoted (excluded by construction).
+        E = ["clarify", "send_message", "read_file"]
+        preds = [
+            _pred_row(self.SCOPE, f"s{i}", f"p{i}",
+                      ceiling=E, always_carry=["clarify", "send_message"],
+                      carry=["read_file"], active=["clarify", "send_message", "read_file"], ts=i)
+            for i in range(20)
+        ]
+        recs = _compute(self.SCOPE, preds, [])
+        demoted = {d["tool"] for d in recs["demote"]}
+        self.assertNotIn("clarify", demoted)
+        self.assertNotIn("send_message", demoted)
+
+    def test_sparse_v1_row_cannot_drive_demotion(self):
+        # 20 sessions of sparse v1 rows: residents present but no ceiling/active,
+        # so residency is not inferable and the tools cannot demote.
+        preds = [
+            _sparse_v1_row(self.SCOPE, f"s{i}", f"p{i}",
+                           always_on=["read_file", "web_search"], ts=i)
+            for i in range(20)
+        ]
+        recs = _compute(self.SCOPE, preds, [])
+        self.assertEqual(recs["demote"], [],
+                         "a sparse (residency_inferred=False) row cannot demote")
+
+
+class ShaperMergeContract(unittest.TestCase):
+    SCOPE = "assistant-a:telegram"
+
+    def _recs(self, promote=(), demote=(), enabled=None):
+        return {
+            "scope": self.SCOPE,
+            "computed_at": "2026-01-01T00:00:00Z",
+            "sessions_considered": 20,
+            "window_requested": 20,
+            "promote": [{"tool": t, "sessions": 3, "calls": 5, "evidence": "expansion"}
+                        for t in promote],
+            "demote": [{"tool": t, "sessions_without_use": 20, "evidence": "carry_unused"}
+                       for t in demote],
+            "enabled_tool_names": sorted(enabled if enabled is not None
+                                         else set(promote) | set(demote)),
+        }
+
+    def _write(self, tmp, doc):
+        (tmp / "learned.json").write_text(json.dumps(doc), encoding="utf-8")
+
+    def _read(self, tmp):
+        return json.loads((tmp / "learned.json").read_text(encoding="utf-8"))
+
+    def test_promotion_moves_tool_from_expand_only_to_carry(self):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            self._write(tmp, {"version": 2, "scopes": {
+                self.SCOPE: {"carry": [], "expand_only": ["web_extract"]}}})
+            recs = self._recs(promote=["web_extract"], enabled=["web_extract"])
+            _state, changed = shaper.merge_into_learned(tmp, {self.SCOPE: recs}, False)
+            self.assertTrue(changed)
+            out = self._read(tmp)
+            self.assertEqual(out["version"], 2)  # written as learned schema v2
+            entry = out["scopes"][self.SCOPE]
+            self.assertEqual(entry["carry"], ["web_extract"])
+            self.assertEqual(entry["expand_only"], [])
+
+    def test_demotion_moves_tool_from_carry_to_expand_only(self):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            self._write(tmp, {"version": 2, "scopes": {
+                self.SCOPE: {"carry": ["web_extract"], "expand_only": []}}})
+            recs = self._recs(demote=["web_extract"], enabled=["web_extract"])
+            _state, changed = shaper.merge_into_learned(tmp, {self.SCOPE: recs}, False)
+            self.assertTrue(changed)
+            out = self._read(tmp)["scopes"][self.SCOPE]
+            self.assertEqual(out["expand_only"], ["web_extract"])
+            self.assertEqual(out["carry"], [])
+
+    def test_writes_v2_fields_and_preserves_unrelated_metadata(self):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            self._write(tmp, {
+                "version": 1,
+                "provenance": "keep-me",              # unrelated top-level key
+                "scopes": {
+                    self.SCOPE: {"notes": "hand-edited"},   # unrelated per-scope key
+                    "other:cli": {"always_on": ["keepme"]},  # unrelated scope
+                },
+            })
+            recs = self._recs(promote=["web_extract"], enabled=["web_extract"])
+            shaper.merge_into_learned(tmp, {self.SCOPE: recs}, False)
+            out = self._read(tmp)
+            self.assertEqual(out["version"], 2)
+            entry = out["scopes"][self.SCOPE]
+            # v2 fields written …
+            self.assertEqual(entry["carry"], ["web_extract"])
+            self.assertIn("expand_only", entry)
+            self.assertEqual(entry["shaping"]["scope"], self.SCOPE)
+            # … unrelated metadata (top-level, per-scope, other scope) preserved.
+            self.assertEqual(out["provenance"], "keep-me")
+            self.assertEqual(entry["notes"], "hand-edited")
+            self.assertEqual(out["scopes"]["other:cli"], {"always_on": ["keepme"]})
+
+    def test_category_candidate_is_rejected_not_stored(self):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            self._write(tmp, {"version": 2, "scopes": {}})
+            # "web" is a toolset/category, not a concrete enabled tool name.
+            recs = self._recs(promote=["web", "web_extract"],
+                              enabled=["web_extract", "clarify"])
+            with self.assertLogs("tool_belt_plugin.shape_ceiling", level="WARNING") as cm:
+                shaper.merge_into_learned(tmp, {self.SCOPE: recs}, False)
+            out = self._read(tmp)["scopes"][self.SCOPE]
+            self.assertIn("web_extract", out["carry"])
+            self.assertNotIn("web", out["carry"], "a category name is never stored")
+            self.assertIn("web", "\n".join(cm.output))
+
+    def test_dry_run_performs_no_writes(self):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            recs = self._recs(promote=["web_extract"], enabled=["web_extract"])
+            _state, changed = shaper.merge_into_learned(tmp, {self.SCOPE: recs}, True)
+            self.assertTrue(changed, "dry-run still reports the intended change")
+            self.assertFalse((tmp / "learned.json").exists(),
+                             "dry-run writes nothing to disk")
+
+    def test_demoted_tool_stays_in_its_trigger_group_after_apply(self):
+        # End-to-end: the shaper demotes web_extract, and applying the learned
+        # overlay to a preset with web_extract in a trigger group leaves that
+        # group byte-identical (an expand_only tool stays trigger-activatable).
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            self._write(tmp, {"version": 2, "scopes": {
+                self.SCOPE: {"carry": ["web_extract"], "expand_only": []}}})
+            recs = self._recs(demote=["web_extract"], enabled=["web_extract"])
+            shaper.merge_into_learned(tmp, {self.SCOPE: recs}, False)
+            demote_doc = self._read(tmp)
+
+        preset = presets_mod.Preset(
+            name="shaper-trigger",
+            always_carry=["clarify"],
+            triggers=[presets_mod.TriggerGroup(
+                name="web_extract", tools=["web_extract"],
+                keyword_patterns=[re.compile(r"https?://", re.IGNORECASE)],
+                exclude_patterns=[], has_attachment=None)],
+        )
+        fp0 = _trigger_fingerprint(preset.triggers)
+        with _temp_learned_state(demote_doc):
+            applied = learned_mod.apply_to_preset(
+                preset, {"learned_mode": "apply", "channels": {}}, self.SCOPE)
+        self.assertEqual(_trigger_fingerprint(applied.preset.triggers), fp0,
+                         "demotion must not alter the trigger group")
+        self.assertIn("web_extract", applied.preset.triggers[0].tools)
+
+
+class ShaperResetAndOverlapContract(unittest.TestCase):
+    SCOPE = "assistant-a:telegram"
+
+    def test_reset_scope_isolation_preserves_unrelated_metadata(self):
+        state = {
+            "version": 2,
+            "provenance": "keep-top",
+            "scopes": {
+                self.SCOPE: {
+                    "carry": ["web_extract"],
+                    "expand_only": ["read_file"],
+                    "shaping": {"scope": self.SCOPE},
+                    "notes": "unrelated, keep me",
+                },
+                "other:cli": {"carry": ["terminal"]},
+            },
+        }
+        new_state, changed = learned_mod.reset_scope(state, self.SCOPE)
+        self.assertTrue(changed)
+        entry = new_state["scopes"][self.SCOPE]
+        # Adaptive assignments/evidence gone …
+        for key in ("carry", "expand_only", "shaping"):
+            self.assertNotIn(key, entry)
+        # … unrelated per-scope metadata, other scopes, top-level metadata kept.
+        self.assertEqual(entry["notes"], "unrelated, keep me")
+        self.assertEqual(new_state["scopes"]["other:cli"], {"carry": ["terminal"]})
+        self.assertEqual(new_state["provenance"], "keep-top")
+        # The original state object is not mutated.
+        self.assertIn("carry", state["scopes"][self.SCOPE])
+
+    def test_reset_scope_drops_entry_when_only_adaptive_keys(self):
+        state = {"version": 2, "scopes": {
+            self.SCOPE: {"carry": ["web_extract"], "expand_only": []},
+            "other:cli": {"carry": ["terminal"]}}}
+        new_state, changed = learned_mod.reset_scope(state, self.SCOPE)
+        self.assertTrue(changed)
+        self.assertNotIn(self.SCOPE, new_state["scopes"])
+        self.assertIn("other:cli", new_state["scopes"])
+
+    def test_malformed_learned_overlap_fails_safe_toward_carry_and_warns(self):
+        # A hand-built scope naming a tool in both carry and expand_only.
+        doc = {"version": 2, "scopes": {
+            self.SCOPE: {"carry": ["web_extract"], "expand_only": ["web_extract", "read_file"]}}}
+        with self.assertLogs(_LOGGER_LEARNED, level="WARNING") as cm:
+            v2 = learned_mod.normalize_state(doc)
+        entry = v2["scopes"][self.SCOPE]
+        self.assertIn("web_extract", entry["carry"], "carry wins the overlap")
+        self.assertNotIn("web_extract", entry["expand_only"])
+        self.assertIn("read_file", entry["expand_only"], "the genuine demote survives")
+        self.assertIn("web_extract", "\n".join(cm.output))
+
+
+_LOGGER_LEARNED = "tool_belt_plugin.learned"
 
 
 if __name__ == "__main__":

@@ -226,13 +226,14 @@ class OnboardingArcTests(OnboardingTestCase):
         self.assertIn(configure.STATE_SHAPED, status)
 
     def test_demote_arm_named_profile(self) -> None:
-        """A chat-only agent in a named profile demotes its unused residents.
+        """A chat-only agent in a named profile demotes its unused carry residents.
 
-        The unused tools are enabled built-ins the runtime keeps resident via
-        the unknown-tools safe-default (``unknown_kept_tools``); after 20 unused
-        sessions the shaper demotes them. The shaper still persists the v1 mirror
-        keys, so the learned file is read through the v2 normalizer and asserted
-        on the ``carry`` / ``expand_only`` surface.
+        Under the 1.0 carrying model shaping moves enabled built-ins only between
+        the adaptive ``carry`` class and ``expand_only``: every ``carry`` resident
+        that goes unused across the window is a demote candidate (there is no
+        protected policy-mirror shielding them anymore). The immutable
+        ``always_carry`` surface is never a candidate. The overlay lands in the
+        named profile's state dir and is read through the v2 normalizer.
         """
         result = self.seed("chat-heavy", profile_override="assistant-b")
         profile_state = self.home / "profiles" / "assistant-b" / "state" / "tool-belt"
@@ -247,14 +248,19 @@ class OnboardingArcTests(OnboardingTestCase):
         entry = seed_sessions.learned.normalize_state(
             self.learned(profile_state)
         )["scopes"][result.scope]
-        # Unused unknown-kept tools land in the v2 expand_only surface; nothing
-        # was promoted into carry.
-        self.assertEqual(sorted(entry["expand_only"]), ["unit_convert", "weather_lookup"])
+        expand_only = set(entry["expand_only"])
+
+        # The injected unused residents demote to expand_only …
+        self.assertLessEqual({"unit_convert", "weather_lookup"}, expand_only)
+        # … alongside every other unused policy carry resident, while the one
+        # carry tool the agent actually used (mnemosyne_recall) stays resident.
+        self.assertNotIn("mnemosyne_recall", expand_only)
+        # Nothing was promoted into carry (no expansion evidence in this arm).
         self.assertEqual(entry["carry"], [])
 
-        # The immutable always_carry surface can never be demoted.
+        # The immutable always_carry surface can never be demoted, by construction.
         always_carry = set(seed_sessions.presets.load_base_policy().always_carry)
-        self.assertEqual(set(entry["expand_only"]) & always_carry, set())
+        self.assertEqual(expand_only & always_carry, set())
 
     def test_multi_scope_independence(self) -> None:
         """Two scopes in one home; shaping one leaves the other untouched."""

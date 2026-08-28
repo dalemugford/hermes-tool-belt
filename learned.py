@@ -333,6 +333,49 @@ def write_state(state: dict[str, Any], path: Path | None = None) -> None:
     load_state(force=True)
 
 
+#: Adaptive shaping keys a reset clears from a scope — the v2 assignments and
+#: evidence plus their transitional v1 mirror. Everything else in a scope dict
+#: (and every other scope) is unrelated metadata a reset must preserve.
+_ADAPTIVE_SCOPE_KEYS = frozenset(
+    {"carry", "expand_only", "shaping", "always_on", "always_off", "cache_aware"}
+)
+
+
+def reset_scope(state: dict[str, Any], scope: str) -> tuple[dict[str, Any], bool]:
+    """Drop one scope's adaptive shaping assignments/evidence, in memory.
+
+    Removes only the adaptive carrying keys (``carry`` / ``expand_only`` /
+    ``shaping`` and their v1 mirror) from the named scope. Any other key in that
+    scope's dict is unrelated metadata and is preserved; if the scope becomes
+    empty it is dropped entirely. Every *other* scope, the top-level metadata,
+    and the always-carry policy / trigger definitions (which live in policy.yaml,
+    never here) are untouched. Returns ``(new_state, changed)``; no write happens.
+    """
+    if not isinstance(state, dict):
+        return {}, False
+    new_state = dict(state)
+    scopes_in = new_state.get("scopes")
+    if not isinstance(scopes_in, dict) or scope not in scopes_in:
+        return new_state, False
+
+    scopes = dict(scopes_in)
+    entry = scopes.get(scope)
+    if not isinstance(entry, dict):
+        scopes.pop(scope, None)
+        new_state["scopes"] = scopes
+        return new_state, True
+
+    remaining = {k: v for k, v in entry.items() if k not in _ADAPTIVE_SCOPE_KEYS}
+    changed = len(remaining) != len(entry)
+    if remaining:
+        scopes[scope] = remaining
+    else:
+        scopes.pop(scope, None)
+        changed = changed or scope in scopes_in
+    new_state["scopes"] = scopes
+    return new_state, changed
+
+
 def scope_state(state: dict[str, Any], scope: str) -> tuple[str, dict[str, Any]]:
     scopes = state.get("scopes") or {}
     if not isinstance(scopes, dict):

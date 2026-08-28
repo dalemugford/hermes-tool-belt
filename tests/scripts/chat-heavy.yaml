@@ -10,11 +10,13 @@
 # (shape-ceiling.py demote path).
 #
 # `weather_lookup` and `unit_convert` are named nowhere in policy.yaml (not in
-# always_carry/carry, not in any trigger group) and are not in
-# BASE_PROTECTED_ALWAYS_ON, so nothing shields them and — because `calls` never
-# names them — they go 20 sessions unused and become demote candidates.
-# `analyze.effective_protected_always_on` shields every always_carry tool plus
-# the policy mirror, so nothing structural can be demoted.
+# always_carry/carry, not in any trigger group); the seeder folds them into
+# `carry_tools`, so under the 1.0 model they are ordinary adaptive residents.
+# Because `calls` never names them they go 20 sessions unused and demote to
+# expand_only — as does every other unused `carry` resident. Shaping only ever
+# moves tools between `carry` and `expand_only`; the immutable `always_carry`
+# surface is excluded from demotion by construction (no protected-mirror list
+# is consulted any more).
 name: chat-heavy
 agent: testagent
 platform: slack
