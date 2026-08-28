@@ -23,14 +23,26 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import sys
 from pathlib import Path
 from typing import Any, Callable
 
 try:  # package context
     from . import savings as _savings
-except ImportError:  # pragma: no cover - standalone load
-    import savings as _savings
+except ImportError:  # pragma: no cover - standalone load (direct exec)
+    # Standalone execution (root `tool-belt` launcher) has no package parent.
+    # Register the namespace so savings.py — and the sibling modules it pulls
+    # in (predictor, presets, learned) — resolve their relative imports.
+    import importlib
+    import types
+
+    _PLUGIN_DIR = Path(__file__).resolve().parent
+    if "tool_belt_plugin" not in sys.modules:
+        _pkg = types.ModuleType("tool_belt_plugin")
+        _pkg.__path__ = [str(_PLUGIN_DIR)]
+        sys.modules["tool_belt_plugin"] = _pkg
+    _savings = importlib.import_module("tool_belt_plugin.savings")
 
 
 # ─── Human rendering ──────────────────────────────────────────────────────────
@@ -136,10 +148,11 @@ def report_rate(proj: _savings.ProjectedCohort) -> str:
 
 # ─── Phase 8 launcher helper ──────────────────────────────────────────────────
 
-_LAUNCHER_TEMPLATE = """#!/usr/bin/env bash
+_LAUNCHER_TEMPLATE = """#!/usr/bin/env sh
 # Hermes Tool Belt launcher — created by onboarding. Delegates to the plugin's
 # repository-root `tool-belt` executable so `tool-belt savings` works from PATH.
-exec {python} {executable} "$@"
+export HERMES_PYTHON={python}
+exec {executable} "$@"
 """
 
 
@@ -183,8 +196,8 @@ def ensure_launcher(
         return False
     target.parent.mkdir(parents=True, exist_ok=True)
     content = _LAUNCHER_TEMPLATE.format(
-        python=python or sys.executable,
-        executable=str(repo_executable),
+        python=shlex.quote(python or sys.executable),
+        executable=shlex.quote(str(repo_executable)),
     )
     target.write_text(content, encoding="utf-8")
     target.chmod(0o755)

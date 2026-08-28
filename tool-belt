@@ -1,55 +1,24 @@
-#!/usr/bin/env python3
-"""Repository-root ``tool-belt`` executable.
+#!/bin/sh
+# Public Tool Belt command launcher. Select the same Python environment Hermes
+# uses, then execute the importable CLI module without loading plugin hooks.
+set -e
 
-Hermes native plugin manifests cannot register shell subcommands, so the plugin
-ships this small launcher. It registers the hyphen-named plugin directory as the
-importable package ``tool_belt_plugin`` (mirroring tests/conftest.py) and
-dispatches to the CLI module.
+_TOOL_BELT_DIR=$(CDPATH= cd -P "$(dirname "$0")" >/dev/null 2>&1 && pwd)
+_HERMES_HOME=${HERMES_HOME:-${HOME}/.hermes}
 
-Usage:
-  ./tool-belt savings
-  ./tool-belt savings --agent=default
-  ./tool-belt savings --json
-"""
-from __future__ import annotations
+if [ -n "${HERMES_PYTHON:-}" ]; then
+  _TOOL_BELT_PYTHON=$HERMES_PYTHON
+elif [ -x "$_HERMES_HOME/hermes-agent/venv/bin/python3" ]; then
+  _TOOL_BELT_PYTHON=$_HERMES_HOME/hermes-agent/venv/bin/python3
+elif [ -x "$_TOOL_BELT_DIR/../../hermes-agent/venv/bin/python3" ]; then
+  _TOOL_BELT_PYTHON=$_TOOL_BELT_DIR/../../hermes-agent/venv/bin/python3
+elif [ -x "$_TOOL_BELT_DIR/.venv/bin/python3" ]; then
+  _TOOL_BELT_PYTHON=$_TOOL_BELT_DIR/.venv/bin/python3
+elif command -v python3 >/dev/null 2>&1; then
+  _TOOL_BELT_PYTHON=python3
+else
+  printf "%s\n" "tool-belt: Python 3 not found; set HERMES_PYTHON to the Hermes interpreter" >&2
+  exit 127
+fi
 
-import importlib.util
-import sys
-from pathlib import Path
-
-_PLUGIN_DIR = Path(__file__).resolve().parent
-_PACKAGE = "tool_belt_plugin"
-
-
-def _register_package() -> None:
-    if _PACKAGE in sys.modules:
-        return
-    spec = importlib.util.spec_from_file_location(
-        _PACKAGE,
-        _PLUGIN_DIR / "__init__.py",
-        submodule_search_locations=[str(_PLUGIN_DIR)],
-    )
-    if spec is None or spec.loader is None:
-        # Fall back to a bare sys.path insert so standalone imports still work.
-        sys.path.insert(0, str(_PLUGIN_DIR))
-        return
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[_PACKAGE] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.path.insert(0, str(_PLUGIN_DIR))
-
-
-def main() -> int:
-    _register_package()
-    try:
-        cli = importlib.import_module(f"{_PACKAGE}.savings_cli")
-    except Exception:
-        sys.path.insert(0, str(_PLUGIN_DIR))
-        import savings_cli as cli  # type: ignore[no-redefine]
-    return cli.main(sys.argv[1:])
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+exec "$_TOOL_BELT_PYTHON" "$_TOOL_BELT_DIR/savings_cli.py" "$@"

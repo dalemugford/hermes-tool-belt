@@ -9,6 +9,7 @@ import importlib
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -216,6 +217,30 @@ class AgentSelectorTests(_HomeCase):
             rc = savings_cli.run(["--agent", "nope", "--hermes-home", str(self.home)])
         self.assertNotEqual(rc, 0)
 
+    def test_stale_explicitly_disabled_profile_is_excluded(self):
+        disabled = self.home / "profiles" / "retired"
+        _write_session(
+            disabled / "sessions", "old", platform="slack", model="m",
+            ceiling=CEILING, turns=[{"user": "old telemetry"}],
+        )
+        disabled.joinpath("config.yaml").write_text(
+            "plugins:\n  enabled: []\n  tool-belt:\n    enabled: false\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(savings.discover_agents(self.home), [])
+        with self.assertRaises(savings.UnknownAgentError):
+            savings.compute(agent="retired", hermes_home=self.home)
+
+    def test_present_profile_without_config_remains_discoverable(self):
+        profile = self.home / "profiles" / "portable"
+        _write_session(
+            profile / "sessions", "s", platform="cli", model="m",
+            ceiling=CEILING, turns=[{"user": "hello"}],
+        )
+        self.assertEqual(
+            [loc.agent for loc in savings.discover_agents(self.home)], ["portable"]
+        )
+
 
 class JsonDeterminismTests(_HomeCase):
     """(3) JSON output is deterministic and prose-free."""
@@ -271,8 +296,31 @@ class FullDefinitionTokenTests(_HomeCase):
         loc_names = savings.discover_agents(self.home)[0]
         proj_names = savings.compute_projected(loc_names, {"enabled": True})
 
-        self.assertGreater(proj_full.gross_schema_token_reduction,
-                           proj_names.gross_schema_token_reduction * 5)
+        self.assertGreater(proj_full.gross_schema_token_reduction, 0)
+        self.assertEqual(proj_names.sessions_analyzed, 0)
+        self.assertEqual(proj_names.confidence, "insufficient")
+        self.assertIsNone(proj_names.net_input_reduction_pct)
+        self.assertIsNone(proj_names.estimated_usd_savings)
+
+    def test_partial_incomplete_evidence_suppresses_percentage_and_usd(self):
+        _write_session(
+            self.home / "sessions", "complete", platform="telegram",
+            model="claude-sonnet-4-6", api_mode="api_key", ceiling=CEILING,
+            turns=[{"user": "hello"}], full_defs=True,
+        )
+        _write_session(
+            self.home / "sessions", "incomplete", platform="telegram",
+            model="claude-sonnet-4-6", api_mode="api_key", ceiling=CEILING,
+            turns=[{"user": "hello"}], full_defs=False,
+        )
+        projection = savings.compute_projected(
+            savings.discover_agents(self.home)[0], {"enabled": True}
+        )
+        self.assertEqual(projection.sessions_analyzed, 1)
+        self.assertEqual(projection.confidence, "low")
+        self.assertIsNone(projection.net_input_reduction_pct)
+        self.assertIsNone(projection.estimated_usd_savings)
+        self.assertEqual(projection.usd_coverage, "none")
 
 
 class CohortSeparationTests(_HomeCase):
@@ -378,6 +426,36 @@ class DenominatorTests(_HomeCase):
         proj = savings.compute_projected(loc, {"enabled": True})
         self.assertEqual(proj.denominator_source, "provider_reported")
         self.assertEqual(proj.input_token_denominator, 99999)
+        self.assertEqual(proj.confidence, "high")
+
+    def test_prediction_bridge_joins_chat_key_to_hermes_session(self):
+        # Production reality: api_calls rows key on the chat session_id, while
+        # historical files are named by Hermes session UUID. The join must go
+        # through predictions.jsonl (prediction_id -> hermes_session_id).
+        path = _write_session(self.home / "sessions", "20260828_090000_ab12",
+                              platform="telegram", model="claude-sonnet-4-6",
+                              ceiling=CEILING, turns=[{"user": "hello"}])
+        state = self.home / "state" / "tool-belt"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "predictions.jsonl").write_text(
+            json.dumps({"prediction_id": "p1", "hermes_session_id": path.stem,
+                        "session_id": "agent:main:telegram:dm:8499413300"}) + "\n",
+            encoding="utf-8")
+        (state / "api_calls.jsonl").write_text(
+            json.dumps({"ts": 1780000000.0, "prediction_id": "p1",
+                        "session_id": "agent:main:telegram:dm:8499413300",
+                        "input_tokens": 4242}) + "\n" +
+            json.dumps({"ts": 1780000001.0, "prediction_id": "p2",
+                        "session_id": "agent:main:telegram:dm:8499413300",
+                        "input_tokens": 111}) + "\n",
+            encoding="utf-8")
+        loc = savings.discover_agents(self.home)[0]
+        proj = savings.compute_projected(loc, {"enabled": True})
+        # p1 joins via the bridge and lands on the session file stem; p2 has no
+        # bridge row and falls back to the chat key (no double counting since
+        # the session lookup keys on the stem).
+        self.assertEqual(proj.denominator_source, "provider_reported")
+        self.assertEqual(proj.input_token_denominator, 4242)
         self.assertEqual(proj.confidence, "high")
 
     def test_incomplete_schema_suppresses_percentage(self):
@@ -504,6 +582,27 @@ class LauncherHelperTests(_HomeCase):
         launcher = savings_cli.launcher_path(self.home)
         self.assertTrue(launcher.exists())
         self.assertTrue(os.access(launcher, os.X_OK))
+
+    def test_repo_executable_honors_hermes_python(self):
+        env = dict(os.environ)
+        env.update(HERMES_HOME=str(self.home), HERMES_PYTHON=sys.executable)
+        result = subprocess.run(
+            [str(PLUGIN_DIR / "tool-belt"), "--help"],
+            env=env, text=True, capture_output=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tool-belt <command>", result.stdout)
+        self.assertNotIn("cannot import run_agent", result.stderr)
+
+    def test_launcher_quotes_interpreter_and_repo_paths(self):
+        repo = self.home / "plugin repo" / "tool-belt"
+        savings_cli.ensure_launcher(
+            self.home, repo, confirm=lambda _p: True,
+            python="/python env/bin/python3", out=lambda _m: None,
+        )
+        content = savings_cli.launcher_path(self.home).read_text(encoding="utf-8")
+        self.assertIn("HERMES_PYTHON='/python env/bin/python3'", content)
+        self.assertIn("exec '" + str(repo) + "' \"$@\"", content)
 
 
 def _snapshot(root: Path) -> dict:

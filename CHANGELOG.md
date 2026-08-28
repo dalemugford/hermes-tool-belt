@@ -10,6 +10,7 @@ The initial public capabilities of the plugin:
 
 ### Added
 
+- **Canonical savings CLI (`tool-belt savings`).** Reports observed and counterfactual token savings across all enabled agents or one selected agent, with deterministic JSON, full-schema replay, confidence-aware percentages, and dollars only for provably metered routes. The launcher honors `HERMES_PYTHON` and the local Hermes environment without importing runtime hooks.
 - **Guided onboarding (`scripts/configure.py`).** One command from install to a
   working configuration. Detects the state of every `agent:platform` scope —
   fresh, observing, ready, or shaped — and offers the step that fits. Two

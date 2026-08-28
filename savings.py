@@ -201,16 +201,44 @@ class AgentLocation:
     sessions_dir: Path       # <profile_home>/sessions
 
 
+def _tool_belt_explicitly_disabled(profile_home: Path) -> bool:
+    """Return True only when profile config explicitly disables Tool Belt.
+
+    Missing or unreadable config remains discoverable: directory presence is the
+    compatibility fallback. An explicit ``plugins.enabled`` exclusion or
+    ``plugins.tool-belt.enabled: false`` prevents stale telemetry from reviving a
+    disabled profile.
+    """
+    config_path = profile_home / "config.yaml"
+    if not config_path.is_file():
+        return False
+    try:
+        import yaml
+
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except Exception:
+        return False
+    plugins = raw.get("plugins") if isinstance(raw, dict) else None
+    if not isinstance(plugins, dict):
+        return False
+    enabled_plugins = plugins.get("enabled")
+    if isinstance(enabled_plugins, list) and "tool-belt" not in {
+        str(name) for name in enabled_plugins
+    }:
+        return True
+    plugin_config = plugins.get("tool-belt")
+    return isinstance(plugin_config, dict) and plugin_config.get("enabled") is False
+
+
 def discover_agents(
     hermes_home: Path | None = None, agent_filter: str | None = None
 ) -> list[AgentLocation]:
     """Discover currently enabled/present agent profiles.
 
-    An agent is included only when its profile is *present on disk now* — the
-    root profile (``default``) or a ``profiles/<name>`` directory that has a
-    ``sessions/`` or ``state/tool-belt`` directory. A profile that has been
-    removed is not resurrected merely because archived telemetry once existed;
-    discovery keys off live directories, not stale rows.
+    An agent is included only when its profile is present on disk now and its
+    config does not explicitly disable Tool Belt. Missing/unreadable config falls
+    back to directory discovery for compatibility; an explicit disable or
+    ``plugins.enabled`` exclusion prevents stale telemetry from reviving it.
     """
     home = Path(hermes_home or default_hermes_home())
     out: list[AgentLocation] = []
@@ -221,7 +249,7 @@ def discover_agents(
         ).is_dir()
 
     if not agent_filter or agent_filter == "default":
-        if _present(home):
+        if _present(home) and not _tool_belt_explicitly_disabled(home):
             out.append(
                 AgentLocation(
                     agent="default",
@@ -237,7 +265,7 @@ def discover_agents(
                 continue  # "default" under profiles/ is reserved by Hermes
             if agent_filter and child.name != agent_filter:
                 continue
-            if _present(child):
+            if _present(child) and not _tool_belt_explicitly_disabled(child):
                 out.append(
                     AgentLocation(
                         agent=child.name,
@@ -525,6 +553,7 @@ class HistoricalSession:
     tool_defs: dict[str, Any]          # name -> full provider tool definition
     tool_order: list[str]              # ceiling order as recorded
     turns: list[dict[str, Any]]        # user/assistant rows in order
+    schemas_complete: bool = True      # every recorded entry has description + schema
 
     @property
     def scope(self) -> str:
@@ -539,6 +568,23 @@ def _def_name(entry: Any) -> str | None:
     else:
         name = entry.get("name")
     return name if isinstance(name, str) and name else None
+
+
+def _definition_is_complete(entry: Any) -> bool:
+    """Whether an entry carries a full provider tool definition."""
+    if not isinstance(entry, dict):
+        return False
+    body = entry.get("function") if isinstance(entry.get("function"), dict) else entry
+    name = body.get("name")
+    description = body.get("description")
+    schema = body.get("parameters")
+    if not isinstance(schema, dict):
+        schema = body.get("input_schema")
+    return (
+        isinstance(name, str) and bool(name)
+        and isinstance(description, str)
+        and isinstance(schema, dict)
+    )
 
 
 def parse_session_full(session_file: Path, agent: str) -> HistoricalSession | None:
@@ -557,9 +603,15 @@ def parse_session_full(session_file: Path, agent: str) -> HistoricalSession | No
     if not meta:
         return None
 
+    recorded_defs = meta.get("tools") or []
+    if not isinstance(recorded_defs, list):
+        recorded_defs = []
+    schemas_complete = bool(recorded_defs) and all(
+        _definition_is_complete(entry) for entry in recorded_defs
+    )
     tool_defs: dict[str, Any] = {}
     tool_order: list[str] = []
-    for entry in meta.get("tools") or []:
+    for entry in recorded_defs:
         name = _def_name(entry)
         if name is None:
             continue
@@ -581,6 +633,7 @@ def parse_session_full(session_file: Path, agent: str) -> HistoricalSession | No
         tool_defs=tool_defs,
         tool_order=tool_order,
         turns=turns,
+        schemas_complete=schemas_complete,
     )
 
 
@@ -891,7 +944,7 @@ def project_sessions(
     assignment_source = "proposed" if proposed_by_scope else "current_effective"
 
     for session in sessions:
-        if not session.tool_defs:
+        if not session.tool_defs or not session.schemas_complete:
             incomplete_schema = True
             continue
         scope = session.scope
@@ -992,7 +1045,9 @@ def project_sessions(
     # Confidence.
     if incomplete_schema:
         cohort.confidence = "low"
+        cohort.net_input_reduction_pct = None
         reasons.append("some sessions had incomplete schemas and were skipped")
+        reasons.append("session-input percentage and USD suppressed for incomplete evidence")
     elif cohort.denominator_source == "provider_reported":
         cohort.confidence = "high"
     else:
@@ -1012,9 +1067,10 @@ def project_sessions(
         usd: float | None = None
         if cc.dollars_allowed:
             any_known = True
-            prices = price_for(model)
-            usd = round(max(0, net) * prices["input"] / 1_000_000.0, 4)
-            known_usd_total += usd
+            if not incomplete_schema:
+                prices = price_for(model)
+                usd = round(max(0, net) * prices["input"] / 1_000_000.0, 4)
+                known_usd_total += usd
         else:
             any_non_known = True
         cohort.models.append(ProjectedModelRow(
@@ -1024,7 +1080,10 @@ def project_sessions(
             net_token_reduction=net, estimated_usd_savings=usd,
         ))
 
-    if any_known and not any_non_known:
+    if incomplete_schema:
+        cohort.usd_coverage = "none"
+        cohort.estimated_usd_savings = None
+    elif any_known and not any_non_known:
         cohort.usd_coverage = "full"
         cohort.estimated_usd_savings = round(known_usd_total, 4)
     elif any_known and any_non_known:
@@ -1072,19 +1131,44 @@ def compute_projected(
 
 
 def _provider_input_by_session(state_dir: Path, since_ts: float = 0.0) -> dict[str, int]:
-    """Sum provider-reported input_tokens per session key from api_calls.jsonl.
+    """Sum provider-reported input_tokens per session from api_calls.jsonl.
 
-    Keyed by the historical session file stem when the telemetry records it,
-    so a pre-install session with organic post-install usage can still be joined.
+    ``api_calls`` rows carry the chat-level ``session_id`` (constant per chat),
+    while historical session files are named by the rotating Hermes session
+    UUID. The bridge is ``predictions.jsonl``: its rows carry both
+    ``prediction_id`` and ``hermes_session_id``, so each api_call is joined
+    prediction -> Hermes session and summed under that file-stem key. Rows are
+    also indexed by the raw chat ``session_id`` for callers that key on it.
     """
+    pid_to_hermes: dict[str, str] = {}
+    for p in load_jsonl(state_dir / "predictions.jsonl"):
+        pid = str(p.get("prediction_id") or "")
+        hermes = str(p.get("hermes_session_id") or "")
+        if pid and hermes:
+            pid_to_hermes[pid] = hermes
+
     out: dict[str, int] = defaultdict(int)
     for a in load_jsonl(state_dir / "api_calls.jsonl"):
         if float(a.get("ts") or 0) < since_ts:
             continue
-        key = str(a.get("session_file") or a.get("session_id") or "")
-        if not key:
+        if not int(a.get("input_tokens") or 0):
             continue
-        out[key] += int(a.get("input_tokens") or 0)
+        keys = []
+        hermes = pid_to_hermes.get(str(a.get("prediction_id") or ""))
+        if hermes:
+            keys.append(hermes)
+        session_file = str(a.get("session_file") or "")
+        if session_file:
+            keys.append(session_file)
+        if not keys:
+            # No bridge available: fall back to the chat key so the
+            # denominator still counts (it may aggregate across /new within
+            # one long-lived chat; confidence labeling covers the imprecision).
+            chat = str(a.get("session_id") or "")
+            if chat:
+                keys.append(chat)
+        for key in keys:
+            out[key] += int(a.get("input_tokens") or 0)
     return dict(out)
 
 
