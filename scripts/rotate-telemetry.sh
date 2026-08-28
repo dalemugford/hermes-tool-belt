@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Rotate tool-belt telemetry to start a clean measurement window.
 #
-# Moves current predictions.jsonl + tool_calls.jsonl into
+# Moves current predictions.jsonl + tool_calls.jsonl + api_calls.jsonl into
 # state-dir/archive/reset-<ts>/. Safe to run while the Hermes gateway
 # is up: logger_io opens append-mode on every write, so the next event
 # transparently creates a fresh file at the original path.
@@ -24,7 +24,7 @@ fi
 mkdir -p "${ARCHIVE_DIR}"
 
 moved=0
-for name in predictions.jsonl tool_calls.jsonl; do
+for name in predictions.jsonl tool_calls.jsonl api_calls.jsonl; do
     src="${STATE_DIR}/${name}"
     if [[ -f "${src}" ]]; then
         mv "${src}" "${ARCHIVE_DIR}/${name}"
