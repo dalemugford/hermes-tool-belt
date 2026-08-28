@@ -21,8 +21,12 @@ ROOT_LOG_DIR="${HERMES_HOME}/state/tool-belt/cron-logs"
 SUMMARY_LOG="${ROOT_LOG_DIR}/daily-summary.log"
 mkdir -p "${ROOT_LOG_DIR}"
 
+# TS_UTC stamps log lines; TS_FILE_LOCAL stamps generated filenames in host
+# local time so operators can match files to their own clock. The two are
+# deliberately in different timezones and can name different days near
+# midnight.
 TS_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-TS_LOCAL="$(date +%Y-%m-%d-%H%M%S)"
+TS_FILE_LOCAL="$(date +%Y-%m-%d-%H%M%S)"
 
 if ! command -v "${PYTHON}" >/dev/null 2>&1; then
     echo "${TS_UTC}  error  python interpreter not found: ${PYTHON}; set HERMES_PYTHON" \
@@ -62,8 +66,8 @@ for entry in "${SOURCES[@]}"; do
 
     ran_any=1
 
-    JSON_OUT="${ROOT_LOG_DIR}/${TS_LOCAL}-${label}.json"
-    STDERR_LOG="${ROOT_LOG_DIR}/${TS_LOCAL}-${label}.stderr"
+    JSON_OUT="${ROOT_LOG_DIR}/${TS_FILE_LOCAL}-${label}.json"
+    STDERR_LOG="${ROOT_LOG_DIR}/${TS_FILE_LOCAL}-${label}.stderr"
     REPORTS_DIR="${PLUGIN_DIR}/reports/${label}"
 
     if "${PYTHON}" "${PLUGIN_DIR}/analyze.py" \
@@ -84,6 +88,8 @@ for entry in "${SOURCES[@]}"; do
     fi
 
     # Pull one-line summary fields out of the JSON for the running log.
+    # The jq branch and the Python fallback below emit the same fields in the
+    # same order — change both together.
     if command -v jq >/dev/null 2>&1; then
         line=$(jq -r --arg ts "${TS_UTC}" --arg label "${label}" '
             "\($ts)  [\($label)]  ok  " +
@@ -113,7 +119,7 @@ PY
 
     echo "${line}" | tee -a "${SUMMARY_LOG}"
 
-    SHAPE_LOG="${ROOT_LOG_DIR}/${TS_LOCAL}-${label}.shape.log"
+    SHAPE_LOG="${ROOT_LOG_DIR}/${TS_FILE_LOCAL}-${label}.shape.log"
     if "${PYTHON}" "${PLUGIN_DIR}/scripts/shape-ceiling.py" \
             --state-dir "${state_dir}" \
             > "${SHAPE_LOG}" \

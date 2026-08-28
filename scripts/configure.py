@@ -148,7 +148,7 @@ def load_base_preset():
 
 
 def load_savings_engine():
-    """The Phase 7B savings engine — the single source of projection math."""
+    """The canonical savings engine — the single source of projection math."""
     try:
         _load_plugin_package()
         return importlib.import_module("tool_belt_plugin.savings")
@@ -722,7 +722,7 @@ def remove_learned_scope(info: ScopeInfo, dry_run: bool = False) -> bool:
 
 
 def render_projection(info: "ScopeInfo", projection) -> list[str]:
-    """Render the Phase 7B projected-savings preview for one scope's proposal.
+    """Render the projected-savings preview for one scope's proposal.
 
     ``projection`` is a canonical ``ProjectedCohort`` from the savings engine —
     its math is never duplicated here. Presentation follows the engine's
@@ -766,7 +766,7 @@ def render_projection(info: "ScopeInfo", projection) -> list[str]:
     return lines
 
 
-def _project_scope(info: "ScopeInfo", proposal: dict[str, list[str]], thresholds: dict[str, int]):
+def _project_scope(info: "ScopeInfo", proposal: dict[str, list[str]]):
     """Run the canonical savings engine over this scope with the proposal.
 
     Returns ``None`` when the engine or the scope's session history is
@@ -812,9 +812,9 @@ def render_shaping_summary(
 
       * Always carried — the immutable policy baseline; never shaped.
       * Carried        — the effective adaptive residents after this shaping.
-      * Expand only    — the enabled remainder; recoverable via triggers or
-        ``expand_tools``, never disabled.
-      * Proposed promotions into carry and demotions into expand-only.
+      * Proposed promotions into carry and demotions into expand-only — the
+        demoted tools stay recoverable via triggers or ``expand_tools``, and
+        are never disabled.
       * Trigger groups, which those transitions never touch.
 
     Never raises on thin or empty input — an unshapeable scope simply says so.
@@ -849,7 +849,6 @@ def render_shaping_summary(
     for name in promoted_names:
         if name not in carried:
             carried.append(name)
-    expand_only = [t for t in demoted_names]
 
     lines.append(f"  Always carried — permanent baseline ({len(base_always_carry)}): "
                  + (", ".join(sorted(base_always_carry)) if base_always_carry else "none"))
@@ -901,7 +900,6 @@ def render_shaping_summary(
     return lines
 
 
-
 def render_status_row(
     info: ScopeInfo, state: str, thresholds: dict[str, int]
 ) -> str:
@@ -949,7 +947,7 @@ def confirm(message: str, reader: Callable[[str], str] = _default_reader) -> boo
 def prompt_multi_select(
     infos: Sequence[ScopeInfo], reader: Callable[[str], str] = _default_reader
 ) -> list[ScopeInfo]:
-    """Numbered multi-select. ``all`` selects everything; blank aborts nothing."""
+    """Numbered multi-select. ``all`` selects everything; blank re-prompts."""
     if len(infos) == 1:
         return list(infos)
     print("\n  Which agents should this cover?")
@@ -1051,9 +1049,9 @@ def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
         for line in render_shaping_summary(info, recs, preset, ctx.thresholds):
             ctx.out(line)
 
-        # Phase 7B projection: the canonical engine replays this scope's real
-        # session history against the *proposed* (not-yet-applied) assignment.
-        agent_savings = _project_scope(info, proposed_assignment(info, recs), ctx.thresholds)
+        # Projection: the canonical engine replays this scope's real session
+        # history against the *proposed* (not-yet-applied) assignment.
+        agent_savings = _project_scope(info, proposed_assignment(info, recs))
         if agent_savings is not None:
             for line in render_projection(info, agent_savings.projected):
                 ctx.out(line)

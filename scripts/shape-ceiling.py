@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -65,8 +66,6 @@ import time
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
-
-import logging
 
 # Read every telemetry row through the centralized v1/v2 normalizer so the
 # shaper sees one canonical shape regardless of the on-disk schema version.
@@ -391,12 +390,6 @@ def compute_scope_recommendations(
         # demote candidate. Subtracting the observed always_carry set here makes
         # the exclusion genuinely by construction for both schema versions.
         demote_candidates = (carry_observed - tools_called) - always_carry_observed
-        # With always_carry removed above, this is a true never-fire invariant:
-        # no always_carry tool can remain in the demote set.
-        assert not (demote_candidates & always_carry_observed), (
-            f"always_carry tool(s) reached demote candidates for {scope!r}: "
-            f"{sorted(demote_candidates & always_carry_observed)}"
-        )
         for tool_name in sorted(demote_candidates):
             if not _valid(tool_name, "demote"):
                 continue

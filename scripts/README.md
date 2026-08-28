@@ -21,7 +21,6 @@ directory names.
 | [`cache-freeze-replay.py`](cache-freeze-replay.py) | Measures frozen-tool-list efficacy and estimates cache cost from matched API-call positions. **Also a hard library dependency of `analyze.py`**, which imports it via `importlib` for the cache-aware savings section; its CLI is an optional focused diagnostic. | Investigate cache behavior or verify analyzer savings. |
 | [`savings-report.py`](savings-report.py) | **Deprecated wrapper.** Kept for backward compatibility; delegates to the canonical engine in [`../savings.py`](../savings.py). Prefer `tool-belt savings`. | Legacy per-scope cache-on/off view. |
 | [`../tool-belt`](../tool-belt) `savings` | Canonical, read-only savings command. Reports every enabled agent (or one via `--agent`) with separately-labeled **observed** and **projected** cohorts; `--json` for a stable schema. Backed by [`../savings.py`](../savings.py). | The supported way to inspect savings. |
-| [`check-tool-drift.py`](check-tool-drift.py) | Finds tool names present in the observed ceiling but absent from policy. | After Hermes/plugin upgrades or toolset changes. |
 | [`smoke-test.py`](smoke-test.py) | Exercises cache-on and cache-off behavior in isolated temporary state. | Before committing hook, freeze, expansion, or telemetry changes. |
 | [`rotate-telemetry.sh`](rotate-telemetry.sh) | Moves live JSONL telemetry into a timestamped archive without stopping the gateway. | Start a clean measurement window. |
 | [`daily-analysis.sh`](daily-analysis.sh) | Runs the analyzer and shaper for the root profile and named profiles with telemetry. | Run manually or from a scheduler. |
@@ -143,7 +142,6 @@ writes only the learned overlay.
 ```bash
 python3 tests/run_tests.py
 python3 scripts/smoke-test.py
-python3 scripts/check-tool-drift.py
 ```
 
 The smoke test currently checks eight cache-off invariants and five cache-on

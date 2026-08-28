@@ -10,9 +10,9 @@ these alongside live telemetry and weights them differently.
 
 This unlocks two things:
 
-  1. Audit acceleration — open questions about trigger precision/recall and
-     dampener candidates can be answered now instead of after 7-14 days of
-     organic accumulation.
+  1. Trigger tuning without waiting — precision/recall and dampener-candidate
+     questions are answered from the session history already on disk, with no
+     organic accumulation period.
   2. Public-release warm start — on first install, the plugin runs harvest
      against the user's existing sessions so day-one recommendations are
      real, not "wait a week".
@@ -43,10 +43,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import importlib
 import json
 import os
+import re as _re
 import sys
 import time
 from dataclasses import dataclass
@@ -60,7 +60,6 @@ sys.path.insert(0, str(PLUGIN_DIR))
 sys.path.insert(0, str(PLUGIN_DIR / "tests"))
 import conftest  # noqa: F401 — registers tool_belt_plugin
 
-plugin = sys.modules["tool_belt_plugin"]
 predictor = importlib.import_module("tool_belt_plugin.predictor")
 presets_mod = importlib.import_module("tool_belt_plugin.presets")
 logger_io = importlib.import_module("tool_belt_plugin.logger_io")
@@ -106,7 +105,11 @@ def parse_session(session_file: Path) -> HarvestedSession | None:
     messages, malformed JSON).
     """
     try:
-        lines = [json.loads(l) for l in session_file.read_text().splitlines() if l.strip()]
+        lines = [
+            json.loads(l)
+            for l in session_file.read_text(encoding="utf-8").splitlines()
+            if l.strip()
+        ]
     except Exception:
         return None
 
@@ -146,9 +149,6 @@ def parse_session(session_file: Path) -> HarvestedSession | None:
         tool_defs=tool_defs,
         turns=turns,
     )
-
-
-import re as _re
 
 
 # Hermes wraps user messages with system-injected framing — quote/reply
@@ -320,7 +320,7 @@ def replay_session(
             active_tools=list(allowed_names),
             expand_only_tools=list(expand_only_names),
             policy_source="harvest",
-            policy_version="harvest-v1",
+            policy_version="harvest-emitter-1",
         )
         out_predictions.append(record.to_dict())
 
@@ -377,7 +377,7 @@ def _load_plugin_config(profile_home: Path) -> dict[str, Any]:
         return {"enabled": True}
     try:
         import yaml  # type: ignore[import-untyped]
-        data = yaml.safe_load(config_path.read_text()) or {}
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except Exception:
         return {"enabled": True}
     plugins = (data.get("plugins") or {}) if isinstance(data.get("plugins"), dict) else {}
@@ -422,10 +422,10 @@ def write_outputs(
     harvest_dir.mkdir(parents=True, exist_ok=True)
     pred_path = harvest_dir / "predictions.jsonl"
     call_path = harvest_dir / "tool_calls.jsonl"
-    with pred_path.open("w") as f:
+    with pred_path.open("w", encoding="utf-8") as f:
         for row in predictions:
             f.write(json.dumps(row) + "\n")
-    with call_path.open("w") as f:
+    with call_path.open("w", encoding="utf-8") as f:
         for row in tool_calls:
             f.write(json.dumps(row) + "\n")
     print(f"  wrote {pred_path} ({len(predictions)} rows)")

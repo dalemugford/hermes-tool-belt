@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Day-one warm start for the tool-belt plugin — mode-aware.
 
-The plugin runs in two modes per scope (cache-on default for Anthropic /
-OpenAI auto-cache; cache-off fallback for kimi / gpt-5.4-mini). This script
-runs the right warm-start for each:
+The plugin runs in two modes per scope (cache-on by default for providers
+with automatic prompt caching; cache-off fallback for providers without it).
+This script runs the right warm-start for each:
 
   · Cache-on scopes → ``shape-ceiling.py`` reports per-tool promote /
     demote candidates from real ``expand_tools`` evidence in live
@@ -129,7 +129,7 @@ def _shape_ceiling_actions(state_dirs: list[tuple[str, Path]], python: str) -> l
                     parts = line.lstrip("- ").split()
                     if parts:
                         actions.append({
-                            "kind": "shape_demote",
+                            "kind": "shape_promote" if in_promote else "shape_demote",
                             "label": label,
                             "scope": current_scope,
                             "tool": parts[0],
@@ -243,8 +243,7 @@ def main() -> int:
             harvest_cmd += ["--profile", args.profile]
         if args.window_days is not None:
             harvest_cmd += ["--window-days", str(args.window_days)]
-        if args.hermes_home:
-            harvest_cmd += ["--hermes-home", str(args.hermes_home)]
+        harvest_cmd += ["--hermes-home", str(args.hermes_home)]
         try:
             subprocess.run(harvest_cmd, capture_output=args.quiet, text=True, check=True)
         except subprocess.CalledProcessError as exc:
