@@ -33,7 +33,6 @@ import unittest
 from pathlib import Path
 
 TESTS_DIR = Path(__file__).resolve().parent
-PLUGIN_DIR = TESTS_DIR.parent
 sys.path.insert(0, str(TESTS_DIR))
 import conftest  # noqa: F401,E402 — registers tool_belt_plugin
 
@@ -226,7 +225,14 @@ class OnboardingArcTests(OnboardingTestCase):
         self.assertIn(configure.STATE_SHAPED, status)
 
     def test_demote_arm_named_profile(self) -> None:
-        """A chat-only agent in a named profile demotes its unused always-ons."""
+        """A chat-only agent in a named profile demotes its unused residents.
+
+        The unused tools are enabled built-ins the runtime keeps resident via
+        the unknown-tools safe-default (``unknown_kept_tools``); after 20 unused
+        sessions the shaper demotes them. The shaper still persists the v1 mirror
+        keys, so the learned file is read through the v2 normalizer and asserted
+        on the ``carry`` / ``expand_only`` surface.
+        """
         result = self.seed("chat-heavy", profile_override="assistant-b")
         profile_state = self.home / "profiles" / "assistant-b" / "state" / "tool-belt"
         self.assertEqual(result.state_dir, profile_state)
@@ -237,14 +243,17 @@ class OnboardingArcTests(OnboardingTestCase):
 
         # The overlay lands in the profile's state dir, not the root's.
         self.assertFalse((self.root_state / "learned.json").exists())
-        entry = self.learned(profile_state)["scopes"][result.scope]
-        self.assertEqual(sorted(entry["always_off"]), ["cronjob", "image_generate"])
-        self.assertEqual(entry["always_on"], [])
+        entry = seed_sessions.learned.normalize_state(
+            self.learned(profile_state)
+        )["scopes"][result.scope]
+        # Unused unknown-kept tools land in the v2 expand_only surface; nothing
+        # was promoted into carry.
+        self.assertEqual(sorted(entry["expand_only"]), ["unit_convert", "weather_lookup"])
+        self.assertEqual(entry["carry"], [])
 
-        # Nothing structurally required may ever be demoted.
-        shaper = configure.load_shaper()
-        protected = shaper.effective_protected_always_on(PLUGIN_DIR)
-        self.assertEqual(set(entry["always_off"]) & protected, set())
+        # The immutable always_carry surface can never be demoted.
+        always_carry = set(seed_sessions.presets.load_base_policy().always_carry)
+        self.assertEqual(set(entry["expand_only"]) & always_carry, set())
 
     def test_multi_scope_independence(self) -> None:
         """Two scopes in one home; shaping one leaves the other untouched."""

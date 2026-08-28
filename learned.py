@@ -123,6 +123,54 @@ def _empty_v2() -> dict[str, Any]:
     return {"version": LEARNED_VERSION, "updated_at": "", "scopes": {}}
 
 
+#: Scope-entry keys the normalizer owns (renames the v1 spellings, keeps the v2
+#: ones). Every *other* key in a scope dict is unrecognized metadata and passes
+#: through untouched, so a writer never drops a field it doesn't understand.
+_KNOWN_SCOPE_KEYS = frozenset(
+    {
+        "always_on", "always_off", "cache_aware", "trigger_adjustments",  # v1
+        "carry", "expand_only", "shaping",                                # v2
+    }
+)
+
+
+def _string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
+
+
+def _reconcile_overlap(
+    carry: list[str], expand_only: list[str], *, scope: str | None = None
+) -> list[str]:
+    """Resolve a ``carry`` ∩ ``expand_only`` overlap toward carrying.
+
+    A tool named in both lists is contradictory; carrying wins (fail safe
+    toward keeping capability resident) and the tool is dropped from
+    ``expand_only``. Returns the reconciled ``expand_only`` list and warns once,
+    naming the offenders. This is the single home for the carry-wins precedence
+    decision — both the read-time normalizer (:func:`_normalize_scope_entry`)
+    and :func:`apply_to_preset` route through it.
+    """
+    carry_set = set(carry)
+    overlap = sorted({t for t in expand_only if t in carry_set})
+    if not overlap:
+        return expand_only
+    if scope:
+        logger.warning(
+            "tool-belt: learned scope %r names %d tool(s) in both carry and "
+            "expand_only; resolving toward carry: %s",
+            scope, len(overlap), ", ".join(overlap),
+        )
+    else:
+        logger.warning(
+            "tool-belt: learned scope names %d tool(s) in both carry and "
+            "expand_only; resolving toward carry: %s",
+            len(overlap), ", ".join(overlap),
+        )
+    return [t for t in expand_only if t not in carry_set]
+
+
 def _normalize_scope_entry(entry: Any, *, warn_trigger_adjustments: bool = True) -> dict[str, Any]:
     """Map one scope's learned entry to the v2 ``{carry, expand_only, shaping}``.
 
@@ -130,9 +178,16 @@ def _normalize_scope_entry(entry: Any, *, warn_trigger_adjustments: bool = True)
     ``trigger_adjustments``) and native v2 keys (``carry`` / ``expand_only`` /
     ``shaping``); native v2 keys win when both are present. A malformed
     carry/expand_only overlap is resolved toward carrying, with a warning.
+
+    Only the known v1/v2 keys are renamed/normalized; any *other* key in the
+    scope dict is unrecognized metadata and is copied through untouched, so a
+    normalize → write round-trip never silently drops a field.
     """
     if not isinstance(entry, dict):
         return {"carry": [], "expand_only": [], "shaping": {}}
+
+    # Preserve every unrecognized key verbatim; the three v2 keys below overwrite.
+    out: dict[str, Any] = {k: v for k, v in entry.items() if k not in _KNOWN_SCOPE_KEYS}
 
     # v1 field mapping.
     carry = _string_list(entry.get("always_on"))
@@ -158,18 +213,10 @@ def _normalize_scope_entry(entry: Any, *, warn_trigger_adjustments: bool = True)
             count,
         )
 
-    # Reconcile a malformed read overlap safely toward carrying.
-    carry_set = set(carry)
-    overlap = [t for t in expand_only if t in carry_set]
-    if overlap:
-        logger.warning(
-            "tool-belt: learned scope names %d tool(s) in both carry and "
-            "expand_only; resolving toward carry: %s",
-            len(set(overlap)), ", ".join(sorted(set(overlap))),
-        )
-        expand_only = [t for t in expand_only if t not in carry_set]
-
-    return {"carry": carry, "expand_only": expand_only, "shaping": shaping}
+    out["carry"] = carry
+    out["expand_only"] = _reconcile_overlap(carry, expand_only)
+    out["shaping"] = shaping
+    return out
 
 
 def normalize_state(doc: Any) -> dict[str, Any]:
@@ -183,17 +230,24 @@ def normalize_state(doc: Any) -> dict[str, Any]:
     if not isinstance(doc, dict):
         return _empty_v2()
 
+    # Preserve every unrecognized top-level key verbatim; the known keys below
+    # overwrite, and ``global`` is handled specially just after.
     out: dict[str, Any] = {
-        "version": LEARNED_VERSION,
-        "updated_at": str(doc.get("updated_at") or ""),
-        "scopes": {},
+        k: v for k, v in doc.items()
+        if k not in ("version", "updated_at", "scopes", "global")
     }
+    out["version"] = LEARNED_VERSION
+    out["updated_at"] = str(doc.get("updated_at") or "")
+    out["scopes"] = {}
     scopes = doc.get("scopes")
     if isinstance(scopes, dict):
         for scope, entry in scopes.items():
             out["scopes"][str(scope)] = _normalize_scope_entry(entry)
 
-    # Preserve a normalized global block only if it carries something.
+    # Preserve a normalized global block only if it carries something. NOTE:
+    # this block is inert today — no consumer reads it (scope_state /
+    # apply_to_preset look at ``scopes`` only). Retained pending the global
+    # fallback decision; do not wire it in this pass.
     global_raw = doc.get("global")
     if isinstance(global_raw, dict):
         g = _normalize_scope_entry(global_raw, warn_trigger_adjustments=False)
@@ -324,14 +378,9 @@ def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -
     # Malformed read overlap (a tool in both learned lists): resolve toward
     # carrying and warn. (normalize_state already does this at load; this is a
     # belt-and-braces guard for a hand-built scope dict.)
-    overlap = set(learned_carry) & set(learned_expand)
-    if overlap:
-        logger.warning(
-            "tool-belt: learned scope %r names %d tool(s) in both carry and "
-            "expand_only; resolving toward carry: %s",
-            matched_scope or scope, len(overlap), ", ".join(sorted(overlap)),
-        )
-        learned_expand = [t for t in learned_expand if t not in overlap]
+    learned_expand = _reconcile_overlap(
+        learned_carry, learned_expand, scope=matched_scope or scope
+    )
 
     # always_carry is immutable — a demotion signal naming one is ignored + warned.
     demoted_always_carry = always_carry_set & set(learned_expand)
@@ -394,9 +443,3 @@ def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -
         learned_changes=changes,
         learned_scope=matched_scope,
     )
-
-
-def _string_list(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]
