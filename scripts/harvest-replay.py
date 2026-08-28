@@ -64,6 +64,7 @@ plugin = sys.modules["tool_belt_plugin"]
 predictor = importlib.import_module("tool_belt_plugin.predictor")
 presets_mod = importlib.import_module("tool_belt_plugin.presets")
 logger_io = importlib.import_module("tool_belt_plugin.logger_io")
+savings_mod = importlib.import_module("tool_belt_plugin.savings")
 
 
 # How far ahead in JSONL order to look for tool calls that "respond" to
@@ -79,6 +80,7 @@ class HarvestedSession:
     profile_agent: str           # "default" or a named profile, derived from path
     platform: str                # from session_meta
     ceiling_tools: list[str]     # tool names visible to the historical model
+    tool_defs: dict[str, Any]    # name -> the COMPLETE session_meta.tools entry
     turns: list[dict[str, Any]]  # ordered list of {role, content, tool_calls?, ts}
 
 
@@ -114,6 +116,7 @@ def parse_session(session_file: Path) -> HarvestedSession | None:
 
     raw_tools = meta.get("tools") or []
     ceiling_names: list[str] = []
+    tool_defs: dict[str, Any] = {}
     for entry in raw_tools:
         if not isinstance(entry, dict):
             continue
@@ -125,6 +128,11 @@ def parse_session(session_file: Path) -> HarvestedSession | None:
             name = entry.get("name")
         if isinstance(name, str) and name:
             ceiling_names.append(name)
+            # Preserve the COMPLETE definition — descriptions and JSON-Schema
+            # parameter blocks dominate real schema-token cost, so token counts
+            # must be taken over full defs, never `[{"name": ...}]` placeholders.
+            if name not in tool_defs:
+                tool_defs[name] = entry
 
     turns = [row for row in lines if row.get("role") in ("user", "assistant")]
     if not any(t.get("role") == "user" for t in turns):
@@ -135,6 +143,7 @@ def parse_session(session_file: Path) -> HarvestedSession | None:
         profile_agent=_profile_agent_from_path(session_file),
         platform=str(meta.get("platform") or "unknown"),
         ceiling_tools=ceiling_names,
+        tool_defs=tool_defs,
         turns=turns,
     )
 
@@ -232,7 +241,16 @@ def replay_session(
     # harvest rows from one session linked together for windowed analysis.
     harvest_session_id = f"harvest:{session.session_file.stem}"
     ceiling_count = len(session.ceiling_tools)
-    ceiling_tokens = logger_io.estimate_tokens([{"name": n} for n in session.ceiling_tools])
+
+    def _defs_for(names: list[str]) -> list[Any]:
+        """Full definitions for the given names, in order. Falls back to a
+        name-only stub only for a name with no recorded definition (should not
+        happen for a well-formed session_meta)."""
+        return [session.tool_defs.get(n, {"name": n}) for n in names]
+
+    # Tokenize the COMPLETE tool definitions (name + description + parameter
+    # schema), via the canonical estimator — not `[{"name": ...}]` placeholders.
+    ceiling_tokens = savings_mod.schema_tokens(_defs_for(list(session.ceiling_tools)))
 
     for i, row in enumerate(session.turns):
         if row.get("role") != "user":
@@ -264,7 +282,7 @@ def replay_session(
                 else:
                     expand_only_names.append(name)
 
-        narrowed_tokens = logger_io.estimate_tokens([{"name": n} for n in allowed_names])
+        narrowed_tokens = savings_mod.schema_tokens(_defs_for(allowed_names))
 
         # Ground truth: tool names the model actually called responding to this msg
         called_tools = _tool_calls_for_response(session.turns, i)

@@ -1,0 +1,523 @@
+"""Canonical savings engine + `tool-belt savings` CLI coverage.
+
+Maps 1:1 to the Phase 7B required-tests list. Every fixture writes into a
+throwaway HERMES_HOME; nothing here touches live Hermes state.
+"""
+from __future__ import annotations
+
+import importlib
+import io
+import json
+import os
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+
+PLUGIN_DIR = Path(__file__).resolve().parent.parent
+TESTS_DIR = PLUGIN_DIR / "tests"
+sys.path.insert(0, str(TESTS_DIR))
+import conftest  # noqa: F401,E402 — registers tool_belt_plugin
+
+savings = importlib.import_module("tool_belt_plugin.savings")
+savings_cli = importlib.import_module("tool_belt_plugin.savings_cli")
+learned = importlib.import_module("tool_belt_plugin.learned")
+
+
+# ─── fixtures ─────────────────────────────────────────────────────────────────
+
+
+def _full_def(name: str) -> dict:
+    """A COMPLETE OpenAI-shape tool definition with description + parameters."""
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": (
+                f"The {name} tool. It performs the {name} operation against the "
+                f"user's environment and returns a structured result describing "
+                f"what changed, including any diagnostics the caller may need."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": f"What {name} acts on."},
+                    "options": {
+                        "type": "object",
+                        "description": "Free-form options bag.",
+                        "properties": {
+                            "verbose": {"type": "boolean", "description": "Chatty output."},
+                            "dry_run": {"type": "boolean", "description": "Preview only."},
+                        },
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+    }
+
+
+def _names_only(name: str) -> dict:
+    return {"name": name}
+
+
+def _write_session(sessions_dir: Path, stem: str, *, platform: str, model: str,
+                   ceiling: list[str], turns: list[dict], api_mode: str = "",
+                   full_defs: bool = True) -> Path:
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    tool_entries = [_full_def(n) if full_defs else _names_only(n) for n in ceiling]
+    meta = {"role": "session_meta", "platform": platform, "model": model, "tools": tool_entries}
+    if api_mode:
+        meta["api_mode"] = api_mode
+    rows = [meta]
+    for turn in turns:
+        rows.append({"role": "user", "content": turn["user"]})
+        calls = turn.get("calls") or []
+        if calls:
+            rows.append({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": c}} for c in calls],
+            })
+    path = sessions_dir / f"{stem}.jsonl"
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    return path
+
+
+def _write_observed(state_dir: Path, scope: str, *, expand_events: int = 0) -> None:
+    """Write a minimal observed-telemetry triple for a scope."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    preds = []
+    apis = []
+    # cache-on narrowed row
+    preds.append({
+        "schema_version": 2, "ts": 1780000000.0, "prediction_id": "on1",
+        "session_id": f"{scope}:S1", "scope": scope, "policy_source": "preset",
+        "ceiling_count": 40, "narrowed_count": 20,
+        "ceiling_tokens": 10000, "narrowed_tokens": 4000, "frozen_reuse": False,
+    })
+    apis.append({"ts": 1780000000.0, "prediction_id": "on1", "scope": scope,
+                 "api_call_idx": 0, "cache_mode": "on", "input_tokens": 4000,
+                 "cache_read_tokens": 6000, "cache_write_tokens": 0})
+    # cache-off narrowed row
+    preds.append({
+        "schema_version": 2, "ts": 1780000001.0, "prediction_id": "off1",
+        "session_id": f"{scope}:S2", "scope": scope, "policy_source": "preset",
+        "ceiling_count": 40, "narrowed_count": 22,
+        "ceiling_tokens": 10000, "narrowed_tokens": 5000, "frozen_reuse": False,
+    })
+    apis.append({"ts": 1780000001.0, "prediction_id": "off1", "scope": scope,
+                 "api_call_idx": 0, "cache_mode": "off", "input_tokens": 5000,
+                 "cache_read_tokens": 0, "cache_write_tokens": 0})
+    tcs = []
+    for i in range(expand_events):
+        tcs.append({"schema_version": 2, "ts": 1780000002.0, "prediction_id": "off1",
+                    "session_id": f"{scope}:S2", "scope": scope,
+                    "tool_name": "expand_tools", "source": "gateway"})
+    (state_dir / "predictions.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in preds), encoding="utf-8")
+    (state_dir / "api_calls.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in apis), encoding="utf-8")
+    (state_dir / "tool_calls.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in tcs), encoding="utf-8")
+
+
+# A ceiling mixing residents, trigger-activatable, and pure expand_only tools.
+CEILING = [
+    "clarify", "todo", "send_message", "expand_tools",       # always_carry
+    "read_file", "web_search", "terminal", "write_file",     # carry residents
+    "delegate_task",       # trigger: delegation
+    "execute_code",        # trigger: code_execution (also reachable bare)
+    "vision_analyze",      # trigger: vision
+    "image_generate",      # trigger: image_gen
+    "session_search",      # trigger: history_search
+    "cronjob",             # trigger: cronjob
+]
+
+
+class _HomeCase(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "hermes home"
+        self.home.mkdir()
+        self._prev_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(self.home)
+        learned._CACHE.update({"path": None, "mtime_ns": None, "state": None, "hash": ""})
+        self.addCleanup(self._restore_home)
+
+    def _restore_home(self):
+        if self._prev_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = self._prev_home
+        learned._CACHE.update({"path": None, "mtime_ns": None, "state": None, "hash": ""})
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class DefaultAllAgentsTests(_HomeCase):
+    """(1) `tool-belt savings` defaults to all enabled/discovered agents and
+    emits aggregate + per-agent results."""
+
+    def test_all_agents_and_aggregate(self):
+        _write_observed(self.home / "state" / "tool-belt", "default:telegram")
+        _write_session(self.home / "sessions", "s1", platform="telegram",
+                       model="claude-sonnet-4-6", ceiling=CEILING,
+                       turns=[{"user": "hello there"}])
+        named = self.home / "profiles" / "assistant-a"
+        _write_observed(named / "state" / "tool-belt", "assistant-a:slack")
+        _write_session(named / "sessions", "s2", platform="slack",
+                       model="claude-sonnet-4-6", ceiling=CEILING,
+                       turns=[{"user": "hi"}])
+
+        report = savings.compute(hermes_home=self.home)
+        agents = {a.agent for a in report.agents}
+        self.assertEqual(agents, {"default", "assistant-a"})
+        payload = report.to_json()
+        self.assertEqual(payload["generated_for"], "all")
+        self.assertIn("aggregate", payload)
+        self.assertEqual(len(payload["agents"]), 2)
+
+
+class AgentSelectorTests(_HomeCase):
+    """(2) --agent=default includes all default platforms and excludes other
+    agents; unknown/disabled agent errors non-zero."""
+
+    def _seed_two_agents(self):
+        _write_observed(self.home / "state" / "tool-belt", "default:telegram")
+        _write_session(self.home / "sessions", "t", platform="telegram",
+                       model="m", ceiling=CEILING, turns=[{"user": "hey"}])
+        _write_session(self.home / "sessions", "c", platform="cli",
+                       model="m", ceiling=CEILING, turns=[{"user": "hey"}])
+        named = self.home / "profiles" / "assistant-a"
+        _write_observed(named / "state" / "tool-belt", "assistant-a:slack")
+
+    def test_agent_scopes_all_platforms_excludes_others(self):
+        self._seed_two_agents()
+        report = savings.compute(agent="default", hermes_home=self.home)
+        self.assertEqual([a.agent for a in report.agents], ["default"])
+        # default has two platforms (telegram from observed, cli from sessions).
+        plats = set(report.agents[0].platforms)
+        self.assertIn("default:telegram", plats)
+        self.assertIn("default:cli", plats)
+        # No assistant-a scope leaks into the default report.
+        self.assertFalse(any(p.startswith("assistant-a") for p in plats))
+
+    def test_unknown_agent_errors_nonzero(self):
+        self._seed_two_agents()
+        with self.assertRaises(savings.UnknownAgentError):
+            savings.compute(agent="nope", hermes_home=self.home)
+        # CLI surfaces it as a non-zero exit.
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = savings_cli.run(["--agent", "nope", "--hermes-home", str(self.home)])
+        self.assertNotEqual(rc, 0)
+
+
+class JsonDeterminismTests(_HomeCase):
+    """(3) JSON output is deterministic and prose-free."""
+
+    def test_json_is_stable_and_prose_free(self):
+        _write_observed(self.home / "state" / "tool-belt", "default:telegram")
+        _write_session(self.home / "sessions", "s", platform="telegram",
+                       model="claude-sonnet-4-6", ceiling=CEILING,
+                       turns=[{"user": "please delegate this task"}])
+
+        def _json_run():
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = savings_cli.run(["--json", "--hermes-home", str(self.home)])
+            self.assertEqual(rc, 0)
+            return buf.getvalue()
+
+        a = _json_run()
+        b = _json_run()
+        self.assertEqual(a, b)  # deterministic
+        parsed = json.loads(a)  # valid JSON
+        self.assertEqual(a.strip()[0], "{")  # no prose preamble
+        self.assertEqual(parsed["schema"], "tool-belt/savings/v1")
+
+
+class FullDefinitionTokenTests(_HomeCase):
+    """(4) Complete tool definitions (parameters/descriptions) materially affect
+    token counts; names-only placeholders cannot pass."""
+
+    def test_full_defs_dominate_names_only(self):
+        full = [_full_def(n) for n in CEILING]
+        names = [_names_only(n) for n in CEILING]
+        full_tok = savings.schema_tokens(full)
+        names_tok = savings.schema_tokens(names)
+        # Descriptions + JSON-schema params dominate: full defs are many times
+        # larger than names-only. A names-only count could never stand in.
+        self.assertGreater(full_tok, names_tok * 5)
+
+    def test_projection_uses_full_defs(self):
+        # Same ceiling, one session with full defs and one names-only; the
+        # projected gross reduction must be far larger for the full-def session.
+        _write_session(self.home / "sessions", "full", platform="telegram",
+                       model="m", ceiling=CEILING, turns=[{"user": "hello"}],
+                       full_defs=True)
+        loc_full = savings.discover_agents(self.home)[0]
+        proj_full = savings.compute_projected(loc_full, {"enabled": True})
+
+        # Rewrite the session names-only.
+        (self.home / "sessions" / "full.jsonl").unlink()
+        _write_session(self.home / "sessions", "names", platform="telegram",
+                       model="m", ceiling=CEILING, turns=[{"user": "hello"}],
+                       full_defs=False)
+        loc_names = savings.discover_agents(self.home)[0]
+        proj_names = savings.compute_projected(loc_names, {"enabled": True})
+
+        self.assertGreater(proj_full.gross_schema_token_reduction,
+                           proj_names.gross_schema_token_reduction * 5)
+
+
+class CohortSeparationTests(_HomeCase):
+    """(5) Observed and projected cohorts are labeled separately and never
+    summed."""
+
+    def test_cohorts_labeled_and_not_summed(self):
+        _write_observed(self.home / "state" / "tool-belt", "default:telegram")
+        _write_session(self.home / "sessions", "s", platform="telegram",
+                       model="m", ceiling=CEILING, turns=[{"user": "hello"}])
+        payload = savings.compute(hermes_home=self.home).to_json()
+        agg = payload["aggregate"]
+        self.assertEqual(agg["observed"]["label"], "observed")
+        self.assertEqual(agg["projected"]["label"], "projected")
+        self.assertTrue(agg["projected"]["counterfactual"])
+        # No key merges the two cohorts into a single total.
+        self.assertNotIn("total_token_reduction", agg)
+        self.assertNotIn("combined", agg)
+        a0 = payload["agents"][0]
+        self.assertEqual(a0["observed"]["label"], "observed")
+        self.assertEqual(a0["projected"]["label"], "projected")
+
+
+class CacheModeReplayTests(_HomeCase):
+    """(6) Cache-on frozen/monotonic replay and cache-off per-turn replay are
+    distinct."""
+
+    def test_cache_on_and_off_differ(self):
+        turns = [
+            {"user": "hello there, how are you"},          # residents only
+            {"user": "please delegate this task to a subagent"},  # trigger delegation
+            {"user": "now search my history for it"},      # trigger history_search
+        ]
+        _write_session(self.home / "sessions", "s", platform="telegram",
+                       model="m", ceiling=CEILING, turns=turns)
+        loc = savings.discover_agents(self.home)[0]
+        on = savings.compute_projected(loc, {"enabled": True}, cache_mode="on")
+        off = savings.compute_projected(loc, {"enabled": True}, cache_mode="off")
+        self.assertEqual(on.cache_mode, "on")
+        self.assertEqual(off.cache_mode, "off")
+        # The frozen (monotonic) active set diverges from per-turn resolution,
+        # so gross reductions are not identical.
+        self.assertNotEqual(on.gross_schema_token_reduction,
+                            off.gross_schema_token_reduction)
+
+
+class ExpansionVsTriggerTests(_HomeCase):
+    """(7) Trigger activation adds no expansion charge; explicit expansion
+    does."""
+
+    def test_trigger_free_expansion_charged(self):
+        # Trigger path: 'delegate this task' fires the delegation trigger, which
+        # activates delegate_task — no expand_tools round trip.
+        _write_session(self.home / "sessions", "trig", platform="telegram",
+                       model="m", ceiling=CEILING,
+                       turns=[{"user": "please delegate this task",
+                               "calls": ["delegate_task"]}])
+        loc = savings.discover_agents(self.home)[0]
+        trig = savings.compute_projected(loc, {"enabled": True}, cache_mode="off")
+        self.assertEqual(trig.expansion_events, 0)
+        self.assertEqual(trig.estimated_expansion_overhead, 0)
+
+        # Expansion path: a bare conversational message that calls an
+        # untriggered expand_only tool — that IS an explicit expansion.
+        (self.home / "sessions" / "trig.jsonl").unlink()
+        _write_session(self.home / "sessions", "exp", platform="telegram",
+                       model="m", ceiling=CEILING,
+                       turns=[{"user": "hello there",
+                               "calls": ["execute_code"]}])
+        loc = savings.discover_agents(self.home)[0]
+        exp = savings.compute_projected(loc, {"enabled": True}, cache_mode="off")
+        self.assertEqual(exp.expansion_events, 1)
+        self.assertEqual(exp.estimated_expansion_overhead,
+                         savings.EXPAND_ROUND_TRIP_TOKENS)
+
+
+class DenominatorTests(_HomeCase):
+    """(8) Provider-reported denominator wins; reconstructed cumulative
+    denominator is labeled and confidence-downgraded; incomplete denominator
+    suppresses percentage."""
+
+    def test_reconstructed_labeled_medium_confidence(self):
+        _write_session(self.home / "sessions", "recon", platform="telegram",
+                       model="m", ceiling=CEILING,
+                       turns=[{"user": "hello"}, {"user": "and now write a file"}])
+        loc = savings.discover_agents(self.home)[0]
+        proj = savings.compute_projected(loc, {"enabled": True})
+        self.assertEqual(proj.denominator_source, "reconstructed")
+        self.assertEqual(proj.confidence, "medium")
+        self.assertIsNotNone(proj.net_input_reduction_pct)
+
+    def test_provider_reported_wins_high_confidence(self):
+        path = _write_session(self.home / "sessions", "prov", platform="telegram",
+                              model="claude-sonnet-4-6", ceiling=CEILING,
+                              turns=[{"user": "hello"}])
+        state = self.home / "state" / "tool-belt"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "api_calls.jsonl").write_text(
+            json.dumps({"ts": 1780000000.0, "session_file": path.stem,
+                        "input_tokens": 99999, "cache_read_tokens": 0}) + "\n",
+            encoding="utf-8")
+        loc = savings.discover_agents(self.home)[0]
+        proj = savings.compute_projected(loc, {"enabled": True})
+        self.assertEqual(proj.denominator_source, "provider_reported")
+        self.assertEqual(proj.input_token_denominator, 99999)
+        self.assertEqual(proj.confidence, "high")
+
+    def test_incomplete_schema_suppresses_percentage(self):
+        # A session whose meta lists no tools -> incomplete; skipped; percentage
+        # suppressed and confidence insufficient.
+        sessions = self.home / "sessions"
+        sessions.mkdir(parents=True, exist_ok=True)
+        meta = {"role": "session_meta", "platform": "telegram", "model": "m", "tools": []}
+        (sessions / "empty.jsonl").write_text(
+            json.dumps(meta) + "\n" + json.dumps({"role": "user", "content": "hi"}) + "\n",
+            encoding="utf-8")
+        loc = savings.discover_agents(self.home)[0]
+        proj = savings.compute_projected(loc, {"enabled": True})
+        self.assertEqual(proj.sessions_analyzed, 0)
+        self.assertIsNone(proj.net_input_reduction_pct)
+        self.assertEqual(proj.confidence, "insufficient")
+
+
+class CostClassificationTests(_HomeCase):
+    """(9) Known variable cost shows estimated USD/rate basis; subscription and
+    unknown routes show no dollars and use net input percentage when
+    defensible."""
+
+    def test_known_metered_shows_usd(self):
+        _write_session(self.home / "sessions", "k", platform="telegram",
+                       model="claude-sonnet-4-6", api_mode="api_key",
+                       ceiling=CEILING, turns=[{"user": "hello"}, {"user": "write a file"}])
+        loc = savings.discover_agents(self.home)[0]
+        proj = savings.compute_projected(loc, {"enabled": True})
+        self.assertEqual(proj.models[0].cost_class, "known")
+        self.assertIsNotNone(proj.estimated_usd_savings)
+        self.assertTrue(proj.models[0].rate_basis)
+
+    def test_subscription_route_shows_no_dollars(self):
+        _write_session(self.home / "sessions", "s", platform="telegram",
+                       model="claude-sonnet-4-6", api_mode="subscription",
+                       ceiling=CEILING, turns=[{"user": "hello"}, {"user": "write a file"}])
+        loc = savings.discover_agents(self.home)[0]
+        proj = savings.compute_projected(loc, {"enabled": True})
+        self.assertEqual(proj.models[0].cost_class, "subscription")
+        self.assertIsNone(proj.estimated_usd_savings)
+        # Falls back to the net input reduction percentage.
+        self.assertIsNotNone(proj.net_input_reduction_pct)
+
+    def test_unknown_route_shows_no_dollars(self):
+        _write_session(self.home / "sessions", "u", platform="telegram",
+                       model="claude-sonnet-4-6", ceiling=CEILING,  # no api_mode
+                       turns=[{"user": "hello"}, {"user": "write a file"}])
+        loc = savings.discover_agents(self.home)[0]
+        proj = savings.compute_projected(loc, {"enabled": True})
+        self.assertEqual(proj.models[0].cost_class, "unknown")
+        self.assertIsNone(proj.estimated_usd_savings)
+
+    def test_classify_cost_list_price_not_enough(self):
+        # A model with a list price but a subscription route is NOT known-cost.
+        cc = savings.classify_cost("claude-sonnet-4-6", api_mode="oauth")
+        self.assertEqual(cc.cost_class, "subscription")
+        self.assertFalse(cc.dollars_allowed)
+
+
+class ProposedAssignmentTests(_HomeCase):
+    """(10) Onboarding-style proposed assignments can call the engine without
+    writing state."""
+
+    def test_proposed_projection_no_writes(self):
+        _write_session(self.home / "sessions", "s", platform="telegram",
+                       model="m", ceiling=CEILING,
+                       turns=[{"user": "hello"}, {"user": "run some code"}])
+        proposed = {"default:telegram": {"carry": ["execute_code"], "expand_only": ["terminal"]}}
+        before = _snapshot(self.home)
+        report = savings.compute(hermes_home=self.home, proposed_by_scope=proposed)
+        after = _snapshot(self.home)
+        self.assertEqual(before, after)  # no writes
+        self.assertEqual(report.agents[0].projected.assignment_source, "proposed")
+
+
+class NoWriteTests(_HomeCase):
+    """(11)+(12) Engine and CLI perform no writes; live config/learned hashes
+    and mtimes remain unchanged."""
+
+    def _seed(self):
+        _write_observed(self.home / "state" / "tool-belt", "default:telegram")
+        _write_session(self.home / "sessions", "s", platform="telegram",
+                       model="claude-sonnet-4-6", api_mode="api_key",
+                       ceiling=CEILING, turns=[{"user": "hello"}, {"user": "write a file"}])
+        # A live-looking learned.json + config we must not touch.
+        state = self.home / "state" / "tool-belt"
+        (state / "learned.json").write_text(
+            json.dumps({"version": 2, "scopes": {}}), encoding="utf-8")
+        (self.home / "config.yaml").write_text("plugins:\n  tool-belt:\n    enabled: true\n",
+                                               encoding="utf-8")
+
+    def test_engine_and_cli_never_write(self):
+        self._seed()
+        before = _snapshot(self.home)
+        savings.compute(hermes_home=self.home)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            savings_cli.run(["--hermes-home", str(self.home)])
+            savings_cli.run(["--json", "--hermes-home", str(self.home)])
+            savings_cli.run(["--agent", "default", "--hermes-home", str(self.home)])
+        after = _snapshot(self.home)
+        self.assertEqual(before, after)
+
+
+class LauncherHelperTests(_HomeCase):
+    """The Phase 8 launcher helper writes only on explicit confirmation and
+    never during a report."""
+
+    def test_launcher_requires_confirmation(self):
+        msgs = []
+        created = savings_cli.ensure_launcher(
+            self.home, PLUGIN_DIR / "tool-belt",
+            confirm=lambda _p: False, out=msgs.append)
+        self.assertFalse(created)
+        self.assertFalse(savings_cli.launcher_path(self.home).exists())
+
+    def test_launcher_created_on_confirmation(self):
+        msgs = []
+        created = savings_cli.ensure_launcher(
+            self.home, PLUGIN_DIR / "tool-belt",
+            confirm=lambda _p: True, out=msgs.append)
+        self.assertTrue(created)
+        launcher = savings_cli.launcher_path(self.home)
+        self.assertTrue(launcher.exists())
+        self.assertTrue(os.access(launcher, os.X_OK))
+
+
+def _snapshot(root: Path) -> dict:
+    """Map every file under ``root`` to (size, mtime_ns, sha1)."""
+    import hashlib
+    out = {}
+    for p in sorted(root.rglob("*")):
+        if p.is_file():
+            data = p.read_bytes()
+            st = p.stat()
+            out[str(p.relative_to(root))] = (
+                st.st_size, st.st_mtime_ns, hashlib.sha1(data).hexdigest())
+    return out
+
+
+if __name__ == "__main__":
+    unittest.main()

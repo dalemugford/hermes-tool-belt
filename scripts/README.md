@@ -19,7 +19,8 @@ directory names.
 | [`shape-ceiling.py`](shape-ceiling.py) | Builds per-scope promote/demote recommendations from recent sessions and writes the learned overlay. | Run after enough organic sessions; inspect with `--dry-run` first. |
 | [`harvest-replay.py`](harvest-replay.py) | Replays existing Hermes sessions through the per-turn predictor and writes privacy-reduced synthetic telemetry. | Tune trigger coverage for cache-off scopes. |
 | [`cache-freeze-replay.py`](cache-freeze-replay.py) | Measures frozen-tool-list efficacy and estimates cache cost from matched API-call positions. **Also a hard library dependency of `analyze.py`**, which imports it via `importlib` for the cache-aware savings section; its CLI is an optional focused diagnostic. | Investigate cache behavior or verify analyzer savings. |
-| [`savings-report.py`](savings-report.py) | Produces the compact, independently checkable token-savings report documented in `docs/SAVINGS.md`. | Inspect all scopes or a selected date/scope window. |
+| [`savings-report.py`](savings-report.py) | **Deprecated wrapper.** Kept for backward compatibility; delegates to the canonical engine in [`../savings.py`](../savings.py). Prefer `tool-belt savings`. | Legacy per-scope cache-on/off view. |
+| [`../tool-belt`](../tool-belt) `savings` | Canonical, read-only savings command. Reports every enabled agent (or one via `--agent`) with separately-labeled **observed** and **projected** cohorts; `--json` for a stable schema. Backed by [`../savings.py`](../savings.py). | The supported way to inspect savings. |
 | [`check-tool-drift.py`](check-tool-drift.py) | Finds tool names present in the observed ceiling but absent from policy. | After Hermes/plugin upgrades or toolset changes. |
 | [`smoke-test.py`](smoke-test.py) | Exercises cache-on and cache-off behavior in isolated temporary state. | Before committing hook, freeze, expansion, or telemetry changes. |
 | [`rotate-telemetry.sh`](rotate-telemetry.sh) | Moves live JSONL telemetry into a timestamped archive without stopping the gateway. | Start a clean measurement window. |
@@ -108,10 +109,17 @@ to `$HERMES_HOME/state/tool-belt/learned.json`.
 ### Analyze cache behavior
 
 ```bash
+./tool-belt savings                       # canonical: all agents, both cohorts
+./tool-belt savings --agent=default --json # machine-readable, one agent
 python3 scripts/cache-freeze-replay.py
 python3 scripts/cache-freeze-replay.py --scope assistant-a:telegram
-python3 scripts/savings-report.py --json
+python3 scripts/savings-report.py --json   # deprecated wrapper
 ```
+
+`tool-belt savings` is the public entry point. Pricing (`PRICE_TABLE`), the
+token estimator, and the expand-round-trip overhead constant are single-sourced
+in `savings.py`; `cache-freeze-replay.py` imports the price table from there and
+`savings-report.py` re-exports the observed-cohort math — no duplicate tables.
 
 The standard `analyze.py` report already includes cache-aware matched-
 counterfactual figures. It computes them by importing `cache-freeze-replay.py`

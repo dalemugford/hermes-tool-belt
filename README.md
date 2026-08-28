@@ -194,9 +194,9 @@ stops everything.
 
 **"The savings numbers look wrong."** Check the `tokens_estimator` field
 in your telemetry — `chars/4` without tiktoken, `tiktoken-cl100k` with.
-Run `python3 scripts/savings-report.py --json` for the independently
-checkable math. Methodology and caveats:
-[docs/SAVINGS.md](docs/SAVINGS.md).
+Run `./tool-belt savings --json` for the independently checkable math
+(the deprecated `python3 scripts/savings-report.py --json` still works).
+Methodology and caveats: [docs/SAVINGS.md](docs/SAVINGS.md).
 
 ## Advanced configuration
 

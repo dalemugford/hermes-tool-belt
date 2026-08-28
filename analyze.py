@@ -28,8 +28,10 @@ from typing import Any, Iterable
 # script (sibling on sys.path) and as the ``tool_belt_plugin.analyze`` module.
 try:  # package / test import
     from . import logger_io  # type: ignore[import-not-found]
+    from . import savings as _savings  # type: ignore[import-not-found]
 except ImportError:  # script mode
     import logger_io  # type: ignore[no-redef]
+    import savings as _savings  # type: ignore[no-redef]
 
 DEFAULT_PER_TOOL_TOKENS = 388
 DEFAULT_MIN_EXPANSIONS = 2
@@ -42,8 +44,10 @@ DEFAULT_TRIGGER_MIN_FIRES = 3
 # and the next API call resends system + messages + widened tool list. The
 # largest term is "extra full API request body," dominated by message history
 # and the widened tool schemas. 1500 is a conservative single-call estimate;
-# tune via --expand-round-trip-tokens once we have a measured baseline.
-DEFAULT_EXPAND_ROUND_TRIP_TOKENS = 1500
+# tune via --expand-round-trip-tokens once we have a measured baseline. The
+# value is single-sourced in the canonical savings engine so the analyzer, the
+# savings report, and the projection all charge the same per-event overhead.
+DEFAULT_EXPAND_ROUND_TRIP_TOKENS = _savings.EXPAND_ROUND_TRIP_TOKENS
 # Dampener suggestion defaults. These are conservative — tuning down min
 # support or precision quickly produces noise; tuning up shrinks the
 # candidate set to obviously-good patterns only.

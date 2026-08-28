@@ -70,7 +70,9 @@ Working and supported, but not the opening pitch:
 - `bootstrap.py` — optional warm start from existing sessions and telemetry
 - `analyze.py` — comprehensive effectiveness and recommendation report
 - `shape-ceiling.py` — writes reviewed per-scope learned adjustments
-- `savings-report.py` — concise, independently checkable savings view
+- `tool-belt savings` — canonical, read-only savings command (observed +
+  projected cohorts); backed by `savings.py`
+- `savings-report.py` — deprecated compatibility wrapper over `savings.py`
 
 **Advanced operations**
 

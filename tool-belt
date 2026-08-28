@@ -1,0 +1,55 @@
+#!/usr/bin/env python3
+"""Repository-root ``tool-belt`` executable.
+
+Hermes native plugin manifests cannot register shell subcommands, so the plugin
+ships this small launcher. It registers the hyphen-named plugin directory as the
+importable package ``tool_belt_plugin`` (mirroring tests/conftest.py) and
+dispatches to the CLI module.
+
+Usage:
+  ./tool-belt savings
+  ./tool-belt savings --agent=default
+  ./tool-belt savings --json
+"""
+from __future__ import annotations
+
+import importlib.util
+import sys
+from pathlib import Path
+
+_PLUGIN_DIR = Path(__file__).resolve().parent
+_PACKAGE = "tool_belt_plugin"
+
+
+def _register_package() -> None:
+    if _PACKAGE in sys.modules:
+        return
+    spec = importlib.util.spec_from_file_location(
+        _PACKAGE,
+        _PLUGIN_DIR / "__init__.py",
+        submodule_search_locations=[str(_PLUGIN_DIR)],
+    )
+    if spec is None or spec.loader is None:
+        # Fall back to a bare sys.path insert so standalone imports still work.
+        sys.path.insert(0, str(_PLUGIN_DIR))
+        return
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_PACKAGE] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.path.insert(0, str(_PLUGIN_DIR))
+
+
+def main() -> int:
+    _register_package()
+    try:
+        cli = importlib.import_module(f"{_PACKAGE}.savings_cli")
+    except Exception:
+        sys.path.insert(0, str(_PLUGIN_DIR))
+        import savings_cli as cli  # type: ignore[no-redefine]
+    return cli.main(sys.argv[1:])
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

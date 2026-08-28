@@ -49,6 +49,10 @@ _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PLUGIN_DIR))
 from logger_io import normalize_prediction_row, normalize_tool_call_row  # noqa: E402
 
+# Pricing is single-sourced in the canonical savings engine; import it rather
+# than defining a second copy (see docs/SAVINGS.md — no duplicate price tables).
+from savings import PRICE_TABLE, price_for  # noqa: E402,F401
+
 
 def _session_key(row: dict[str, Any]) -> str:
     """Distinct-session key matching the shaper/analyzer semantics.
@@ -66,30 +70,11 @@ def default_state_dir() -> Path:
     return Path(home) / "state" / "tool-belt"
 
 
-# ─── Price table and matched counterfactual ──────────────────────────────
+# ─── Matched counterfactual ───────────────────────────────────────────────
 #
-# Single source of truth for per-model token economics. Tokens-per-million
-# costs in USD; ``miss_premium`` is the input/cache_read ratio that drives
-# the savings correction. Unknown models fall back to "generic" — the
-# Anthropic Sonnet ratio (~10×) is the right default because (a) it's the
-# providers' published ratio for most modern caches and (b) erring high
-# keeps the corrected savings honest.
-PRICE_TABLE: dict[str, dict[str, float]] = {
-    # Anthropic
-    "claude-sonnet-4-6": {"input": 3.00, "cache_read": 0.30, "cache_write": 3.75, "output": 15.00, "miss_premium": 10.0},
-    "claude-haiku-4-5-20251001": {"input": 1.00, "cache_read": 0.10, "cache_write": 1.25, "output": 5.00, "miss_premium": 10.0},
-    # OpenAI Codex (via subscription — list prices for ratio computation)
-    "gpt-5.4": {"input": 1.25, "cache_read": 0.125, "cache_write": 1.25, "output": 10.00, "miss_premium": 10.0},
-    "gpt-5.4-mini": {"input": 0.15, "cache_read": 0.075, "cache_write": 0.15, "output": 0.60, "miss_premium": 2.0},
-    "gpt-5.5": {"input": 2.50, "cache_read": 0.25, "cache_write": 2.50, "output": 10.00, "miss_premium": 10.0},
-    # Kimi (Ollama Cloud) — no provider-side prefix caching to break
-    "kimi-k2.6:cloud": {"input": 0.0, "cache_read": 0.0, "cache_write": 0.0, "output": 0.0, "miss_premium": 1.0},
-    "generic": {"input": 1.0, "cache_read": 0.1, "cache_write": 1.0, "output": 5.0, "miss_premium": 10.0},
-}
-
-
-def price_for(model: str) -> dict[str, float]:
-    return PRICE_TABLE.get(model, PRICE_TABLE["generic"])
+# ``PRICE_TABLE`` / ``price_for`` are imported from ``savings`` above (the
+# single source of truth for per-model token economics). Unknown models fall
+# back to "generic" there.
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
