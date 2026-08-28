@@ -402,15 +402,41 @@ class DenominatorTests(_HomeCase):
     denominator is labeled and confidence-downgraded; incomplete denominator
     suppresses percentage."""
 
-    def test_reconstructed_labeled_medium_confidence(self):
+    def test_reconstructed_labeled_low_confidence_pct_suppressed(self):
+        # Reconstruction omits tool results, system prompt, and per-call
+        # accumulation, so its session-input percentage is never shown.
         _write_session(self.home / "sessions", "recon", platform="telegram",
                        model="m", ceiling=CEILING,
                        turns=[{"user": "hello"}, {"user": "and now write a file"}])
         loc = savings.discover_agents(self.home)[0]
         proj = savings.compute_projected(loc, {"enabled": True})
         self.assertEqual(proj.denominator_source, "reconstructed")
-        self.assertEqual(proj.confidence, "medium")
-        self.assertIsNotNone(proj.net_input_reduction_pct)
+        self.assertEqual(proj.confidence, "low")
+        self.assertIsNone(proj.net_input_reduction_pct)
+        # The schema-only percentage is shown instead, labeled separately.
+        self.assertIsNotNone(proj.schema_reduction_pct)
+
+    def test_partial_provider_coverage_suppresses_percentage(self):
+        _write_session(self.home / "sessions", "bridged", platform="telegram",
+                       model="m", ceiling=CEILING, turns=[{"user": "hello"}])
+        _write_session(self.home / "sessions", "unbridged", platform="cli",
+                       model="m", ceiling=CEILING, turns=[{"user": "hello"}])
+        state = self.home / "state" / "tool-belt"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "predictions.jsonl").write_text(
+            json.dumps({"prediction_id": "p1",
+                        "hermes_session_id": "bridged"}) + "\n",
+            encoding="utf-8")
+        (state / "api_calls.jsonl").write_text(
+            json.dumps({"ts": 1780000000.0, "prediction_id": "p1",
+                        "session_id": "agent:main:telegram:dm:1",
+                        "input_tokens": 50000}) + "\n",
+            encoding="utf-8")
+        proj = savings.compute_projected(
+            savings.discover_agents(self.home)[0], {"enabled": True})
+        self.assertEqual(proj.denominator_source, "partial")
+        self.assertEqual(proj.confidence, "low")
+        self.assertIsNone(proj.net_input_reduction_pct)
 
     def test_provider_reported_wins_high_confidence(self):
         path = _write_session(self.home / "sessions", "prov", platform="telegram",
@@ -497,8 +523,10 @@ class CostClassificationTests(_HomeCase):
         proj = savings.compute_projected(loc, {"enabled": True})
         self.assertEqual(proj.models[0].cost_class, "subscription")
         self.assertIsNone(proj.estimated_usd_savings)
-        # Falls back to the net input reduction percentage.
-        self.assertIsNotNone(proj.net_input_reduction_pct)
+        # No provider usage in the fixture -> session-input % suppressed; the
+        # schema-only percentage is what remains defensible.
+        self.assertIsNone(proj.net_input_reduction_pct)
+        self.assertIsNotNone(proj.schema_reduction_pct)
 
     def test_unknown_route_shows_no_dollars(self):
         _write_session(self.home / "sessions", "u", platform="telegram",

@@ -732,7 +732,7 @@ class ProjectedCohort:
     schema_reduction_pct: float | None = None
     # Session-input denominator.
     input_token_denominator: int = 0
-    denominator_source: str = "reconstructed"  # provider_reported | reconstructed | none
+    denominator_source: str = "reconstructed"  # provider_reported | partial | reconstructed | none
     net_input_reduction_pct: float | None = None
     # Costing.
     models: list[ProjectedModelRow] = field(default_factory=list)
@@ -1018,41 +1018,56 @@ def project_sessions(
         cohort.net_input_reduction_pct = None
         return cohort
 
+    # Denominator discipline (hardened 2026-08-28): the reconstruction models
+    # only tool schemas + conversation text per user turn. It omits the system
+    # prompt, context injections, tool results, and per-API-call accumulation,
+    # so against provider billing it can undercount input by orders of
+    # magnitude. It is therefore NEVER used for the session-input percentage.
+    #   * provider_reported — the only basis for net_input_reduction_pct.
+    #   * partial          — provider data exists but does not cover every
+    #                        replayed session; percentage suppressed (mixing
+    #                        units would understate the denominator and
+    #                        overstate the reduction).
+    #   * none             — pre-install sessions only: the schema-only
+    #                        percentage (schema_reduction_pct) is shown instead,
+    #                        explicitly labeled.
     if have_provider and not have_reconstructed:
         cohort.denominator_source = "provider_reported"
         cohort.input_token_denominator = denom_provider
-        reasons.append("provider-reported input_tokens joined from telemetry")
+        cohort.confidence = "high"
+        cohort.net_input_reduction_pct = round(
+            cohort.net_token_reduction / denom_provider * 100, 2
+        ) if denom_provider > 0 else None
+        reasons.append("provider-reported input_tokens joined via predictions bridge")
+        reasons.append("session-input percentage is provider-basis; numerator is per-user-turn (conservative)")
     elif have_provider and have_reconstructed:
-        # Mixed — label as reconstructed (the weaker guarantee dominates) so we
-        # never overclaim precision on a partially-reconstructed denominator.
-        cohort.denominator_source = "reconstructed"
-        cohort.input_token_denominator = denom_provider + denom_reconstructed
-        reasons.append("mixed provider-reported and reconstructed denominator; labeled reconstructed")
+        cohort.denominator_source = "partial"
+        cohort.input_token_denominator = denom_provider
+        cohort.confidence = "low"
+        cohort.net_input_reduction_pct = None
+        reasons.append(
+            "provider denominator covers only part of the replay; "
+            "session-input percentage suppressed (reconstruction omits tool "
+            "results, system prompt, and per-call accumulation)"
+        )
     else:
         cohort.denominator_source = "reconstructed"
         cohort.input_token_denominator = denom_reconstructed
-        reasons.append("cumulative request input reconstructed from turns + full schemas")
-
-    # Net input reduction pct: defensible only with a denominator.
-    if cohort.input_token_denominator > 0:
-        cohort.net_input_reduction_pct = round(
-            cohort.net_token_reduction / cohort.input_token_denominator * 100, 2
-        )
-    else:
-        cohort.net_input_reduction_pct = None
-        reasons.append("input denominator unavailable; session-input percentage suppressed")
-
-    # Confidence.
-    if incomplete_schema:
         cohort.confidence = "low"
         cohort.net_input_reduction_pct = None
+        reasons.append(
+            "no provider-reported usage for these sessions; reconstructed "
+            "input omits tool results/system prompt/per-call accumulation, so "
+            "the session-input percentage is suppressed"
+        )
+        reasons.append("schema-only reduction shown as schema_reduction_pct; not the session-input %")
+
+    if incomplete_schema:
+        if cohort.confidence != "insufficient":
+            cohort.confidence = "low"
+            cohort.net_input_reduction_pct = None
         reasons.append("some sessions had incomplete schemas and were skipped")
         reasons.append("session-input percentage and USD suppressed for incomplete evidence")
-    elif cohort.denominator_source == "provider_reported":
-        cohort.confidence = "high"
-    else:
-        cohort.confidence = "medium"
-        reasons.append("reconstructed denominator downgrades confidence to medium")
 
     # Costing rows.
     known_usd_total = 0.0
@@ -1093,7 +1108,7 @@ def project_sessions(
     else:
         cohort.usd_coverage = "none"
         cohort.estimated_usd_savings = None
-        reasons.append("no known variable-cost route; dollars suppressed, net input % used instead")
+        reasons.append("no known variable-cost route; dollars suppressed")
 
     cohort.reasons = reasons
     return cohort
