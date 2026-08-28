@@ -51,13 +51,13 @@ PLUGIN_DIR = HERE.parent
 sys.path.insert(0, str(PLUGIN_DIR.parent))
 sys.path.insert(0, str(PLUGIN_DIR))
 
-# The conftest under tests/ registers the package alias the plugin uses
-# internally. Reuse it so this script and the unit tests load the
-# plugin the same way.
-sys.path.insert(0, str(PLUGIN_DIR / "tests"))
-import conftest  # noqa: F401 — side-effect: register tool_belt_plugin
+# The shared loader registers the package alias the plugin uses internally,
+# so this script, the other scripts, and the unit tests all load the plugin
+# the same way.
+sys.path.insert(0, str(HERE))
+from _plugin_loader import load_plugin_package  # noqa: E402
 
-plugin = sys.modules["tool_belt_plugin"]
+plugin = load_plugin_package()
 logger_io = importlib.import_module("tool_belt_plugin.logger_io")
 
 

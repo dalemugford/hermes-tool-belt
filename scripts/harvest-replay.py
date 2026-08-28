@@ -57,8 +57,10 @@ HERE = Path(__file__).resolve().parent
 PLUGIN_DIR = HERE.parent
 sys.path.insert(0, str(PLUGIN_DIR.parent))
 sys.path.insert(0, str(PLUGIN_DIR))
-sys.path.insert(0, str(PLUGIN_DIR / "tests"))
-import conftest  # noqa: F401 — registers tool_belt_plugin
+sys.path.insert(0, str(HERE))
+from _plugin_loader import load_plugin_package  # noqa: E402
+
+load_plugin_package()
 
 predictor = importlib.import_module("tool_belt_plugin.predictor")
 presets_mod = importlib.import_module("tool_belt_plugin.presets")

@@ -101,7 +101,8 @@ triggers:
     tools: [execute_code]
     keywords:
       - '\b(for each|loop (over|through)|process all|filter|aggregate|map over)\b'
-      - '\b(N pages|N files|fetch all|all of them|batch|in bulk)\b'
+      - '\b\d+\s+(pages|files|items|rows|records)\b'
+      - '\b(fetch all|all of them|batch|in bulk)\b'
       - '\bwrite a (python|simple) script\b'
 
   # Subagent delegation — explicit worker/spawn intent
@@ -187,8 +188,13 @@ triggers:
       - '\b(turn (on|off)|switch (on|off)|toggle)\b.*\b(lights?|lamp|fan|outlet|plug|tv|switch|alarm)\b'
       - '\b(temperature|thermostat|climate)\b'
       - '\b(garage|door|gate|window|blinds)\b.*\b(open|close|lock|unlock)\b'
-      - '\bhome assistant\b'
-      - '\bHA\b'
+      - '\bhome ?assistant\b'
+      - '\bhass(\.io)?\b'
+      # Bare "HA" is the interjection far more often than the product, and the
+      # keyword list compiles case-insensitively (`presets._compile_keywords`),
+      # so the acronym only counts when it is upper-case *and* carries a
+      # smart-home co-word.
+      - '(?-i:\bHA\b).{0,30}\b(entit(y|ies)|state|service|automation|scene|sensor|lights?|switch)\b'
       - '\b(dim|brighten) (the )?lights?\b'
 
   # Note: tool_search / tool_describe / tool_call (Hermes' native deferred-
@@ -205,7 +211,14 @@ triggers:
       - '\bwhat did we\b'
       - '\bremember when\b'
       - '\bsession search\b'
-      - '\bhistory\b'
+      # Bare "history" is git/browser/project history far more often than the
+      # conversation log, so it needs a conversational qualifier.
+      - '\b(chat|conversation|session|message|our|my)\s+history\b'
+      - '\bsearch\b.{0,20}\bhistory\b'
+    exclude_keywords:
+      # …and the qualified forms still lose to an explicit non-conversation
+      # history ("search the git history", "clear my browser history").
+      - '\b(git|commit|revision|version|browser|shell|bash|command|file|edit|purchase|order|payment|medical)\s+histor(y|ies)\b'
 
   # Extended Mnemosyne surface — shared/canonical/triple/graph/sync/persona/
   # scratchpad/export/import/diagnose/etc. The core loop (remember, recall,
@@ -251,15 +264,15 @@ triggers:
       - mnemosyne_apply_pending
       - mnemosyne_recall_diagnostics
     keywords:
+      # This is the most expensive group in the policy, so every keyword has
+      # to be unambiguous. Bare `sync`, `batch`, `graph`, `diagnose`,
+      # `canonical` and `triple` are ordinary English in a working channel —
+      # they only count next to a memory-domain co-word.
+      - '\bmnemosyne\w*\b'
       - '\bshared memory\b'
       - '\bknowledge graph\b'
-      - '\btriple\b'
-      - '\bcanonical\b'
       - '\bpersona\b'
       - '\bscratchpad\b'
-      - '\bexport memory\b'
-      - '\bimport memory\b'
-      - '\bsync\b'
-      - '\bdiagnose\b'
-      - '\bbatch\b'
-      - '\bgraph\b'
+      - '\b(export|import)\s+(the\s+)?memor(y|ies)\b'
+      - '\bmemor(y|ies)\b.{0,30}\b(sync|synced|syncing|graph|batch|export|import|diagnose|diagnostics?|canonical|triples?|stats|validate|sleep)\b'
+      - '\b(sync|syncing|graph|batch|export|import|diagnose|diagnostics?|canonical|triples?)\b.{0,30}\bmemor(y|ies)\b'

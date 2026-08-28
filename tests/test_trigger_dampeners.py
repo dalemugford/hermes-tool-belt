@@ -27,7 +27,9 @@ def _trigger(name: str):
     return next(group for group in preset.triggers if group.name == name)
 
 
-class TriggerDampenerTests(unittest.TestCase):
+class _TriggerAssertions:
+    """Shared trigger assertions for the policy-keyword test cases."""
+
     def assert_fires(self, group_name: str, message: str) -> None:
         self.assertTrue(_trigger(group_name).matches(message, []))
 
@@ -37,6 +39,17 @@ class TriggerDampenerTests(unittest.TestCase):
         self.assertTrue(group.is_excluded(message))
         self.assertTrue(group.would_fire_positive(message, []))
 
+    def assert_quiet(self, group_name: str, message: str) -> None:
+        """No keyword matches at all — distinct from a dampened match."""
+        group = _trigger(group_name)
+        self.assertFalse(
+            group.would_fire_positive(message, []),
+            f"{group_name} should not match {message!r}",
+        )
+        self.assertFalse(group.matches(message, []))
+
+
+class TriggerDampenerTests(_TriggerAssertions, unittest.TestCase):
     def test_file_write_direct_requests_fire_and_discussion_is_suppressed(self):
         self.assert_fires("file_write", "Save notes on this to a markdown file.")
         self.assert_fires("file_write", "Patch `presets.py` with that change.")
@@ -49,6 +62,19 @@ class TriggerDampenerTests(unittest.TestCase):
         self.assert_suppressed("delegation", "Should we use subagents for this eventually?")
         self.assert_fires("cronjob", "Schedule a weekly report.")
         self.assert_suppressed("cronjob", "Should we schedule this reminder later?")
+
+    def test_code_execution_bulk_counts_use_a_numeral(self):
+        # The policy shipped a literal ``N pages`` placeholder that could only
+        # ever match the letter N; the intent was a count.
+        self.assert_fires("code_execution", "Summarise 40 pages of this PDF.")
+        self.assert_fires("code_execution", "Rename 12 files in that folder.")
+        self.assert_fires("code_execution", "Pull 500 rows out of the export.")
+
+    def test_batch_belongs_to_code_execution_only(self):
+        # `batch` used to sit in both groups, so one word loaded execute_code
+        # *and* 36 mnemosyne schemas.
+        self.assert_fires("code_execution", "Send these in one batch, please.")
+        self.assert_quiet("mnemosyne_extended", "Send these in one batch, please.")
 
     def test_learned_merge_preserves_dampeners(self):
         preset = presets.load_preset_file(PLUGIN_DIR / "policy.yaml")
@@ -101,6 +127,53 @@ class TriggerDampenerTests(unittest.TestCase):
                 else:
                     os.environ["HERMES_HOME"] = original_home
                 learned.load_state(force=True)
+
+
+class TriggerKeywordPrecisionTests(_TriggerAssertions, unittest.TestCase):
+    """Everyday words must not load specialist tool groups.
+
+    Each negative here is a false positive the shipped policy had: the
+    interjection "ha", a bare `sync`/`batch`/`graph`/`diagnose`, and any
+    mention of "history".
+    """
+
+    def test_home_assistant_requires_the_product_not_the_interjection(self):
+        self.assert_fires("homeassistant", "Ask Home Assistant for the porch light state.")
+        self.assert_fires("homeassistant", "homeassistant is offline again")
+        self.assert_fires("homeassistant", "hass keeps dropping the zigbee stick")
+        self.assert_fires("homeassistant", "Call the HA service for the hallway switch.")
+        # …but the acronym alone, lower-cased or laughing, must stay quiet.
+        self.assert_quiet("homeassistant", "ha")
+        self.assert_quiet("homeassistant", "ha ha, that's a good one")
+        self.assert_quiet("homeassistant", "haha nice")
+        self.assert_quiet("homeassistant", "ha! the state machine bit us again")
+
+    def test_mnemosyne_extended_needs_a_memory_co_word(self):
+        self.assert_fires("mnemosyne_extended", "Run mnemosyne diagnose on Sue's bank.")
+        self.assert_fires("mnemosyne_extended", "Push the memory sync to the other machine.")
+        self.assert_fires("mnemosyne_extended", "Sync my memories across the fleet.")
+        self.assert_fires("mnemosyne_extended", "Write that to the scratchpad.")
+        self.assert_fires("mnemosyne_extended", "Add it to the knowledge graph.")
+        self.assert_fires("mnemosyne_extended", "Promote that to a persona fact.")
+        self.assert_fires("mnemosyne_extended", "Export memories to a file.")
+        # The 36-schema group must not load on ordinary developer English.
+        self.assert_quiet("mnemosyne_extended", "sync the repo before you start")
+        self.assert_quiet("mnemosyne_extended", "diagnose the failing build")
+        self.assert_quiet("mnemosyne_extended", "show me a graph of the savings")
+        self.assert_quiet("mnemosyne_extended", "batch those API calls")
+        self.assert_quiet("mnemosyne_extended", "triple check the numbers")
+        self.assert_quiet("mnemosyne_extended", "use the canonical path here")
+
+    def test_history_search_needs_a_conversational_qualifier(self):
+        self.assert_fires("history_search", "Search my chat history for that link.")
+        self.assert_fires("history_search", "Pull up our conversation history from Tuesday.")
+        self.assert_fires("history_search", "Search my history for the pricing thread.")
+        self.assert_fires("history_search", "What did we decide about pricing yesterday?")
+        # Every other kind of history is somebody else's.
+        self.assert_quiet("history_search", "check the git history for that line")
+        self.assert_quiet("history_search", "clear my browser history")
+        self.assert_quiet("history_search", "the history of this project is messy")
+        self.assert_suppressed("history_search", "search the git history for that commit")
 
 
 class LearnedModeNormalizationTests(unittest.TestCase):
