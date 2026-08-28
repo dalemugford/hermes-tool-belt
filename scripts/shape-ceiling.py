@@ -34,8 +34,8 @@ What it does NOT do
   · No bundle-level decisions. The unit is the tool, not the toolset.
   · No per-turn adjustments. Run-frequency is on the order of daily
     or session-boundary, not per-message.
-  · No clobbering of user-facing config. Hand-tuning happens via
-    ``config.yaml`` (existing mechanism); this script owns the adaptive
+  · No clobbering of user-facing config. Hand-tuning happens through
+    ``hermes config set`` (existing mechanism); this script owns the adaptive
     ``carry`` / ``expand_only`` assignment for a scope under its own
     ``shaping`` sub-key of ``learned.json``, written in the canonical v2
     shape (``carry`` / ``expand_only`` / ``shaping``) through
@@ -48,9 +48,24 @@ Usage
   python3 scripts/shape-ceiling.py --dry-run            # report only
   python3 scripts/shape-ceiling.py --scope assistant-a:telegram
   python3 scripts/shape-ceiling.py --window 50          # consider last 50 sessions per scope
+  python3 scripts/shape-ceiling.py --json               # porcelain document on stdout
+  python3 scripts/shape-ceiling.py --json-file out.json # porcelain document to a file
 
 Threshold defaults come from ``policy.yaml`` under
 ``learning.shape_ceiling``. CLI flags still win when passed explicitly.
+
+Output contract
+===============
+
+The prose printed to stdout is for humans and is **not** a contract: no
+caller may parse it. Programs consume the porcelain document produced by
+``--json`` / ``--json-file`` — a versioned JSON object (see
+:data:`PORCELAIN_SCHEMA` / :data:`PORCELAIN_VERSION`) whose top-level
+``wrote_learned_state`` boolean is the single authoritative answer to "did
+this run rewrite ``learned.json``".
+
+PyYAML is required (it ships in every Hermes virtualenv); running under an
+interpreter without it exits loudly rather than degrading.
 """
 
 from __future__ import annotations
@@ -75,8 +90,15 @@ from typing import Any
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PLUGIN_DIR))
 from logger_io import normalize_prediction_row, normalize_tool_call_row  # noqa: E402
+from yaml_required import require_yaml  # noqa: E402
 
 logger = logging.getLogger("tool_belt_plugin.shape_ceiling")
+
+#: Porcelain (machine-readable) output identity. ``PORCELAIN_VERSION`` is
+#: bumped whenever a key is removed or its meaning changes; additive keys do
+#: not bump it.
+PORCELAIN_SCHEMA = "tool-belt/shape-ceiling"
+PORCELAIN_VERSION = 1
 
 
 def _load_learned():
@@ -125,80 +147,32 @@ def default_state_dir() -> Path:
 
 
 def load_shape_ceiling_defaults(policy_path: Path = _POLICY_PATH) -> dict[str, int]:
-    """Load shaper defaults from policy.yaml, falling back silently on errors.
+    """Load shaper defaults from ``policy.yaml``'s ``learning.shape_ceiling``.
 
-    Prefer PyYAML when available so the parser follows the real policy shape.
-    If this runtime lacks PyYAML, fall back to a tiny indentation-based reader
-    for the `learning.shape_ceiling` block rather than disabling inheritance.
+    PyYAML is required: :func:`yaml_required.require_yaml` exits loudly when
+    it is missing rather than degrading to a second, divergent parser. A
+    missing or malformed policy file still falls back to :data:`DEFAULTS` —
+    that is a policy-content question, not a wrong-interpreter one.
     """
+    yaml = require_yaml()
     try:
         raw = policy_path.read_text(encoding="utf-8")
     except Exception:
         return dict(DEFAULTS)
 
-    data: dict[str, Any] | None = None
     try:
-        import yaml  # type: ignore[import-untyped]
         loaded = yaml.safe_load(raw) or {}
-        if isinstance(loaded, dict):
-            data = loaded
     except Exception:
-        data = None
+        return dict(DEFAULTS)
+    if not isinstance(loaded, dict):
+        return dict(DEFAULTS)
 
-    if isinstance(data, dict):
-        learning = data.get("learning")
-        if isinstance(learning, dict):
-            shape = learning.get("shape_ceiling")
-            if isinstance(shape, dict):
-                return _merge_shape_defaults(shape)
-
-    shape: dict[str, int] = {}
-    in_learning = False
-    in_shape = False
-    learning_indent = None
-    shape_indent = None
-    for raw_line in raw.splitlines():
-        line = raw_line.split("#", 1)[0].rstrip()
-        if not line.strip():
-            continue
-        indent = len(line) - len(line.lstrip(" "))
-        stripped = line.strip()
-
-        if stripped == "learning:":
-            in_learning = True
-            in_shape = False
-            learning_indent = indent
-            shape_indent = None
-            continue
-        if in_learning and learning_indent is not None and indent <= learning_indent and stripped != "learning:":
-            in_learning = False
-            in_shape = False
-            learning_indent = None
-            shape_indent = None
-        if not in_learning:
-            continue
-
-        if stripped == "shape_ceiling:":
-            in_shape = True
-            shape_indent = indent
-            continue
-        if in_shape and shape_indent is not None and indent <= shape_indent and stripped != "shape_ceiling:":
-            in_shape = False
-            shape_indent = None
-        if not in_shape or ":" not in stripped:
-            continue
-
-        key, value = [part.strip() for part in stripped.split(":", 1)]
-        if key not in {"session_window", "promote_min_sessions", "promote_min_calls", "demote_min_sessions_no_use"}:
-            continue
-        try:
-            parsed = int(value)
-        except Exception:
-            continue
-        if parsed > 0:
-            shape[key] = parsed
-
-    return _merge_shape_defaults(shape)
+    learning = loaded.get("learning")
+    if isinstance(learning, dict):
+        shape = learning.get("shape_ceiling")
+        if isinstance(shape, dict):
+            return _merge_shape_defaults(shape)
+    return dict(DEFAULTS)
 
 
 def _merge_shape_defaults(overrides: dict[str, Any]) -> dict[str, int]:
@@ -560,6 +534,98 @@ def merge_into_learned(
     return state, changed
 
 
+def _activation_hint(scopes: list[str]) -> str:
+    """Guidance for turning written recommendations into a live loadout.
+
+    Hermes owns its configuration file: activation goes through the guided
+    command or through ``hermes config set``. This text must never tell an
+    operator to hand-edit a config file — ``scripts/configure.py`` and
+    ``scripts/README.md`` forbid exactly that.
+    """
+    agents = sorted({(s.split(":", 1)[0] or s) for s in scopes if s}) or ["<agent>"]
+    lines = [
+        "\nRecommendations are written but inert until the scope's learned_mode is 'apply'.",
+        "  Guided:  python3 scripts/configure.py --agent %s --path shape" % agents[0],
+    ]
+    if len(agents) > 1:
+        lines.append("           (repeat per agent: %s)" % ", ".join(agents[1:]))
+    lines.append("  Direct:  hermes config set "
+                 "plugins.tool-belt.channels.<scope>.learned_mode apply")
+    for scope in scopes[:5]:
+        lines.append("             e.g. hermes config set "
+                     f"plugins.tool-belt.channels.{scope}.learned_mode apply")
+    return "\n".join(lines)
+
+
+def build_porcelain(
+    per_scope: dict[str, dict[str, Any]],
+    state_dir: Path,
+    thresholds: dict[str, int],
+    dry_run: bool,
+    changed: bool,
+) -> dict[str, Any]:
+    """Assemble the machine-readable run document.
+
+    This is the shaper's only output contract. ``wrote_learned_state`` is the
+    stable top-level answer callers branch on: true exactly when this run
+    persisted ``learned.json`` (i.e. there was a structural change *and* the
+    run was not a dry run). ``changed`` reports the recommendation delta
+    independently of whether it was written, so a dry run can still say
+    "changes pending".
+    """
+    scopes: list[dict[str, Any]] = []
+    for scope in sorted(per_scope):
+        recs = per_scope[scope]
+        considered = int(recs.get("sessions_considered") or 0)
+        scopes.append({
+            "scope": scope,
+            "sessions_considered": considered,
+            "window_requested": int(recs.get("window_requested") or 0),
+            "computed_at": recs.get("computed_at"),
+            "promote": [
+                {
+                    "tool": str(p.get("tool") or ""),
+                    "sessions": int(p.get("sessions") or 0),
+                    "calls": int(p.get("calls") or 0),
+                    "evidence": str(p.get("evidence") or ""),
+                }
+                for p in (recs.get("promote") or [])
+            ],
+            "demote": [
+                {
+                    "tool": str(d.get("tool") or ""),
+                    "sessions_without_use": int(d.get("sessions_without_use") or 0),
+                    "evidence": str(d.get("evidence") or ""),
+                }
+                for d in (recs.get("demote") or [])
+            ],
+            # True when the window was too short for the demote half to run at
+            # all — distinct from "ran and found nothing".
+            "demote_skipped_insufficient_sessions": (
+                considered < int(thresholds.get("demote_min_sessions_no_use") or 0)
+            ),
+        })
+    return {
+        "schema": PORCELAIN_SCHEMA,
+        "version": PORCELAIN_VERSION,
+        "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "state_dir": str(state_dir),
+        "learned_path": str(state_dir / "learned.json"),
+        "dry_run": bool(dry_run),
+        "changed": bool(changed),
+        "wrote_learned_state": bool(changed and not dry_run),
+        "thresholds": {
+            "session_window": int(thresholds.get("session_window") or 0),
+            "promote_min_sessions": int(thresholds.get("promote_min_sessions") or 0),
+            "promote_min_calls": int(thresholds.get("promote_min_calls") or 0),
+            "demote_min_sessions_no_use": int(
+                thresholds.get("demote_min_sessions_no_use") or 0
+            ),
+        },
+        "scopes": scopes,
+    }
+
+
 def main() -> int:
     defaults = load_shape_ceiling_defaults()
     ap = argparse.ArgumentParser(description=__doc__)
@@ -570,13 +636,51 @@ def main() -> int:
     ap.add_argument("--promote-min-calls", type=int, default=defaults["promote_min_calls"])
     ap.add_argument("--demote-min-sessions", type=int, default=defaults["demote_min_sessions_no_use"])
     ap.add_argument("--dry-run", action="store_true", help="report only, don't write learned.json")
+    ap.add_argument("--json", action="store_true",
+                    help="emit the porcelain JSON document on stdout instead of prose")
+    ap.add_argument("--json-file", default="",
+                    help="also write the porcelain JSON document to this path")
     args = ap.parse_args()
 
+    # Prose goes to stderr under --json so stdout stays a single JSON document.
+    out = sys.stderr if args.json else sys.stdout
+
     state_dir = Path(args.state_dir)
+    thresholds = {
+        "session_window": args.window,
+        "promote_min_sessions": args.promote_min_sessions,
+        "promote_min_calls": args.promote_min_calls,
+        "demote_min_sessions_no_use": args.demote_min_sessions,
+    }
+
+    def emit_porcelain(
+        per_scope: dict[str, dict[str, Any]],
+        changed: bool,
+        error: str = "",
+    ) -> None:
+        """Write the porcelain document wherever the flags asked for it.
+
+        Emitted on every exit path, including the empty ones, so a caller can
+        always parse a document rather than special-casing an error banner.
+        """
+        if not args.json and not args.json_file:
+            return
+        doc = build_porcelain(per_scope, state_dir, thresholds, args.dry_run, changed)
+        if error:
+            doc["error"] = error
+        text = json.dumps(doc, indent=2, sort_keys=False)
+        if args.json_file:
+            path = Path(args.json_file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text + "\n", encoding="utf-8")
+        if args.json:
+            print(text)
+
     preds = load_jsonl(state_dir / "predictions.jsonl")
     tool_calls = load_jsonl(state_dir / "tool_calls.jsonl")
     if not preds:
         print(f"No predictions.jsonl rows under {state_dir}. Nothing to shape.", file=sys.stderr)
+        emit_porcelain({}, changed=False, error="no_predictions")
         return 1
 
     grouped = group_predictions_by_scope_session(preds)
@@ -598,34 +702,40 @@ def main() -> int:
 
     if not per_scope:
         print(f"No scopes matched filter {args.scope!r}.", file=sys.stderr)
+        emit_porcelain({}, changed=False, error="no_matching_scopes")
         return 1
 
     state, changed = merge_into_learned(state_dir, per_scope, args.dry_run)
+    emit_porcelain(per_scope, changed=changed)
 
+    # ── Human-readable report. Prose only: no caller parses any of this. ──
     for scope, recs in per_scope.items():
-        print(f"\n=== {scope}  (sessions_considered={recs['sessions_considered']}) ===")
+        print(f"\n=== {scope}  (sessions_considered={recs['sessions_considered']}) ===", file=out)
         if recs["promote"]:
-            print("  Promote:")
+            print("  Promote:", file=out)
             for p in recs["promote"]:
-                print(f"    + {p['tool']:<30} sessions={p['sessions']:>2}  calls={p['calls']:>3}  evidence={p['evidence']}")
+                print(f"    + {p['tool']:<30} sessions={p['sessions']:>2}  calls={p['calls']:>3}  evidence={p['evidence']}", file=out)
         else:
-            print("  Promote: (none — no tools met the threshold)")
+            print("  Promote: (none — no tools met the threshold)", file=out)
         if recs["demote"]:
-            print("  Demote:")
+            print("  Demote:", file=out)
             for d in recs["demote"]:
-                print(f"    - {d['tool']:<30} sessions_without_use={d['sessions_without_use']}  evidence={d['evidence']}")
+                print(f"    - {d['tool']:<30} sessions_without_use={d['sessions_without_use']}  evidence={d['evidence']}", file=out)
         elif recs["sessions_considered"] < args.demote_min_sessions:
-            print(f"  Demote: (skipped — only {recs['sessions_considered']} sessions, need ≥{args.demote_min_sessions})")
+            print(f"  Demote: (skipped — only {recs['sessions_considered']} sessions, need ≥{args.demote_min_sessions})", file=out)
         else:
-            print("  Demote: (none)")
+            print("  Demote: (none)", file=out)
 
-    if args.dry_run:
-        print("\n[dry-run] No changes written to learned.json")
+    if args.dry_run and changed:
+        print("\n[dry-run] Recommendations differ from learned.json; nothing was written.", file=out)
+        print("  Re-run without --dry-run to write them.", file=out)
+    elif args.dry_run:
+        print("\n[dry-run] No changes — recommendations match current learned.json content.", file=out)
     elif changed:
-        print(f"\nWrote updated recommendations to {state_dir / 'learned.json'}")
-        print("To activate the recommendations, set ``learned_mode: apply`` for the scope in config.yaml.")
+        print(f"\nWrote updated recommendations to {state_dir / 'learned.json'}", file=out)
+        print(_activation_hint(sorted(per_scope)), file=out)
     else:
-        print("\nNo changes — recommendations match current learned.json content.")
+        print("\nNo changes — recommendations match current learned.json content.", file=out)
     return 0
 
 

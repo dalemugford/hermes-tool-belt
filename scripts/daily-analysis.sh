@@ -8,12 +8,28 @@
 # line in the consolidated daily-summary.log, prefixed with the source
 # label so a week of runs is still scannable with one `cat`.
 #
+# After the analyzer, each source is also run through the between-session
+# shaper. The shaper runs in --dry-run by default: an unattended job reports
+# what it would change but does not rewrite the reviewed learned.json.
+# Set SHAPE_APPLY=1 to opt in to the write (the effect is still gated behind
+# each scope's learned_mode).
+#
 # Safe to run by hand or from the scheduler appropriate to the host.
 set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
 PYTHON="${HERMES_PYTHON:-python3}"
+
+# Consent default: the shaper only writes learned.json when explicitly asked.
+SHAPE_APPLY="${SHAPE_APPLY:-0}"
+if [[ "${SHAPE_APPLY}" == "1" ]]; then
+    SHAPE_MODE_ARGS=()
+    SHAPE_MODE_LABEL="apply"
+else
+    SHAPE_MODE_ARGS=(--dry-run)
+    SHAPE_MODE_LABEL="dry-run"
+fi
 
 # Logs are always written to the root state dir, regardless of which
 # source the run is analyzing — keeps the summary log consolidated.
@@ -120,24 +136,55 @@ PY
     echo "${line}" | tee -a "${SUMMARY_LOG}"
 
     SHAPE_LOG="${ROOT_LOG_DIR}/${TS_FILE_LOCAL}-${label}.shape.log"
+    SHAPE_JSON="${ROOT_LOG_DIR}/${TS_FILE_LOCAL}-${label}.shape.json"
+    # The shaper's prose is for humans; the porcelain document written to
+    # --json-file is the contract this script branches on. `${arr[@]+…}` keeps
+    # the empty-array expansion legal under `set -u` on bash 3.2.
     if "${PYTHON}" "${PLUGIN_DIR}/scripts/shape-ceiling.py" \
             --state-dir "${state_dir}" \
+            --json-file "${SHAPE_JSON}" \
+            ${SHAPE_MODE_ARGS[@]+"${SHAPE_MODE_ARGS[@]}"} \
             > "${SHAPE_LOG}" \
             2>&1; then
         :
     else
         rc=$?
-        echo "${TS_UTC}  [${label}]  shape_error  shaper exited rc=${rc}; see ${SHAPE_LOG}" \
+        echo "${TS_UTC}  [${label}]  shape_error (${SHAPE_MODE_LABEL})  shaper exited rc=${rc}; see ${SHAPE_LOG}" \
             | tee -a "${SUMMARY_LOG}" >&2
         overall_rc=$rc
         continue
     fi
 
-    if grep -q "Wrote updated recommendations" "${SHAPE_LOG}"; then
-        echo "${TS_UTC}  [${label}]  shape_ok  learned.json updated" \
-            | tee -a "${SUMMARY_LOG}"
+    # Read the two booleans out of the porcelain document: whether the run
+    # actually persisted learned.json, and whether the recommendations differ
+    # from what is on disk. jq when present; otherwise the same guaranteed
+    # interpreter resolved above (both print "<wrote> <changed>", lowercase).
+    if command -v jq >/dev/null 2>&1; then
+        shape_flags="$(jq -r '[(.wrote_learned_state | tostring), (.changed | tostring)] | join(" ")' \
+            "${SHAPE_JSON}" 2>/dev/null || true)"
     else
-        echo "${TS_UTC}  [${label}]  shape_ok  learned.json unchanged" \
+        shape_flags="$("${PYTHON}" -c 'import json,sys; d=json.load(open(sys.argv[1])); print(str(bool(d.get("wrote_learned_state"))).lower(), str(bool(d.get("changed"))).lower())' \
+            "${SHAPE_JSON}" 2>/dev/null || true)"
+    fi
+    shape_wrote="${shape_flags%% *}"
+    shape_changed="${shape_flags##* }"
+
+    shape_keep_log=0
+    if [[ -z "${shape_flags}" ]]; then
+        echo "${TS_UTC}  [${label}]  shape_error (${SHAPE_MODE_LABEL})  porcelain output unreadable; see ${SHAPE_JSON}" \
+            | tee -a "${SUMMARY_LOG}" >&2
+        overall_rc=1
+        shape_keep_log=1
+    elif [[ "${shape_wrote}" == "true" ]]; then
+        echo "${TS_UTC}  [${label}]  shape_ok (apply)  learned.json updated" \
+            | tee -a "${SUMMARY_LOG}"
+        shape_keep_log=1
+    elif [[ "${shape_changed}" == "true" ]]; then
+        echo "${TS_UTC}  [${label}]  shape_pending (${SHAPE_MODE_LABEL})  changes recommended, nothing written; re-run with SHAPE_APPLY=1" \
+            | tee -a "${SUMMARY_LOG}"
+        shape_keep_log=1
+    else
+        echo "${TS_UTC}  [${label}]  shape_ok (${SHAPE_MODE_LABEL})  learned.json unchanged" \
             | tee -a "${SUMMARY_LOG}"
     fi
 
@@ -145,11 +192,12 @@ PY
     # "recommendations:" info lines (analyzer routes those to stderr when
     # --format json so stdout stays parseable). Drop it to keep the
     # directory readable — a real failure exits non-zero above and stderr
-    # is preserved. Keep the shaper log only when it actually wrote or
-    # failed, so normal no-op runs stay tidy while first writes are auditable.
+    # is preserved. Keep the shaper's log and porcelain document only when
+    # the run wrote, has changes pending, or could not be read, so normal
+    # no-op runs stay tidy while anything auditable is preserved.
     rm -f "${STDERR_LOG}"
-    if ! grep -q "Wrote updated recommendations" "${SHAPE_LOG}"; then
-        rm -f "${SHAPE_LOG}"
+    if [[ "${shape_keep_log}" -eq 0 ]]; then
+        rm -f "${SHAPE_LOG}" "${SHAPE_JSON}"
     fi
 done
 

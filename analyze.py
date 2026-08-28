@@ -31,9 +31,11 @@ from typing import Any, Iterable
 try:  # package / test import
     from . import logger_io  # type: ignore[import-not-found]
     from . import savings as _savings  # type: ignore[import-not-found]
+    from .yaml_required import require_yaml  # type: ignore[import-not-found]
 except ImportError:  # script mode
     import logger_io  # type: ignore[no-redef]
     import savings as _savings  # type: ignore[no-redef]
+    from yaml_required import require_yaml  # type: ignore[no-redef]
 
 DEFAULT_PER_TOOL_TOKENS = 388
 DEFAULT_MIN_EXPANSIONS = 2
@@ -555,21 +557,19 @@ def _load_preset_excludes(
     Returns ``(excludes_by_trigger, status)`` where ``status`` is one of:
 
       ``"ok"``           — policy.yaml parsed and excludes compiled
-      ``"no_yaml"``      — PyYAML not importable in this Python runtime
       ``"no_policy"``    — policy.yaml file missing under ``plugin_dir``
       ``"parse_error"``  — YAML present but failed to parse
 
-    The status lets the caller distinguish an empty policy from a missing
-    loader, so a degraded run can say so instead of silently reporting
-    "existing_exclude_keyword_count: 0".
+    A missing PyYAML is not one of them: :func:`require_yaml` exits the
+    process instead, because a run without the parser silently reports
+    "existing_exclude_keyword_count: 0" against a policy it never read. The
+    ``"no_yaml"`` status remains in :data:`_EXCLUDES_STATUS_MESSAGE` so
+    previously written payloads still render.
     """
     path = plugin_dir / "policy.yaml"
     if not path.exists():
         return {}, "no_policy"
-    try:
-        import yaml  # type: ignore[import-untyped]
-    except Exception:
-        return {}, "no_yaml"
+    yaml = require_yaml()
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
@@ -594,6 +594,8 @@ def _load_preset_excludes(
 
 
 _EXCLUDES_STATUS_MESSAGE = {
+    # Retained for payloads written before PyYAML became a hard requirement;
+    # the loaders now exit rather than returning this status.
     "no_yaml": (
         "PyYAML is not installed in this Python runtime — policy.yaml "
         "exclude_keywords are NOT being applied to dampener candidates. "
@@ -621,43 +623,20 @@ def _load_preset_always_carry(plugin_dir: Path) -> tuple[set[str], str]:
     into ``carry`` is protected against spurious demotion by this set).
 
     Returns ``(tools, status)`` using the same status enum as
-    :func:`_load_preset_excludes`. When PyYAML is unavailable, fall back to a
-    tiny line-oriented parser for the top-level ``always_carry`` list so the
-    analyzer still honors the immutable residents.
+    :func:`_load_preset_excludes`. PyYAML is required — the previous
+    line-oriented fallback honored ``always_carry`` but silently dropped
+    ``exclude_keywords`` and ``triggers``, producing a half-read policy that
+    looked like a complete one.
     """
     path = plugin_dir / "policy.yaml"
     if not path.exists():
         return set(), "no_policy"
 
-    def fallback_parse() -> set[str]:
-        tools: set[str] = set()
-        in_always_carry = False
-        for raw_line in path.read_text(encoding="utf-8").splitlines():
-            stripped = raw_line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            if not in_always_carry:
-                if stripped == "always_carry:":
-                    in_always_carry = True
-                continue
-            if raw_line and not raw_line.startswith((" ", "	")):
-                break
-            if stripped.startswith("- "):
-                item = stripped[2:].split("#", 1)[0].strip()
-                if item:
-                    tools.add(item)
-        return tools
-
-    try:
-        import yaml  # type: ignore[import-untyped]
-    except Exception:
-        tools = fallback_parse()
-        return tools, "ok" if tools else "no_yaml"
+    yaml = require_yaml()
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:
-        tools = fallback_parse()
-        return tools, "ok" if tools else "parse_error"
+        return set(), "parse_error"
     tools = {
         str(tool).strip()
         for tool in (data.get("always_carry") or [])
@@ -696,10 +675,7 @@ def _load_preset_triggers(
     path = plugin_dir / "policy.yaml"
     if not path.exists():
         return {}, "no_policy"
-    try:
-        import yaml  # type: ignore[import-untyped]
-    except Exception:
-        return {}, "no_yaml"
+    yaml = require_yaml()
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except Exception:

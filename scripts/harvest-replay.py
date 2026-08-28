@@ -66,6 +66,7 @@ predictor = importlib.import_module("tool_belt_plugin.predictor")
 presets_mod = importlib.import_module("tool_belt_plugin.presets")
 logger_io = importlib.import_module("tool_belt_plugin.logger_io")
 savings_mod = importlib.import_module("tool_belt_plugin.savings")
+require_yaml = importlib.import_module("tool_belt_plugin.yaml_required").require_yaml
 
 
 # How far ahead in JSONL order to look for tool calls that "respond" to
@@ -371,14 +372,18 @@ def _load_plugin_config(profile_home: Path) -> dict[str, Any]:
     Returns a config dict shaped exactly like what the plugin's
     register() builds from ``cfg_get("plugins.tool-belt.*")``, with
     ``enabled: True`` so resolve_preset proceeds. Returns ``{"enabled":
-    True}`` (no overrides) if config.yaml is missing or unreadable —
+    True}`` (no overrides) if the config file is missing or unparseable —
     matches the live fail-safe behavior.
+
+    A missing PyYAML is *not* one of those cases: it would silently drop
+    every per-profile override and replay the wrong policy, so
+    :func:`require_yaml` exits instead.
     """
     config_path = profile_home / "config.yaml"
     if not config_path.is_file():
         return {"enabled": True}
+    yaml = require_yaml()
     try:
-        import yaml  # type: ignore[import-untyped]
         data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except Exception:
         return {"enabled": True}

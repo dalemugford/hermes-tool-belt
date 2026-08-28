@@ -378,7 +378,15 @@ class SessionEndCleanupTests(unittest.TestCase):
 
 
 class AnalyzerExcludesDegradedModeTests(unittest.TestCase):
-    def test_load_preset_excludes_returns_status_no_yaml(self):
+    def test_load_preset_excludes_exits_without_pyyaml(self):
+        """PyYAML is a hard requirement for the operator scripts.
+
+        A missing parser means the wrong interpreter, not a missing
+        dependency: every Hermes venv ships PyYAML. Degrading would report
+        "existing_exclude_keyword_count: 0" against a policy never read, so
+        the loader exits instead. The ``no_yaml`` status string survives only
+        so payloads written before this change still render.
+        """
         import builtins
         real_import = builtins.__import__
 
@@ -389,9 +397,9 @@ class AnalyzerExcludesDegradedModeTests(unittest.TestCase):
 
         with mock.patch.dict(sys.modules, {"yaml": None}):
             with mock.patch.object(builtins, "__import__", fake_import):
-                out, status = analyze._load_preset_excludes(Path(plugin.__file__).parent)
-        self.assertEqual(out, {})
-        self.assertEqual(status, "no_yaml")
+                with self.assertRaises(SystemExit) as ctx:
+                    analyze._load_preset_excludes(Path(plugin.__file__).parent)
+        self.assertEqual(ctx.exception.code, 2)
         self.assertIn("PyYAML is not installed", analyze._EXCLUDES_STATUS_MESSAGE["no_yaml"])
 
     def test_load_preset_excludes_returns_status_no_policy(self):
@@ -399,7 +407,10 @@ class AnalyzerExcludesDegradedModeTests(unittest.TestCase):
         self.assertEqual(out, {})
         self.assertEqual(status, "no_policy")
 
-    def test_load_preset_always_carry_falls_back_without_pyyaml(self):
+    def test_load_preset_always_carry_reads_the_shipped_policy(self):
+        # (Formerly named for a no-PyYAML fallback it never exercised; the
+        # fallback is gone — see tests/test_shaper_porcelain.py for the
+        # loud-exit path.)
         tools, status = analyze._load_preset_always_carry(Path(plugin.__file__).parent)
         self.assertEqual(status, "ok")
         # always_carry holds only the immutable residents; adaptive carry tools

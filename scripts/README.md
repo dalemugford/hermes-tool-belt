@@ -161,15 +161,24 @@ recreates each file on the next append.
 ### Run periodic analysis
 
 ```bash
-scripts/daily-analysis.sh
+scripts/daily-analysis.sh              # analyze + shape in dry-run (default)
+SHAPE_APPLY=1 scripts/daily-analysis.sh  # also let the shaper write learned.json
 ```
+
+The shaper step runs with `--dry-run` by default: an unattended run reports
+what it would change and logs `shape_pending`, but never rewrites the
+`learned.json` you reviewed. Set `SHAPE_APPLY=1` to opt in to the write (its
+effect on the live loadout is still gated by each scope's `learned_mode`).
 
 Generated output is written to:
 
 - `reports/<profile>/` inside the local plugin checkout (ignored by Git)
 - `<state-dir>/learned_recommendations.json`
-- `<state-dir>/learned.json` when shaping evidence changes
-- `$HERMES_HOME/state/tool-belt/cron-logs/`
+- `<state-dir>/learned.json` — only under `SHAPE_APPLY=1`, and only when
+  shaping evidence changes
+- `$HERMES_HOME/state/tool-belt/cron-logs/` (per-run shaper log and its
+  machine-readable `*.shape.json`, kept when a run wrote or has changes
+  pending)
 
 Scheduler setup is environment-specific. Invoke `daily-analysis.sh` from the
 scheduler appropriate to the host; no machine-specific scheduler configuration
