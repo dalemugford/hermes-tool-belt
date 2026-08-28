@@ -82,6 +82,7 @@ predictor_mod = importlib.import_module("tool_belt_plugin.predictor")
 learned_mod = importlib.import_module("tool_belt_plugin.learned")
 analyze_mod = importlib.import_module("tool_belt_plugin.analyze")
 logger_io_mod = importlib.import_module("tool_belt_plugin.logger_io")
+expand_tools_mod = importlib.import_module("tool_belt_plugin.expand_tools")
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 
@@ -658,6 +659,57 @@ class ExpansionCeilingContract(_CarryingContract):
         self.assertIn("read_file", m.active,
                       "a ceiling-present expand_only tool activates via expansion")
         self.assertIn("read_file", m.X, "activation does not change residency")
+
+
+# ─── 18. discoverability manifest is derived from X (Phase 4 contract) ──────
+
+class DiscoverabilityManifestContract(_CarryingContract):
+    """The expand-only manifest names exactly the expand_only stratum ``X`` —
+    residents (A ∪ C) and MCP/plugin pass-through names never appear, and the
+    manifest is stable across trigger activation (residency, not the active
+    set, drives it)."""
+
+    _INDEX = {
+        "web": {"web_extract"},
+        "browser": {"browser_exec"},
+    }
+
+    def test_manifest_names_only_expand_only_stratum(self):
+        E = {"clarify", "send_message", "expand_tools", "read_file",
+             "web_extract", "browser_exec"}
+        m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry={"read_file"},
+                         passthrough={"mcp__github__create_issue"})
+
+        text = expand_tools_mod.build_expand_only_manifest(
+            m.X, category_index=self._INDEX)
+
+        # Every X member is named.
+        for name in m.X:
+            self.assertIn(name, text, f"expand_only tool {name!r} must be listed")
+        # No resident (A ∪ C) is named as a listed member.
+        for name in (m.A | m.C):
+            for line in text.splitlines()[1:]:  # skip header prose
+                if ":" in line:
+                    self.assertNotIn(name, line.split(":", 1)[1],
+                                     f"resident {name!r} must not be a manifest entry")
+        # Pass-through is outside the built-in partition and never listed.
+        self.assertNotIn("mcp__github__create_issue", text)
+        self.assertNotIn("github", text)
+
+    def test_manifest_stable_across_trigger_activation(self):
+        E = {"clarify", "send_message", "read_file", "web_extract", "browser_exec"}
+        carry = {"read_file"}
+
+        m0 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry)
+        m1 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry,
+                          triggered={"web_extract"}, prior_active=m0.active)
+        # Residency (X) is frozen; activation grew the active set only.
+        self.assertEqual(m0.X, m1.X)
+        self.assertEqual(
+            expand_tools_mod.build_expand_only_manifest(m0.X, category_index=self._INDEX),
+            expand_tools_mod.build_expand_only_manifest(m1.X, category_index=self._INDEX),
+            "manifest is stable across trigger activation",
+        )
 
 
 if __name__ == "__main__":

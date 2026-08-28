@@ -337,5 +337,121 @@ class CeilingGateTests(unittest.TestCase):
         self.assertEqual(payload["unavailable_tools"], [])
 
 
+class ExpandOnlyManifestBuilderTests(unittest.TestCase):
+    """Phase 4: the name-only expand-only discoverability manifest.
+
+    These pin the pure builder (``build_expand_only_manifest``) and the
+    non-mutating clone helper (``augment_schema_with_manifest``). A category
+    index is injected so the builder is exercised without the live ``toolsets``
+    table.
+    """
+
+    # A representative toolset table (category -> member tool names).
+    _INDEX = {
+        "browser": {"browser_navigate", "browser_click", "browser_exec"},
+        "image_gen": {"image_generate"},
+        "web": {"web_extract", "web_search"},
+        "terminal": {"run_command"},
+    }
+
+    def test_manifest_groups_names_by_category(self):
+        text = expand_tools.build_expand_only_manifest(
+            ["browser_exec", "browser_click", "web_extract"],
+            category_index=self._INDEX,
+        )
+        self.assertIn("browser: browser_click, browser_exec", text)
+        self.assertIn("web: web_extract", text)
+        # Names within a group are sorted; the group header names the category.
+        self.assertLess(text.index("browser:"), text.index("web:"),
+                        "categories sort alphabetically")
+
+    def test_unknown_name_falls_into_labeled_ungrouped_bucket(self):
+        text = expand_tools.build_expand_only_manifest(
+            ["brand_new_builtin", "browser_exec"],
+            category_index=self._INDEX,
+        )
+        self.assertIn("(ungrouped): brand_new_builtin", text)
+        # Ungrouped bucket always sorts last, after known categories.
+        self.assertLess(text.index("browser:"), text.index("(ungrouped):"))
+
+    def test_ordering_deterministic_across_input_orders(self):
+        a = expand_tools.build_expand_only_manifest(
+            ["web_extract", "browser_exec", "brand_new", "browser_click"],
+            category_index=self._INDEX,
+        )
+        b = expand_tools.build_expand_only_manifest(
+            ["browser_click", "brand_new", "web_extract", "browser_exec"],
+            category_index=self._INDEX,
+        )
+        self.assertEqual(a, b, "manifest text is independent of input ordering")
+
+    def test_empty_when_no_expand_only_names(self):
+        self.assertEqual(
+            expand_tools.build_expand_only_manifest([], category_index=self._INDEX),
+            "",
+        )
+        self.assertEqual(
+            expand_tools.build_expand_only_manifest(None, category_index=self._INDEX),
+            "",
+        )
+
+    def test_names_deduplicated(self):
+        text = expand_tools.build_expand_only_manifest(
+            ["browser_exec", "browser_exec"],
+            category_index=self._INDEX,
+        )
+        self.assertEqual(text.count("browser_exec"), 1, "duplicate names collapse")
+
+    def test_manifest_size_budget_under_representative_full_ceiling(self):
+        # A generous but realistic full expand-only stratum: ~40 tools across
+        # a dozen categories plus a couple of unknowns. The manifest must stay
+        # compact (names + labels, not prose). This guards against future
+        # schema bloat — if the manifest grows past the budget the failure is
+        # visible and intentional to change.
+        index = {
+            f"cat{c:02d}": {f"tool_{c:02d}_{i}" for i in range(4)}
+            for c in range(12)
+        }
+        names = sorted(n for members in index.values() for n in members)
+        names += ["orphan_alpha", "orphan_beta"]
+        text = expand_tools.build_expand_only_manifest(names, category_index=index)
+        budget = 2000  # characters
+        self.assertLess(
+            len(text), budget,
+            f"expand-only manifest is {len(text)} chars; budget is {budget}. "
+            "Prefer names + category labels over prose.",
+        )
+        # Report the size for the delegation record.
+        print(f"[manifest-size] representative_full_ceiling_chars={len(text)}")
+
+    def test_augment_clones_schema_without_mutating_original(self):
+        import copy
+        original = copy.deepcopy(expand_tools.SCHEMA)
+        manifest = "MANIFEST-SENTINEL"
+        clone = expand_tools.augment_schema_with_manifest(expand_tools.SCHEMA, manifest)
+        # The registered object is untouched...
+        self.assertEqual(expand_tools.SCHEMA, original,
+                         "the registered SCHEMA must remain deep-equal")
+        # ...and the clone is a distinct object carrying the manifest.
+        self.assertIsNot(clone, expand_tools.SCHEMA)
+        self.assertIn(manifest, clone["description"])
+        self.assertNotIn(manifest, expand_tools.SCHEMA["description"])
+
+    def test_augment_with_empty_manifest_returns_original_object(self):
+        # Fail-open contract: no manifest text -> the original schema object,
+        # unchanged and un-cloned.
+        result = expand_tools.augment_schema_with_manifest(expand_tools.SCHEMA, "")
+        self.assertIs(result, expand_tools.SCHEMA)
+
+    def test_augment_handles_openai_function_shape(self):
+        schema = {"type": "function",
+                  "function": {"name": "expand_tools", "description": "base"}}
+        clone = expand_tools.augment_schema_with_manifest(schema, "MFEST")
+        self.assertIn("MFEST", clone["function"]["description"])
+        # Original nested dict untouched.
+        self.assertEqual(schema["function"]["description"], "base")
+        self.assertIsNot(clone["function"], schema["function"])
+
+
 if __name__ == "__main__":
     unittest.main()

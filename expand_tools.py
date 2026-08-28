@@ -73,6 +73,116 @@ def _available_toolset_names() -> list[str]:
         return []
 
 
+# ─── Expand-only discoverability manifest (Phase 4) ─────────────────────────
+#
+# Lets the model *discover* which enabled built-in tools live in the
+# ``expand_only`` stratum ``X`` without carrying their full schemas. A compact,
+# deterministic, name-only manifest is appended to a per-request CLONE of the
+# carried ``expand_tools`` description — the registered SCHEMA object is never
+# mutated. Grouping uses Hermes' live toolset table; names with no known
+# category land in an explicitly labeled ungrouped bucket.
+
+_UNGROUPED_LABEL = "(ungrouped)"
+
+_MANIFEST_HEADER = (
+    "Enabled expand-only tools (full schemas omitted this turn to save "
+    "context). A trigger may auto-activate one when your message needs it; "
+    "otherwise call expand_tools(tool=NAME) — or expand_tools(category=NAME) — "
+    "to load it explicitly. Grouped by toolset:"
+)
+
+
+def _build_category_index() -> dict[str, set[str]]:
+    """Return ``{category: {tool_name, ...}}`` from the live toolset table.
+
+    Best-effort: an unresolvable toolset is skipped, and a missing ``toolsets``
+    module yields an empty index (every name then falls to the ungrouped bucket).
+    """
+    index: dict[str, set[str]] = {}
+    available = _available_toolset_names()
+    try:
+        from toolsets import resolve_toolset  # type: ignore[import-not-found]
+    except Exception:
+        return index
+    for cat in available:
+        try:
+            tools = resolve_toolset(cat) or []
+        except Exception:
+            continue
+        members = {str(t) for t in tools if t}
+        if members:
+            index[str(cat)] = members
+    return index
+
+
+def build_expand_only_manifest(expand_only_names, *, category_index=None) -> str:
+    """Compose the compact, deterministic expand-only manifest text.
+
+    ``expand_only_names`` is the effective stratum ``X = E − (always_carry ∪
+    carry)`` — already built-in-only (MCP/plugin pass-through names are excluded
+    upstream). Names are grouped by toolset category (a name with no known
+    category is placed under an explicitly labeled ungrouped bucket, sorted
+    last). Groups and names sort deterministically, so the manifest is stable
+    across differently ordered source schema lists. Returns ``""`` when there
+    are no expand-only names.
+
+    ``category_index`` (``{category: {tool_name}}``) may be injected for tests;
+    when ``None`` it is resolved from the live toolset table.
+    """
+    names = sorted({str(n) for n in (expand_only_names or []) if n})
+    if not names:
+        return ""
+
+    if category_index is None:
+        category_index = _build_category_index()
+
+    # Reverse map tool -> category. Iterate categories in sorted order so a
+    # tool that (pathologically) belongs to more than one toolset resolves to
+    # a single, deterministic category.
+    tool_to_cat: dict[str, str] = {}
+    for cat in sorted(category_index):
+        for tool in category_index[cat]:
+            tool_to_cat.setdefault(str(tool), str(cat))
+
+    groups: dict[str, list[str]] = {}
+    for name in names:
+        cat = tool_to_cat.get(name, _UNGROUPED_LABEL)
+        groups.setdefault(cat, []).append(name)
+
+    # Known categories alphabetical; the ungrouped bucket always sorts last.
+    def _group_key(cat: str) -> tuple[int, str]:
+        return (1, "") if cat == _UNGROUPED_LABEL else (0, cat)
+
+    lines = [_MANIFEST_HEADER]
+    for cat in sorted(groups, key=_group_key):
+        members = ", ".join(sorted(groups[cat]))
+        lines.append(f"{cat}: {members}")
+    return "\n".join(lines)
+
+
+def augment_schema_with_manifest(schema, manifest_text):
+    """Return a per-request CLONE of ``schema`` with ``manifest_text`` appended
+    to its description. The input schema object is never mutated.
+
+    Handles both the Anthropic tool shape (top-level ``description``) and the
+    OpenAI shape (``function.description``). When ``manifest_text`` is empty the
+    original object is returned unchanged.
+    """
+    if not manifest_text or not isinstance(schema, dict):
+        return schema
+    clone = dict(schema)
+    fn = clone.get("function")
+    if isinstance(fn, dict):
+        fn_clone = dict(fn)
+        base = str(fn_clone.get("description") or "")
+        fn_clone["description"] = (base + "\n\n" + manifest_text).strip()
+        clone["function"] = fn_clone
+    else:
+        base = str(clone.get("description") or "")
+        clone["description"] = (base + "\n\n" + manifest_text).strip()
+    return clone
+
+
 def _resolve_category(category: str) -> tuple[str, list[str], list[str]]:
     """Resolve a user-supplied category to (canonical_name, tools, available).
 

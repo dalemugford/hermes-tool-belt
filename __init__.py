@@ -410,6 +410,29 @@ def _wrap_build_api_kwargs(original):
                     ceiling_names[:5], expand_only_names[:5],
                 )
 
+            # Append the expand-only discoverability manifest to a per-request
+            # CLONE of the expand_tools schema. Built from ``model.expand_only``
+            # (the residency stratum X), so it stays byte-identical across a
+            # cache-on session even when a trigger later activates one of these
+            # tools — residency never changes, only the active set grows. Fail
+            # OPEN: any error leaves ``filtered`` and the original schema intact.
+            try:
+                manifest_text = expand_tools_mod.build_expand_only_manifest(
+                    model.expand_only
+                )
+                if manifest_text:
+                    filtered = [
+                        expand_tools_mod.augment_schema_with_manifest(t, manifest_text)
+                        if _base_tool_name(_tool_name(t)) == "expand_tools"
+                        else t
+                        for t in filtered
+                    ]
+            except Exception as exc:
+                logger.debug(
+                    "tool-belt: expand-only manifest skipped (%s) — original "
+                    "expand_tools schema preserved", exc,
+                )
+
             kwargs = dict(kwargs)
             kwargs["tools"] = filtered
 

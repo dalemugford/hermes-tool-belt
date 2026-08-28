@@ -744,6 +744,169 @@ class CacheOnRetriggerAttributionTests(unittest.TestCase):
                       "the previously triggered tool remains active")
 
 
+class ExpandOnlyManifestInjectionTests(unittest.TestCase):
+    """Phase 4: the request builder appends a compact expand-only manifest to a
+    CLONE of the carried ``expand_tools`` schema — naming enabled expand-only
+    built-ins the model would otherwise not know exist, without carrying their
+    full schemas."""
+
+    # category -> member tool names, injected so grouping is deterministic
+    # without the live ``toolsets`` table.
+    _INDEX = {
+        "web": {"web_extract"},
+        "browser": {"browser_exec", "browser_navigate"},
+    }
+
+    def setUp(self):
+        _seed_plugin_config()
+        _reset_plugin_state()
+
+    def _tools(self):
+        # A live tool list: two residents (clarify, expand_tools), one adaptive
+        # resident (read_file), three expand-only built-ins (two categorized,
+        # one unknown), and one MCP pass-through.
+        return [
+            {"name": "clarify"},
+            {"name": "expand_tools", "description": expand_tools_SCHEMA_DESC},
+            {"name": "read_file"},
+            {"name": "web_extract"},
+            {"name": "browser_exec"},
+            {"name": "brand_new_builtin"},
+            {"name": "mcp__github__create_issue"},
+        ]
+
+    def _run(self, *, tools=None, triggered=(), expand_tools_schema=None,
+             manifest_side_effect=None):
+        """Run the wrapped builder and return (result_kwargs, expand_tools_desc)."""
+        if tools is None:
+            tools = self._tools()
+        if expand_tools_schema is not None:
+            tools = [expand_tools_schema if plugin._tool_name(t) == "expand_tools"
+                     else t for t in tools]
+        state = {
+            "active_tool_names": ["clarify", "expand_tools", "read_file"],
+            "resolved_always_carry": ["clarify", "expand_tools"],
+            "resolved_carry": ["read_file"],
+            "triggered_tools": list(triggered),
+            "expansions": set(),
+            "logged": False,
+            "session_id": "",
+        }
+        token = plugin._PREDICTION_CV.set(state)
+
+        def original(self_, msgs):
+            return {"tools": list(tools), "model": "claude-test"}
+
+        wrapped = plugin._wrap_build_api_kwargs(original)
+        patches = [
+            mock.patch.dict(plugin._CONFIG, {"enabled": True}),
+            mock.patch.object(plugin, "_maybe_log_prediction", lambda *a, **k: None),
+            mock.patch.object(plugin.expand_tools_mod, "_build_category_index",
+                              return_value={k: set(v) for k, v in self._INDEX.items()}),
+        ]
+        if manifest_side_effect is not None:
+            patches.append(mock.patch.object(
+                plugin.expand_tools_mod, "build_expand_only_manifest",
+                side_effect=manifest_side_effect))
+        try:
+            with patches[0], patches[1], patches[2]:
+                if manifest_side_effect is not None:
+                    with patches[3]:
+                        result = wrapped(object(), [])
+                else:
+                    result = wrapped(object(), [])
+        finally:
+            plugin._PREDICTION_CV.reset(token)
+
+        desc = ""
+        for t in result["tools"]:
+            if plugin._tool_name(t) == "expand_tools":
+                desc = t.get("description", "")
+        return result, desc
+
+    def test_manifest_names_unlisted_enabled_expand_only_tools(self):
+        _result, desc = self._run()
+        # The model discovers the expand-only built-ins by name, grouped.
+        self.assertIn("web: web_extract", desc)
+        self.assertIn("browser: browser_exec", desc)
+        self.assertIn("(ungrouped): brand_new_builtin", desc)
+        # The recovery affordance is explained.
+        self.assertIn("expand_tools(tool=", desc)
+        self.assertIn("trigger", desc.lower())
+
+    def test_manifest_omits_full_schemas_of_expand_only_tools(self):
+        result, _desc = self._run()
+        kept = [plugin._tool_name(t) for t in result["tools"]]
+        # The expand-only tools are named in the manifest but their full
+        # schemas are NOT carried in the tool list.
+        self.assertNotIn("web_extract", kept)
+        self.assertNotIn("browser_exec", kept)
+        self.assertNotIn("brand_new_builtin", kept)
+
+    def test_carried_and_always_carried_names_absent_from_manifest(self):
+        _result, desc = self._run()
+        # clarify + expand_tools (always_carry) and read_file (carry) are
+        # residents — they must not appear in the expand-only manifest.
+        manifest = desc.split("Grouped by toolset:", 1)[-1]
+        self.assertNotIn("clarify", manifest)
+        self.assertNotIn("read_file", manifest)
+        # 'expand_tools' appears in the recovery prose but never as a listed
+        # expand-only entry (no line naming it as a group member).
+        for line in manifest.splitlines():
+            if ":" in line:
+                self.assertNotIn("expand_tools", line.split(":", 1)[1])
+
+    def test_mcp_passthrough_names_absent_from_manifest(self):
+        _result, desc = self._run()
+        self.assertNotIn("mcp__github__create_issue", desc)
+        self.assertNotIn("github", desc)
+
+    def test_ceiling_absent_trigger_name_absent_from_manifest(self):
+        # A trigger references a tool that is NOT in the enabled ceiling E.
+        _result, desc = self._run(triggered=["ghost_tool"])
+        self.assertNotIn("ghost_tool", desc)
+
+    def test_original_registered_schema_unchanged_after_build(self):
+        import copy
+        snapshot = copy.deepcopy(plugin.expand_tools_mod.SCHEMA)
+        _result, desc = self._run(expand_tools_schema=plugin.expand_tools_mod.SCHEMA)
+        # The registered object is byte/deep-equal after request construction...
+        self.assertEqual(plugin.expand_tools_mod.SCHEMA, snapshot,
+                         "the registered expand_tools schema must not be mutated")
+        # ...but the per-request clone carried the manifest.
+        self.assertIn("web: web_extract", desc)
+        self.assertNotIn(
+            "web: web_extract",
+            plugin.expand_tools_mod.SCHEMA["description"],
+            "the manifest must live only on the per-request clone",
+        )
+
+    def test_cache_on_manifest_identical_before_and_after_trigger(self):
+        # Residency (hence X) is identical across turns; a later trigger only
+        # grows the active set. The manifest must stay byte-identical.
+        _r1, before = self._run(triggered=())
+        _r2, after = self._run(triggered=["web_extract"])
+        self.assertEqual(before, after,
+                         "manifest is stable across trigger activation (cache-on)")
+
+    def test_manifest_construction_failure_preserves_original_schema(self):
+        # If manifest construction raises, the build fails OPEN: the expand_tools
+        # tool keeps its original description and the tool list is still returned.
+        result, desc = self._run(
+            manifest_side_effect=RuntimeError("boom"))
+        self.assertEqual(desc, expand_tools_SCHEMA_DESC,
+                         "on failure the original expand_tools description survives")
+        # The rest of the narrowing still happened.
+        kept = [plugin._tool_name(t) for t in result["tools"]]
+        self.assertIn("clarify", kept)
+        self.assertNotIn("web_extract", kept)
+
+
+# The real schema description, captured once so injection tests can compare
+# against it without hardcoding prose.
+expand_tools_SCHEMA_DESC = plugin.expand_tools_mod.SCHEMA["description"]
+
+
 class TokenEstimatorTests(unittest.TestCase):
     """Verify estimate_tokens uses tiktoken when available, chars/4 when not.
 
