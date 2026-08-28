@@ -74,7 +74,7 @@ The initial public capabilities of the plugin:
   regression fails the seed rather than producing quietly-wrong fixtures, and
   rows are built through `logger_io.PredictionRecord` so the harness inherits
   the production schema by construction. The seeder doubles as an operator
-  command for demoing onboarding by hand. Design: `docs/TEST_HARNESS.md`.
+  command for demoing onboarding by hand.
 
 ### Changed
 

@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Scripted-session seeder — synthetic telemetry for onboarding simulation.
 
-Design: ``docs/TEST_HARNESS.md``.
-
 ``scripts/configure.py`` discovers ``agent:platform`` scopes from the
 telemetry the runtime hooks write during real gateway sessions. Producing
 that telemetry for real needs a live provider, a running gateway, *and* a
-messaging-platform account (``docs/TEST_HARNESS.md`` §1). This module
+messaging-platform account. This module
 replaces only the transport: it runs the **real** policy resolver and the
 **real** predictor over scripted messages — the same two calls
 ``_on_pre_gateway_dispatch`` makes (``__init__.py:1513-1514``) — and writes
@@ -164,7 +162,7 @@ def _hermes_home(home: Path) -> Iterator[None]:
     Non-negotiable for isolation: ``learned.state_dir()``
     (``learned.py:66-67``) falls back to ``~/.hermes``, so a
     ``resolve_preset`` call without this reads the developer's real learned
-    overlay (``docs/TEST_HARNESS.md`` §F.3).
+    overlay.
     """
     previous = os.environ.get("HERMES_HOME")
     os.environ["HERMES_HOME"] = str(home)

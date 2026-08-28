@@ -28,6 +28,7 @@ the same change.
 ## Repository map
 
 - Runtime hooks and cache behavior: `__init__.py`
+- Carrying-strata partition helpers: `carrying.py`
 - Prediction and policy: `predictor.py`, `presets.py`, `policy.yaml`
 - Dynamic recovery: `expand_tools.py`
 - Learned overlay: `learned.py`
@@ -35,13 +36,16 @@ the same change.
 - Telemetry analysis: `analyze.py`
 - Analyzer cache-cost library: `scripts/cache-freeze-replay.py` (imported by
   `analyze.py`; also a standalone CLI)
+- Savings engine and CLI: `savings.py`, `savings_cli.py`, `tool-belt` launcher
 - Supported operator commands: `scripts/`
 - Tests: `tests/`
 - Architecture: `docs/ARCHITECTURE.md`
 - Configuration reference: `docs/CONFIGURATION.md`
 - Savings methodology: `docs/SAVINGS.md`
 - Known limitations: `docs/KNOWN_ISSUES.md`
-- Surface audit summary: `docs/SURFACE_AUDIT.md`
+- Privacy contract: `docs/PRIVACY.md`
+- Release checklist: `docs/RELEASING.md`
+- Surface audit summary (partly superseded, historical): `docs/SURFACE_AUDIT.md`
 
 ## Verification
 
@@ -58,7 +62,6 @@ python3 -m venv .venv
 Run targeted diagnostics when their mechanism changes:
 
 ```bash
-.venv/bin/python scripts/check-tool-drift.py
 .venv/bin/python scripts/shape-ceiling.py --dry-run
 ```
 

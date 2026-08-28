@@ -9,7 +9,7 @@ Contract::
 
     tool-belt savings                 # every enabled agent + aggregate totals
     tool-belt savings --agent=default # one agent, all its platforms
-    tool-belt savings --agent=sue     # unknown/disabled -> non-zero error
+    tool-belt savings --agent=alice   # unknown/disabled -> non-zero error
     tool-belt savings --json          # stable machine-readable schema, no prose
     tool-belt savings --since 2026-05-15
 

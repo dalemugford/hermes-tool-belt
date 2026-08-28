@@ -30,8 +30,7 @@ directory names.
 Trigger-dampener regression coverage lives in
 [`tests/test_trigger_dampeners.py`](../tests/test_trigger_dampeners.py) and runs
 with the normal test suite. End-to-end onboarding coverage lives in
-[`tests/test_onboarding_e2e.py`](../tests/test_onboarding_e2e.py); the harness
-behind it is described in [`docs/TEST_HARNESS.md`](../docs/TEST_HARNESS.md).
+[`tests/test_onboarding_e2e.py`](../tests/test_onboarding_e2e.py).
 
 ## Common workflows
 

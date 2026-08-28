@@ -1,8 +1,13 @@
 # Tool Belt — Surface Audit Summary
 
 **Date:** 2026-08-27
-**Commit audited:** `13c953e` (Task 6, read-only)
-**Sources:** Claude Code runtime-feature audit (`workspace/delegations/2026-08-27-084655-task-6-runtime-feature-audit/report.md`) and supported-surface audit (`workspace/delegations/2026-08-27-084655-task-6-supported-surface-audit/report.md`), reconciled against source by Bernard.
+**Commit audited:** `13c953e` (read-only pre-release audit)
+
+> **Superseded in part.** This audit predates the carrying-model refactor.
+> Its factual record stands, but statements about unknown tools staying
+> available, the protected always-on set, `learned_mode: off | auto`, and
+> `check-tool-drift.py` describe the pre-refactor model. Current behavior is
+> documented in `docs/ARCHITECTURE.md` and `docs/CONFIGURATION.md`.
 
 ---
 

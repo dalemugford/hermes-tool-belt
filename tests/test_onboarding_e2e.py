@@ -4,15 +4,15 @@ Where ``tests/test_configure.py`` unit-tests ``scripts/configure.py`` against
 hand-built fixture rows, this file drives the whole onboarding arc over
 telemetry produced by ``tests/seed_sessions.py`` — the real policy resolver
 and the real predictor, run over the scripted conversations in
-``tests/scripts/``. Design: ``docs/TEST_HARNESS.md``.
+``tests/scripts/``.
 
 Isolation, in every test:
 
 * a temporary ``HERMES_HOME`` whose path contains a space
   (``test_configure.TempHomeTestCase``);
 * ``shutil.which`` and ``configure._default_runner`` both patched, so no real
-  ``hermes`` binary is ever reachable — and, per ``docs/TEST_HARNESS.md``
-  §F.1, so the overlay write is reached at all: ``flow_shape`` returns before
+  ``hermes`` binary is ever reachable — and so the overlay write is reached
+  at all: ``flow_shape`` returns before
   writing ``learned.json`` when ``hermes`` is missing;
 * ``learned._CACHE`` cleared, so one test's overlay cannot survive into the
   next through the mtime cache;
