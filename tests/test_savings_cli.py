@@ -323,6 +323,48 @@ class FullDefinitionTokenTests(_HomeCase):
         self.assertEqual(projection.usd_coverage, "none")
 
 
+class RenderLabelTests(_HomeCase):
+    """Text render shows the provider-only session-input % OR the labeled
+    schema-only figure — never a reconstructed-denominator percentage."""
+
+    def _render(self, proj):
+        report = savings.SavingsReport(
+            generated_for="default", cache_mode="on",
+            agents=[savings.AgentSavings(agent="default", platforms=["telegram"],
+                                         observed=savings.ObservedCohort(),
+                                         projected=proj)],
+            hermes_home=str(self.home), token_estimator="chars-div-4")
+        return savings_cli.render_text(report)
+
+    def test_provider_basis_shows_session_input_pct(self):
+        _write_session(self.home / "sessions", "prov", platform="telegram",
+                       model="claude-sonnet-4-6", ceiling=CEILING,
+                       turns=[{"user": "hello"}])
+        state = self.home / "state" / "tool-belt"
+        state.mkdir(parents=True, exist_ok=True)
+        (state / "api_calls.jsonl").write_text(
+            json.dumps({"ts": 1780000000.0, "session_file": "prov",
+                        "input_tokens": 99999}) + "\n", encoding="utf-8")
+        proj = savings.compute_projected(
+            savings.discover_agents(self.home)[0], {"enabled": True})
+        self.assertIsNotNone(proj.net_input_reduction_pct)
+        text = self._render(proj)
+        self.assertIn("net input reduction:", text)
+        self.assertIn("(denominator: provider_reported)", text)
+        self.assertNotIn("not the session-input %", text)
+
+    def test_reconstructed_basis_shows_schema_only_label(self):
+        _write_session(self.home / "sessions", "recon", platform="telegram",
+                       model="m", ceiling=CEILING, turns=[{"user": "hello"}])
+        proj = savings.compute_projected(
+            savings.discover_agents(self.home)[0], {"enabled": True})
+        self.assertIsNone(proj.net_input_reduction_pct)
+        text = self._render(proj)
+        self.assertIn("schema-only reduction:", text)
+        self.assertIn("(not the session-input %)", text)
+        self.assertNotIn("net input reduction:", text)
+
+
 class CohortSeparationTests(_HomeCase):
     """(5) Observed and projected cohorts are labeled separately and never
     summed."""
@@ -449,10 +491,18 @@ class DenominatorTests(_HomeCase):
                         "input_tokens": 99999, "cache_read_tokens": 0}) + "\n",
             encoding="utf-8")
         loc = savings.discover_agents(self.home)[0]
+        loc = savings.discover_agents(self.home)[0]
         proj = savings.compute_projected(loc, {"enabled": True})
         self.assertEqual(proj.denominator_source, "provider_reported")
         self.assertEqual(proj.input_token_denominator, 99999)
         self.assertEqual(proj.confidence, "high")
+        # The provider-basis percentage is the single source of
+        # net_input_reduction_pct; assert its exact value.
+        self.assertEqual(
+            proj.net_input_reduction_pct,
+            round(proj.net_token_reduction / 99999 * 100, 2),
+        )
+        self.assertGreaterEqual(proj.net_input_reduction_pct, 0.0)
 
     def test_prediction_bridge_joins_chat_key_to_hermes_session(self):
         # Production reality: api_calls rows key on the chat session_id, while
