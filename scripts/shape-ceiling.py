@@ -15,16 +15,18 @@ What it computes
 
 For each scope:
 
-  Promote candidates — tools that the model reached for via
-    ``expand_tools`` across recent sessions. Direct evidence the tool
-    was wanted and wasn't in the baseline. Folded into the next
-    session's frozen ceiling so the model can call them immediately
-    without a round-trip.
+  Promote candidates — ``expand_only`` tools that the model reached for
+    via ``expand_tools`` across recent sessions. Direct evidence the tool
+    was wanted and wasn't being carried. Moved into the adaptive
+    ``carry`` class so the next session's frozen ceiling carries them and
+    the model can call them immediately without a round-trip.
 
-  Demote candidates — tools currently in always_on that went unused
-    across enough recent sessions. Pulling them out of the ceiling
-    keeps the prefix tighter without losing real capability.
-    Conservative thresholds — easy to revert via a single use.
+  Demote candidates — adaptive ``carry`` residents that went unused
+    across enough recent sessions. Moving them to ``expand_only`` keeps
+    the carried prefix tighter without losing real capability (they stay
+    reachable via ``expand_tools`` / triggers). The immutable
+    ``always_carry`` surface is never a demote candidate. Conservative
+    thresholds — easy to revert via a single use.
 
 What it does NOT do
 ===================
@@ -33,12 +35,12 @@ What it does NOT do
   · No per-turn adjustments. Run-frequency is on the order of daily
     or session-boundary, not per-message.
   · No clobbering of user-facing config. Hand-tuning happens via
-    ``config.yaml``'s ``always_on_extra`` / ``always_off`` (existing
-    mechanism); this script owns ``scopes[].always_on`` /
-    ``scopes[].always_off`` *only* under its own ``cache_aware``
-    sub-key, then mirrors the consumed values to the top-level
-    ``always_on`` / ``always_off`` for the existing
-    ``apply_to_preset`` reader.
+    ``config.yaml`` (existing mechanism); this script owns the adaptive
+    ``carry`` / ``expand_only`` assignment for a scope under its own
+    ``shaping`` sub-key of ``learned.json``, writing the canonical v2
+    keys (``carry`` / ``expand_only`` / ``shaping``) plus a transitional
+    v1 mirror (``always_on`` / ``always_off`` / ``cache_aware``) for
+    not-yet-migrated readers of ``apply_to_preset``.
 
 Usage
 =====
@@ -58,6 +60,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -380,10 +383,16 @@ def compute_scope_recommendations(
 
     demote: list[dict[str, Any]] = []
     if len(recent_sessions) >= demote_min_sessions_no_use:
-        demote_candidates = carry_observed - tools_called
-        # always_carry can never reach the demote set: candidates come only from
-        # the carry residency class, which the normalizer keeps disjoint from
-        # always_carry. Pin that invariant explicitly.
+        # Exclude the immutable always_carry surface by construction. For v2 rows
+        # the normalizer already keeps the ``carry`` residency class disjoint from
+        # always_carry, so this is a no-op. For *complete v1* rows the normalizer
+        # collapses every resident into ``carry`` (v1 had no immutable split), so
+        # an unused always_carry baseline resident would otherwise surface as a
+        # demote candidate. Subtracting the observed always_carry set here makes
+        # the exclusion genuinely by construction for both schema versions.
+        demote_candidates = (carry_observed - tools_called) - always_carry_observed
+        # With always_carry removed above, this is a true never-fire invariant:
+        # no always_carry tool can remain in the demote set.
         assert not (demote_candidates & always_carry_observed), (
             f"always_carry tool(s) reached demote candidates for {scope!r}: "
             f"{sorted(demote_candidates & always_carry_observed)}"
@@ -471,11 +480,14 @@ def merge_into_learned(
         enabled_names = set(recs.get("enabled_tool_names") or [])
 
         def _accept(tool: str, kind: str) -> bool:
-            # enabled_tool_names empty ⇒ no telemetry basis to validate against;
-            # trust the recommendation (compute already validated it). Otherwise a
-            # candidate absent from the concrete enabled set is a category/toolset
-            # name and must never enter a per-tool carrying list.
-            if not enabled_names or (tool and tool in enabled_names):
+            # An empty enabled ceiling means no candidate can be proven eligible:
+            # there is no concrete enabled tool set to validate against, so refuse
+            # every candidate (defense-in-depth for hand-built recs that bypass
+            # ``compute``, whose ``_valid`` already drops candidates when the
+            # enabled set is empty). Otherwise a candidate must be a concrete
+            # enabled tool name — a category/toolset name never enters a per-tool
+            # carrying list.
+            if enabled_names and tool and tool in enabled_names:
                 return True
             logger.warning(
                 "tool-belt: refusing to write %s candidate %r into scope %r "
@@ -541,9 +553,23 @@ def merge_into_learned(
 
     if changed and not dry_run:
         learned_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = learned_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        tmp.replace(learned_path)
+        payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
+        # Unique same-directory temp so two concurrent runs can't race on a
+        # fixed name; flush+fsync then atomic replace so a reader always sees a
+        # complete file. Clean up the temp if anything fails before the rename.
+        fd, tmp_name = tempfile.mkstemp(
+            prefix="learned.", suffix=".tmp", dir=str(learned_path.parent)
+        )
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp.replace(learned_path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
 
     return state, changed
 

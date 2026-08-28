@@ -760,6 +760,26 @@ def _sparse_v1_row(scope, sid, pid, *, always_on, ts=0.0):
     }
 
 
+def _complete_v1_row(scope, sid, pid, *, ceiling, residents, active, ts=0.0):
+    """A *complete* v1 prediction row (no schema_version, no always_carry_tools).
+
+    Ceiling + residents + active are all present, so the normalizer can
+    reconstruct residency (``residency_inferred`` True). v1 has no immutable
+    split, so the normalizer collapses every resident into the ``carry``
+    residency class — including any always_carry baseline tool that is resident.
+    This is the exact transitional shape that used to abort the shaper.
+    """
+    return {
+        "scope": scope,
+        "hermes_session_id": sid,
+        "prediction_id": pid,
+        "ts": ts,
+        "ceiling_tools": list(ceiling),
+        "always_on_tools": list(residents),
+        "allowed_tools": list(active),
+    }
+
+
 def _expansion_call(pid, tool):
     """A tool-call row that is direct expansion evidence (expand_only → carry)."""
     return {
@@ -878,6 +898,29 @@ class ShaperDemotionContract(unittest.TestCase):
         self.assertEqual(recs["demote"], [],
                          "a sparse (residency_inferred=False) row cannot demote")
 
+    def test_complete_v1_unused_always_carry_never_demotes_and_no_abort(self):
+        # Regression for the transitional-v1 abort: complete v1 rows normalize
+        # every resident (including the immutable always_carry baseline tool
+        # ``clarify``) into the ``carry`` residency class. With a full window of
+        # such rows where ``clarify`` is resident-but-unused, the shaper must
+        # neither raise nor recommend demoting ``clarify``. The adaptive
+        # (non-baseline) resident ``read_file`` still demotes normally.
+        ceiling = ["clarify", "read_file", "web_extract"]
+        residents = ["clarify", "read_file"]  # clarify is always_carry baseline
+        preds = [
+            _complete_v1_row(self.SCOPE, f"s{i}", f"p{i}",
+                             ceiling=ceiling, residents=residents,
+                             active=residents, ts=i)
+            for i in range(20)  # ≥ demote_min_sessions_no_use
+        ]
+        # Must not raise (the old assert aborted the whole run here).
+        recs = _compute(self.SCOPE, preds, [])
+        demoted = {d["tool"] for d in recs["demote"]}
+        self.assertNotIn("clarify", demoted,
+                         "an unused always_carry resident from a v1 row never demotes")
+        self.assertIn("read_file", demoted,
+                      "a non-baseline carry resident still demotes on a v1 window")
+
 
 class ShaperMergeContract(unittest.TestCase):
     SCOPE = "assistant-a:telegram"
@@ -966,6 +1009,25 @@ class ShaperMergeContract(unittest.TestCase):
             self.assertIn("web_extract", out["carry"])
             self.assertNotIn("web", out["carry"], "a category name is never stored")
             self.assertIn("web", "\n".join(cm.output))
+
+    def test_empty_enabled_ceiling_refuses_all_candidates(self):
+        # Defense-in-depth (O4): an empty enabled ceiling means no candidate can
+        # be proven eligible, so hand-built recs that bypass ``compute`` must not
+        # write anything into a carrying list.
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            self._write(tmp, {"version": 2, "scopes": {
+                self.SCOPE: {"carry": [], "expand_only": []}}})
+            recs = self._recs(promote=["web_extract"], demote=["read_file"],
+                              enabled=[])  # empty enabled ceiling
+            with self.assertLogs("tool_belt_plugin.shape_ceiling", level="WARNING"):
+                shaper.merge_into_learned(tmp, {self.SCOPE: recs}, False)
+            entry = self._read(tmp)["scopes"][self.SCOPE]
+            # No candidate may enter a carrying list when nothing can be validated.
+            self.assertEqual(entry["carry"], [],
+                             "no promote candidate is carried with an empty enabled ceiling")
+            self.assertEqual(entry["expand_only"], [],
+                             "no demote candidate is written with an empty enabled ceiling")
 
     def test_dry_run_performs_no_writes(self):
         with tempfile.TemporaryDirectory() as t:
