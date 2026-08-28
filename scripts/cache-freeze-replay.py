@@ -5,11 +5,11 @@ the cache cost of tool-list mutations.
 Why the matched counterfactual matters
 ======================================
 
-The original ``tokens_saved_via_narrowing`` ledger reports schema-token
-savings without netting out the cache-miss penalty that mutation-driven
-narrowing imposes on the conversation history prefix. Under cache-on
-providers (Anthropic + OpenAI auto-cache, ~80% of our traffic) that
-penalty dominates the savings on any session past a handful of turns.
+The ``tokens_saved_via_narrowing`` ledger reports schema-token savings
+without netting out the cache-miss penalty that mutation-driven narrowing
+imposes on the conversation history prefix. Under cache-on providers
+(Anthropic + OpenAI auto-cache) that penalty can dominate the savings on
+any session past a handful of turns.
 
 The corrected counterfactual:
 
@@ -36,7 +36,7 @@ import argparse
 import json
 import os
 import sys
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +51,7 @@ from logger_io import normalize_prediction_row, normalize_tool_call_row  # noqa:
 
 # Pricing is single-sourced in the canonical savings engine; import it rather
 # than defining a second copy (see docs/SAVINGS.md — no duplicate price tables).
-from savings import PRICE_TABLE, price_for  # noqa: E402,F401
+from savings import price_for  # noqa: E402
 
 
 def _session_key(row: dict[str, Any]) -> str:
@@ -72,9 +72,8 @@ def default_state_dir() -> Path:
 
 # ─── Matched counterfactual ───────────────────────────────────────────────
 #
-# ``PRICE_TABLE`` / ``price_for`` are imported from ``savings`` above (the
-# single source of truth for per-model token economics). Unknown models fall
-# back to "generic" there.
+# ``price_for`` is imported from ``savings`` above (the single source of truth
+# for per-model token economics). Unknown models fall back to "generic" there.
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -191,7 +190,6 @@ def freeze_simulation(
     first_calls = 0
     cached_on_match: list[int] = []
     cached_on_break: list[int] = []
-    expand_break_breakdown: Counter[str] = Counter()
 
     for sid, cs in sess_calls.items():
         if not cs:
@@ -213,14 +211,11 @@ def freeze_simulation(
             meta = pred_meta.get(pid, {})
             if meta.get("expand_called_this_turn"):
                 expand_driven += 1
-                expand_break_breakdown["expand_driven"] += 1
             elif meta.get("trigger_driven_mutation"):
                 trigger_driven += 1
-                expand_break_breakdown["trigger_driven"] += 1
             else:
                 would_break += 1
                 cached_on_break.append(cached)
-                expand_break_breakdown["would_break"] += 1
 
     def avg(xs: list[int]) -> float:
         return (sum(xs) / len(xs)) if xs else 0.0
@@ -357,7 +352,7 @@ def matched_counterfactual(
 
 def render_markdown(result: dict[str, Any], cf: dict[str, Any]) -> str:
     out: list[str] = []
-    out.append(f"# Cache-Aware Replay Report\n")
+    out.append("# Cache-Aware Replay Report\n")
     out.append(f"_scope: {result['scope_filter']}_\n")
     out.append("## Freeze coverage\n")
     out.append(f"- sessions: {result['sessions']}, predictions: {result['predictions']}, api_calls: {result['api_calls']}")
@@ -415,18 +410,18 @@ def main() -> int:
     print(f"    would_break mutations:      {result['would_break_mutations']:>4} calls  (cached avg: {result['avg_cache_read_when_would_break']:,.0f})")
     print()
     print(f"  Freeze eliminates {result['freeze_eliminates_pct_of_mutations'] * 100:.1f}% of currently-observed mutations.")
-    print(f"  The remainder is expand_tools-driven and is the accepted cost of the safety valve.")
+    print("  The remainder is expand_tools-driven and is the accepted cost of the safety valve.")
 
     if cf.get("per_model"):
         print()
-        print(f"  Cache-adjusted savings (matched counterfactual, position-bucket by api_call_idx):")
+        print("  Cache-adjusted savings (matched counterfactual, position-bucket by api_call_idx):")
         for model, m in sorted(cf["per_model"].items(), key=lambda kv: -int(kv[1]["calls"])):
             print(
                 f"    {model:30s}  calls={m['calls']:4d}  mut={m['mutated']:3d}  stable={m['stable']:3d}  "
                 f"lost_upper_bound={m['cache_read_lost_upper_bound']:>10,} tok  ≈ ${m['est_usd_lost_upper_bound']:.4f}"
             )
-        print(f"  Methodology: per-call counterfactual = stable-cohort mean at the same api_call_idx for the same model.")
-        print(f"  Numbers are upper bounds (signed). Negative = mutation coincided with a cache refresh.")
+        print("  Methodology: per-call counterfactual = stable-cohort mean at the same api_call_idx for the same model.")
+        print("  Numbers are upper bounds (signed). Negative = mutation coincided with a cache refresh.")
     return 0
 
 

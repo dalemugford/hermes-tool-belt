@@ -13,6 +13,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import statistics
 import sys
 import time
@@ -23,9 +24,10 @@ from typing import Any, Iterable
 
 # Canonical telemetry adapter. Every prediction/tool-call row is read through
 # ``logger_io.normalize_prediction_row`` / ``normalize_tool_call_row`` so v1, v2,
-# and mixed streams all present the same carrying-model fields (always_carry /
-# carry / expand_only, was_expand_only, activation_source). Works both as a
-# script (sibling on sys.path) and as the ``tool_belt_plugin.analyze`` module.
+# and mixed streams all present the same carrying-model fields. This module
+# consumes ``carry_tools``, ``expand_only_tools``, and ``was_expand_only``.
+# Works both as a script (sibling on sys.path) and as the
+# ``tool_belt_plugin.analyze`` module.
 try:  # package / test import
     from . import logger_io  # type: ignore[import-not-found]
     from . import savings as _savings  # type: ignore[import-not-found]
@@ -56,6 +58,13 @@ DEFAULT_DAMPENER_MIN_PRECISION = 0.8
 DEFAULT_DAMPENER_MIN_N = 2
 DEFAULT_DAMPENER_MAX_N = 4
 DEFAULT_DAMPENER_MAX_CANDIDATES = 10
+# Minimum was_expand_only call count before a tool surfaces as a harvest-driven
+# promote-to-carry candidate.
+DEFAULT_HARVEST_MIN_EXPAND_ONLY_CALLS = 3
+# Session-bounded lookahead window for trigger true-positive attribution. This
+# is an analysis-time approximation of the runtime ``sticky_ttl_turns`` (default
+# 3), which is config-overridable — the two can diverge on a tuned install.
+DEFAULT_STICKY_LOOKAHEAD_TURNS = 3
 
 @dataclass
 class ScopeStats:
@@ -67,22 +76,18 @@ class ScopeStats:
     total_narrowed_tokens: int = 0
     expansion_events: int = 0
     expansions_by_category: Counter[str] = field(default_factory=Counter)
-    expansion_ids_by_category: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     # Tools resolved by each category (from expand_tools result payload).
     # Used by expand-cost accounting to estimate carry cost if we promote.
     tools_per_category: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     used_expansion_rows: int = 0
     used_expansion_event_ids_by_category: dict[str, set[str]] = field(default_factory=lambda: defaultdict(set))
     expanded_uses_by_category: Counter[str] = field(default_factory=Counter)
-    expanded_uses_by_tool: Counter[str] = field(default_factory=Counter)
     turns_until_used: list[int] = field(default_factory=list)
     tool_calls: Counter[str] = field(default_factory=Counter)
     # Per-tool count of turns a `carry`-class resident was carried. Immutable
     # `always_carry` residents are excluded (they can never be demoted). Feeds
     # demote-to-expand_only candidate detection.
     carry_turns: Counter[str] = field(default_factory=Counter)
-    # Per-tool count of turns a tool sat in the derived `expand_only` class.
-    expand_only_turns: Counter[str] = field(default_factory=Counter)
     trigger_fires: Counter[str] = field(default_factory=Counter)
     trigger_hits: Counter[str] = field(default_factory=Counter)
     trigger_needs: Counter[str] = field(default_factory=Counter)
@@ -112,7 +117,6 @@ class ScopeStats:
     # proposing promote-to-carry.
     harvest_was_expand_only: Counter[str] = field(default_factory=Counter)
     harvest_predictions: int = 0
-    harvest_tool_calls_total: int = 0
     # Per-tool sample of message previews that led to a was_expand_only call.
     # Used by the trigger-keyword suggester to mine candidate keywords for
     # broadening the trigger groups that would activate those expand_only tools.
@@ -248,13 +252,6 @@ def _resolved_tools_from_expand_row(row: dict[str, Any]) -> list[str]:
     return []
 
 
-def expansion_event_key(row: dict[str, Any], category: str) -> str:
-    prediction_id = str(row.get("prediction_id") or "").strip()
-    line_no = row.get("_line_no", "")
-    source_file = row.get("_source_file", "")
-    return f"{prediction_id}:{category}" if prediction_id else f"{source_file}:line:{line_no}:{category}"
-
-
 def trigger_tools(row: dict[str, Any]) -> dict[str, set[str]]:
     raw = row.get("trigger_tools_by_group")
     if not isinstance(raw, dict):
@@ -323,8 +320,6 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
         # residents all normalize into `carry_tools`).
         for tool in string_list(row.get("carry_tools")):
             stat.carry_turns[tool] += 1
-        for tool in string_list(row.get("expand_only_tools")):
-            stat.expand_only_turns[tool] += 1
         for trigger in string_list(row.get("triggers_fired")):
             stat.trigger_fires[trigger] += 1
         learned_mode = str(row.get("learned_mode") or "").strip().lower()
@@ -359,29 +354,20 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
                 preview = prediction_preview.get(prediction_id, "")
                 if preview and len(stat.harvest_expand_only_previews[tool]) < 200:
                     stat.harvest_expand_only_previews[tool].append(preview)
-            if cohort == "harvest":
-                stat.harvest_tool_calls_total += 1
 
         if tool == "expand_tools":
             category = category_from_expand_row(row)
-            event_key = expansion_event_key(row, category)
             stat.expansion_events += 1
             stat.expansions_by_category[category] += 1
-            stat.expansion_ids_by_category[category].add(event_key)
             if cohort:
                 stat.cohort_expansions[cohort] += 1
             for resolved in _resolved_tools_from_expand_row(row):
                 stat.tools_per_category[category].add(resolved)
             continue
 
-        # Filter out the "tool was already in the initial allowed set"
-        # case at read time so historical telemetry (written before the
-        # writer-side fix) doesn't inflate expansion-success metrics.
-        # The corrected writer no longer credits these, but old rows
-        # still carry the inflated flag. ``was_initially_available`` is
-        # present on every row written since the multi-profile telemetry
-        # commit, so it's safe to consult here.
-        if row.get("expand_tools_used") is True and not row.get("was_initially_available", False):
+        # Skip calls where the tool was already active before expansion —
+        # those are not expansion successes.
+        if row.get("expansion_provided_access") is True and not row.get("was_initially_active", False):
             category = str(row.get("expand_category") or "unknown").strip() or "unknown"
             stat.used_expansion_rows += 1
             expansion_prediction_id = str(row.get("expansion_prediction_id") or "").strip()
@@ -389,21 +375,18 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
             if event_prediction_id:
                 stat.used_expansion_event_ids_by_category[category].add(f"{event_prediction_id}:{category}")
             stat.expanded_uses_by_category[category] += 1
-            expanded_tool = str(row.get("expanded_tool") or tool or "unknown").strip() or "unknown"
-            stat.expanded_uses_by_tool[expanded_tool] += 1
             stat.turns_until_used.append(max(0, safe_int(row.get("turns_until_used"))))
 
     # Build a session-bounded lookahead window so that sticky-carried
     # tool calls in subsequent turns count as TPs for the trigger that
     # fired on the earlier turn. Without this, a trigger that correctly
     # predicted intent but where the model called the tool 1-2 turns
-    # later (sticky residency carried the expansion) is miscounted as
-    # an FP — inflating dampener-candidate FP counts by ~30% on file_write
-    # and ~50% on shell in observed telemetry.
+    # later (sticky residency carried the expansion) would be miscounted as
+    # an FP, inflating dampener-candidate FP counts.
     #
     # Rows without a session identifier fall back to same-prediction behavior
     # so scope-ordered timeline lookups cannot leak across sessions.
-    WINDOW = 3  # matches the default sticky_ttl_turns
+    WINDOW = DEFAULT_STICKY_LOOKAHEAD_TURNS
     session_ordered_preds: dict[str, list[str]] = defaultdict(list)
     pred_session: dict[str, str] = {}
     for row in predictions:
@@ -532,8 +515,6 @@ def carrying_cost(carried_turns: int, per_tool_tokens: int) -> int:
     return carried_turns * per_tool_tokens
 
 
-import re
-
 _TOKEN_RE = re.compile(r"[a-z0-9']+")
 
 
@@ -565,10 +546,9 @@ def _load_preset_excludes(
       ``"no_policy"``    — policy.yaml file missing under ``plugin_dir``
       ``"parse_error"``  — YAML present but failed to parse
 
-    The status lets the caller surface a clear degraded-mode message
-    instead of silently reporting "existing_exclude_keyword_count: 0",
-    which previously made an empty result look like a real policy state
-    on a runtime that simply lacked PyYAML.
+    The status lets the caller distinguish an empty policy from a missing
+    loader, so a degraded run can say so instead of silently reporting
+    "existing_exclude_keyword_count: 0".
     """
     path = plugin_dir / "policy.yaml"
     if not path.exists():
@@ -962,7 +942,7 @@ def category_net_value(
     expand_round_trip_tokens: int,
     per_tool_tokens: int,
 ) -> dict[str, int]:
-    """Estimate the net token value of promoting a category to always-on.
+    """Estimate the net token value of promoting a category into the carry class.
 
     Saved by promotion: each expansion event avoids one round-trip
     (``expansions × expand_round_trip_tokens``). Costs of promotion: every
@@ -1403,14 +1383,12 @@ def recommendation_rows(
                     "expand_round_trip_tokens": args.expand_round_trip_tokens,
                     "per_tool_tokens": args.per_tool_tokens,
                 },
-                # Category rows are advisory only. ``item`` is a toolset/category
-                # name, not a per-tool identifier, and the analyzer has no
-                # reliable category→enabled-member map here (``tools_per_category``
-                # is telemetry-observed usage, not the preset's membership), so
-                # writing ``[category]`` into a per-tool ``carry`` list would
-                # violate the Phase-6 invariant "never write a toolset/category
-                # name into a per-tool carry list." The promote signal is carried
-                # by ``action``/``metrics``/``reason``; no learned patch is emitted.
+                # Category rows are advisory: ``item`` is a toolset name, not a
+                # tool name, so no per-tool ``carry`` patch can be emitted. The
+                # analyzer also has no reliable category→enabled-member map here
+                # (``tools_per_category`` is telemetry-observed usage, not the
+                # preset's membership). The promote signal is carried by
+                # ``action``/``metrics``/``reason`` instead.
                 "proposed_learned_patch": {"scopes": {}},
                 "reason": (
                     f"expanded {count} time(s), had downstream use on {used_events} expansion event(s), "
@@ -1668,21 +1646,12 @@ def compute_cache_cost(
     return result
 
 
-def _cache_cost_total_usd(cache_cost: dict[str, dict[str, Any]]) -> float:
-    """Sum est_usd_lost_upper_bound across all scopes and models."""
-    total = 0.0
+def _cache_cost_total(cache_cost: dict[str, dict[str, Any]], key: str, default: Any = 0) -> Any:
+    """Sum one per-model counterfactual field across all scopes and models."""
+    total = default
     for scope_data in cache_cost.values():
         for model_data in scope_data.get("counterfactual", {}).get("per_model", {}).values():
-            total += model_data.get("est_usd_lost_upper_bound", 0.0)
-    return round(total, 4)
-
-
-def _cache_cost_total_tokens_lost(cache_cost: dict[str, dict[str, Any]]) -> int:
-    """Sum cache_read_lost_upper_bound across all scopes and models."""
-    total = 0
-    for scope_data in cache_cost.values():
-        for model_data in scope_data.get("counterfactual", {}).get("per_model", {}).values():
-            total += model_data.get("cache_read_lost_upper_bound", 0)
+            total += model_data.get(key, default)
     return total
 
 
@@ -1690,9 +1659,10 @@ def format_summary(
     stats: dict[str, ScopeStats],
     recs: list[dict[str, Any]],
     args: argparse.Namespace,
-    dampeners: list[dict[str, Any]] | None = None,
 ) -> str:
-    payload = summary_payload(stats, recs, args, dampeners)
+    # The text summary renders only ``payload["totals"]``, which dampener
+    # candidates do not affect, so none are passed through.
+    payload = summary_payload(stats, recs, args)
     totals = payload["totals"]
     lines = [
         "tool-belt analyzer",
@@ -1786,8 +1756,8 @@ def markdown_report(
 
     # ─── Cache-Aware Savings section ──────────────────────────────────
     if cache_cost:
-        total_usd_lost = _cache_cost_total_usd(cache_cost)
-        total_tokens_lost = _cache_cost_total_tokens_lost(cache_cost)
+        total_usd_lost = round(_cache_cost_total(cache_cost, "est_usd_lost_upper_bound", 0.0), 4)
+        total_tokens_lost = _cache_cost_total(cache_cost, "cache_read_lost_upper_bound", 0)
         net_savings = totals["estimated_net_savings_tokens"]
         lines.extend([
             "## Cache-Aware Savings (matched counterfactual)",
@@ -1800,7 +1770,8 @@ def markdown_report(
             f"- Cache read tokens lost to mutations (upper bound): **{total_tokens_lost:,}**",
             f"- Estimated USD cost of those lost cache reads: **${total_usd_lost:.4f}**",
             f"- Schema-savings net (from Summary above): **{net_savings:+,}** tokens",
-            f"- Cache-corrected net = schema savings − cache-miss penalty (in tokens, not directly comparable due to different price rates)",
+            "- Cache-corrected net = schema savings − cache-miss penalty; the two are in tokens but "
+            "priced at different rates, so they are not directly comparable.",
             "",
         ])
         for scope, scope_data in cache_cost.items():
@@ -1854,7 +1825,7 @@ def markdown_report(
         f"- Minimum expansions before promotion review: `{args.min_expansions}`",
         f"- Promotion expand-rate default: `{args.promote_expand_rate:.2f}`",
         f"- Promotion use-rate default: `{args.promote_use_rate:.2f}`",
-        f"- Always-on unused review floor: `{args.unused_carry_turns}` carried turns",
+        f"- Unused-carry demotion floor: `{args.unused_carry_turns}` carried turns",
         f"- Trigger precision review floor: `{args.trigger_min_fires}` fires",
         "",
         "These defaults are levers. Live telemetry should move them if re-invocation rates, latency, or false-positive costs point elsewhere.",
@@ -2149,7 +2120,10 @@ def parse_args() -> argparse.Namespace:
                         help="Shortest n-gram length to consider (default 2)")
     parser.add_argument("--dampener-max-n", type=int, default=DEFAULT_DAMPENER_MAX_N,
                         help="Longest n-gram length to consider (default 4)")
-    parser.add_argument("--harvest-min-expand-only-calls", type=int, default=3,
+    parser.add_argument("--dampener-max-candidates", type=int, default=DEFAULT_DAMPENER_MAX_CANDIDATES,
+                        help="Max candidates surfaced per (scope, trigger)")
+    parser.add_argument("--harvest-min-expand-only-calls", type=int,
+        default=DEFAULT_HARVEST_MIN_EXPAND_ONLY_CALLS,
         help="Minimum was_expand_only call count before a tool surfaces as a "
              "harvest-driven promote-to-carry candidate. Filters thin-signal "
              "noise. (default: 3)")
@@ -2157,8 +2131,6 @@ def parse_args() -> argparse.Namespace:
         help="Mine expand_only-tool message previews for candidate trigger "
              "keywords. Symmetric inverse of --suggest-dampeners. Requires "
              "harvest data.")
-    parser.add_argument("--dampener-max-candidates", type=int, default=DEFAULT_DAMPENER_MAX_CANDIDATES,
-                        help="Max candidates surfaced per (scope, trigger)")
     return parser.parse_args()
 
 
@@ -2198,7 +2170,7 @@ def main() -> int:
         payload["totals"]["tool_call_source_counts"] = source_counts
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
-        print(format_summary(stats, recs, args, dampeners))
+        print(format_summary(stats, recs, args))
         excluded = source_counts["cron"] + source_counts["subagent"]
         if excluded:
             print(
