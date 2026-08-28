@@ -27,8 +27,9 @@ Two paths are offered on a fresh scope:
 
 Config is written **only** through ``hermes config set`` / ``hermes config
 unset``. Hermes owns ``config.yaml``; this script never edits it directly.
-Every write is preceded by a ``before → after`` line, and nothing is written
-without explicit confirmation (or ``--yes``).
+Every write is preceded by a ``before → after`` line — the config keys, the
+``learned.json`` overlay, and the configure-state sidecar alike — and nothing
+is written without explicit confirmation (or ``--yes``).
 
 Usage
 =====
@@ -154,6 +155,19 @@ def load_savings_engine():
         return importlib.import_module("tool_belt_plugin.savings")
     except Exception:
         return None
+
+
+def require_yaml():
+    """PyYAML, or a loud exit — the shared operator-script policy.
+
+    Delegates to the root ``yaml_required.require_yaml`` so this script
+    degrades exactly like ``shape-ceiling.py`` / ``analyze.py``: a missing
+    parser means the wrong interpreter, and stopping beats reading a partial
+    policy. Raises ``SystemExit(2)``; never returns ``None``.
+    """
+    _load_plugin_package()
+    guard = importlib.import_module("tool_belt_plugin.yaml_required")
+    return guard.require_yaml()
 
 
 def load_savings_cli():
@@ -348,16 +362,16 @@ def hermes_config_get(key: str, runner: Runner = _default_runner) -> str | None:
 def read_plugin_config(runner: Runner = _default_runner) -> dict[str, Any]:
     """Read the whole ``plugins.tool-belt`` block as a dict.
 
-    Returns ``{}`` when the block is unset or when PyYAML is unavailable —
-    callers fall back to per-key scalar reads, which need no parser.
+    Returns ``{}`` when the block is unset or unparseable. A *missing PyYAML*
+    is not a degraded mode: it means the wrong interpreter, and
+    :func:`require_yaml` exits loudly (status 2) rather than silently reporting
+    an empty config block — which would read as "nothing is configured" and
+    offer to configure a scope that already is.
     """
     raw = hermes_config_get(CONFIG_PREFIX, runner=runner)
     if not raw:
         return {}
-    try:
-        import yaml  # type: ignore[import-untyped]
-    except Exception:
-        return {}
+    yaml = require_yaml()
     try:
         data = yaml.safe_load(raw)
     except Exception:
@@ -380,7 +394,8 @@ def scope_settings(
     """Current per-scope ``learned_mode`` / ``bypass_rate`` (raw, may be None).
 
     Prefers the parsed config block; falls back to targeted ``hermes config
-    get`` reads when PyYAML is missing or the block could not be parsed.
+    get`` reads when the block is unset or could not be parsed (a *missing*
+    PyYAML never reaches here — ``read_plugin_config`` exits first).
     """
     if plugin_config:
         channels = plugin_config.get("channels")
@@ -532,6 +547,32 @@ def build_diff(write: ConfigWrite) -> str:
     return f"  {write.key}: {format_value(write.before)} → {after}"
 
 
+def build_overlay_diff(
+    info: ScopeInfo, before: dict[str, list[str]], after: dict[str, list[str]]
+) -> list[str]:
+    """``before → after`` lines for the ``learned.json`` overlay write.
+
+    The config diff alone under-discloses: the substantive change a confirmed
+    shaping makes is to the learned overlay, not to the two config scalars.
+    Every list that changes is shown with its per-tool moves, so nothing is
+    written that did not appear in the diff.
+    """
+    lines = [f"  {info.state_dir / 'learned.json'} — the shaping overlay:"]
+    for key in ("carry", "expand_only"):
+        old = sorted({str(t) for t in (before.get(key) or [])})
+        new = sorted({str(t) for t in (after.get(key) or [])})
+        label = f"    learned.json[{info.scope}].{key}"
+        if old == new:
+            lines.append(f"{label}: {len(old)} tool(s) → unchanged")
+            continue
+        moves = [f"+{t}" for t in new if t not in set(old)]
+        moves += [f"-{t}" for t in old if t not in set(new)]
+        lines.append(
+            f"{label}: {len(old)} tool(s) → {len(new)} ({', '.join(moves)})"
+        )
+    return lines
+
+
 def _fmt_rate(value: float) -> str:
     """Render a bypass rate without rounding it away.
 
@@ -611,11 +652,15 @@ def apply_writes(
     dry_run: bool = False,
     out: Callable[[str], None] = _default_out,
 ) -> list[str]:
-    """Execute pending writes. ``dry_run`` runs no subprocess at all."""
+    """Execute pending writes. ``dry_run`` runs no subprocess at all.
+
+    Under ``dry_run`` the returned commands are the ones that *would* run; the
+    epilogue titles them "Would apply:", so they carry no per-line marker.
+    """
     applied: list[str] = []
     for write in writes:
         if dry_run:
-            applied.append(f"[dry-run] {' '.join(write.argv())}")
+            applied.append(" ".join(write.argv()))
             continue
         try:
             result = _run(runner, write.argv())
@@ -669,31 +714,59 @@ def write_learned_overlay(
     return changed
 
 
+def _assignment_of(state: dict[str, Any], scope: str) -> dict[str, list[str]]:
+    """Read one scope's carrying assignment out of a learned-state document.
+
+    The document is put through ``learned.normalize_state`` — the central
+    v1→v2 adapter — so no v1 key spelling is read (or known) here.
+    """
+    learned = load_learned()
+    if learned is not None:
+        try:
+            state = learned.normalize_state(state)
+        except Exception:
+            pass
+    entry = (state.get("scopes") or {}).get(scope) or {}
+
+    def _lst(key: str) -> list[str]:
+        value = entry.get(key)
+        if not isinstance(value, list):
+            return []
+        return [str(t) for t in value if str(t).strip()]
+
+    return {"carry": _lst("carry"), "expand_only": _lst("expand_only")}
+
+
+def current_assignment(info: ScopeInfo) -> dict[str, list[str]]:
+    """The scope's carrying assignment as ``learned.json`` holds it today.
+
+    The "before" half of the overlay disclosure. A missing/unreadable file is
+    an empty assignment — the same thing the shaper's merge starts from.
+    """
+    path = info.state_dir / "learned.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"carry": [], "expand_only": []}
+    if not isinstance(state, dict):
+        return {"carry": [], "expand_only": []}
+    return _assignment_of(state, info.scope)
+
+
 def proposed_assignment(info: ScopeInfo, recs: dict[str, Any]) -> dict[str, list[str]]:
     """The carrying assignment shaping would write, without writing it.
 
     Delegates to the shaper's own ``merge_into_learned`` in dry-run mode and
     reads the proposed scope entry back from the merged state — the same moves
     (promote/demote across the adaptive carry ⇄ expand_only boundary) the real
-    apply would make. No math is reimplemented here.
+    apply would make, applied to the assignment the scope *already* has. No
+    math is reimplemented here, so a re-shape previews what it will write.
     """
     shaper = load_shaper()
     merged, _changed = shaper.merge_into_learned(
         info.state_dir, {info.scope: recs}, dry_run=True
     )
-    entry = (merged.get("scopes") or {}).get(info.scope) or {}
-
-    def _lst(*keys: str) -> list[str]:
-        for key in keys:
-            value = entry.get(key)
-            if isinstance(value, list):
-                return [str(t) for t in value if str(t).strip()]
-        return []
-
-    return {
-        "carry": _lst("carry", "always_on"),
-        "expand_only": _lst("expand_only", "always_off"),
-    }
+    return _assignment_of(merged, info.scope)
 
 
 def remove_learned_scope(info: ScopeInfo, dry_run: bool = False) -> bool:
@@ -809,11 +882,61 @@ def _project_scope(info: "ScopeInfo", proposal: dict[str, list[str]]):
     return None
 
 
+def _preset_baselines(preset: Any) -> tuple[list[str], list[str]]:
+    """``(always_carry, carry)`` from the shipped policy preset, defensively."""
+    always_carry: list[str] = []
+    carry: list[str] = []
+    if preset is not None:
+        raw = getattr(preset, "always_carry", None)
+        if isinstance(raw, list):
+            always_carry = [str(t) for t in raw]
+        raw = getattr(preset, "carry", None)
+        if isinstance(raw, list):
+            carry = [str(t) for t in raw]
+    return always_carry, carry
+
+
+def _trigger_lines(preset: Any) -> list[str]:
+    """The "trigger groups unchanged" line, or nothing when there are none."""
+    triggers = list(getattr(preset, "triggers", []) or []) if preset is not None else []
+    rows = [
+        f"{getattr(group, 'name', '?')} ({len(list(getattr(group, 'tools', []) or []))} tools)"
+        for group in triggers
+    ]
+    if not rows:
+        return []
+    return [
+        f"  Trigger groups unchanged by these transitions ({len(rows)}): "
+        + ", ".join(rows)
+    ]
+
+
+def _effective_carried(
+    always_carry: Sequence[str], policy_carry: Sequence[str], proposal: dict[str, list[str]]
+) -> list[str]:
+    """Adaptive residents once ``proposal`` is the live overlay.
+
+    Mirrors ``learned.apply_to_preset``'s precedence — ``(policy carry −
+    learned expand_only) ∪ learned carry`` minus the immutable
+    ``always_carry`` — over the overlay the shaper's merge would actually
+    write. The promote/demote move algebra itself is never recomputed here;
+    it arrives already resolved in ``proposal``.
+    """
+    expand_set = {str(t) for t in (proposal.get("expand_only") or [])}
+    always_set = {str(t) for t in always_carry}
+    carried = [t for t in policy_carry if t not in expand_set]
+    for tool in proposal.get("carry") or []:
+        if tool not in carried:
+            carried.append(str(tool))
+    return [t for t in carried if t not in always_set]
+
+
 def render_shaping_summary(
     info: "ScopeInfo",
     recs: dict[str, Any] | None,
     preset: Any = None,
     thresholds: dict[str, int] | None = None,
+    proposal: dict[str, list[str]] | None = None,
 ) -> list[str]:
     """Plain-language description of what shaping would do to one scope.
 
@@ -826,6 +949,12 @@ def render_shaping_summary(
         are never disabled.
       * Trigger groups, which those transitions never touch.
 
+    ``proposal`` is the assignment the apply would write —
+    ``proposed_assignment()``, i.e. the shaper's own dry-run merge. It is
+    computed here when the caller does not supply it. Because it starts from
+    the scope's *existing* overlay, a re-shape previews the same result the
+    apply will write; nothing about the move algebra is recomputed locally.
+
     Never raises on thin or empty input — an unshapeable scope simply says so.
     """
     thresholds = thresholds or {}
@@ -836,28 +965,19 @@ def render_shaping_summary(
 
     lines = [f"{info.scope} — from {considered} recorded session(s)"]
 
-    base_always_carry: list[str] = []
-    base_carry: list[str] = []
-    if preset is not None:
-        raw = getattr(preset, "always_carry", None)
-        if isinstance(raw, list):
-            base_always_carry = [str(t) for t in raw]
-        raw = getattr(preset, "carry", None)
-        if isinstance(raw, list):
-            base_carry = [str(t) for t in raw]
+    base_always_carry, base_carry = _preset_baselines(preset)
 
     demoted_names = sorted(str(d.get("tool") or "") for d in demote)
     demoted_names = [n for n in demoted_names if n]
     promoted_names = sorted(str(p.get("tool") or "") for p in promote)
     promoted_names = [name for name in promoted_names if name]
 
-    # Proposed adaptive residents: policy carry − demotions + promotions.
-    # always_carry is immutable — it wins every conflict by construction, so a
-    # demote candidate there can never appear (the shaper asserts this too).
-    carried = [t for t in base_carry if t not in set(demoted_names)]
-    for name in promoted_names:
-        if name not in carried:
-            carried.append(name)
+    if proposal is None:
+        try:
+            proposal = proposed_assignment(info, recs)
+        except Exception:
+            proposal = {"carry": [], "expand_only": []}
+    carried = _effective_carried(base_always_carry, base_carry, proposal)
 
     lines.append(f"  Always carried — permanent baseline ({len(base_always_carry)}): "
                  + (", ".join(sorted(base_always_carry)) if base_always_carry else "none"))
@@ -894,18 +1014,7 @@ def render_shaping_summary(
                 "  Proposed demotions: none — every adaptive carry resident got used."
             )
 
-    triggers = list(getattr(preset, "triggers", []) or []) if preset is not None else []
-    if triggers:
-        rows = [
-            f"{getattr(group, 'name', '?')} ({len(list(getattr(group, 'tools', []) or []))} tools)"
-            for group in triggers
-        ]
-        if rows:
-            lines.append(
-                f"  Trigger groups unchanged by these transitions ({len(rows)}): "
-                + ", ".join(rows)
-            )
-
+    lines.extend(_trigger_lines(preset))
     return lines
 
 
@@ -1028,11 +1137,24 @@ class RunContext:
         return scope_settings(scope, self.plugin_config, runner=self.runner)
 
 
-def _confirm_writes(ctx: RunContext, title: str, writes: Sequence[ConfigWrite]) -> bool:
-    """Show the diff, then ask. ``--yes`` skips the ask, never the diff."""
+def _confirm_writes(
+    ctx: RunContext,
+    title: str,
+    writes: Sequence[ConfigWrite],
+    extra: Sequence[str] = (),
+) -> bool:
+    """Show the diff, then ask. ``--yes`` skips the ask, never the diff.
+
+    ``extra`` carries the non-config half of the disclosure (the learned
+    overlay, the configure-state sidecar). It is printed with the config diff,
+    before the question — an answer of ``y`` must never write something the
+    user was not shown.
+    """
     ctx.out(f"\n  {title}")
     for write in writes:
         ctx.out(build_diff(write))
+    for line in extra:
+        ctx.out(line)
     if not ctx.have_hermes:
         print_manual_commands(writes, ctx.out)
         return False
@@ -1054,13 +1176,16 @@ def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
             ctx.out(f"\n  {info.scope}: no telemetry recorded yet — nothing to shape.")
             ctx.out("    Choose the 'recommend' path for this agent instead.")
             continue
+        # One dry-run merge feeds the preview, the projection and the diff, so
+        # all three describe exactly what the apply will write.
+        proposal = proposed_assignment(info, recs)
         ctx.out("")
-        for line in render_shaping_summary(info, recs, preset, ctx.thresholds):
+        for line in render_shaping_summary(info, recs, preset, ctx.thresholds, proposal):
             ctx.out(line)
 
         # Projection: the canonical engine replays this scope's real session
         # history against the *proposed* (not-yet-applied) assignment.
-        agent_savings = _project_scope(info, proposed_assignment(info, recs))
+        agent_savings = _project_scope(info, proposal)
         if agent_savings is not None:
             for line in render_projection(info, agent_savings.projected):
                 ctx.out(line)
@@ -1070,7 +1195,8 @@ def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
             )
 
         writes = plan_shape_writes(info, ctx.settings(info.scope))
-        if not _confirm_writes(ctx, f"Config changes for {info.scope}:", writes):
+        overlay = build_overlay_diff(info, current_assignment(info), proposal)
+        if not _confirm_writes(ctx, f"Changes for {info.scope}:", writes, overlay):
             ctx.out(f"  Skipped {info.scope}. Nothing written.")
             continue
 
@@ -1129,7 +1255,12 @@ def flow_recommend(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
     for info in infos:
         settings = ctx.settings(info.scope)
         writes = plan_recommend_writes(info, settings)
-        if not _confirm_writes(ctx, f"Config changes for {info.scope}:", writes):
+        sidecar = [
+            f"  {_configure_state_path(info.state_dir)} — records the current "
+            f"bypass_rate for {info.scope} so a later reset can restore it.",
+            "    The learned overlay is not touched on this path.",
+        ]
+        if not _confirm_writes(ctx, f"Changes for {info.scope}:", writes, sidecar):
             ctx.out(f"  Skipped {info.scope}. Nothing written.")
             continue
         if not ctx.dry_run:
@@ -1252,9 +1383,61 @@ def _menu(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
 
 
 def _ask_platforms(ctx: RunContext) -> list[str]:
-    ctx.out("\n  No telemetry recorded yet, so the platforms you run aren't known.")
     answer = prompt("  Which platforms do you use? (e.g. telegram, slack, cli): ", ctx.reader)
     return [p.strip().lower() for p in answer.replace(" ", ",").split(",") if p.strip()]
+
+
+def _print_no_profiles(ctx: RunContext) -> None:
+    """Said only when ``discover_state_dirs`` genuinely found nothing."""
+    ctx.out(f"\n  No Hermes profiles found under {ctx.hermes_home}.")
+    ctx.out("  Point this at the right home with --hermes-home, or install and")
+    ctx.out("  start a Hermes gateway first, then re-run this command.")
+
+
+def _print_fresh_install_guidance(ctx: RunContext) -> None:
+    """The brand-new-install front door: profiles exist, telemetry does not.
+
+    Never says the profiles are absent — the caller has just listed them by
+    name. What is missing is telemetry, which only real gateway sessions
+    produce.
+    """
+    needed = required_sessions(ctx.thresholds)
+    ctx.out("\n  What to expect")
+    ctx.out("    · Tool Belt records one row per gateway session; a brand-new")
+    ctx.out("      install has none until you use your agents.")
+    ctx.out(f"    · Once a scope reaches {needed} recorded session(s), re-running")
+    ctx.out("      this command offers the shaping review.")
+    ctx.out("    · `python3 scripts/configure.py --status` shows the count at any time.")
+    ctx.out("    · To start observation mode now — before any telemetry exists —")
+    ctx.out("      name the platforms you run:")
+    ctx.out("        python3 scripts/configure.py --platform telegram --platform slack")
+
+
+def _recover_fresh_install(ctx: RunContext, profile_filter: str | None, args) -> list[ScopeInfo]:
+    """No scopes: distinguish "no profiles" from "no telemetry yet", then help.
+
+    Returns any scopes recovered by asking which platforms the user runs; an
+    empty list means the caller should stop after the guidance printed here.
+    """
+    found = discover_state_dirs(ctx.hermes_home, profile_filter)
+    if not found:
+        _print_no_profiles(ctx)
+        return []
+
+    labels = [label for label, _ in found]
+    ctx.out(f"\n  Hermes profile(s) found: {', '.join(labels)}.")
+    ctx.out("  No Tool Belt telemetry has been recorded for them yet, so the")
+    ctx.out("  platforms each one runs aren't known.")
+    # --platform was already honored by discovery; --yes must not prompt.
+    if args.platform or args.yes:
+        _print_fresh_install_guidance(ctx)
+        return []
+
+    platforms = _ask_platforms(ctx)
+    infos = discover_scopes(ctx.hermes_home, profile_filter, platforms)
+    if not infos:
+        _print_fresh_install_guidance(ctx)
+    return infos
 
 
 # ──────────────────────────────────── CLI ────────────────────────────────────
@@ -1280,6 +1463,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(list(argv) if argv is not None else None)
     hermes_home = args.hermes_home or default_hermes_home()
 
+    # Both of the PyYAML-dependent reads (the shaper's policy thresholds, then
+    # the plugin config block) happen here, before a single line of the
+    # conversation is printed — so a wrong-interpreter run exits 2 with the
+    # guard's message and nothing else, never half a rendered flow.
     ctx = RunContext(
         hermes_home=hermes_home,
         dry_run=bool(args.dry_run),
@@ -1305,14 +1492,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         ctx.out("  below is printed as a command for you to run by hand.")
 
     try:
-        if not infos and not args.status:
-            if args.platform or args.yes or profile_filter is None:
-                ctx.out(f"\n  No Hermes profiles found under {hermes_home}.")
-                return 0
-            platforms = _ask_platforms(ctx)
-            infos = discover_scopes(hermes_home, profile_filter, platforms)
+        if not infos:
+            infos = _recover_fresh_install(ctx, profile_filter, args)
             if not infos:
-                ctx.out("\n  Nothing to configure yet.")
                 return 0
 
         if args.reset:
@@ -1328,7 +1510,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if ctx.applied:
-        ctx.out("\n  Applied:")
+        ctx.out("\n  Would apply:" if ctx.dry_run else "\n  Applied:")
         for line in ctx.applied:
             ctx.out(f"    {line}")
     elif not ctx.dry_run:

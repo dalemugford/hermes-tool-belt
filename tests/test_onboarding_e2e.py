@@ -158,6 +158,19 @@ class OnboardingArcTests(OnboardingTestCase):
         self.assertIn("No agent scopes found yet", output)
         self.assertEqual(runner.writes, [])
 
+    def test_fresh_install_front_door(self) -> None:
+        """Profiles but no telemetry: truthful text, guidance, nothing written."""
+        before = self.fs_snapshot()
+        runner = tc.FakeRunner()
+        rc, output = self.run_main(["--yes"], runner)
+        self.assertEqual(rc, 0)
+        self.assertNotIn("No Hermes profiles found", output)
+        self.assertIn("Hermes profile(s) found: default", output)
+        self.assertIn("No Tool Belt telemetry has been recorded", output)
+        self.assertIn("What to expect", output)
+        self.assertEqual(runner.writes, [])
+        self.assertEqual(self.fs_snapshot(), before)
+
     def test_recommend_to_observing(self) -> None:
         """recommend → the two config writes, the sidecar, then ``observing``."""
         result = self.seed("observing")
@@ -230,6 +243,28 @@ class OnboardingArcTests(OnboardingTestCase):
         )
         self.assertIn(configure.STATE_SHAPED, status)
 
+    def test_overlay_write_is_disclosed_and_matches_what_lands_on_disk(self) -> None:
+        """The terminal diff names every tool the overlay write then contains."""
+        result = self.seed("terminal-heavy")
+        runner = tc.FakeRunner(self.observing_config(result.scope))
+        rc, output = self.run_main(["--path", "shape", "--yes"], runner)
+        self.assertEqual(rc, 0)
+
+        entry = self.learned()["scopes"][result.scope]
+        lines = output.splitlines()
+        carry_line = next(
+            l for l in lines if f"learned.json[{result.scope}].carry:" in l
+        )
+        expand_line = next(
+            l for l in lines if f"learned.json[{result.scope}].expand_only:" in l
+        )
+        self.assertIn(f"→ {len(entry['carry'])} (", carry_line)
+        self.assertIn(f"→ {len(entry['expand_only'])} (", expand_line)
+        for tool in entry["carry"]:
+            self.assertIn(f"+{tool}", carry_line)
+        for tool in entry["expand_only"]:
+            self.assertIn(f"+{tool}", expand_line)
+
     def test_demote_arm_named_profile(self) -> None:
         """A chat-only agent in a named profile demotes its unused carry residents.
 
@@ -298,6 +333,9 @@ class OnboardingArcTests(OnboardingTestCase):
         rc, output = self.run_main(["--path", "shape", "--yes", "--dry-run"], runner)
         self.assertEqual(rc, 0)
         self.assertIn("dry-run", output)
+        # …and the epilogue never claims the run applied anything.
+        self.assertIn("Would apply:", output)
+        self.assertNotIn("Applied:", output)
         self.assertEqual(self.fs_snapshot(), before)
         self.assertFalse((self.root_state / "learned.json").exists())
         # Config is read (main() reads the block once) but never mutated.

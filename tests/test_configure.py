@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -253,11 +254,15 @@ class ShapingSummaryTests(TempHomeTestCase):
         )
 
     def test_renders_promotions_demotions_and_triggers(self) -> None:
+        # ``enabled_tool_names`` is what the shaper validates candidates
+        # against; the preview now runs through the shaper's own dry-run merge,
+        # so a fixture without it would (correctly) preview no moves at all.
         recs = {
             "scope": "default:telegram",
             "sessions_considered": 24,
             "promote": [{"tool": "terminal", "sessions": 4, "calls": 9, "evidence": "expand_tools"}],
             "demote": [{"tool": "web_search", "sessions_without_use": 24, "evidence": "carry_unused"}],
+            "enabled_tool_names": ["terminal", "web_search"],
         }
         preset = configure.load_base_preset()
         self.assertIsNotNone(preset, "shipped policy should load")
@@ -298,6 +303,191 @@ class ShapingSummaryTests(TempHomeTestCase):
         recs = {"sessions_considered": 24, "promote": [], "demote": []}
         blob = "\n".join(configure.render_shaping_summary(self._info(), recs, None, self.thresholds))
         self.assertNotIn("bypass", blob.lower())
+
+
+class ReShapePreviewTests(TempHomeTestCase):
+    """The preview of a re-shape must equal what the apply then writes.
+
+    Regression: the summary used to re-implement the move algebra as
+    ``policy carry − demoted + promoted``, ignoring the scope's *existing*
+    learned assignment — so re-shaping an already-shaped scope previewed a
+    different loadout than ``merge_into_learned`` wrote.
+    """
+
+    SCOPE = "default:telegram"
+
+    def _seed_already_shaped(self) -> "configure.ScopeInfo":
+        seed_telemetry(
+            self.root_state,
+            self.SCOPE,
+            sessions=self.needed,
+            always_on=["web_search", "read_file"],
+            expanded_tool="terminal",
+            expanded_sessions=3,
+            expanded_calls_each=2,
+        )
+        # An overlay that a previous shaping left behind: one adaptive resident
+        # the current recommendations never mention, and one policy carry tool
+        # already demoted out.
+        (self.root_state / "learned.json").write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "scopes": {
+                        self.SCOPE: {
+                            "carry": ["mnemosyne_recall"],
+                            "expand_only": ["read_file"],
+                            "shaping": {},
+                        }
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return configure.discover_scopes(self.home)[0]
+
+    def test_preview_matches_what_the_apply_writes(self) -> None:
+        info = self._seed_already_shaped()
+        sink: list[str] = []
+        ctx = make_ctx(
+            self.home,
+            FakeRunner(),
+            assume_yes=True,
+            thresholds=self.thresholds,
+            out=sink.append,
+        )
+        self.assertEqual(configure.flow_shape(ctx, [info]), 0)
+
+        # What was actually written …
+        entry = json.loads((self.root_state / "learned.json").read_text())["scopes"][
+            self.SCOPE
+        ]
+        written_carry = set(entry["carry"])
+        written_expand = set(entry["expand_only"])
+
+        # … composed onto the policy baseline exactly as learned.apply_to_preset
+        # does at runtime (computed here, not imported, so this test also runs
+        # against the pre-change revision).
+        preset = configure.load_base_preset()
+        self.assertIsNotNone(preset)
+        always = set(preset.always_carry)
+        effective = [t for t in preset.carry if t not in written_expand]
+        for tool in sorted(written_carry):
+            if tool not in effective:
+                effective.append(tool)
+        effective = sorted(t for t in effective if t not in always)
+
+        carried_line = next(l for l in sink if l.startswith("  Carried"))
+        self.assertEqual(
+            carried_line,
+            f"  Carried — adaptive residents after shaping ({len(effective)}): "
+            + ", ".join(effective),
+        )
+        # The pre-existing resident survives the re-shape and is previewed.
+        self.assertIn("mnemosyne_recall", carried_line)
+        # The already-demoted policy tool is not previewed back into carry.
+        self.assertNotIn("read_file", carried_line)
+
+
+class WriteDisclosureTests(TempHomeTestCase):
+    """Nothing is written that did not appear in the pre-prompt diff."""
+
+    def _shapeable(self) -> "configure.ScopeInfo":
+        seed_telemetry(
+            self.root_state,
+            "default:telegram",
+            sessions=self.needed,
+            always_on=["web_search", "read_file"],
+            expanded_tool="terminal",
+            expanded_sessions=3,
+            expanded_calls_each=2,
+        )
+        return configure.discover_scopes(self.home)[0]
+
+    def _run_until_prompt(self, flow, info) -> list[str]:
+        """Drive ``flow`` with a reader that declines, marking the ask."""
+        sink: list[str] = []
+
+        def reader(message: str) -> str:
+            sink.append(f"<<PROMPT>> {message}")
+            return "n"
+
+        ctx = make_ctx(
+            self.home,
+            FakeRunner(),
+            thresholds=self.thresholds,
+            out=sink.append,
+            reader=reader,
+        )
+        flow(ctx, [info])
+        return sink
+
+    def test_learned_overlay_change_is_shown_before_the_question(self) -> None:
+        info = self._shapeable()
+        sink = self._run_until_prompt(configure.flow_shape, info)
+        blob = "\n".join(sink)
+        self.assertIn("learned.json[default:telegram].carry:", blob)
+        self.assertIn("learned.json[default:telegram].expand_only:", blob)
+        self.assertIn("+terminal", blob)
+
+        overlay_at = next(
+            i for i, l in enumerate(sink) if "learned.json[default:telegram].carry:" in l
+        )
+        prompt_at = next(i for i, l in enumerate(sink) if l.startswith("<<PROMPT>>"))
+        self.assertLess(overlay_at, prompt_at, "the overlay diff must precede the ask")
+
+        # Declining still writes nothing at all.
+        self.assertFalse((self.root_state / "learned.json").exists())
+
+    def test_sidecar_write_is_disclosed_on_the_recommend_path(self) -> None:
+        info = self._shapeable()
+        sink = self._run_until_prompt(configure.flow_recommend, info)
+        blob = "\n".join(sink)
+        self.assertIn(configure.CONFIGURE_STATE_FILE, blob)
+        sidecar_at = next(
+            i for i, l in enumerate(sink) if configure.CONFIGURE_STATE_FILE in l
+        )
+        prompt_at = next(i for i, l in enumerate(sink) if l.startswith("<<PROMPT>>"))
+        self.assertLess(sidecar_at, prompt_at)
+
+    def test_disclosed_overlay_equals_the_overlay_written_on_yes(self) -> None:
+        info = self._shapeable()
+        sink: list[str] = []
+        ctx = make_ctx(
+            self.home, FakeRunner(), assume_yes=True, thresholds=self.thresholds,
+            out=sink.append,
+        )
+        configure.flow_shape(ctx, [info])
+        entry = json.loads((self.root_state / "learned.json").read_text())["scopes"][
+            info.scope
+        ]
+        carry_line = next(
+            l for l in sink if f"learned.json[{info.scope}].carry:" in l
+        )
+        self.assertIn(f"→ {len(entry['carry'])} (", carry_line)
+        for tool in entry["carry"]:
+            self.assertIn(f"+{tool}", carry_line)
+
+
+class MissingPyYAMLTests(unittest.TestCase):
+    """A missing parser is a wrong-interpreter fault, not a degraded mode."""
+
+    def test_config_block_read_exits_loudly_instead_of_reporting_empty(self) -> None:
+        runner = FakeRunner({"plugins.tool-belt": "enabled: true\nlearned_mode: apply\n"})
+        with mock.patch.dict(sys.modules, {"yaml": None}):
+            with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                with self.assertRaises(SystemExit) as ctx:
+                    configure.read_plugin_config(runner)
+        self.assertEqual(ctx.exception.code, 2)
+        message = err.getvalue()
+        self.assertIn("PyYAML is required", message)
+        self.assertIn("pip install pyyaml", message)
+
+    def test_an_unset_block_never_reaches_the_guard(self) -> None:
+        # No config block to parse means no parser is needed — a fresh install
+        # without PyYAML-dependent state must not be turned into a hard exit.
+        with mock.patch.dict(sys.modules, {"yaml": None}):
+            self.assertEqual(configure.read_plugin_config(FakeRunner()), {})
 
 
 class ConfigDiffTests(unittest.TestCase):
@@ -648,6 +838,102 @@ class MainEntryPointTests(TempHomeTestCase):
         self.assertEqual(runner.writes, [])
         self.assertFalse((self.root_state / "learned.json").exists())
         self.assertIn("dry-run", output)
+
+    def test_dry_run_epilogue_never_claims_anything_was_applied(self) -> None:
+        runner = FakeRunner()
+        _rc, output, _runner = self._run(
+            ["--agent", "default", "--path", "shape", "--yes", "--dry-run"], runner
+        )
+        self.assertIn("Would apply:", output)
+        self.assertNotIn("Applied:", output)
+
+    def test_a_real_apply_still_says_applied(self) -> None:
+        runner = FakeRunner()
+        _rc, output, _runner = self._run(
+            ["--agent", "default", "--path", "shape", "--yes"], runner
+        )
+        self.assertIn("Applied:", output)
+        self.assertNotIn("Would apply:", output)
+
+
+class FreshInstallFrontDoorTests(TempHomeTestCase):
+    """The very first command a new user runs, on a home with no telemetry.
+
+    Regression: profiles plainly present, ``discover_scopes`` empty, and the
+    user was told "No Hermes profiles found" and given nothing.
+    """
+
+    ABSENT = "No Hermes profiles found"
+
+    def _run(self, argv: list[str], answers: list[str] | None = None):
+        runner = FakeRunner()
+        lines: list[str] = []
+        replies = iter(answers or [])
+        with contextlib.ExitStack() as stack:
+            for patch in isolate(runner, "/usr/bin/hermes", lines):
+                stack.enter_context(patch)
+            # RunContext binds ``_default_reader`` as a dataclass default, so
+            # the interception has to happen one level down, at ``input``.
+            stack.enter_context(mock.patch("builtins.input", lambda _p="": next(replies)))
+            rc = configure.main(argv + ["--hermes-home", str(self.home)])
+        return rc, "\n".join(lines), runner
+
+    def test_profiles_without_telemetry_are_never_reported_absent(self) -> None:
+        # self.home has state/tool-belt (so a profile is discoverable) but no
+        # predictions.jsonl at all — a genuinely fresh install.
+        self.assertEqual(configure.discover_scopes(self.home), [])
+        self.assertTrue(configure.discover_state_dirs(self.home))
+
+        rc, output, runner = self._run(["--yes"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn(self.ABSENT, output)
+        self.assertIn("Hermes profile(s) found: default", output)
+        self.assertIn("No Tool Belt telemetry has been recorded", output)
+        self.assertEqual(runner.writes, [])
+
+    def test_the_fresh_install_is_told_what_to_expect(self) -> None:
+        _rc, output, _runner = self._run(["--yes"])
+        self.assertIn("What to expect", output)
+        self.assertIn("one row per gateway session", output)
+        self.assertIn(f"{self.needed} recorded session(s)", output)
+        self.assertIn("--status", output)
+        self.assertIn("--platform", output)
+
+    def test_the_platform_prompt_is_reachable_without_agent(self) -> None:
+        # No --agent, no --platform: the recovery must still be offered, and
+        # naming a platform must produce a configurable scope.
+        rc, output, runner = self._run(["--path", "recommend"], answers=["telegram", "y"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn(self.ABSENT, output)
+        self.assertIn("default:telegram", output)
+        self.assertEqual(
+            {c[3]: c[4] for c in runner.writes},
+            {
+                "plugins.tool-belt.channels.default:telegram.learned_mode": "recommend",
+                "plugins.tool-belt.channels.default:telegram.bypass_rate": "1.0",
+            },
+        )
+
+    def test_an_empty_answer_falls_through_to_the_same_guidance(self) -> None:
+        rc, output, runner = self._run(["--path", "recommend"], answers=[""])
+        self.assertEqual(rc, 0)
+        self.assertNotIn(self.ABSENT, output)
+        self.assertIn("What to expect", output)
+        self.assertEqual(runner.writes, [])
+
+    def test_a_home_with_no_profiles_still_says_so(self) -> None:
+        empty = Path(self.tmp.name) / "empty home"
+        empty.mkdir()
+        runner = FakeRunner()
+        lines: list[str] = []
+        with contextlib.ExitStack() as stack:
+            for patch in isolate(runner, "/usr/bin/hermes", lines):
+                stack.enter_context(patch)
+            rc = configure.main(["--yes", "--hermes-home", str(empty)])
+        output = "\n".join(lines)
+        self.assertEqual(rc, 0)
+        self.assertIn(self.ABSENT, output)
+        self.assertEqual(runner.writes, [])
 
 
 class DegradedModeTests(TempHomeTestCase):
