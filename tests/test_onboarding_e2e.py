@@ -211,6 +211,11 @@ class OnboardingArcTests(OnboardingTestCase):
         self.assertEqual(entry["cache_aware"]["scope"], result.scope)
         self.assertIn("execute_code", output)
 
+        # The confirmed-apply epilogue speaks the 1.0 vocabulary: the retired
+        # "moved to on-demand" phrasing must never resurface in any flow.
+        self.assertIn("moved to expand-only", output)
+        self.assertNotIn("moved to on-demand", output)
+
         self.assertEqual(
             {c[3]: c[4] for c in runner.writes},
             {

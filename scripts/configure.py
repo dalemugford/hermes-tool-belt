@@ -1083,7 +1083,7 @@ def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
         ctx.out("\n  What happens next")
         ctx.out("    · Restart the Hermes gateway to pick up the new configuration.")
         ctx.out("    · Shaped agents load a tighter tool set from their next session on.")
-        ctx.out("    · Anything moved to on-demand comes back instantly via expand_tools.")
+        ctx.out("    · Anything moved to expand-only comes back instantly via expand_tools.")
         ctx.out("    · Re-run this command any time to review or reset an agent.")
     return 0
 
