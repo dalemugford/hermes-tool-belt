@@ -3,7 +3,33 @@
 # uses, then execute the importable CLI module without loading plugin hooks.
 set -e
 
-_TOOL_BELT_DIR=$(CDPATH= cd -P "$(dirname "$0")" >/dev/null 2>&1 && pwd)
+# Resolve $0 through symlinks before deriving the plugin dir: `ln -s
+# .../plugins/tool-belt/tool-belt ~/.local/bin/tool-belt` is a natural thing to
+# do, and without this the script would look for savings_cli.py in ~/.local/bin.
+# `readlink -f` is GNU-only, so walk the chain by hand (BSD/macOS + GNU), and
+# skip the walk entirely where readlink is absent.
+_tb_src=$0
+if command -v readlink >/dev/null 2>&1; then
+  _tb_hops=0
+  while [ -L "$_tb_src" ]; do
+    _tb_hops=$((_tb_hops + 1))
+    if [ "$_tb_hops" -gt 40 ]; then
+      printf "%s\n" "tool-belt: symlink loop while resolving $0" >&2
+      exit 1
+    fi
+    _tb_dir=$(CDPATH= cd -P "$(dirname "$_tb_src")" >/dev/null 2>&1 && pwd)
+    _tb_link=$(readlink "$_tb_src" 2>/dev/null) || _tb_link=
+    if [ -z "$_tb_link" ]; then
+      break
+    fi
+    case $_tb_link in
+      /*) _tb_src=$_tb_link ;;
+      *)  _tb_src=$_tb_dir/$_tb_link ;;
+    esac
+  done
+fi
+
+_TOOL_BELT_DIR=$(CDPATH= cd -P "$(dirname "$_tb_src")" >/dev/null 2>&1 && pwd)
 
 if [ -n "${HERMES_PYTHON:-}" ] && [ ! -x "$HERMES_PYTHON" ] \
    && ! command -v "$HERMES_PYTHON" >/dev/null 2>&1; then

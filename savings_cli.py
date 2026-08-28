@@ -157,6 +157,24 @@ export HERMES_PYTHON={python}
 exec {executable} "$@"
 """
 
+#: Ownership marker — present in every launcher this module has ever written.
+#: A file at the target without it belongs to someone else and is never touched.
+_LAUNCHER_MARKER = "Hermes Tool Belt launcher"
+
+
+def _launcher_exec_target(content: str) -> str | None:
+    """The path a generated launcher ``exec``s, or None if unreadable."""
+    for line in content.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("exec "):
+            continue
+        try:
+            parts = shlex.split(stripped[len("exec "):])
+        except ValueError:
+            return None
+        return parts[0] if parts else None
+    return None
+
 
 def user_local_bin() -> Path:
     """The user-level bin dir the Hermes installer guarantees is on PATH."""
@@ -203,20 +221,57 @@ def ensure_launcher(
 
     Prefers ``~/.local/bin`` (on PATH for standard Hermes installs); falls
     back to ``$HERMES_HOME/bin`` when ``~/.local/bin`` does not exist. Never
-    writes silently: ``confirm`` must return True. Returns True if the
-    launcher exists (already present, or created now). Prints PATH guidance
-    when the launcher's directory is not on PATH. Intended for onboarding —
-    this function is the *only* writing surface in the CLI module.
+    writes silently: ``confirm`` must return True. Returns True if a working
+    launcher for *this* plugin exists (already present, or created now).
+    Prints PATH guidance when the launcher's directory is not on PATH.
+    Intended for onboarding — this function is the *only* writing surface in
+    the CLI module.
+
+    An existing file at the target is not taken on faith. The launcher bakes
+    in an absolute ``exec`` path, so a shim left behind by a moved or replaced
+    plugin directory keeps dispatching to a path that no longer exists (or to
+    a different checkout). Three cases:
+
+    * ours and current (``exec`` target exists and is ``repo_executable``) —
+      nothing to do, still idempotent;
+    * ours and stale — offer to refresh it through the same ``confirm`` gate;
+    * not ours (no Tool Belt marker) — warn, leave it alone, claim nothing.
     """
     target = launcher_path(hermes_home, user_home=user_home)
+    desired_exec = str(repo_executable)
     if target.exists():
-        out(f"Launcher already present: {target}")
-        _maybe_path_note(hermes_home, out)
-        return True
-    if not confirm(f"Create launcher at {target}? [y/N] "):
+        try:
+            content = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            content = ""
+        if _LAUNCHER_MARKER not in content:
+            out(
+                f"A file at {target} was not created by Tool Belt; leaving it "
+                "untouched. Remove or rename it, then re-run configure."
+            )
+            out(path_guidance(hermes_home))
+            return False
+        existing = _launcher_exec_target(content)
+        if existing == desired_exec and Path(desired_exec).exists():
+            out(f"Launcher already present: {target}")
+            _maybe_path_note(hermes_home, out)
+            return True
+        if not existing:
+            detail = "it has no readable exec target"
+        elif not Path(existing).exists():
+            detail = f"its exec target no longer exists: {existing}"
+        else:
+            detail = f"it points at a different plugin: {existing}"
+        out(f"Launcher at {target} is stale — {detail}")
+        if not confirm(f"Refresh launcher at {target} to {desired_exec}? [y/N] "):
+            out("Skipped launcher refresh.")
+            out(path_guidance(hermes_home))
+            return False
+    elif not confirm(f"Create launcher at {target}? [y/N] "):
         out("Skipped launcher creation.")
         out(path_guidance(hermes_home))
         return False
+    was_present = target.exists()
     target.parent.mkdir(parents=True, exist_ok=True)
     content = _LAUNCHER_TEMPLATE.format(
         python=shlex.quote(python or sys.executable),
@@ -224,7 +279,7 @@ def ensure_launcher(
     )
     target.write_text(content, encoding="utf-8")
     target.chmod(0o755)
-    out(f"Created launcher: {target}")
+    out(f"{'Refreshed' if was_present else 'Created'} launcher: {target}")
     _maybe_path_note(hermes_home, out)
     return True
 
@@ -280,7 +335,7 @@ def run(argv: list[str] | None = None, *, out: Callable[[str], None] | None = No
             since=args.since,
             cache_mode=args.cache_mode,
         )
-    except _savings.UnknownAgentError as exc:
+    except (_savings.UnknownAgentError, _savings.InvalidSinceError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

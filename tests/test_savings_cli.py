@@ -13,8 +13,9 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 TESTS_DIR = PLUGIN_DIR / "tests"
@@ -122,6 +123,42 @@ def _write_observed(state_dir: Path, scope: str, *, expand_events: int = 0) -> N
         "".join(json.dumps(r) + "\n" for r in apis), encoding="utf-8")
     (state_dir / "tool_calls.jsonl").write_text(
         "".join(json.dumps(r) + "\n" for r in tcs), encoding="utf-8")
+
+
+def _write_route_evidence(state_dir: Path, session_stem: str, calls: list[dict],
+                          *, scope: str = "default:telegram",
+                          base_ts: float = 1780000000.0) -> None:
+    """Seed the predictions→api_calls bridge for one session file.
+
+    Mirrors what the plugin actually writes: ``predictions.jsonl`` rows carry
+    ``hermes_session_id`` (the session file stem) and ``api_calls.jsonl`` rows
+    carry ``provider``/``api_mode``/``input_tokens`` — the fields live
+    ``session_meta`` records never contain.
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    preds, apis = [], []
+    for i, call in enumerate(calls):
+        pid = f"{session_stem}-p{i}"
+        preds.append({
+            "schema_version": 2, "ts": base_ts + i, "prediction_id": pid,
+            "hermes_session_id": session_stem, "session_id": f"chat-{session_stem}",
+            "scope": scope, "policy_source": "preset",
+            "ceiling_count": 40, "narrowed_count": 20,
+            "ceiling_tokens": 10000, "narrowed_tokens": 4000, "frozen_reuse": False,
+        })
+        apis.append({
+            "ts": base_ts + i, "prediction_id": pid, "session_id": f"chat-{session_stem}",
+            "scope": scope, "api_call_idx": 0, "cache_mode": "on",
+            "model": call.get("model", "claude-sonnet-4-6"),
+            "provider": call.get("provider", ""),
+            "api_mode": call.get("api_mode", ""),
+            "input_tokens": int(call.get("input_tokens") or 0),
+            "cache_read_tokens": 0, "cache_write_tokens": 0,
+        })
+    (state_dir / "predictions.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in preds), encoding="utf-8")
+    (state_dir / "api_calls.jsonl").write_text(
+        "".join(json.dumps(r) + "\n" for r in apis), encoding="utf-8")
 
 
 # A ceiling mixing residents, trigger-activatable, and pure expand_only tools.
@@ -594,6 +631,150 @@ class CostClassificationTests(_HomeCase):
         self.assertFalse(cc.dollars_allowed)
 
 
+class ApiCallRouteCostingTests(_HomeCase):
+    """Costing evidence comes from `api_calls.jsonl` — the only place the
+    billing route is actually recorded. Every evidence gate is preserved: no
+    route evidence means `unknown` means no dollars."""
+
+    TURNS = [{"user": "hello there"}, {"user": "write a file for me"}]
+
+    def _project(self):
+        return savings.compute_projected(
+            savings.discover_agents(self.home)[0], {"enabled": True})
+
+    def test_metered_route_from_api_calls_produces_usd(self):
+        """session_meta carries no route; api_calls prove a metered one."""
+        _write_session(self.home / "sessions", "m", platform="telegram",
+                       model="claude-sonnet-4-6", ceiling=CEILING, turns=self.TURNS)
+        _write_route_evidence(
+            self.home / "state" / "tool-belt", "m",
+            [{"provider": "anthropic", "api_mode": "api_key", "input_tokens": 50000}])
+        proj = self._project()
+        self.assertEqual(len(proj.models), 1)
+        row = proj.models[0]
+        self.assertEqual(row.cost_class, "known")
+        self.assertEqual(row.provider, "anthropic")
+        self.assertEqual(row.rate_basis, savings.PRICE_TABLE_RATE_BASIS)
+        self.assertIsNotNone(row.estimated_usd_savings)
+        self.assertGreater(proj.estimated_usd_savings, 0.0)
+        self.assertEqual(proj.usd_coverage, "full")
+
+    def test_no_api_call_rows_still_suppress_usd(self):
+        """A session with no matching api_calls row has no route evidence."""
+        _write_session(self.home / "sessions", "orphan", platform="telegram",
+                       model="claude-sonnet-4-6", ceiling=CEILING, turns=self.TURNS)
+        # Evidence exists, but for a different session file entirely.
+        _write_route_evidence(
+            self.home / "state" / "tool-belt", "elsewhere",
+            [{"provider": "anthropic", "api_mode": "api_key", "input_tokens": 50000}])
+        proj = self._project()
+        self.assertEqual(proj.models[0].cost_class, "unknown")
+        self.assertEqual(proj.models[0].provider, "")
+        self.assertIsNone(proj.estimated_usd_savings)
+        self.assertEqual(proj.usd_coverage, "none")
+
+    def test_subscription_route_from_api_calls_shows_tokens_only(self):
+        _write_session(self.home / "sessions", "sub", platform="telegram",
+                       model="claude-sonnet-4-6", ceiling=CEILING, turns=self.TURNS)
+        _write_route_evidence(
+            self.home / "state" / "tool-belt", "sub",
+            [{"provider": "anthropic", "api_mode": "oauth", "input_tokens": 50000}])
+        proj = self._project()
+        self.assertEqual(proj.models[0].cost_class, "subscription")
+        self.assertIsNone(proj.estimated_usd_savings)
+        self.assertEqual(proj.usd_coverage, "none")
+        self.assertGreater(proj.gross_schema_token_reduction, 0)
+
+    def test_conflicting_route_within_session_is_resolved_conservatively(self):
+        """Calls that disagree on the route prove nothing; dollars stay off."""
+        _write_session(self.home / "sessions", "mixed", platform="telegram",
+                       model="claude-sonnet-4-6", ceiling=CEILING, turns=self.TURNS)
+        _write_route_evidence(
+            self.home / "state" / "tool-belt", "mixed",
+            [{"provider": "anthropic", "api_mode": "api_key", "input_tokens": 20000},
+             {"provider": "anthropic", "api_mode": "oauth", "input_tokens": 20000}])
+        proj = self._project()
+        self.assertEqual(proj.models[0].cost_class, "unknown")
+        self.assertIsNone(proj.estimated_usd_savings)
+        self.assertTrue(any("disagreed" in r for r in proj.reasons), proj.reasons)
+
+    def test_session_meta_route_overrides_api_calls(self):
+        """session_meta remains an explicit override when it carries a route."""
+        _write_session(self.home / "sessions", "ovr", platform="telegram",
+                       model="claude-sonnet-4-6", api_mode="subscription",
+                       ceiling=CEILING, turns=self.TURNS)
+        _write_route_evidence(
+            self.home / "state" / "tool-belt", "ovr",
+            [{"provider": "anthropic", "api_mode": "api_key", "input_tokens": 50000}])
+        proj = self._project()
+        self.assertEqual(proj.models[0].cost_class, "subscription")
+        self.assertIsNone(proj.estimated_usd_savings)
+
+
+class ComparableBaselineTests(_HomeCase):
+    """`current` and `proposed` projections must be computed against the same
+    non-learned configuration, or the before/after onboarding shows is
+    apples-to-oranges."""
+
+    SCOPE = "default:telegram"
+    CONFIG = {"enabled": True, "channels": {SCOPE: {"learned_mode": "apply"}}}
+    OVERLAY = {"version": 2, "scopes": {
+        SCOPE: {"expand_only": ["web_search"], "carry": ["session_search"]}}}
+
+    def test_proposed_branch_keeps_learned_overlay_and_channel_config(self):
+        with mock.patch.object(learned, "load_state", return_value=self.OVERLAY):
+            current = savings._resolve_effective_preset(self.CONFIG, self.SCOPE, None)
+            proposed = savings._resolve_effective_preset(
+                self.CONFIG, self.SCOPE, {"carry": [], "expand_only": []})
+        # An empty proposed delta must reproduce the current effective preset.
+        self.assertEqual(list(current.always_carry), list(proposed.always_carry))
+        self.assertEqual(list(current.carry), list(proposed.carry))
+        # ...and that shared baseline is the learned one, not raw policy.yaml.
+        self.assertNotIn("web_search", proposed.carry)   # learned demotion honored
+        self.assertIn("session_search", proposed.carry)  # learned promotion honored
+
+    def test_proposed_delta_still_applies_on_top_of_the_overlay(self):
+        with mock.patch.object(learned, "load_state", return_value=self.OVERLAY):
+            proposed = savings._resolve_effective_preset(
+                self.CONFIG, self.SCOPE,
+                {"carry": ["cronjob"], "expand_only": ["read_file"]})
+        self.assertIn("cronjob", proposed.carry)         # proposed promotion
+        self.assertNotIn("read_file", proposed.carry)    # proposed demotion
+        self.assertNotIn("web_search", proposed.carry)   # learned demotion survives
+        self.assertIn("session_search", proposed.carry)  # learned promotion survives
+
+
+class SinceParsingTests(_HomeCase):
+    """(11) A malformed `--since` must fail loudly, never degrade to
+    'report the entire history'."""
+
+    def test_absent_since_means_no_cutoff(self):
+        self.assertEqual(savings.parse_since(None), 0.0)
+        self.assertEqual(savings.parse_since(""), 0.0)
+
+    def test_valid_since_parses(self):
+        self.assertGreater(savings.parse_since("2026-05-15"), 0.0)
+        self.assertGreater(savings.parse_since("2026-05-15T10:30:00"), 0.0)
+
+    def test_malformed_since_raises(self):
+        for bad in ("2026-13-45", "lastweek", "05/15/2026"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(savings.InvalidSinceError):
+                    savings.parse_since(bad)
+
+    def test_cli_exits_non_zero_on_malformed_since(self):
+        _write_session(self.home / "sessions", "s", platform="telegram",
+                       model="m", ceiling=CEILING, turns=[{"user": "hello"}])
+        err = io.StringIO()
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = savings_cli.run(
+                ["--since", "lastweek", "--hermes-home", str(self.home)])
+        self.assertEqual(code, 2)
+        self.assertIn("lastweek", err.getvalue())
+        self.assertNotIn("OBSERVED", out.getvalue())
+
+
 class ProposedAssignmentTests(_HomeCase):
     """(10) Onboarding-style proposed assignments can call the engine without
     writing state."""
@@ -719,6 +900,93 @@ class LauncherHelperTests(_HomeCase):
             any("$HOME/.hermes" not in m and (str(self.home / "bin") in m
                 or "not on your PATH" in m) for m in msgs),
             f"expected PATH guidance mentioning the launcher dir, got {msgs}")
+
+
+class LauncherStalenessTests(_HomeCase):
+    """(13a) An existing file at the launcher target is never taken on faith:
+    the baked-in absolute exec path must still exist and still be ours."""
+
+    def setUp(self):
+        super().setUp()
+        self.user_home = Path(self.tmp.name) / "barehome"  # no ~/.local/bin
+        self.target = savings_cli.launcher_path(self.home, user_home=self.user_home)
+
+    def _ensure(self, repo, *, confirm=True, msgs=None):
+        return savings_cli.ensure_launcher(
+            self.home, repo, confirm=lambda _p: confirm,
+            out=(msgs.append if msgs is not None else (lambda _m: None)),
+            user_home=self.user_home)
+
+    def test_correct_launcher_is_idempotent_without_reconfirming(self):
+        real = PLUGIN_DIR / "tool-belt"
+        self._ensure(real)
+        first = self.target.read_text(encoding="utf-8")
+        msgs = []
+
+        def _never(_prompt):
+            raise AssertionError("a current launcher must not re-prompt")
+
+        created = savings_cli.ensure_launcher(
+            self.home, real, confirm=_never, out=msgs.append,
+            user_home=self.user_home)
+        self.assertTrue(created)
+        self.assertEqual(self.target.read_text(encoding="utf-8"), first)
+        self.assertTrue(any("already present" in m for m in msgs), msgs)
+
+    def test_stale_exec_target_is_refreshed(self):
+        gone = Path(self.tmp.name) / "moved-plugin" / "tool-belt"
+        self._ensure(gone)
+        self.assertIn(str(gone), self.target.read_text(encoding="utf-8"))
+        real = PLUGIN_DIR / "tool-belt"
+        msgs = []
+        created = self._ensure(real, msgs=msgs)
+        self.assertTrue(created)
+        content = self.target.read_text(encoding="utf-8")
+        self.assertIn(f"exec {real} ", content)
+        self.assertNotIn(str(gone), content)
+        self.assertTrue(any("stale" in m for m in msgs), msgs)
+
+    def test_stale_launcher_refresh_still_requires_confirmation(self):
+        gone = Path(self.tmp.name) / "moved-plugin" / "tool-belt"
+        self._ensure(gone)
+        before = self.target.read_text(encoding="utf-8")
+        msgs = []
+        created = self._ensure(PLUGIN_DIR / "tool-belt", confirm=False, msgs=msgs)
+        self.assertFalse(created)
+        self.assertEqual(self.target.read_text(encoding="utf-8"), before)
+        self.assertTrue(any("Skipped" in m for m in msgs), msgs)
+
+    def test_foreign_file_is_never_adopted_or_overwritten(self):
+        self.target.parent.mkdir(parents=True, exist_ok=True)
+        self.target.write_text("#!/bin/sh\necho some other program\n", encoding="utf-8")
+        msgs = []
+        created = self._ensure(PLUGIN_DIR / "tool-belt", msgs=msgs)
+        self.assertFalse(created)
+        self.assertIn("some other program", self.target.read_text(encoding="utf-8"))
+        self.assertTrue(any("not created by Tool Belt" in m for m in msgs), msgs)
+
+
+class ShLauncherTests(unittest.TestCase):
+    """(13b) The repo-root `tool-belt` sh launcher stays POSIX-clean and works
+    through a hand-made symlink (`ln -s ... ~/.local/bin/tool-belt`)."""
+
+    def test_launcher_is_posix_sh_clean(self):
+        result = subprocess.run(["sh", "-n", str(PLUGIN_DIR / "tool-belt")],
+                                text=True, capture_output=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_launcher_works_through_a_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            link = Path(tmp) / "bin" / "tool-belt"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(PLUGIN_DIR / "tool-belt")
+            env = dict(os.environ)
+            env.update(HERMES_PYTHON=sys.executable)
+            env.pop("HERMES_HOME", None)
+            result = subprocess.run([str(link), "--help"], env=env, text=True,
+                                    capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("tool-belt <command>", result.stdout)
 
 
 def _snapshot(root: Path) -> dict:

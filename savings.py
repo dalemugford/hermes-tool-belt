@@ -140,6 +140,11 @@ def classify_cost(model: str, provider: str = "", api_mode: str = "") -> CostCla
     ``known`` requires an explicitly metered API route *and* a non-generic price
     row. A public list price alone is never enough — an OAuth/subscription route
     stays ``subscription`` even for a model that appears in ``PRICE_TABLE``.
+
+    ``api_mode`` must name a *billing* route. Producers that record a transport
+    label there instead (``chat_completions``, ``codex_responses``, …) prove
+    nothing about billing and are deliberately left ``unknown``: guessing a
+    route from a transport name is how a report starts inventing dollars.
     """
     model = str(model or "")
     mode = str(api_mode or "").strip().lower()
@@ -303,16 +308,35 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return out
 
 
+class InvalidSinceError(ValueError):
+    """Raised when a ``--since`` value was supplied but could not be parsed.
+
+    Silently degrading a malformed cutoff to "no filter" is the worst possible
+    outcome: the caller asked for a window and would be shown the entire
+    history as if it were that window. A supplied value must parse or fail.
+    """
+
+
 def parse_since(s: str | None) -> float:
+    """Parse a ``--since`` cutoff into an epoch timestamp.
+
+    An empty/absent value means "no cutoff" and returns ``0.0``. A supplied
+    value that is neither an ISO-8601 datetime nor ``YYYY-MM-DD`` raises
+    :class:`InvalidSinceError` — it is never downgraded to "no cutoff".
+    """
     if not s:
         return 0.0
     try:
         return _dt.datetime.fromisoformat(s).timestamp()
     except Exception:
-        try:
-            return _dt.datetime.strptime(s, "%Y-%m-%d").timestamp()
-        except Exception:
-            return 0.0
+        pass
+    try:
+        return _dt.datetime.strptime(s, "%Y-%m-%d").timestamp()
+    except Exception:
+        raise InvalidSinceError(
+            f"could not parse --since value {s!r}; expected YYYY-MM-DD or an "
+            "ISO-8601 datetime"
+        ) from None
 
 
 def _session_key(row: dict[str, Any]) -> str:
@@ -783,16 +807,23 @@ def _resolve_effective_preset(
     """Resolve the carrying preset for a scope, read-only.
 
     ``proposed`` (supplied by the configure flow) is a ``{carry: [...],
-    expand_only: [...]}`` mapping to project *before* it is applied — it is
-    layered onto the base policy without touching ``learned.json``. Without it,
-    the *current effective* assignment is used: ``presets.resolve_preset``
-    (which honors an applied learned overlay, read-only).
+    expand_only: [...]}`` mapping to project *before* it is applied. Without
+    it, the *current effective* assignment is used.
+
+    **Both branches resolve through the same pipeline**
+    (:func:`presets.resolve_preset`, which honors the applied learned overlay
+    and per-channel config, read-only). The proposed deltas are layered on top
+    of that resolved preset, so a ``current`` and a ``proposed`` projection of
+    the same scope differ *only* by the proposed assignment — which is exactly
+    the comparison the onboarding flow presents. Resolving the proposed branch
+    against the raw base policy instead would silently drop the learned overlay
+    and channel config and make the two projections non-comparable.
     """
     presets = _import_sibling("presets")
+    base = presets.resolve_preset(plugin_config, scope)
     if proposed is None:
-        return presets.resolve_preset(plugin_config, scope)
+        return base
 
-    base = presets.load_base_policy()
     if base.is_wildcard:
         return base
     always_carry = list(base.always_carry)
@@ -921,6 +952,7 @@ def project_sessions(
     cache_mode: str = "on",
     proposed_by_scope: dict[str, dict[str, Any]] | None = None,
     provider_input_by_session: dict[str, int] | None = None,
+    route_by_session: dict[str, SessionRoute] | None = None,
 ) -> ProjectedCohort:
     """Replay a set of historical sessions into one projected cohort.
 
@@ -930,9 +962,15 @@ def project_sessions(
     ``provider_input_by_session`` maps a session key to provider-reported
     ``input_tokens`` — when present for a session it is the authoritative
     denominator and wins over reconstruction.
+    ``route_by_session`` maps a session key to the billing route its API calls
+    were actually made on (see :func:`_api_call_evidence`). It is the
+    production source of ``provider``/``api_mode`` for costing, because live
+    Hermes ``session_meta`` records carry neither field. A value recorded in
+    ``session_meta`` still wins as an explicit override.
     """
     proposed_by_scope = proposed_by_scope or {}
     provider_input_by_session = provider_input_by_session or {}
+    route_by_session = route_by_session or {}
 
     gross = 0
     ceiling_total = 0
@@ -944,6 +982,8 @@ def project_sessions(
     have_provider = False
     have_reconstructed = False
     incomplete_schema = False
+    route_from_api_calls = False
+    route_conflicts = False
 
     # Per-model accumulation of gross/net for costing.
     per_model_gross: dict[tuple[str, str, str], int] = defaultdict(int)
@@ -983,12 +1023,29 @@ def project_sessions(
         turns_analyzed += len(user_indices)
         sessions_analyzed += 1
 
-        key = (session.model or "generic", session.provider, session.api_mode)
+        skey = session.session_file.stem
+
+        # Costing route. session_meta is an explicit override when it carries
+        # the fields; otherwise the evidence comes from this session's api_calls
+        # rows (live session_meta records never carry provider/api_mode). No
+        # evidence at all leaves both fields empty -> classify_cost -> unknown
+        # -> no dollars.
+        route = route_by_session.get(skey)
+        provider = session.provider or (route.provider if route else "")
+        api_mode = session.api_mode or (route.api_mode if route else "")
+        if route is not None:
+            if route.conflicting:
+                route_conflicts = True
+            if (not session.provider and route.provider) or (
+                not session.api_mode and route.api_mode
+            ):
+                route_from_api_calls = True
+
+        key = (session.model or "generic", provider, api_mode)
         per_model_gross[key] += session_gross
         per_model_overhead[key] += overhead
 
         # Denominator: provider-reported wins per session.
-        skey = session.session_file.stem
         prov = provider_input_by_session.get(skey)
         if prov is not None:
             denom_provider += int(prov)
@@ -1075,6 +1132,16 @@ def project_sessions(
         reasons.append("session-input percentage and USD suppressed for incomplete evidence")
 
     # Costing rows.
+    if route_from_api_calls:
+        reasons.append(
+            "billing route (provider/api_mode) sourced from api_calls.jsonl; "
+            "session_meta does not record it"
+        )
+    if route_conflicts:
+        reasons.append(
+            "some sessions' API calls disagreed on provider/api_mode; that "
+            "route evidence was discarded (conservative) and those rows stay unknown"
+        )
     known_usd_total = 0.0
     any_known = False
     any_non_known = False
@@ -1139,26 +1206,86 @@ def compute_projected(
             continue
         sessions.append(parsed)
 
-    # Provider-reported denominator: join api_calls input_tokens where present.
-    provider_input = _provider_input_by_session(location.state_dir, since_ts)
+    # api_calls join: provider-reported input_tokens (denominator) and the
+    # billing route each session was actually served on (costing evidence).
+    provider_input, routes = _api_call_evidence(location.state_dir, since_ts)
 
     return project_sessions(
         sessions, plugin_config,
         cache_mode=cache_mode,
         proposed_by_scope=proposed_by_scope,
         provider_input_by_session=provider_input,
+        route_by_session=routes,
     )
 
 
-def _provider_input_by_session(state_dir: Path, since_ts: float = 0.0) -> dict[str, int]:
-    """Sum provider-reported input_tokens per session from api_calls.jsonl.
+@dataclass(frozen=True)
+class SessionRoute:
+    """Billing-route evidence for one session, sourced from ``api_calls.jsonl``.
+
+    Empty strings mean "no evidence" — never "not metered". A field is emptied
+    when the session's api-call rows disagree about it (see
+    :func:`_api_call_evidence`), which keeps :func:`classify_cost` at
+    ``unknown`` and suppresses dollars.
+    """
+
+    provider: str = ""
+    api_mode: str = ""
+    conflicting: bool = False
+
+
+def _api_call_session_keys(
+    row: dict[str, Any], pid_to_hermes: dict[str, str]
+) -> list[str]:
+    """Session keys an ``api_calls`` row can be attributed to.
 
     ``api_calls`` rows carry the chat-level ``session_id`` (constant per chat),
     while historical session files are named by the rotating Hermes session
     UUID. The bridge is ``predictions.jsonl``: its rows carry both
     ``prediction_id`` and ``hermes_session_id``, so each api_call is joined
-    prediction -> Hermes session and summed under that file-stem key. Rows are
-    also indexed by the raw chat ``session_id`` for callers that key on it.
+    prediction -> Hermes session under that file-stem key. ``session_file`` is
+    a supported external-producer key. The raw chat ``session_id`` is the
+    last-resort fallback when no bridge is available.
+    """
+    keys: list[str] = []
+    hermes = pid_to_hermes.get(str(row.get("prediction_id") or ""))
+    if hermes:
+        keys.append(hermes)
+    session_file = str(row.get("session_file") or "")
+    if session_file:
+        keys.append(session_file)
+    if not keys:
+        # No bridge available: fall back to the chat key so the denominator
+        # still counts (it may aggregate across /new within one long-lived
+        # chat; confidence labeling covers the imprecision).
+        chat = str(row.get("session_id") or "")
+        if chat:
+            keys.append(chat)
+    return keys
+
+
+def _api_call_evidence(
+    state_dir: Path, since_ts: float = 0.0
+) -> tuple[dict[str, int], dict[str, SessionRoute]]:
+    """Join ``api_calls.jsonl`` to sessions for denominator **and** route evidence.
+
+    Returns ``(provider_input_by_session, route_by_session)``:
+
+    * ``provider_input_by_session`` — summed provider-reported ``input_tokens``
+      per session key (rows reporting zero input contribute nothing).
+    * ``route_by_session`` — the ``provider`` / ``api_mode`` the calls for that
+      session were actually billed through. These are the only fields that can
+      prove a metered route, and live Hermes ``session_meta`` records never
+      carry them; ``api_calls`` rows do (written by the ``post_api_request``
+      hook).
+
+    **Conservative conflict rule.** Each field is resolved independently and
+    only when the session's rows agree: if a session's calls report more than
+    one distinct non-empty ``provider`` (or ``api_mode``) — a mid-session
+    failover or route change — that field is emptied and the route is flagged
+    ``conflicting``. An empty ``api_mode`` cannot classify as ``known``, so a
+    mixed-route session falls back to ``unknown`` and earns no dollars. We
+    never pick the cheaper, the more common, or the first-seen value.
     """
     pid_to_hermes: dict[str, str] = {}
     for p in load_jsonl(state_dir / "predictions.jsonl"):
@@ -1167,29 +1294,41 @@ def _provider_input_by_session(state_dir: Path, since_ts: float = 0.0) -> dict[s
         if pid and hermes:
             pid_to_hermes[pid] = hermes
 
-    out: dict[str, int] = defaultdict(int)
+    tokens_by_session: dict[str, int] = defaultdict(int)
+    providers: dict[str, set[str]] = defaultdict(set)
+    modes: dict[str, set[str]] = defaultdict(set)
     for a in load_jsonl(state_dir / "api_calls.jsonl"):
         if float(a.get("ts") or 0) < since_ts:
             continue
-        if not int(a.get("input_tokens") or 0):
-            continue
-        keys = []
-        hermes = pid_to_hermes.get(str(a.get("prediction_id") or ""))
-        if hermes:
-            keys.append(hermes)
-        session_file = str(a.get("session_file") or "")
-        if session_file:
-            keys.append(session_file)
+        keys = _api_call_session_keys(a, pid_to_hermes)
         if not keys:
-            # No bridge available: fall back to the chat key so the
-            # denominator still counts (it may aggregate across /new within
-            # one long-lived chat; confidence labeling covers the imprecision).
-            chat = str(a.get("session_id") or "")
-            if chat:
-                keys.append(chat)
+            continue
+        tokens = int(a.get("input_tokens") or 0)
+        provider = str(a.get("provider") or "").strip()
+        api_mode = str(a.get("api_mode") or "").strip().lower()
         for key in keys:
-            out[key] += int(a.get("input_tokens") or 0)
-    return dict(out)
+            if tokens:
+                tokens_by_session[key] += tokens
+            if provider:
+                providers[key].add(provider)
+            if api_mode:
+                modes[key].add(api_mode)
+
+    routes: dict[str, SessionRoute] = {}
+    for key in set(providers) | set(modes):
+        seen_providers = providers.get(key) or set()
+        seen_modes = modes.get(key) or set()
+        routes[key] = SessionRoute(
+            provider=next(iter(seen_providers)) if len(seen_providers) == 1 else "",
+            api_mode=next(iter(seen_modes)) if len(seen_modes) == 1 else "",
+            conflicting=len(seen_providers) > 1 or len(seen_modes) > 1,
+        )
+    return dict(tokens_by_session), routes
+
+
+def _provider_input_by_session(state_dir: Path, since_ts: float = 0.0) -> dict[str, int]:
+    """Summed provider-reported ``input_tokens`` per session (denominator only)."""
+    return _api_call_evidence(state_dir, since_ts)[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════════
