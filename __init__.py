@@ -1125,6 +1125,54 @@ def _wrap_compress_context(original):
     return wrapped
 
 
+def _pin_expand_tools_visible() -> None:
+    """Keep ``expand_tools`` out of Hermes' native tiered-disclosure bridge.
+
+    Hermes' Tool Search bridge (``model_tools._compute_tool_definitions`` →
+    ``tools.tool_search.assemble_tool_defs``) runs at tool-definition time,
+    *upstream* of our ``_build_api_kwargs`` narrowing. Its classifier,
+    ``tool_search.is_deferrable_tool_name``, treats ``expand_tools`` as
+    deferrable (a non-core, non-MCP plugin tool) and replaces it with the
+    ``tool_search``/``describe``/``call`` bridge tools — hiding the one tool
+    whose whole job is expanding tools. Our narrowing only ever subtracts
+    from the on-the-wire list, so once the bridge has removed ``expand_tools``
+    we can never add it back, and ``always_carry`` (policy.yaml) never gets a
+    chance to protect it (``A = always_carry ∩ E`` is empty when the tool is
+    absent from the enabled ceiling ``E``).
+
+    Fix: wrap the classifier so ``expand_tools`` is never classified
+    deferrable. It then survives into ``E`` and our existing ``always_carry``
+    entry keeps it resident. Every caller of ``is_deferrable_tool_name`` lives
+    inside ``tool_search`` and resolves it via the module global at call time
+    (``classify_tools`` included), so rebinding the module attribute reaches
+    them all. Idempotent (guarded by a marker attribute) and fail-open: any
+    error leaves the bridge untouched and ``expand_tools`` merely deferred.
+    """
+    try:
+        import tools.tool_search as _ts  # type: ignore[import-not-found]
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.debug("tool-belt: tool_search unavailable, expand_tools pin skipped (%s)", exc)
+        return
+
+    original = getattr(_ts, "is_deferrable_tool_name", None)
+    if original is None or getattr(original, "_tool_belt_expand_pin", False):
+        return
+
+    pinned_name = expand_tools_mod.SCHEMA["name"]
+
+    def _is_deferrable_keep_expand(name, *args, **kwargs):
+        # Only expand_tools is pinned — any other tool-belt tool keeps the
+        # native classifier's default treatment.
+        if name == pinned_name:
+            return False
+        return original(name, *args, **kwargs)
+
+    _is_deferrable_keep_expand._tool_belt_expand_pin = True  # type: ignore[attr-defined]
+    _is_deferrable_keep_expand.__wrapped__ = original  # type: ignore[attr-defined]
+    _ts.is_deferrable_tool_name = _is_deferrable_keep_expand
+    logger.info("tool-belt: expand_tools pinned visible against the Tool Search bridge")
+
+
 def _install_patches() -> bool:
     """Install the AIAgent monkey-patches.
 
@@ -1134,6 +1182,12 @@ def _install_patches() -> bool:
     global _ORIGINAL_BUILD_API_KWARGS, _ORIGINAL_COMPRESS_CONTEXT, _PATCHED
     if _PATCHED:
         return True
+
+    # Pin expand_tools visible first — the Tool Search bridge runs at
+    # tool-definition time and is independent of run_agent, so install this
+    # even on builds where the run_agent patch below can't (yet) load.
+    _pin_expand_tools_visible()
+
     try:
         import run_agent  # type: ignore[import-not-found]
     except ImportError as exc:
