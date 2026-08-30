@@ -1,14 +1,15 @@
-# Aggressive preset — minimum always-on, heavy trigger gating.
-# Default for messaging channels (Telegram, Slack, Discord, etc.).
-# Keeps the resident messaging loadout small; telemetry records actual savings.
+# Shipped policy — structural always_carry baseline + trigger groups.
+# Full-start contract: a fresh scope carries everything Hermes enables;
+# evidence-driven demotion shapes the loadout down; telemetry records savings.
 
 name: aggressive
 # Documentation only — nothing reads `description`; the loader consumes
-# `name`, `always_carry`, `carry`, and `triggers`.
+# `name`, `always_carry`, and `triggers` (a legacy `carry` list still loads
+# but the shipped policy no longer carries one).
 description: >
-  Minimum always-on; everything else trigger-gated. Best for short conversational
-  channels. The model can call `expand_tools(category=...)` if it needs something
-  that wasn't loaded.
+  Full-start: every enabled tool is carried on a fresh scope; evidence-driven
+  demotion trims the loadout over time, and demoted tools stay reachable via
+  triggers or `expand_tools(category=...)`.
 
 # Between-session shaper defaults. `scripts/shape-ceiling.py` inherits these
 # values unless explicit CLI flags override them for an ad-hoc run.
@@ -19,15 +20,27 @@ learning:
     promote_min_calls: 3
     demote_min_sessions_no_use: 20
 
-# ── Resident partition (Tool Belt 1.0 carrying model) ─────────────────────────
+# ── Resident partition (full-start contract, 2026-08-30) ─────────────────────
 # Hermes supplies the enabled built-in ceiling E each request. Tool Belt splits
 # it into three classes:
-#   A = always_carry ∩ E   immutable residents (win every conflict; never shaped)
-#   C = carry ∩ E          adaptive residents (promotion/demotion move tools here)
-#   X = E − (A ∪ C)        expand_only — the derived enabled remainder
-# Promotion moves expand_only → carry; demotion moves carry → expand_only, and
-# trigger definitions never change during either transition. Tool Belt has no
-# disabling semantics: absent/disabled tools are owned by E, not by policy.
+#   A = always_carry ∩ E             immutable residents (never shaped); the
+#                                    effective set also unions the per-agent
+#                                    config pins (plugins.tool-belt.always_carry
+#                                    and channels.<scope>.always_carry)
+#   C = ((E − A) − demoted) ∪ carry  adaptive residents — EVERYTHING enabled is
+#                                    carried until evidence demotes it; `demoted`
+#                                    and the explicit `carry` promotions live in
+#                                    learned.json, not here
+#   X = E − (A ∪ C)                  expand_only — the demoted remainder
+# Demotion (no-use evidence over sessions) is the primary shaping motion;
+# promotion moves a demoted tool back to carry. Trigger definitions never
+# change during either transition. Tool Belt has no disabling semantics:
+# absent/disabled tools are owned by E, not by policy.
+#
+# NOTE — this file no longer ships a `carry` list. The old curated warm-start
+# carry list is retired: runtime resolution never reads a policy carry list
+# (a fresh scope simply carries all of E), and onboarding derives any
+# warm-start prior from historical telemetry analysis instead.
 
 # always_carry — permanent residents. Discovery, planning, asking for help, plus
 # the structural gateway/meta tools the agent must never lose. Immutable: the
@@ -42,29 +55,9 @@ always_carry:
   # Always-on meta-tool the plugin itself adds.
   - expand_tools
 
-# carry — adaptive residents. Resident by default; the learned overlay may
-# demote a consistently-unused one to expand_only (and promote it back later).
-carry:
-  # Core Mnemosyne loop: recall first, remember what matters, invalidate stale
-  # memories. session_search and the specialist/maintenance Mnemosyne surface
-  # stay expand_only (see the history_search and mnemosyne_extended triggers).
-  - mnemosyne_remember
-  - mnemosyne_recall
-  - mnemosyne_invalidate
-  # Universal cheap tools.
-  - web_search
-  - read_file
-  - search_files
-  - process
-  # Core action tools — resident so the agent can always act without an
-  # expand_tools round trip (itself vulnerable to registration/ceiling issues).
-  - terminal
-  - write_file
-  - patch
-
 # NOTE — no always_off key. Tool Belt has no disabling semantics. Any enabled
-# tool outside always_carry/carry is expand_only; disabling is owned by Hermes's
-# ceiling.
+# tool outside always_carry is carried until demoted by evidence; disabling is
+# owned by Hermes's ceiling.
 
 # Triggered tool groups. Each group fires when ANY of its signals match.
 # When a group fires, all listed tools are added to the active set.
@@ -72,7 +65,7 @@ carry:
 triggers:
 
   # File modifications — re-activates the write surface when it has been
-  # demoted to expand_only; harmless while it is still resident (see `carry`).
+  # demoted to expand_only; harmless while it is still resident (the full-start default).
   - name: file_write
     tools: [write_file, patch]
     keywords:
@@ -88,7 +81,7 @@ triggers:
       - '```'
 
   # Shell — re-activates `terminal` when it has been demoted to expand_only;
-  # harmless while it is still resident (see `carry`).
+  # harmless while it is still resident (the full-start default).
   - name: shell
     tools: [terminal]
     keywords:

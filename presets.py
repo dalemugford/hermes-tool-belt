@@ -1,21 +1,29 @@
 """Tool-policy loading and per-scope override resolution (Tool Belt 1.0).
 
-There's one policy YAML (``policy.yaml`` at the plugin root). Under the 1.0
-carrying model it declares a two-way resident partition plus trigger groups:
+There's one policy YAML (``policy.yaml`` at the plugin root). Under the
+full-start contract (Promise #2, 2026-08-30) it declares the structural
+``always_carry`` baseline plus trigger groups:
 
   - ``always_carry``: immutable residents. They win every conflict and are
     never shaped by the learned/adaptive layer (partition class ``A`` once
-    intersected with Hermes's enabled built-in ceiling ``E``).
-  - ``carry``: adaptive residents. Promotion/demotion move tools across the
-    ``carry`` ⇄ ``expand_only`` boundary (partition class ``C``). Trigger
-    definitions never change during either transition.
+    intersected with Hermes's enabled built-in ceiling ``E``). The effective
+    always_carry set is this shipped structural baseline unioned with the
+    per-agent config pins (``plugins.tool-belt.always_carry`` and additive
+    ``channels.<scope>.always_carry``) — the union lives in
+    ``learned.apply_to_preset``, the single precedence home.
   - ``triggers``: trigger groups that *activate* an enabled-but-not-resident
     (``expand_only``) tool for a single message without changing its residency.
 
-``expand_only`` (class ``X``) is *derived* — the enabled remainder
-``E − (A ∪ C)`` — and is only knowable when Hermes supplies ``E`` at request
-time. Tool Belt has no disabling semantics: absent/disabled tools are owned by
-Hermes's ceiling, not by policy.
+The adaptive residency default is **full-start**: every enabled tool outside
+``always_carry`` is carried until an evidence-driven demotion (the learned
+overlay's ``expand_only`` list, carried on ``Preset.demoted``) moves it out.
+The shipped policy no longer ships a curated ``carry`` warm-start list —
+runtime resolution never reads one; a legacy policy file's ``carry`` entries
+still load as explicit residents (they only ever add). ``expand_only``
+(class ``X``) is *derived* — the demoted subset of ``E`` — and is only
+knowable when Hermes supplies ``E`` at request time. Tool Belt has no
+disabling semantics: absent/disabled tools are owned by Hermes's ceiling,
+not by policy.
 
 Legacy compatibility lives only in :func:`load_preset_file`, which folds a
 pre-1.0 policy file's single ``always_on`` list (or the ``"*"`` spelling of
@@ -93,11 +101,16 @@ class TriggerGroup:
 class Preset:
     """A resolved preset — the canonical Tool Belt 1.0 carrying model.
 
-    Canonical fields:
-      · ``always_carry`` — immutable residents (source of partition class A).
-        Win every conflict; never shaped by the learned/adaptive layer.
-      · ``carry``        — adaptive residents (source of class C). Promotion/
-        demotion mutate this loadout; trigger definitions never change.
+    Canonical fields (full-start contract):
+      · ``always_carry`` — immutable residents (source of partition class A):
+        the shipped structural baseline ∪ config pins. Win every conflict;
+        never shaped by the learned/adaptive layer.
+      · ``carry``        — *explicit* adaptive residents: learned promotions
+        (and any legacy policy carry entries). Under full-start these only
+        ever add — the bulk of class C is ``(E − A) − demoted``, computed
+        against the live ceiling in ``carrying.resolve``.
+      · ``demoted``      — evidence-driven expand_only assignments from the
+        learned overlay; the only way an enabled tool leaves residency.
       · ``triggers``     — trigger groups (``expand_only`` activation).
       · ``no_narrowing`` — neutral "load the whole ceiling" flag.
     """
@@ -109,17 +122,20 @@ class Preset:
         carry: list[str] | None = None,
         triggers: list[TriggerGroup] | None = None,
         no_narrowing: bool = False,
+        demoted: list[str] | None = None,
     ) -> None:
         self.name = str(name)
         self.triggers: list[TriggerGroup] = list(triggers) if triggers else []
         self.no_narrowing = bool(no_narrowing)
         self.always_carry = [str(t) for t in (always_carry or []) if isinstance(t, str)]
         self.carry = [str(t) for t in (carry or []) if isinstance(t, str)]
+        self.demoted = [str(t) for t in (demoted or []) if isinstance(t, str)]
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return (
             f"Preset(name={self.name!r}, always_carry={self.always_carry!r}, "
-            f"carry={self.carry!r}, triggers={len(self.triggers)}, "
+            f"carry={self.carry!r}, demoted={self.demoted!r}, "
+            f"triggers={len(self.triggers)}, "
             f"no_narrowing={self.no_narrowing!r})"
         )
 
@@ -230,8 +246,10 @@ def resolve_preset(plugin_config: dict[str, Any], channel: str) -> Preset:
     """Resolve the effective policy for a given scope.
 
     Resolution order (later overrides earlier):
-      1. Base policy from ``policy.yaml`` (``always_carry`` + ``carry``).
-      2. Learned overlay, when ``learned_mode`` is ``apply`` — the centralized
+      1. Base policy from ``policy.yaml`` (the structural ``always_carry``
+         baseline + triggers).
+      2. Config always_carry pins and the learned overlay (demotions apply
+         only when ``learned_mode`` is ``apply``) — the centralized
          precedence lives in :func:`learned.apply_to_preset`.
 
     The pre-1.0 config-level ``always_on_extra`` / ``always_off`` knobs are no

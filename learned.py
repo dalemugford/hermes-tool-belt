@@ -50,11 +50,16 @@ logger = logging.getLogger(__name__)
 
 LEARNED_VERSION = 2
 # Two effective learned modes:
-#   recommend (default) — runtime does NOT merge learned.json into the preset.
-#                         Recommendations flow through analyze.py
-#                         (--write-recommendations) and the shaper for human review.
-#   apply               — runtime merges learned.json into the preset.
+#   apply (default)     — runtime merges learned.json into the preset.
+#                         Evidence-driven shaping applies automatically; this
+#                         is the zero-config product contract.
+#   recommend           — opt-in observe/trial mode: runtime does NOT merge
+#                         learned.json. Recommendations flow through analyze.py
+#                         (--write-recommendations) and the shaper for human
+#                         review.
 _ALLOWED_MODES = {"recommend", "apply"}
+#: The zero-config default (Promise #2, 2026-08-30 — flipped from "recommend").
+DEFAULT_MODE = "apply"
 # ``learned_mode`` accepts the pre-1.0 spellings "off"/"auto"/"audit" as aliases
 # for "recommend"/"apply" ("off" behaved like recommend at runtime; "auto" and
 # "audit" both merged). Unrelated to the v1→v2 learned-state field migration
@@ -72,7 +77,7 @@ class LearnedMergeResult:
     """
 
     preset: Preset
-    mode: str = "recommend"
+    mode: str = "apply"
     policy_source: str = "preset"
     policy_version: str = ""
     learned_changes: list[str] = field(default_factory=list)
@@ -91,7 +96,7 @@ def learned_path() -> Path:
 def normalize_mode(value: Any) -> str:
     mode = str(value or "").strip().lower()
     mode = _LEGACY_ALIASES.get(mode, mode)  # migrate off/auto/audit → recommend/apply
-    return mode if mode in _ALLOWED_MODES else "recommend"
+    return mode if mode in _ALLOWED_MODES else DEFAULT_MODE
 
 
 def scope_candidates(scope: str) -> list[str]:
@@ -114,7 +119,7 @@ def scope_candidates(scope: str) -> list[str]:
 
 def learned_mode(plugin_config: dict[str, Any], scope: str) -> str:
     """Resolve learned_mode with per-scope/per-platform override support."""
-    mode = normalize_mode(plugin_config.get("learned_mode", "recommend"))
+    mode = normalize_mode(plugin_config.get("learned_mode", DEFAULT_MODE))
     channels = plugin_config.get("channels") or {}
     if isinstance(channels, dict):
         for key in scope_candidates(scope):
@@ -408,24 +413,67 @@ def scope_state(state: dict[str, Any], scope: str) -> tuple[str, dict[str, Any]]
     return "", {}
 
 
+def config_always_carry(plugin_config: dict[str, Any], scope: str) -> list[str]:
+    """Per-agent always_carry config pins for a scope, in stable order.
+
+    The union of the global ``plugins.tool-belt.always_carry`` list and the
+    scope's ``channels.<scope>.always_carry`` list (platform fallback via
+    :func:`scope_candidates`; the first matching channel entry contributes).
+    Union semantics only — a scope entry can add pins, never remove the
+    global ones. Names are not validated here: an unknown/disabled name is
+    inert at resolution (``∩ E`` in ``carrying.resolve``) and warned about at
+    request time when the live ceiling is known.
+    """
+    pins = _string_list(plugin_config.get("always_carry"))
+    channels = plugin_config.get("channels") or {}
+    if isinstance(channels, dict):
+        for key in scope_candidates(scope):
+            cfg = channels.get(key)
+            if isinstance(cfg, dict) and "always_carry" in cfg:
+                for tool in _string_list(cfg.get("always_carry")):
+                    if tool not in pins:
+                        pins.append(tool)
+                break
+    # De-dupe, order-preserving.
+    return list(dict.fromkeys(pins))
+
+
 def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -> LearnedMergeResult:
-    """Merge the learned overlay into a resolved preset when learned_mode is
-    ``apply``.
+    """Merge config pins + the learned overlay into a resolved preset.
 
-    Implements the centralized Tool Belt 1.0 precedence::
+    The single home of carrying precedence (full-start contract)::
 
-        effective_always_carry = policy always_carry
-        effective_carry = ((policy carry − learned expand_only)
-                            ∪ learned carry) − always_carry
+        effective_always_carry = policy always_carry ∪ config always_carry
+        demoted  = learned expand_only − learned carry − effective_always_carry
+        carry    = learned carry − effective_always_carry
 
-    ``always_carry`` wins every conflict and is immutable. Trigger definitions
-    are copied byte-for-byte — promotion/demotion move a tool across the
-    ``carry`` ⇄ ``expand_only`` boundary only, never touching a trigger group.
-    ``recommend`` (the default) never merges; the recommendation path lives in
-    the analyzer and shaper instead.
+    The bulk of adaptive residency is *implicit*: ``carrying.resolve``
+    computes class C as ``((E − A) − demoted) ∪ carry`` against the live
+    ceiling, so with no learned state everything enabled is carried.
+    Config pins apply in every mode; the learned demotion/promotion overlay
+    merges only when ``learned_mode`` resolves to ``apply`` (the default) —
+    ``recommend`` is the opt-in observe/trial mode and never narrows.
+
+    ``always_carry`` (policy ∪ config) wins every conflict and is immutable —
+    undemotable by construction. Trigger definitions are copied byte-for-byte;
+    promotion/demotion never touch a trigger group.
     """
     mode = learned_mode(plugin_config, scope)
     version = f"{preset.name}+learned:{state_hash() or 'none'}"
+
+    # Config always_carry pins join the structural baseline in EVERY mode.
+    pins = config_always_carry(plugin_config, scope)
+    new_pins = [t for t in pins if t not in set(preset.always_carry)]
+    if new_pins and not preset.no_narrowing:
+        preset = Preset(
+            name=preset.name,
+            always_carry=[*preset.always_carry, *new_pins],
+            carry=[t for t in preset.carry if t not in set(new_pins)],
+            triggers=preset.triggers,
+            demoted=[t for t in getattr(preset, "demoted", []) if t not in set(new_pins)],
+        )
+    setattr(preset, "config_always_carry", pins)
+
     if mode != "apply" or preset.no_narrowing:
         return LearnedMergeResult(preset=preset, mode=mode, policy_version=version)
 
@@ -446,7 +494,9 @@ def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -
         learned_carry, learned_expand, scope=matched_scope or scope
     )
 
-    # always_carry is immutable — a demotion signal naming one is ignored + warned.
+    # always_carry (policy ∪ config pins) is immutable — a demotion signal
+    # naming one is ignored + warned. This is the undemotable-by-construction
+    # guarantee for config-pinned tools.
     demoted_always_carry = always_carry_set & set(learned_expand)
     if demoted_always_carry:
         logger.warning(
@@ -454,14 +504,18 @@ def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -
             "ignored (always_carry is immutable and wins every conflict)",
             ", ".join(sorted(demoted_always_carry)),
         )
+    learned_expand = [t for t in learned_expand if t not in always_carry_set]
 
-    # Centralized precedence.
+    # Centralized precedence (full-start): the demotion list is the ONLY thing
+    # that moves an enabled tool out of residency; explicit carry entries
+    # (learned promotions, plus any legacy policy carry) only ever add.
     expand_set = set(learned_expand)
     effective_carry = [t for t in policy_carry if t not in expand_set]
     for tool in learned_carry:
         if tool not in effective_carry:
             effective_carry.append(tool)
     effective_carry = [t for t in effective_carry if t not in always_carry_set]
+    effective_demoted = [t for t in learned_expand if t not in set(effective_carry)]
 
     # Trigger definitions are immutable across promotion/demotion — copy them
     # byte-for-byte. Never strip a demoted tool out of its trigger group; an
@@ -477,16 +531,16 @@ def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -
         for group in preset.triggers
     ]
 
-    # Change log (telemetry): what moved relative to the policy baseline.
+    # Change log (telemetry): what moved relative to the full-start baseline
+    # (everything enabled carried). Demotions are the shaping motion; explicit
+    # carry entries record promotions/un-demotions.
     policy_carry_set = set(policy_carry)
-    effective_set = set(effective_carry)
     changes: list[str] = []
     for tool in effective_carry:
         if tool not in policy_carry_set:
             changes.append(f"{tool}:carry")
-    for tool in policy_carry:
-        if tool not in effective_set:
-            changes.append(f"{tool}:expand_only")
+    for tool in effective_demoted:
+        changes.append(f"{tool}:expand_only")
 
     if not changes:
         return LearnedMergeResult(
@@ -498,7 +552,9 @@ def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -
         always_carry=always_carry,
         carry=effective_carry,
         triggers=triggers,
+        demoted=effective_demoted,
     )
+    setattr(merged, "config_always_carry", pins)
     return LearnedMergeResult(
         preset=merged,
         mode=mode,

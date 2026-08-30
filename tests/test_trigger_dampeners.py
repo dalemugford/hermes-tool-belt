@@ -185,10 +185,12 @@ class LearnedModeNormalizationTests(unittest.TestCase):
         # Canonical values pass through.
         self.assertEqual(learned.normalize_mode("recommend"), "recommend")
         self.assertEqual(learned.normalize_mode("apply"), "apply")
-        # Blank/unknown fall back to the safe default.
-        self.assertEqual(learned.normalize_mode(""), "recommend")
-        self.assertEqual(learned.normalize_mode(None), "recommend")
-        self.assertEqual(learned.normalize_mode("bogus"), "recommend")
+        # Blank/unknown fall back to the zero-config default — "apply"
+        # (Promise #2, 2026-08-30: automatic shaping is the default;
+        # "recommend" is the explicit opt-in observe/trial mode).
+        self.assertEqual(learned.normalize_mode(""), "apply")
+        self.assertEqual(learned.normalize_mode(None), "apply")
+        self.assertEqual(learned.normalize_mode("bogus"), "apply")
 
     def test_learned_mode_resolution_uses_aliases(self):
         self.assertEqual(learned.learned_mode({"learned_mode": "auto"}, "telegram"), "apply")

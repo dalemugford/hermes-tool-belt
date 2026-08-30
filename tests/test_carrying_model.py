@@ -9,17 +9,19 @@ the model is caught.
 The locked model (Hermes supplies the enabled built-in ceiling ``E``)::
 
     A = always_carry ∩ E                     # permanent residents, never shaped
-    C = (carry ∩ E) − A                      # adaptive residents
-    X = E − (A ∪ C)                          # expand_only — the enabled remainder
+    C = ((E − A) − demoted) ∪ ((carry ∩ E) − A)   # adaptive residents (full-start)
+    X = E − (A ∪ C)                          # expand_only — the demoted remainder
     T = triggered ∩ X                        # trigger-activated expand_only tools
     R = expanded  ∩ X                        # explicitly expanded expand_only tools
     active = A ∪ C ∪ T ∪ R (∪ passthrough)   # what the model sees this message
 
-Key invariants pinned here:
+Key invariants pinned here (full-start contract, Promise #2 2026-08-30):
 
   * A, C, X are a genuine three-way partition of E (precedence
-    always_carry > carry > expand_only).
-  * Unknown enabled built-ins default to expand_only.
+    always_carry > carry > demoted).
+  * Unknown enabled built-ins default to CARRY — everything enabled is
+    carried until evidence-driven demotion moves it to expand_only (this
+    deliberately flips the pre-full-start "unknowns → expand_only" default).
   * always_carry is immune to learned demotion — proven against
     ``learned.apply_to_preset``, the single home of demotion precedence
     (the carrying partition receives an already-reconciled loadout).
@@ -46,7 +48,8 @@ produces a clean test *failure*, never an import-time collection error)::
     tool_belt_plugin.carrying.resolve(
         enabled,          # E — enabled built-in ceiling (tool names)
         always_carry,     # immutable resident baseline (tool names)
-        carry,            # adaptive resident loadout (promotion/demotion mutate this)
+        carry,            # explicit carry promotions (win over demoted)
+        demoted=(),       # evidence-driven expand_only assignments
         triggered=(),     # names activated by trigger match this message
         expanded=(),      # names activated by explicit expand_tools
         passthrough=(),   # MCP/plugin names — outside the built-in partition
@@ -54,9 +57,9 @@ produces a clean test *failure*, never an import-time collection error)::
     ) -> model exposing .always_carry(A) .carry(C) .expand_only(X)
                         .active .passthrough .warnings
 
-Learned demotion signals never reach ``resolve``: they are reconciled
-upstream in ``learned.apply_to_preset`` (always_carry immunity, carry-wins
-overlap), and the demotion contracts below exercise that module directly.
+Learned demotion *reconciliation* (always_carry immunity, carry-wins
+overlap) lives upstream in ``learned.apply_to_preset``; the reconciled
+``demoted`` loadout then reaches ``resolve`` as its own argument.
 
 Plus, for the persistence/telemetry cases, the real modules are exercised
 directly (``learned``/``analyze``/``logger_io``) with a v2 normalization
@@ -272,12 +275,13 @@ class _CarryingContract(unittest.TestCase):
                 f"{exc}\nExpected: {_EXPECTED_SIGNATURE}"
             )
 
-    def resolve(self, *, enabled, always_carry, carry, triggered=(), expanded=(),
-                passthrough=(), prior_active=()):
+    def resolve(self, *, enabled, always_carry, carry, demoted=(), triggered=(),
+                expanded=(), passthrough=(), prior_active=()):
         raw = self._resolve_raw(
             enabled=set(enabled),
             always_carry=set(always_carry),
             carry=set(carry),
+            demoted=set(demoted),
             triggered=set(triggered),
             expanded=set(expanded),
             passthrough=set(passthrough),
@@ -297,8 +301,11 @@ class ThreeWayPartitionContract(_CarryingContract):
     def test_three_way_partition_over_explicit_ceiling(self):
         E = {"clarify", "send_message", "expand_tools", "read_file",
              "web_extract", "browser_exec"}
+        # Full-start contract: only a demotion moves a tool into X; an explicit
+        # carry entry (learned promotion) wins over a demotion naming it.
         carry = {"read_file"}
-        m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry)
+        m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry,
+                         demoted={"read_file", "web_extract", "browser_exec"})
 
         # Genuine partition: covers E exactly, pairwise disjoint.
         self.assertEqual(m.A | m.C | m.X, set(E), "A ∪ C ∪ X must equal E")
@@ -315,19 +322,28 @@ class ThreeWayPartitionContract(_CarryingContract):
         self.assertEqual(m.active, m.A | m.C)
 
 
-# ─── 2. unknown enabled built-ins default to expand_only ───────────────────
+# ─── 2. unknown enabled built-ins default to CARRY (full-start) ────────────
+# Deliberate contract flip (Promise #2, 2026-08-30): the pre-full-start model
+# defaulted unknowns to expand_only; now they are carried until demoted.
 
 class UnknownDefaultsContract(_CarryingContract):
-    def test_unknown_enabled_builtin_defaults_to_expand_only(self):
+    def test_unknown_enabled_builtin_defaults_to_carry(self):
         E = {"clarify", "send_message", "brand_new_builtin"}
         m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set())
 
-        self.assertIn("brand_new_builtin", m.X,
-                      "an unknown enabled built-in defaults to expand_only")
+        self.assertIn("brand_new_builtin", m.C,
+                      "an unknown enabled built-in defaults to carry (full-start)")
         self.assertNotIn("brand_new_builtin", m.A)
-        self.assertNotIn("brand_new_builtin", m.C)
-        self.assertNotIn("brand_new_builtin", m.active,
-                         "unknown tool is not active until triggered/expanded")
+        self.assertNotIn("brand_new_builtin", m.X)
+        self.assertIn("brand_new_builtin", m.active,
+                      "unknown tool is active until evidence demotes it")
+
+    def test_only_demotion_moves_an_unknown_out(self):
+        E = {"clarify", "send_message", "brand_new_builtin"}
+        m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
+                         demoted={"brand_new_builtin"})
+        self.assertIn("brand_new_builtin", m.X)
+        self.assertNotIn("brand_new_builtin", m.active)
 
 
 # ─── 3. always_carry immunity from learned demotion ────────────────────────
@@ -377,12 +393,15 @@ class PromotionContract(_CarryingContract):
     def test_promotion_expand_only_to_carry(self):
         E = {"clarify", "send_message", "web_extract"}
 
-        before = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set())
-        self.assertIn("web_extract", before.X, "starts as expand_only")
+        before = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
+                              demoted={"web_extract"})
+        self.assertIn("web_extract", before.X, "starts as demoted expand_only")
         self.assertNotIn("web_extract", before.C)
 
-        # Promotion == the adaptive carry loadout gains the tool.
-        after = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry={"web_extract"})
+        # Promotion == the explicit carry loadout gains the tool (an
+        # un-demotion under full-start); carry wins over demoted.
+        after = self.resolve(enabled=E, always_carry=ALWAYS_CARRY,
+                             carry={"web_extract"}, demoted={"web_extract"})
         self.assertIn("web_extract", after.C, "promotion moves expand_only -> carry")
         self.assertNotIn("web_extract", after.X)
         self.assertEqual(before.A, after.A, "promotion does not touch always_carry")
@@ -394,12 +413,14 @@ class DemotionContract(_CarryingContract):
     def test_demotion_carry_to_expand_only(self):
         E = {"clarify", "send_message", "web_extract"}
 
-        resident = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry={"web_extract"})
-        self.assertIn("web_extract", resident.C, "starts as a carry resident")
+        resident = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set())
+        self.assertIn("web_extract", resident.C,
+                      "starts as a carry resident (full-start default)")
         self.assertNotIn("web_extract", resident.X)
 
-        # Demotion == the adaptive carry loadout drops the tool.
-        demoted = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set())
+        # Demotion == the demoted loadout gains the tool.
+        demoted = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
+                               demoted={"web_extract"})
         self.assertIn("web_extract", demoted.X, "demotion moves carry -> expand_only")
         self.assertNotIn("web_extract", demoted.C)
 
@@ -410,7 +431,7 @@ class ExpandOnlyActivationContract(_CarryingContract):
     def test_expand_only_tool_activates_via_trigger_without_promotion(self):
         E = {"clarify", "send_message", "web_extract"}
         m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
-                         triggered={"web_extract"})
+                         demoted={"web_extract"}, triggered={"web_extract"})
 
         self.assertIn("web_extract", m.X, "trigger activation does not change residency")
         self.assertNotIn("web_extract", m.C)
@@ -419,7 +440,7 @@ class ExpandOnlyActivationContract(_CarryingContract):
     def test_expand_only_tool_activates_via_expand_tools_without_promotion(self):
         E = {"clarify", "send_message", "browser_exec"}
         m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
-                         expanded={"browser_exec"})
+                         demoted={"browser_exec"}, expanded={"browser_exec"})
 
         self.assertIn("browser_exec", m.X, "explicit expansion does not change residency")
         self.assertNotIn("browser_exec", m.C)
@@ -690,14 +711,17 @@ class CacheOnFrozenActiveSetContract(_CarryingContract):
     def test_cache_on_trigger_activation_grows_frozen_active_set_once(self):
         E = {"clarify", "send_message", "read_file", "web_extract", "browser_exec"}
         carry = {"read_file"}
+        demoted = {"web_extract", "browser_exec"}
 
         # message 0 — freeze: residency fixed, no triggers fired yet.
-        m0 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry)
+        m0 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry,
+                          demoted=demoted)
         frozen_residency = (m0.A, m0.C, m0.X)
 
         # message 1 — web_extract (an expand_only tool) newly triggers. Prior
         # active carries forward (the session's frozen active set).
         m1 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry,
+                          demoted=demoted,
                           triggered={"web_extract"}, prior_active=m0.active)
         self.assertEqual((m1.A, m1.C, m1.X), frozen_residency,
                          "carrying assignment is fixed per session")
@@ -707,12 +731,14 @@ class CacheOnFrozenActiveSetContract(_CarryingContract):
 
         # message 2 — no new trigger: the previously triggered tool STAYS active.
         m2 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry,
+                          demoted=demoted,
                           triggered=set(), prior_active=m1.active)
         self.assertEqual(m2.active, m1.active,
                          "active is monotonic — grew once, now stable")
 
         # message 3 — re-trigger the same tool: the union is idempotent.
         m3 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry,
+                          demoted=demoted,
                           triggered={"web_extract"}, prior_active=m2.active)
         self.assertEqual(m3.active, m2.active,
                          "re-trigger does not regrow the frozen active set")
@@ -727,12 +753,12 @@ class CacheOffTriggerEphemeralContract(_CarryingContract):
         # Turn 1: web_extract triggers. Cache-off recomputes per turn, so no
         # prior_active is carried forward.
         m1 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
-                          triggered={"web_extract"})
+                          demoted={"web_extract"}, triggered={"web_extract"})
         self.assertIn("web_extract", m1.active, "trigger activates the tool this turn")
 
         # Turn 2: an unrelated message — nothing triggers, nothing carried.
         m2 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
-                          triggered=set())
+                          demoted={"web_extract"}, triggered=set())
         self.assertNotIn("web_extract", m2.active,
                          "cache-off trigger activation does not persist to the next turn")
         self.assertEqual(m2.active, m2.A | m2.C, "turn 2 active is residents-only")
@@ -746,6 +772,7 @@ class ExpansionCeilingContract(_CarryingContract):
         # ``expanded`` here stands in for sticky/category expansion tool names.
         # A ceiling-absent name must never activate; a ceiling-present one does.
         m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
+                         demoted={"read_file"},
                          expanded={"ghost_sticky_tool", "read_file"})
         self.assertNotIn("ghost_sticky_tool", m.active,
                          "an expansion cannot add a tool absent from E")
@@ -772,6 +799,7 @@ class DiscoverabilityManifestContract(_CarryingContract):
         E = {"clarify", "send_message", "expand_tools", "read_file",
              "web_extract", "browser_exec"}
         m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry={"read_file"},
+                         demoted={"web_extract", "browser_exec"},
                          passthrough={"mcp__github__create_issue"})
 
         text = expand_tools_mod.build_expand_only_manifest(
@@ -793,9 +821,12 @@ class DiscoverabilityManifestContract(_CarryingContract):
     def test_manifest_stable_across_trigger_activation(self):
         E = {"clarify", "send_message", "read_file", "web_extract", "browser_exec"}
         carry = {"read_file"}
+        demoted = {"web_extract", "browser_exec"}
 
-        m0 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry)
+        m0 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry,
+                          demoted=demoted)
         m1 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry,
+                          demoted=demoted,
                           triggered={"web_extract"}, prior_active=m0.active)
         # Residency (X) is frozen; activation grew the active set only.
         self.assertEqual(m0.X, m1.X)

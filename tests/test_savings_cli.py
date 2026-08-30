@@ -174,6 +174,30 @@ CEILING = [
 ]
 
 
+# The demoted loadout for replay scenarios. Full-start contract: a fresh scope
+# carries the whole ceiling (zero narrowing, zero savings on day one), so the
+# replay-based projection tests seed learned demotions — the shaped state the
+# old curated policy carry list used to imply.
+DEMOTED = [
+    "delegate_task", "execute_code", "vision_analyze",
+    "image_generate", "session_search", "cronjob",
+]
+
+
+def _seed_demotions(home: Path, scope: str = "telegram",
+                    tools: list[str] | None = None) -> None:
+    """Write a learned.json demoting ``tools`` for ``scope`` (platform key
+    matches any agent on that platform) and drop the learned cache."""
+    state = home / "state" / "tool-belt"
+    state.mkdir(parents=True, exist_ok=True)
+    doc = {"version": 2, "scopes": {scope: {
+        "carry": [], "expand_only": list(DEMOTED if tools is None else tools),
+        "shaping": {},
+    }}}
+    (state / "learned.json").write_text(json.dumps(doc), encoding="utf-8")
+    learned._CACHE.update({"path": None, "mtime_ns": None, "state": None, "hash": ""})
+
+
 class _HomeCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -317,6 +341,7 @@ class FullDefinitionTokenTests(_HomeCase):
         self.assertGreater(full_tok, names_tok * 5)
 
     def test_projection_uses_full_defs(self):
+        _seed_demotions(self.home)
         # Same ceiling, one session with full defs and one names-only; the
         # projected gross reduction must be far larger for the full-def session.
         _write_session(self.home / "sessions", "full", platform="telegram",
@@ -428,6 +453,7 @@ class CacheModeReplayTests(_HomeCase):
     distinct."""
 
     def test_cache_on_and_off_differ(self):
+        _seed_demotions(self.home)
         turns = [
             {"user": "hello there, how are you"},          # residents only
             {"user": "please delegate this task to a subagent"},  # trigger delegation
@@ -451,6 +477,7 @@ class ExpansionVsTriggerTests(_HomeCase):
     does."""
 
     def test_trigger_free_expansion_charged(self):
+        _seed_demotions(self.home)
         # Trigger path: 'delegate this task' fires the delegation trigger, which
         # activates delegate_task — no expand_tools round trip.
         _write_session(self.home / "sessions", "trig", platform="telegram",
@@ -643,6 +670,7 @@ class ApiCallRouteCostingTests(_HomeCase):
             savings.discover_agents(self.home)[0], {"enabled": True})
 
     def test_metered_route_from_api_calls_produces_usd(self):
+        _seed_demotions(self.home)
         """session_meta carries no route; api_calls prove a metered one."""
         _write_session(self.home / "sessions", "m", platform="telegram",
                        model="claude-sonnet-4-6", ceiling=CEILING, turns=self.TURNS)
@@ -674,6 +702,7 @@ class ApiCallRouteCostingTests(_HomeCase):
         self.assertEqual(proj.usd_coverage, "none")
 
     def test_subscription_route_from_api_calls_shows_tokens_only(self):
+        _seed_demotions(self.home)
         _write_session(self.home / "sessions", "sub", platform="telegram",
                        model="claude-sonnet-4-6", ceiling=CEILING, turns=self.TURNS)
         _write_route_evidence(

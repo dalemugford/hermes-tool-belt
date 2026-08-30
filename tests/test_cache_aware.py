@@ -594,6 +594,10 @@ class EnabledCeilingCaptureTests(unittest.TestCase):
             "active_tool_names": ["clarify"],
             "resolved_always_carry": ["clarify"],
             "resolved_carry": [],
+            # Full-start: narrowing on the wire happens only through the
+            # demoted loadout — this also pins that learned demotions REACH
+            # the resolve path (a missing wire would keep read_file active).
+            "resolved_demoted": ["read_file"],
             "triggered_tools": [],
             "expansions": set(),
             "logged": False,
@@ -773,6 +777,8 @@ class ExpandOnlyManifestInjectionTests(unittest.TestCase):
             "active_tool_names": ["clarify", "expand_tools", "read_file"],
             "resolved_always_carry": ["clarify", "expand_tools"],
             "resolved_carry": ["read_file"],
+            # Full-start: X materializes only from the demoted loadout.
+            "resolved_demoted": ["web_extract", "browser_exec", "brand_new_builtin"],
             "triggered_tools": list(triggered),
             "expansions": set(),
             "logged": False,

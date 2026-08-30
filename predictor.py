@@ -3,8 +3,13 @@
 Given a message, returns the set of tool names the model is likely to need
 this turn. The result is the union of:
 
-  · The preset's residents (``always_carry`` ∪ ``carry``)
+  · The preset's explicit residents (``always_carry`` ∪ ``carry``)
   · Tools from every trigger group whose signals match the message
+
+Under the full-start contract this is a *candidate/activation* set only: the
+bulk of adaptive residency is implicit (everything enabled minus the
+preset's ``demoted`` list) and materializes in ``carrying.resolve`` once the
+live ceiling ``E`` is known.
 
 Always returns a result. Never raises — on any error, falls back to the
 NO_NARROWING sentinel so the gateway behaves as if the plugin weren't

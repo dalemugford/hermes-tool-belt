@@ -193,7 +193,8 @@ def normalize_mode(value: Any) -> str:
             pass
     mode = str(value or "").strip().lower()
     mode = {"off": "recommend", "auto": "apply", "audit": "apply"}.get(mode, mode)
-    return mode if mode in {"recommend", "apply"} else "recommend"
+    # Default flipped to "apply" (Promise #2): matches learned.DEFAULT_MODE.
+    return mode if mode in {"recommend", "apply"} else "apply"
 
 
 # ──────────────────────────────── discovery ──────────────────────────────────
@@ -446,14 +447,41 @@ def required_sessions(thresholds: dict[str, int] | None = None) -> int:
     )
 
 
+def _has_learned_assignment(info: ScopeInfo) -> bool:
+    """True when the scope has an adaptive carrying assignment in learned.json.
+
+    Read-only and fail-open (a read problem means "no assignment"). Checks
+    the v2 keys and their v1 spellings.
+    """
+    try:
+        doc = json.loads((info.state_dir / "learned.json").read_text(encoding="utf-8"))
+        entry = (doc.get("scopes") or {}).get(info.scope) or {}
+        return bool(
+            entry.get("carry") or entry.get("expand_only")
+            or entry.get("always_on") or entry.get("always_off")
+        )
+    except Exception:
+        return False
+
+
 def classify_scope(
     info: ScopeInfo,
     settings: dict[str, Any],
     thresholds: dict[str, int] | None = None,
 ) -> str:
-    """Which of the four states this scope is in."""
+    """Which of the four states this scope is in.
+
+    ``learned_mode`` now DEFAULTS to ``apply`` (full-start contract), so an
+    unset mode no longer implies "shaped": fresh means everything is active
+    and telemetry is accumulating. A scope counts as shaped when the operator
+    set ``apply`` explicitly, or when a learned carrying assignment exists on
+    disk (evidence-driven shaping has landed, hand-run or auto).
+    """
     needed = required_sessions(thresholds)
-    if normalize_mode(settings.get("learned_mode")) == "apply":
+    explicit_mode = settings.get("learned_mode")
+    if explicit_mode is not None and normalize_mode(explicit_mode) == "apply":
+        return STATE_SHAPED
+    if _has_learned_assignment(info):
         return STATE_SHAPED
     bypass = settings.get("scope_bypass_rate")
     if bypass is None:
@@ -880,6 +908,32 @@ def _project_scope(info: "ScopeInfo", proposal: dict[str, list[str]]):
         if a.projected.sessions_analyzed:
             return a
     return None
+
+
+def _always_carried_line(plugin_config: dict[str, Any] | None) -> str:
+    """One-line always-carried summary, showing config pins distinctly.
+
+    e.g. ``Always carried: 6 policy + 2 pinned (web_search, terminal)``.
+    Config pins come from ``plugins.tool-belt.always_carry`` (global; scope
+    entries add more per scope). Never raises.
+    """
+    policy_count = 0
+    try:
+        preset = load_base_preset()
+        policy_count = len(list(getattr(preset, "always_carry", []) or []))
+    except Exception:
+        pass
+    pins: list[str] = []
+    try:
+        learned = load_learned()
+        if learned is not None:
+            pins = list(learned.config_always_carry(plugin_config or {}, ""))
+    except Exception:
+        pins = []
+    if pins:
+        return (f"Always carried: {policy_count} policy + {len(pins)} pinned "
+                f"({', '.join(sorted(pins))})")
+    return f"Always carried: {policy_count} policy (no config pins)"
 
 
 def _preset_baselines(preset: Any) -> tuple[list[str], list[str]]:
@@ -1345,6 +1399,7 @@ def flow_status(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
     ctx.out("Tool Belt — configuration status")
     ctx.out(f"  Hermes home: {ctx.hermes_home}")
     ctx.out(f"  Sessions needed before shaping: {needed}")
+    ctx.out("  " + _always_carried_line(ctx.plugin_config))
     if not ctx.have_hermes:
         ctx.out("  `hermes` not on PATH — config values could not be read.")
     if not infos:

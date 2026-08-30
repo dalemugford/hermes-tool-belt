@@ -836,11 +836,19 @@ def _resolve_effective_preset(
         if t not in effective:
             effective.append(t)
     effective = [t for t in effective if t not in always_carry_set]
+    # Full-start precedence: the proposed demotions union the already-applied
+    # ones; an explicit carry entry (promotion) wins over any demotion, and
+    # always_carry is untouchable.
+    demoted = sorted(
+        ((set(getattr(base, "demoted", []) or []) | prop_expand)
+         - set(effective)) - always_carry_set
+    )
     return presets.Preset(
         name=f"{base.name}+proposed[{scope}]",
         always_carry=always_carry,
         carry=effective,
         triggers=base.triggers,
+        demoted=demoted,
     )
 
 
@@ -885,7 +893,14 @@ def _replay_active_names(
         if prediction.no_narrowing:
             per_turn = set(ceiling_names)
         else:
-            resolved = set(prediction.active_tool_names) & ceiling_set
+            # Full-start: residency is the ceiling minus demotions (plus any
+            # explicit carry), mirroring carrying.resolve; the predictor's
+            # candidate set contributes trigger activations on top.
+            demoted = set(getattr(preset, "demoted", []) or [])
+            residents = (ceiling_set - mcp_names - demoted) | (
+                (set(preset.always_carry) | set(preset.carry)) & ceiling_set
+            )
+            resolved = residents | (set(prediction.active_tool_names) & ceiling_set)
             per_turn = resolved | mcp_names  # passthrough never narrowed
 
         called = _called_tools_for_turn(session.turns, i)

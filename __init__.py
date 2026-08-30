@@ -124,11 +124,19 @@ _PREDICTION_CV: contextvars.ContextVar[dict[str, Any] | None] = contextvars.Cont
 )
 
 _CONFIG: dict[str, Any] = {
-    "enabled": False,
+    # Zero-config default: hooks are live as soon as Hermes loads the plugin
+    # (the `plugins.enabled` list already gates whether the plugin loads at
+    # all). `plugins.tool-belt.enabled: false` is the explicit opt-out; an
+    # UNSET key must not silently disable every hook while register() still
+    # exposes expand_tools (2026-08-30 live incident).
+    "enabled": True,
     "log": True,
     "channels": {},
     "agent": "",
-    "learned_mode": "recommend",
+    # Zero-config default (Promise #2, 2026-08-30): evidence-driven shaping
+    # applies automatically. `learned_mode: recommend` is the documented
+    # opt-in observe/trial mode; explicit configs win as always.
+    "learned_mode": "apply",
     # In-process periodic auto-shaping (session-end trigger). True by
     # default — automatic application for apply-mode scopes is the product
     # promise; `auto_shape: false` is the global opt-out. Per-scope debounce
@@ -287,7 +295,7 @@ def _load_user_config() -> None:
             return
         for key in (
             "enabled", "log", "agent", "learned_mode", "bypass_rate", "cache_mode",
-            "auto_shape", "auto_shape_interval_hours",
+            "auto_shape", "auto_shape_interval_hours", "always_carry",
         ):
             if key in plugin_cfg:
                 _CONFIG[key] = plugin_cfg[key]
@@ -396,21 +404,40 @@ def _wrap_build_api_kwargs(original):
 
             # Finalize the three strata (A/C/X) and the per-message active set
             # against the LIVE enabled ceiling. No selection source can add a
-            # tool absent from ``E``; unknown enabled built-ins fall to
-            # expand_only and are cut unless triggered/expanded. Learned
-            # demotions were already applied upstream (learned.apply_to_preset)
-            # before resolved_carry was computed — the loadout arrives here
-            # reconciled.
+            # tool absent from ``E``. Full-start contract: unknown enabled
+            # built-ins are CARRIED; only the reconciled ``demoted`` loadout
+            # (learned.apply_to_preset) moves a tool to expand_only.
             model = carrying_mod.resolve(
                 enabled=builtin_ceiling,
                 always_carry=set(state.get("resolved_always_carry") or []),
                 carry=set(state.get("resolved_carry") or []),
+                demoted=set(state.get("resolved_demoted") or []),
                 triggered=triggered_names,
                 expanded=expanded_names,
                 passthrough=set(),  # passthrough handled directly on the tool list
                 prior_active=set(state.get("prior_active_tools") or []),
             )
             active_set = model.active
+
+            # Full-start: the pre-ceiling baseline (predictor residents ∪
+            # trigger tools) understates what the model actually saw — most of
+            # class C is implicit (E − A − demoted). Widen the credit baseline
+            # with the resolved resident classes so expansion-credit
+            # attribution never credits expand_tools for a tool that was
+            # carried anyway.
+            baseline = state.get("baseline_active_tools")
+            if isinstance(baseline, list):
+                state["baseline_active_tools"] = sorted(
+                    set(baseline) | model.always_carry | model.carry
+                )
+
+            # Config always_carry pins absent from the enabled ceiling are
+            # inert — warn once per scope, naming them.
+            _warn_inert_pins(
+                str(state.get("scope") or ""),
+                state.get("config_always_carry") or [],
+                builtin_ceiling,
+            )
 
             filtered = []
             expand_only_names = []
@@ -1026,6 +1053,35 @@ def _agent_platform_from_context(event: Any = None, kwargs: dict[str, Any] | Non
     return agent, platform, f"{agent}:{platform}"
 
 
+#: Scopes already warned about inert config always_carry pins (per process).
+_WARNED_INERT_PINS: set[tuple[str, frozenset]] = set()
+
+
+def _warn_inert_pins(scope: str, pins: Any, enabled: set[str]) -> None:
+    """Warn once, naming config always_carry pins absent from ``E``.
+
+    A pinned name that is not an enabled tool is inert — the ceiling stays
+    authoritative and the pin cannot re-enable anything (``∩ E`` in
+    ``carrying.resolve``). Never fails; never raises.
+    """
+    try:
+        missing = frozenset(str(t) for t in (pins or []) if str(t) not in enabled)
+        if not missing:
+            return
+        key = (str(scope), missing)
+        if key in _WARNED_INERT_PINS:
+            return
+        _WARNED_INERT_PINS.add(key)
+        logger.warning(
+            "tool-belt: config always_carry pin(s) %s for scope %r are not in "
+            "the enabled tool ceiling — inert (a disabled/absent tool cannot "
+            "be re-enabled by pinning; check the name or enable the tool)",
+            ", ".join(sorted(missing)), scope,
+        )
+    except Exception:  # pragma: no cover — warning must never break dispatch
+        pass
+
+
 def _maybe_log_prediction(
     state: dict[str, Any],
     ceiling: list,
@@ -1092,7 +1148,7 @@ def _maybe_log_prediction(
             sticky_remaining_turns=dict(state.get("sticky_remaining_turns") or {}),
             policy_source=str(state.get("policy_source", "preset")),
             policy_version=str(state.get("policy_version", "")),
-            learned_mode=str(state.get("learned_mode", "recommend")),
+            learned_mode=str(state.get("learned_mode", "apply")),
             learned_scope=str(state.get("learned_scope", "")),
             learned_changes=list(state.get("learned_changes") or []),
             lookback_used=int(state.get("lookback_used", 0)),
@@ -1427,6 +1483,8 @@ def _freeze_session_snapshot(
     learned_changes: list[str],
     resolved_always_carry: list[str] | None = None,
     resolved_carry: list[str] | None = None,
+    resolved_demoted: list[str] | None = None,
+    config_always_carry: list[str] | None = None,
     triggered_tools: list[str] | None = None,
 ) -> None:
     """Persist the first dispatch's carrying decision for the session.
@@ -1448,6 +1506,8 @@ def _freeze_session_snapshot(
         # Frozen residency strata — the A/C loadout does not change in-session.
         "resolved_always_carry": list(resolved_always_carry or []),
         "resolved_carry": list(resolved_carry or []),
+        "resolved_demoted": list(resolved_demoted or []),
+        "config_always_carry": list(config_always_carry or []),
         # Monotonic accumulator of trigger-activated (expand_only) tool names.
         # Grows at most once per newly firing trigger group across the session.
         "triggered_tools": list(triggered_tools or []),
@@ -1497,6 +1557,8 @@ def _build_state_from_frozen(
         # Frozen residency strata — the A/C loadout is fixed per session.
         "resolved_always_carry": list(frozen.get("resolved_always_carry") or []),
         "resolved_carry": list(frozen.get("resolved_carry") or []),
+        "resolved_demoted": list(frozen.get("resolved_demoted") or []),
+        "config_always_carry": list(frozen.get("config_always_carry") or []),
         # Trigger matching still runs each message under freeze; the caller
         # merges newly fired trigger tools into ``frozen["triggered_tools"]``
         # before this state is built, so the accumulated set is authoritative.
@@ -1535,7 +1597,7 @@ def _build_state_from_frozen(
         # multiple sources.
         "policy_source": frozen.get("policy_source", "preset"),
         "policy_version": frozen.get("policy_version", ""),
-        "learned_mode": frozen.get("learned_mode", "recommend"),
+        "learned_mode": frozen.get("learned_mode", "apply"),
         "learned_scope": frozen.get("learned_scope", ""),
         "learned_changes": list(frozen.get("learned_changes") or []),
         # Lookback disabled under freeze.
@@ -1670,6 +1732,8 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         prediction = predictor_mod.predict(predictor_input, attachments, preset)
         resolved_always_carry = list(getattr(preset, "always_carry", []) or [])
         resolved_carry = list(getattr(preset, "carry", []) or [])
+        resolved_demoted = list(getattr(preset, "demoted", []) or [])
+        config_pins = list(getattr(preset, "config_always_carry", []) or [])
         trigger_tools = _trigger_tools_by_group(preset, prediction.triggers_fired)
         triggered_tool_names = sorted({t for tools in trigger_tools.values() for t in tools})
 
@@ -1727,6 +1791,8 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             # finalized against the live enabled ceiling in _build_api_kwargs.
             "resolved_always_carry": resolved_always_carry,
             "resolved_carry": resolved_carry,
+            "resolved_demoted": resolved_demoted,
+            "config_always_carry": config_pins,
             "triggered_tools": triggered_tool_names,
             "prior_active_tools": [],
             "expansions": set(),
@@ -1748,7 +1814,7 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             "sticky_remaining_turns": sticky_remaining,
             "policy_source": policy_source,
             "policy_version": getattr(preset, "policy_version", ""),
-            "learned_mode": getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "recommend")),
+            "learned_mode": getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "apply")),
             "learned_scope": getattr(preset, "learned_scope", ""),
             "learned_changes": list(getattr(preset, "learned_changes", []) or []),
             "lookback_used": len(prior_messages),
@@ -1772,11 +1838,13 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
                 triggers_suppressed=prediction.triggers_suppressed,
                 policy_source=policy_source,
                 policy_version=getattr(preset, "policy_version", ""),
-                learned_mode=getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "recommend")),
+                learned_mode=getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "apply")),
                 learned_scope=getattr(preset, "learned_scope", ""),
                 learned_changes=list(getattr(preset, "learned_changes", []) or []),
                 resolved_always_carry=resolved_always_carry,
                 resolved_carry=resolved_carry,
+                resolved_demoted=resolved_demoted,
+                config_always_carry=config_pins,
                 triggered_tools=triggered_tool_names,
             )
     except Exception as exc:
@@ -2502,6 +2570,17 @@ def _on_session_reset(session_id=None, **kwargs) -> None:
 
 def register(ctx) -> None:
     _load_user_config()
+
+    # One-shot visibility for the config-disabled state: registration still
+    # happens (Plugin Doctor needs it), but every hook guards on
+    # ``_CONFIG["enabled"]`` — a config-disabled plugin exposes expand_tools
+    # while narrowing nothing. That state should never be silent.
+    if not _CONFIG.get("enabled", True):
+        logger.warning(
+            "tool-belt: registered but disabled by config "
+            "(plugins.tool-belt.enabled is false) — hooks inert, no narrowing, "
+            "no telemetry; expand_tools stays registered but idle"
+        )
 
     # NOTE: registration is unconditional. Hermes' plugin manager already
     # gates load/no-load via ``plugins.enabled`` in config.yaml, so an

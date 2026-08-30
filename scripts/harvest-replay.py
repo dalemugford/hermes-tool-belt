@@ -272,14 +272,22 @@ def replay_session(
             allowed_names = list(session.ceiling_tools)
             expand_only_names: list[str] = []
         else:
-            allowed_set = set(prediction.active_tool_names)  # type: ignore[arg-type]
+            # Full-start contract: an enabled built-in is resident unless the
+            # resolved preset demotes it; the predictor's candidate set adds
+            # trigger activations on top. Only demoted, un-triggered tools
+            # land in expand_only.
+            demoted = set(getattr(preset, "demoted", []) or [])
+            explicit = set(getattr(preset, "always_carry", []) or []) | set(
+                getattr(preset, "carry", []) or []
+            )
+            allowed_set = (
+                (set(session.ceiling_tools) - demoted)
+                | (explicit & set(session.ceiling_tools))
+                | set(prediction.active_tool_names)  # type: ignore[arg-type]
+            )
             allowed_names = []
             expand_only_names = []
             for name in session.ceiling_tools:
-                # Under the 1.0 carrying model, an enabled built-in outside the
-                # resolved active set is expand_only — it activates only on
-                # trigger activation or explicit expansion. Only names in the
-                # resolved active set stay resident/active.
                 if name in allowed_set:
                     allowed_names.append(name)
                 else:
@@ -295,8 +303,15 @@ def replay_session(
         # resident tools; ``expand_only_names`` is the expand_only stratum X.
         ac_base = set(getattr(preset, "always_carry", []) or [])
         c_base = set(getattr(preset, "carry", []) or [])
+        demoted_base = set(getattr(preset, "demoted", []) or [])
         always_carry_tools = [t for t in allowed_names if t in ac_base]
-        carry_tools = [t for t in allowed_names if t in c_base and t not in ac_base]
+        # Full-start: class C is everything resident that isn't always_carry
+        # and wasn't demoted (a demoted name in `allowed` is a trigger/expansion
+        # activation, not residency) — plus any explicit carry promotion.
+        carry_tools = [
+            t for t in allowed_names
+            if t not in ac_base and (t not in demoted_base or t in c_base)
+        ]
 
         record = logger_io.PredictionRecord(
             ts=harvest_run_ts,

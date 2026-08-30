@@ -246,21 +246,22 @@ def build_prediction_row(
     active_names = prediction.active_tool_names
     narrowed = ([] if active_names == presets.NO_NARROWING
                 else [str(t) for t in active_names])
-    # v2 residency split, straight from the canonical preset fields: class A
-    # (always_carry) and class C (carry). Unknown enabled built-ins fall to
-    # expand_only under the 1.0 carrying model — they ride in the ceiling but
-    # are never resident.
+    # v2 residency split under the full-start contract: class A is the
+    # preset's always_carry; class C is EVERYTHING else enabled minus the
+    # preset's demotions (fresh scopes have none, so the whole ceiling rides
+    # resident — exactly what the runtime now does). ``unknown_kept``
+    # fixture tools join the ceiling and are therefore carried too.
     always_carry_tools = list(getattr(preset, "always_carry", []) or [])
-    carry_tools = list(getattr(preset, "carry", []) or [])
-    # Fixture-injected adaptive residents (the demote arm): resident every turn
-    # but never called, so after enough sessions the shaper demotes an unused
-    # one. v2 models these as ``carry`` — the demotable resident class (the
-    # retired v1 "unknown-kept safe default" no longer keeps them resident).
-    for t in unknown_kept:
-        if t not in carry_tools and t not in always_carry_tools:
-            carry_tools.append(t)
-    residents = always_carry_tools + carry_tools
+    demoted_tools = set(getattr(preset, "demoted", []) or [])
     ceiling_full = list(ceiling) + [t for t in unknown_kept if t not in ceiling]
+    carry_tools = [
+        t for t in ceiling_full
+        if t not in always_carry_tools and t not in demoted_tools
+    ]
+    for t in getattr(preset, "carry", []) or []:
+        if t not in carry_tools and t not in always_carry_tools:
+            carry_tools.append(str(t))
+    residents = always_carry_tools + carry_tools
     # Residents are active every turn; the remainder of the ceiling is X.
     active = sorted(set(narrowed) | set(residents))
     active_set = set(active)

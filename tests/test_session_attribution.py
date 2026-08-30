@@ -1058,6 +1058,8 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
             "baseline_active_tools": ["memory", "send_message"],
             "resolved_always_carry": [],
             "resolved_carry": ["memory", "send_message"],
+            # Full-start: terminal/file_read are cut via the demoted loadout.
+            "resolved_demoted": ["terminal", "file_read"],
             "triggered_tools": [],
             "expansions": set(),
             "agent": "assistant-a", "platform": "telegram", "scope": "assistant-a:telegram",
@@ -1111,6 +1113,8 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
             "baseline_active_tools": ["memory"],           # pre-sticky
             "resolved_always_carry": [],
             "resolved_carry": ["memory"],
+            # terminal was demoted — that's why sticky recovery matters here.
+            "resolved_demoted": ["terminal"],
             "triggered_tools": [],
             "expansions": set(),
             "agent": "assistant-a", "platform": "telegram", "scope": "assistant-a:telegram",

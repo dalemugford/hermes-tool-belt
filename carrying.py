@@ -5,17 +5,27 @@ loadout, this module finalizes the three-way residency partition and the
 per-message active set. It is the single authority for the locked algebra::
 
     A = always_carry ∩ E                     # immutable residents (class A)
-    C = (carry ∩ E) − A                      # adaptive residents  (class C)
+    C = ((E − A) − demoted) ∪ ((carry ∩ E) − A)   # adaptive residents (class C)
     X = E − (A ∪ C)                          # expand_only         (class X)
     T = triggered ∩ X                        # trigger-activated expand_only
     R = expanded  ∩ X                        # explicitly expanded expand_only
     active = A ∪ C ∪ T ∪ R ∪ passthrough ∪ (prior_active ∩ (E ∪ passthrough))
 
+This is the *full-start* contract (Promise #2, 2026-08-30): with no learned
+state (``demoted`` empty), every enabled tool is carried — ``active == E`` —
+and only evidence-driven demotion moves a tool into ``expand_only``. Unknown
+enabled built-ins are CARRIED until demoted. ``carry`` is the explicit
+promotion loadout (learned promotions / un-demotions); it wins over
+``demoted`` for a tool named in both (carry-wins, matching ``learned.py``'s
+reconciliation).
+
 Invariants:
 
   * A, C, X are a genuine three-way partition of E (precedence
-    always_carry > carry > expand_only). The partition itself enforces the
-    always_carry > carry precedence: C is computed minus A.
+    always_carry > carry > demoted). The partition itself enforces the
+    always_carry precedence: C is computed minus A.
+  * X ⊆ demoted: a tool only becomes expand_only through a demotion signal
+    (or by being outside E entirely, in which case it is simply absent).
   * No selection source (policy, learning, triggers, sticky/prior-active
     carry-forward, or explicit expansion) can add a tool absent from ``E``.
     Disabled/absent tools never re-enter.
@@ -24,13 +34,13 @@ Invariants:
   * Any internal failure fails **open** — the returned model's active set is
     the whole enabled ceiling (no narrowing).
 
-Demotion/promotion precedence is applied *upstream*, in
-``learned.apply_to_preset``, before the preset reaches this module: a learned
-demotion moves a tool out of the adaptive ``carry`` loadout there, and the
-always_carry-immunity and carried∧demoted conflict rules (fail safe toward
-carrying, with a warning) live in ``learned.py`` — its single home. By the
-time :func:`resolve` runs, the loadout is already reconciled; this module
-partitions an already-reconciled preset and never sees a demotion signal.
+Demotion/promotion *reconciliation* still lives upstream, in
+``learned.apply_to_preset`` — the always_carry-immunity and carried∧demoted
+conflict rules (fail safe toward carrying, with a warning) have their single
+home there. What reaches this module is the already-reconciled ``demoted``
+loadout (evidence-driven expand_only assignments) plus the explicit ``carry``
+promotions; this module only applies the set algebra against the live
+ceiling ``E``, which is where the full-start default materializes.
 """
 
 from __future__ import annotations
@@ -133,6 +143,7 @@ def resolve(
     enabled,
     always_carry,
     carry,
+    demoted=(),
     triggered=(),
     expanded=(),
     passthrough=(),
@@ -151,7 +162,8 @@ def resolve(
     try:
         E = _coerce(enabled)
         return _resolve_inner(
-            E, always_carry, carry, triggered, expanded, passthrough, prior_active
+            E, always_carry, carry, demoted, triggered, expanded, passthrough,
+            prior_active,
         )
     except Exception as exc:  # fail OPEN — never narrow on an internal error
         logger.warning("tool-belt: carrying.resolve failed (%s) — failing open", exc)
@@ -173,6 +185,7 @@ def _resolve_inner(
     E: set[str],
     always_carry,
     carry,
+    demoted,
     triggered,
     expanded,
     passthrough,
@@ -180,6 +193,7 @@ def _resolve_inner(
 ) -> CarryingModel:
     ac = _coerce(always_carry)
     ca = _coerce(carry)
+    dm = _coerce(demoted)
     tr = _coerce(triggered)
     ex = _coerce(expanded)
     pt = _coerce(passthrough)
@@ -195,13 +209,16 @@ def _resolve_inner(
     # ── Class A: immutable residents (always_carry ∩ E). ──────────────────
     A = ac & E_builtin
 
-    # ── Class C: adaptive residents (carry ∩ E) − A. ──────────────────────
-    # Subtracting A enforces the always_carry > carry precedence inside the
-    # partition itself; demotion conflicts were already reconciled upstream in
-    # ``learned.apply_to_preset`` (see the module docstring).
-    C = (ca & E_builtin) - A
+    # ── Class C: adaptive residents — full-start minus demotions. ─────────
+    # Everything enabled and not always_carry is carried unless an
+    # evidence-driven demotion names it; an explicit ``carry`` entry
+    # (learned promotion) wins over a demotion for a tool named in both.
+    # Subtracting A enforces the always_carry precedence inside the
+    # partition itself; always_carry-immunity to demotion was already
+    # reconciled upstream in ``learned.apply_to_preset``.
+    C = ((E_builtin - A) - dm) | ((ca & E_builtin) - A)
 
-    # ── Class X: expand_only — the enabled remainder (incl. unknowns). ─────
+    # ── Class X: expand_only — demoted-only (unknowns are carried). ────────
     X = E_builtin - (A | C)
 
     # ── Activation over X only (residency never changes). ─────────────────
