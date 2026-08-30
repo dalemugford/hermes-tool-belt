@@ -183,6 +183,22 @@ undemotable by construction: the runtime ignores any learned demotion
 naming one, and the shaper/auto-shape engine drops such candidates before
 writing.
 
+**When to pin — an honest note.** The shaper's economics optimize token
+cost, and for most tools that's the whole story. But a tool's *presence in
+the manifest is also an invitation*: the model reaches for tools it can
+see. For proactive tools — ones the model should use on its own initiative
+rather than when the user asks — demotion doesn't just add a fetch
+round-trip, it trains the behavior away entirely. Low usage then looks
+like evidence, and the shaping becomes self-confirming. Memory tools are
+the canonical case: an agent whose `remember` is buried behind
+`expand_tools` quietly stops forming memories, and nothing errors. If your
+agent runs a memory plugin, pin its core write/read/correct surface (for
+Mnemosyne: `mnemosyne_remember`, `mnemosyne_recall`, `mnemosyne_update`,
+`mnemosyne_invalidate`) and let the specialist remainder ride the
+evidence. The same reasoning applies to any tool your agent's own
+instructions (SOUL/system prompt) tell it to use habitually: if your
+directives insist on a tool, pin it.
+
 ### `bypass_rate`
 
 Type: `float` in `[0.0, 1.0]`. Default: `0.0`.
