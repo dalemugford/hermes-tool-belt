@@ -150,23 +150,38 @@ Resolved by
 
 ### `learned_mode`
 
-Type: `string`. One of `recommend`, `apply`. Default:
-`recommend`. Resolved by [`learned.py:learned_mode`](../learned.py).
+Type: `string`. One of `apply`, `recommend`. Default:
+`apply`. Resolved by [`learned.py:learned_mode`](../learned.py).
 
 Controls whether [`learned.json`](#learnedjson-reference) is applied
 to the active preset:
 
-- `recommend` (default) — the runtime does **not** merge `learned.json`.
-  Recommendations flow through `analyze.py --write-recommendations` and the
-  shaper for human review; behavior is unchanged.
-- `apply` — merge the learned overlay (`always_on` / `always_off` /
-  `trigger_adjustments`) into the preset during resolution. Prediction rows
-  stamp `learned_mode: apply`.
+- `apply` (default) — merge the learned overlay (demotions/promotions)
+  into the preset during resolution; evidence-driven shaping lands
+  automatically. Prediction rows stamp `learned_mode: apply`.
+- `recommend` — opt-in observe/trial mode: the runtime does **not** merge
+  `learned.json`. Recommendations flow through
+  `analyze.py --write-recommendations` and the shaper for human review;
+  behavior is unchanged.
 
 Legacy values normalize at load: `off` → `recommend`, and `auto` /
 `audit` → `apply`.
 
 May be overridden per scope via `channels.<scope>.learned_mode`.
+
+### `always_carry`
+
+Type: `list[string]`. Default: `[]`. Also accepted under
+`channels.<scope>.always_carry` — union semantics: a scope entry adds
+pins, it never removes global ones.
+
+Per-agent always-carry pins. The effective immutable resident baseline is
+the shipped `policy.yaml` `always_carry` ∪ this list, intersected with the
+enabled tool ceiling at resolution — a name Hermes has disabled (or a typo)
+is inert and logged as a warning, never an error. Pinned tools are
+undemotable by construction: the runtime ignores any learned demotion
+naming one, and the shaper/auto-shape engine drops such candidates before
+writing.
 
 ### `bypass_rate`
 

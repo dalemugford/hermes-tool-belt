@@ -489,6 +489,63 @@ def merge_into_learned(
     return state, changed
 
 
+def effective_always_carry(plugin_config: dict[str, Any], scope: str) -> set[str]:
+    """The full undemotable surface for a scope.
+
+    Shipped policy ``always_carry`` (structural baseline) ∪ the per-agent
+    config pins (``plugins.tool-belt.always_carry`` plus the scope's additive
+    ``channels.<scope>.always_carry`` — resolved via
+    ``learned.config_always_carry``). Never raises; a load failure degrades
+    to whatever half resolved.
+    """
+    protected: set[str] = set()
+    try:
+        from . import presets
+        protected |= set(presets.load_base_policy().always_carry)
+    except Exception as exc:  # pragma: no cover — policy load is fail-safe
+        logger.warning("tool-belt: shaper could not load policy always_carry: %s", exc)
+    try:
+        protected |= set(learned.config_always_carry(plugin_config or {}, scope))
+    except Exception as exc:  # pragma: no cover
+        logger.warning("tool-belt: shaper could not resolve config pins: %s", exc)
+    return protected
+
+
+def filter_protected_demotions(
+    plugin_config: dict[str, Any],
+    per_scope: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Strip demote candidates naming an always_carry tool (policy ∪ config).
+
+    always_carry — including config-pinned tools — is undemotable by
+    construction. ``compute_scope_recommendations`` already excludes the
+    *observed* always_carry residency class, but a config pin added after the
+    telemetry window (whose rows still show the tool as adaptive carry) would
+    otherwise surface as a candidate. This filter is the shaper-side half of
+    the guarantee; the runtime half lives in ``learned.apply_to_preset``,
+    which ignores any demotion signal naming an always_carry tool. Returns a
+    new per-scope mapping; inputs are not mutated.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for scope, recs in per_scope.items():
+        protected = effective_always_carry(plugin_config, scope)
+        demote = list(recs.get("demote") or [])
+        kept = [d for d in demote if str(d.get("tool") or "") not in protected]
+        dropped = sorted(
+            {str(d.get("tool") or "") for d in demote} - {str(d.get("tool") or "") for d in kept}
+        )
+        if dropped:
+            logger.warning(
+                "tool-belt: dropping demote candidate(s) %s for scope %r — "
+                "always_carry (policy baseline or config pin) is undemotable",
+                ", ".join(dropped), scope,
+            )
+        new_recs = dict(recs)
+        new_recs["demote"] = kept
+        out[scope] = new_recs
+    return out
+
+
 # ─── In-process auto-shape engine ───────────────────────────────────────────
 
 def _coerce_bool(value: Any, default: bool = True) -> bool:
@@ -626,7 +683,20 @@ def auto_shape_run(
         for scope in eligible
     }
 
+    # always_carry (policy ∪ config pins) is undemotable by construction.
+    per_scope = filter_protected_demotions(plugin_config, per_scope)
+
     state, changes = apply_recommendations(state, per_scope)
+
+    # Explicit assertion of the immunity contract: nothing protected was
+    # written toward expand_only by this run.
+    for scope, delta in changes.items():
+        protected = effective_always_carry(plugin_config, scope)
+        leaked = protected & set(delta.get("demoted") or [])
+        assert not leaked, (
+            f"tool-belt: auto-shape demoted protected always_carry tool(s) "
+            f"{sorted(leaked)} in scope {scope!r}"
+        )
     ts_iso = _utc_iso(now)
 
     scopes = dict(state.get("scopes") or {})

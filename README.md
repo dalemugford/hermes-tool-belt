@@ -176,7 +176,8 @@ what shaping did, promote a scope from observation, or reset an agent.
 **"A tool I need isn't loading."** The model should call
 `expand_tools(category=...)` to recover it — that's the designed path,
 and repeated use gets the category promoted in future sessions. For an
-immediate fix, add it per-scope with `always_on_extra` in config. Check
+immediate, permanent fix, pin it with `plugins.tool-belt.always_carry:
+[tool_name]` (global, or additively under `channels.<scope>.`). Check
 `configure.py --status` to see what shaping is active for that agent.
 
 **"Tools load that I never use."** That's carry cost the shaper will
@@ -227,14 +228,20 @@ plugins:
     # against. 1.0 on a scope fully disables narrowing there.
     bypass_rate: 0.0
 
-    # Learned overlay: recommend (default) never applies learned.json;
-    # apply merges it during preset resolution.
-    learned_mode: recommend    # recommend | apply
+    # Per-agent always-carry pins: union with the shipped structural
+    # baseline, never demotable, inert for tools Hermes has disabled.
+    always_carry: []
+
+    # Learned overlay: apply (the default) merges learned.json during
+    # preset resolution; recommend is the opt-in observe/trial mode that
+    # never applies it.
+    learned_mode: apply        # apply (default) | recommend
 
     # Per-scope overrides
     channels:
       default:telegram:        # agent-scoped override
         learned_mode: recommend
+        always_carry: []       # adds to the global pins (union, never removes)
         bypass_rate: 0.05      # 5% baseline cohort on this scope only
         always_on_extra: [terminal]
       slack:                    # platform-wide fallback
@@ -301,9 +308,11 @@ telemetry joins — is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   busts cache on the next call regardless of what the plugin does.
   Anthropic-side cache is more deterministic. See
   [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
-- **`learned_mode: apply` is not the default.** Adaptive promotion
-  is deliberately opt-in until recommendations have been reviewed for a
-  given scope. The default `recommend` never merges `learned.json`.
+- **`learned_mode: apply` IS the default** (zero-config contract): a fresh
+  scope carries every enabled tool, and evidence-driven demotions apply
+  automatically as they accumulate. Set `learned_mode: recommend` on a
+  scope to opt into observe/trial mode, where `learned.json` is never
+  merged and shaping stays a human-reviewed proposal.
 
 ## Failure modes
 

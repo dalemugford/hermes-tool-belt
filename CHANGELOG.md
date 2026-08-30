@@ -10,6 +10,28 @@ The initial public capabilities of the plugin:
 
 ### Added
 
+- **Zero-config full-start default.** On a scope with no learned state,
+  Tool Belt now carries **everything Hermes enables** — active == the
+  enabled ceiling — and evidence-driven demotion (the existing no-use
+  thresholds) is the shaping motion that moves tools to expand-only over
+  time. This flips the old defaults: unknown enabled built-ins are carried
+  (not expand-only), the shipped curated `carry` warm-start list is retired
+  from `policy.yaml` and runtime resolution, and the default `learned_mode`
+  is now `apply` (automatic shaping); `recommend` becomes the documented
+  opt-in observe/trial mode. Explicit configs win as always, legacy aliases
+  are unchanged, and triggers/expand_tools/fail-open semantics are
+  untouched. The plugin's internal `enabled` default also flips to `true`
+  (Hermes' `plugins.enabled` list still gates loading; a config-disabled
+  plugin now logs a one-shot warning instead of going silently inert).
+- **Per-agent `always_carry` config pinning.** New key
+  `plugins.tool-belt.always_carry: [tool, ...]` (plus additive
+  `channels.<scope>.always_carry` — union semantics, scope adds and never
+  removes). Pins union with the shipped structural baseline, are validated
+  against the enabled ceiling (a disabled/unknown name is inert, with one
+  clear warning naming it), and are undemotable by construction — the
+  runtime ignores learned demotions naming a pin and the shaper/auto-shape
+  engine filters such candidates before writing. `configure --status`
+  shows pins distinctly ("Always carried: N policy + M pinned (...)").
 - **In-process periodic auto-shaping.** Scopes whose `learned_mode` resolves
   to `apply` are now shaped automatically by the plugin itself — triggered
   from the session-end path, debounced to once per 24h per scope
