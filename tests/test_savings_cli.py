@@ -163,7 +163,7 @@ def _write_route_evidence(state_dir: Path, session_stem: str, calls: list[dict],
 
 # A ceiling mixing residents, trigger-activatable, and pure expand_only tools.
 CEILING = [
-    "clarify", "todo", "send_message", "expand_tools",       # always_carry
+    "clarify", "todo", "send_message", "expand_tools",       # clarify/expand_tools always_carry; todo/send_message ordinary since the 2026-08-30 pin audit
     "read_file", "web_search", "terminal", "write_file",     # carry residents
     "delegate_task",       # trigger: delegation
     "execute_code",        # trigger: code_execution (also reachable bare)

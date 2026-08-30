@@ -113,7 +113,8 @@ shaper = _load_shaper()
 
 # The immutable always_carry baseline from the locked model.
 ALWAYS_CARRY = frozenset(
-    {"clarify", "skill_view", "skills_list", "todo", "send_message", "expand_tools"}
+    {"clarify", "skill_view", "skills_list", "expand_tools",
+     "tool_search", "tool_describe", "tool_call"}
 )
 
 _EXPECTED_SIGNATURE = (
@@ -315,7 +316,9 @@ class ThreeWayPartitionContract(_CarryingContract):
 
         # Class contents follow the locked definitions (precedence AC > C > X).
         self.assertEqual(m.A, set(ALWAYS_CARRY) & set(E))
-        self.assertEqual(m.C, {"read_file"})
+        # send_message is no longer pinned (2026-08-30 audit) — as an
+        # undemoted enabled tool it is an ordinary class-C resident here.
+        self.assertEqual(m.C, {"read_file", "send_message"})
         self.assertEqual(m.X, {"web_extract", "browser_exec"})
 
         # With no triggers/expansions, active == residents (A ∪ C).

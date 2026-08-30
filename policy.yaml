@@ -42,18 +42,42 @@ learning:
 # (a fresh scope simply carries all of E), and onboarding derives any
 # warm-start prior from historical telemetry analysis instead.
 
-# always_carry — permanent residents. Discovery, planning, asking for help, plus
-# the structural gateway/meta tools the agent must never lose. Immutable: the
-# learned/adaptive layer can never demote these.
+# always_carry — permanent residents. Immutable: the learned/adaptive layer can
+# never demote these. Shipped pins are union-only (users can add via config but
+# never remove), so this list is kept minimal: only tools whose demotion
+# evidence is categorically invalid (access infrastructure) or whose absence is
+# silent and unrecoverable.
+#
+# NOT here on purpose:
+#   send_message — not agent-callable on current Hermes (send_message_tool.py
+#     deliberately registers no model tool; it is CLI/cron/notifier transport
+#     only), so a pin would be permanently inert misinformation. Do not "fix"
+#     it back; if a future Hermes re-registers it, users can pin via config.
+#   todo — evidence-ruled since 1.0: demotion is recoverable via expand_tools
+#     and 20 sessions of no-use is real evidence on a chat-only scope. Users
+#     who want it resident can pin it back via plugins.tool-belt.always_carry.
 always_carry:
+  # Class 2 — asking the user. No alternative expression; demotion is silent
+  # and self-confirming (a demoted clarify yields zero clarify calls forever).
   - clarify
+  # No trigger group covers the skill read pair, so demotion would be
+  # recoverable only via expand_tools.
   - skill_view
   - skills_list
-  - todo
-  # Gateway essential — ignored on CLI by the plugin.
-  - send_message
-  # Always-on meta-tool the plugin itself adds.
+  # Always-on meta-tool the plugin itself adds — Tool Belt's own hatch out of
+  # the expand_only stratum.
   - expand_tools
+  # Hermes' tiered-disclosure access infrastructure: the Tool Search bridge.
+  # When the bridge is active these are the ONLY reach into the deferred
+  # MCP/plugin catalog — their own call counts are categorically invalid
+  # demotion evidence (low usage means "the agent had what it needed", and
+  # demotion silently severs all MCP access). Pure-data backup for the
+  # structural pass-through in __init__.py (bridge tools sit outside the
+  # partition, like MCP tools); the pin covers the case where
+  # tools.tool_search cannot be imported.
+  - tool_search
+  - tool_describe
+  - tool_call
 
 # NOTE — no always_off key. Tool Belt has no disabling semantics. Any enabled
 # tool outside always_carry is carried until demoted by evidence; disabling is

@@ -46,7 +46,8 @@ SCHEMA_VERSION = 2
 # baseline is read from policy.yaml (see ``_always_carry_baseline``); this
 # mirror keeps the normalizer working even if that load fails.
 _FALLBACK_ALWAYS_CARRY = frozenset(
-    {"clarify", "skill_view", "skills_list", "todo", "send_message", "expand_tools"}
+    {"clarify", "skill_view", "skills_list", "expand_tools",
+     "tool_search", "tool_describe", "tool_call"}
 )
 
 
