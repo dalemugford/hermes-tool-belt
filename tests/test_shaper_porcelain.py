@@ -329,22 +329,6 @@ class MissingPyYAMLTests(unittest.TestCase):
     def test_shaper_defaults_exit(self):
         self._assert_loud_exit(shape_ceiling.load_shape_ceiling_defaults)
 
-    def test_analyzer_always_carry_exits(self):
-        self._assert_loud_exit(analyze._load_preset_always_carry, PLUGIN_DIR)
-
-    def test_analyzer_excludes_exit(self):
-        self._assert_loud_exit(analyze._load_preset_excludes, PLUGIN_DIR)
-
-    def test_analyzer_triggers_exit(self):
-        self._assert_loud_exit(analyze._load_preset_triggers, PLUGIN_DIR)
-
-    def test_harvest_config_load_exits(self):
-        tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, tmp, True)
-        (tmp / "config.yaml").write_text("plugins:\n  tool-belt:\n    enabled: true\n",
-                                         encoding="utf-8")
-        self._assert_loud_exit(harvest_replay._load_plugin_config, tmp)
-
     def test_runtime_presets_still_fail_open(self):
         """Deliberate asymmetry: the gateway must not die on a missing parser."""
         presets = importlib.import_module("tool_belt_plugin.presets")

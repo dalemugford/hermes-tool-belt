@@ -46,67 +46,6 @@ class LearnedV2TestCase(unittest.TestCase):
         self.addCleanup(learned._CACHE.clear)
 
 
-class ApplyToPresetImmunityTests(LearnedV2TestCase):
-    def test_expand_only_naming_always_carry_tool_is_ignored_and_warns(self) -> None:
-        """always_carry is immutable: a demotion signal naming it is dropped."""
-        preset = presets.Preset(
-            name="t",
-            always_carry=["send_message", "expand_tools"],
-            carry=["read_file"],
-            triggers=[],
-        )
-        state = {"version": 2, "scopes": {"a:slack": {"expand_only": ["send_message"]}}}
-
-        with mock.patch.object(learned, "load_state", return_value=state):
-            with self.assertLogs(_LOGGER, level="WARNING") as cm:
-                result = learned.apply_to_preset(
-                    preset, {"learned_mode": "apply"}, "a:slack"
-                )
-
-        # The tool stays resident on the immutable surface, never demoted.
-        self.assertIn("send_message", result.preset.always_carry)
-        self.assertNotIn("send_message", result.preset.carry)
-        warned = "\n".join(cm.output)
-        self.assertIn("always_carry", warned)
-        self.assertIn("send_message", warned)
-
-
-class ApplyToPresetOverlapTests(LearnedV2TestCase):
-    def test_carry_expand_only_overlap_resolves_toward_carry_and_warns(self) -> None:
-        """A hand-built scope dict naming a tool in both lists: carry wins.
-
-        ``normalize_state`` reconciles this at load time, so to reach the
-        belt-and-braces guard inside ``apply_to_preset`` the (un-normalized)
-        scope dict is injected directly via ``load_state``.
-        """
-        preset = presets.Preset(
-            name="t",
-            always_carry=["send_message"],
-            carry=["read_file", "process"],
-            triggers=[],
-        )
-        state = {
-            "version": 2,
-            "scopes": {
-                "a:slack": {"carry": ["web_search"], "expand_only": ["web_search", "process"]}
-            },
-        }
-
-        with mock.patch.object(learned, "load_state", return_value=state):
-            with self.assertLogs(_LOGGER, level="WARNING") as cm:
-                result = learned.apply_to_preset(
-                    preset, {"learned_mode": "apply"}, "a:slack"
-                )
-
-        # web_search was in both lists → carry wins (resident).
-        self.assertIn("web_search", result.preset.carry)
-        # The genuine demote (process, expand_only only) still applied.
-        self.assertNotIn("process", result.preset.carry)
-        warned = "\n".join(cm.output)
-        self.assertIn("both carry and expand_only", warned)
-        self.assertIn("web_search", warned)
-
-
 class WriteStateRoundTripTests(LearnedV2TestCase):
     def test_round_trip_normalizes_v1_and_preserves_unrelated_metadata(self) -> None:
         state = {

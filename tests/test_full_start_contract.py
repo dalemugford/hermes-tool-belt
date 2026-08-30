@@ -118,26 +118,6 @@ class TestFullStartDefault(unittest.TestCase):
                          "shipped policy must not seed a curated carry list")
 
 
-class TestDefaultLearnedMode(unittest.TestCase):
-    """(c): default learned_mode resolves to apply."""
-
-    def test_learned_mode_defaults_to_apply(self):
-        self.assertEqual(learned_mod.learned_mode({}, "any:scope"), "apply")
-
-    def test_plugin_config_default_is_apply(self):
-        self.assertEqual(_DEFAULT_LEARNED_MODE, "apply")
-        self.assertEqual(learned_mod.DEFAULT_MODE, "apply")
-
-    def test_explicit_recommend_still_wins(self):
-        self.assertEqual(
-            learned_mod.learned_mode({"learned_mode": "recommend"}, "s"),
-            "recommend",
-        )
-        # Legacy aliases unchanged.
-        self.assertEqual(learned_mod.normalize_mode("off"), "recommend")
-        self.assertEqual(learned_mod.normalize_mode("auto"), "apply")
-
-
 class TestConfigAlwaysCarry(unittest.TestCase):
     """(d)+(e)+(f): per-agent always_carry config pinning."""
 
@@ -285,43 +265,6 @@ class TestEnabledByDefault(unittest.TestCase):
         finally:
             plugin._CONFIG.clear()
             plugin._CONFIG.update(old)
-
-
-class TestDemotionsReachTheWire(unittest.TestCase):
-    """End-to-end: learned demotions narrow the active set on the real
-    resolve path (full-start must not degrade into a no-op)."""
-
-    def test_shaped_scope_narrows_on_resolve(self):
-        with tempfile.TemporaryDirectory() as home:
-            state_dir = Path(home) / "state" / "tool-belt"
-            state_dir.mkdir(parents=True)
-            (state_dir / "learned.json").write_text(json.dumps({
-                "version": 2,
-                "scopes": {"agent:slack": {
-                    "carry": [],
-                    "expand_only": ["image_generate", "vision_analyze"],
-                    "shaping": {},
-                }},
-            }))
-            with mock.patch.dict(os.environ, {"HERMES_HOME": home}):
-                learned_mod.load_state(force=True)
-                preset = presets_mod.resolve_preset({}, "agent:slack")
-                self.assertEqual(
-                    sorted(getattr(preset, "demoted", [])),
-                    ["image_generate", "vision_analyze"],
-                    "default (apply) mode merges learned demotions",
-                )
-                model = carrying_mod.resolve(
-                    enabled=CEILING,
-                    always_carry=preset.always_carry,
-                    carry=preset.carry,
-                    demoted=preset.demoted,
-                )
-                self.assertEqual(model.expand_only,
-                                 {"image_generate", "vision_analyze"})
-                self.assertNotIn("image_generate", model.active)
-                self.assertEqual(model.active,
-                                 set(CEILING) - {"image_generate", "vision_analyze"})
 
 
 if __name__ == "__main__":

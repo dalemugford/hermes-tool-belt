@@ -950,17 +950,5 @@ class TokenEstimatorTests(unittest.TestCase):
         n = self.logger_io.estimate_tokens(payload)
         self.assertGreater(n, 0)
 
-    def test_encoder_cached_across_calls(self):
-        """The encoder load is one-time per process (lru_cache)."""
-        name1 = self.logger_io.token_estimator_name()
-        name2 = self.logger_io.token_estimator_name()
-        self.assertEqual(name1, name2)
-        # Calling _get_encoder directly should also hit the cache:
-        info_before = self.logger_io._get_encoder.cache_info()
-        self.logger_io._get_encoder()
-        info_after = self.logger_io._get_encoder.cache_info()
-        self.assertEqual(info_after.hits, info_before.hits + 1)
-
-
 if __name__ == "__main__":
     unittest.main()

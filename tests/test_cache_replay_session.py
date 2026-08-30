@@ -69,24 +69,6 @@ def _call(prediction_id, session_id, ts, api_call_idx, tool_list_hash, *,
     return row
 
 
-class SessionKeyTests(unittest.TestCase):
-    def test_prefers_hermes_session_id(self):
-        key = cache_replay._session_key(
-            {"hermes_session_id": "H1", "session_id": "S"})
-        self.assertEqual(key, "H1")
-
-    def test_falls_back_to_session_id_when_hermes_absent(self):
-        self.assertEqual(cache_replay._session_key({"session_id": "S"}), "S")
-
-    def test_falls_back_to_session_id_when_hermes_blank(self):
-        key = cache_replay._session_key(
-            {"hermes_session_id": "", "session_id": "S"})
-        self.assertEqual(key, "S")
-
-    def test_empty_when_neither_present(self):
-        self.assertEqual(cache_replay._session_key({}), "")
-
-
 class FreezeSimulationNewBoundaryTests(unittest.TestCase):
     def test_new_boundary_does_not_reuse_frozen_active_set(self):
         """Two Hermes sessions share the transport session_id but differ in

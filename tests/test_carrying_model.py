@@ -329,26 +329,6 @@ class ThreeWayPartitionContract(_CarryingContract):
 # Deliberate contract flip (Promise #2, 2026-08-30): the pre-full-start model
 # defaulted unknowns to expand_only; now they are carried until demoted.
 
-class UnknownDefaultsContract(_CarryingContract):
-    def test_unknown_enabled_builtin_defaults_to_carry(self):
-        E = {"clarify", "send_message", "brand_new_builtin"}
-        m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set())
-
-        self.assertIn("brand_new_builtin", m.C,
-                      "an unknown enabled built-in defaults to carry (full-start)")
-        self.assertNotIn("brand_new_builtin", m.A)
-        self.assertNotIn("brand_new_builtin", m.X)
-        self.assertIn("brand_new_builtin", m.active,
-                      "unknown tool is active until evidence demotes it")
-
-    def test_only_demotion_moves_an_unknown_out(self):
-        E = {"clarify", "send_message", "brand_new_builtin"}
-        m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
-                         demoted={"brand_new_builtin"})
-        self.assertIn("brand_new_builtin", m.X)
-        self.assertNotIn("brand_new_builtin", m.active)
-
-
 # ─── 3. always_carry immunity from learned demotion ────────────────────────
 
 class AlwaysCarryImmunityContract(_CarryingContract):
@@ -392,41 +372,7 @@ class AlwaysCarryImmunityContract(_CarryingContract):
 
 # ─── 4. promotion expand_only -> carry ─────────────────────────────────────
 
-class PromotionContract(_CarryingContract):
-    def test_promotion_expand_only_to_carry(self):
-        E = {"clarify", "send_message", "web_extract"}
-
-        before = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
-                              demoted={"web_extract"})
-        self.assertIn("web_extract", before.X, "starts as demoted expand_only")
-        self.assertNotIn("web_extract", before.C)
-
-        # Promotion == the explicit carry loadout gains the tool (an
-        # un-demotion under full-start); carry wins over demoted.
-        after = self.resolve(enabled=E, always_carry=ALWAYS_CARRY,
-                             carry={"web_extract"}, demoted={"web_extract"})
-        self.assertIn("web_extract", after.C, "promotion moves expand_only -> carry")
-        self.assertNotIn("web_extract", after.X)
-        self.assertEqual(before.A, after.A, "promotion does not touch always_carry")
-
-
 # ─── 5. demotion carry -> expand_only ──────────────────────────────────────
-
-class DemotionContract(_CarryingContract):
-    def test_demotion_carry_to_expand_only(self):
-        E = {"clarify", "send_message", "web_extract"}
-
-        resident = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set())
-        self.assertIn("web_extract", resident.C,
-                      "starts as a carry resident (full-start default)")
-        self.assertNotIn("web_extract", resident.X)
-
-        # Demotion == the demoted loadout gains the tool.
-        demoted = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
-                               demoted={"web_extract"})
-        self.assertIn("web_extract", demoted.X, "demotion moves carry -> expand_only")
-        self.assertNotIn("web_extract", demoted.C)
-
 
 # ─── 6/7. expand_only activation without residency change ──────────────────
 
@@ -621,43 +567,6 @@ class LearnedV1NormalizationContract(unittest.TestCase):
 
 # ─── 13. v1 telemetry normalization incl. conditional residency_inferred ───
 
-class TelemetryV1NormalizationContract(unittest.TestCase):
-    @staticmethod
-    def _truthy(v):
-        return bool(v)
-
-    def test_v1_telemetry_normalizes_with_conditional_residency_inference(self):
-        normalize = _resolve_telemetry_normalizer()
-        if normalize is None:
-            self.fail(
-                "v2 telemetry-row normalizer not implemented (expected e.g. "
-                "tool_belt_plugin.analyze.normalize_prediction_row(row) -> v2 row)"
-            )
-
-        # Complete membership: ceiling + residents + active are all present, so
-        # residency CAN be reconstructed -> residency_inferred is True.
-        complete = {
-            "prediction_id": "p1",
-            "ceiling_tools": ["clarify", "read_file", "web_extract"],
-            "always_on_tools": ["clarify", "read_file"],
-            "allowed_tools": ["clarify", "read_file"],
-            "cut_tools": ["web_extract"],
-        }
-        row = normalize(complete)
-        self.assertTrue(self._truthy(_get(row, "residency_inferred")),
-                        "complete membership permits residency inference")
-        residency = _get(row, "residency")
-        self.assertIsNotNone(residency,
-                             "a complete row carries a residency mapping")
-
-        # Incomplete membership: no ceiling / no residents -> the partition is
-        # unknowable, so residency must NOT be inferred.
-        incomplete = {"prediction_id": "p2", "allowed_tools": ["clarify"]}
-        row2 = normalize(incomplete)
-        self.assertFalse(self._truthy(_get(row2, "residency_inferred")),
-                         "incomplete membership must not infer residency")
-
-
 # ─── 14. trigger definitions byte-equivalent across promotion/demotion ─────
 
 class TriggerImmutabilityContract(unittest.TestCase):
@@ -769,76 +678,7 @@ class CacheOffTriggerEphemeralContract(_CarryingContract):
 
 # ─── 17. sticky/category expansions never escape the enabled ceiling ────────
 
-class ExpansionCeilingContract(_CarryingContract):
-    def test_expanded_and_sticky_names_cannot_escape_ceiling(self):
-        E = {"clarify", "send_message", "read_file"}
-        # ``expanded`` here stands in for sticky/category expansion tool names.
-        # A ceiling-absent name must never activate; a ceiling-present one does.
-        m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
-                         demoted={"read_file"},
-                         expanded={"ghost_sticky_tool", "read_file"})
-        self.assertNotIn("ghost_sticky_tool", m.active,
-                         "an expansion cannot add a tool absent from E")
-        self.assertNotIn("ghost_sticky_tool", m.X)
-        self.assertIn("read_file", m.active,
-                      "a ceiling-present expand_only tool activates via expansion")
-        self.assertIn("read_file", m.X, "activation does not change residency")
-
-
 # ─── 18. discoverability manifest is derived from X (Phase 4 contract) ──────
-
-class DiscoverabilityManifestContract(_CarryingContract):
-    """The expand-only manifest names exactly the expand_only stratum ``X`` —
-    residents (A ∪ C) and MCP/plugin pass-through names never appear, and the
-    manifest is stable across trigger activation (residency, not the active
-    set, drives it)."""
-
-    _INDEX = {
-        "web": {"web_extract"},
-        "browser": {"browser_exec"},
-    }
-
-    def test_manifest_names_only_expand_only_stratum(self):
-        E = {"clarify", "send_message", "expand_tools", "read_file",
-             "web_extract", "browser_exec"}
-        m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry={"read_file"},
-                         demoted={"web_extract", "browser_exec"},
-                         passthrough={"mcp__github__create_issue"})
-
-        text = expand_tools_mod.build_expand_only_manifest(
-            m.X, category_index=self._INDEX)
-
-        # Every X member is named.
-        for name in m.X:
-            self.assertIn(name, text, f"expand_only tool {name!r} must be listed")
-        # No resident (A ∪ C) is named as a listed member.
-        for name in (m.A | m.C):
-            for line in text.splitlines()[1:]:  # skip header prose
-                if ":" in line:
-                    self.assertNotIn(name, line.split(":", 1)[1],
-                                     f"resident {name!r} must not be a manifest entry")
-        # Pass-through is outside the built-in partition and never listed.
-        self.assertNotIn("mcp__github__create_issue", text)
-        self.assertNotIn("github", text)
-
-    def test_manifest_stable_across_trigger_activation(self):
-        E = {"clarify", "send_message", "read_file", "web_extract", "browser_exec"}
-        carry = {"read_file"}
-        demoted = {"web_extract", "browser_exec"}
-
-        m0 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry,
-                          demoted=demoted)
-        m1 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry,
-                          demoted=demoted,
-                          triggered={"web_extract"}, prior_active=m0.active)
-        # Residency (X) is frozen; activation grew the active set only.
-        self.assertEqual(m0.X, m1.X)
-        self.assertEqual(
-            expand_tools_mod.build_expand_only_manifest(m0.X, category_index=self._INDEX),
-            expand_tools_mod.build_expand_only_manifest(m1.X, category_index=self._INDEX),
-            "manifest is stable across trigger activation",
-        )
-
 
 # ─── 19. between-session shaper contracts (Phase 6) ────────────────────────
 

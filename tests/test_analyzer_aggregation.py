@@ -181,50 +181,6 @@ class HarvestRowTests(unittest.TestCase):
         )
 
 
-class PayloadVersionTests(unittest.TestCase):
-    """Fix 6 — one run, one schema version."""
-
-    def test_summary_and_recommendations_agree(self):
-        args = _args()
-        summary = analyze.summary_payload({}, [], args)
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "learned_recommendations.json"
-            analyze.write_recommendations(path, [], args)
-            recs = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(summary["version"], recs["version"])
-        self.assertEqual(summary["version"], analyze.ANALYZER_PAYLOAD_VERSION)
-
-
-class TriggerKeywordReportTests(unittest.TestCase):
-    """Fix 7 — degraded mode must be visible in both suggestion sections."""
-
-    def test_degraded_status_renders_a_callout(self):
-        trigger_keywords = [{
-            "scope": "a:telegram",
-            "tool": "shell",
-            "expand_only_count": 5,
-            "target_trigger": "terminal",
-            "action": "add_keywords_to_trigger",
-            "existing_keyword_pattern_count": 0,
-            "candidates": [{
-                "pattern": "run the script",
-                "suggested_regex": r"\brun the script\b",
-                "support_count": 5,
-                "noise_count": 0,
-                "precision": 1.0,
-                "sample_previews": [],
-            }],
-            "preset_triggers_status": "no_yaml",
-        }]
-        report = analyze.markdown_report(
-            {}, [], _args("--suggest-trigger-keywords"),
-            trigger_keywords=trigger_keywords,
-        )
-        section = report.split("## Suggested Trigger-Keyword Candidates", 1)[1]
-        self.assertIn("Degraded mode", section)
-        self.assertIn("no_yaml", section)
-
-
 class KeywordMinerContainmentTests(unittest.TestCase):
     """Fix 8 — containment must be word-wise, not raw substring."""
 

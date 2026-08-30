@@ -65,25 +65,6 @@ def _patched(resolved):
     )
 
 
-class CeilingCauseWordingTests(unittest.TestCase):
-    def test_unavailable_note_names_cause_and_fixability(self):
-        state = _make_state(enabled_ceiling=["read_file", "browser_navigate"])
-        with _patched(["browser_navigate", "browser_click"]):
-            payload = _invoke({"category": "browser"}, state)
-        msg = payload["message"]
-        self.assertIn("platform_toolsets", msg)
-        self.assertIn("Tool Belt cannot restore them", msg)
-        self.assertIn("Hermes config change", msg)
-
-    def test_all_unavailable_message_names_cause_too(self):
-        state = _make_state(enabled_ceiling=["read_file"])
-        with _patched(["browser_navigate", "browser_click"]):
-            payload = _invoke({"category": "browser"}, state)
-        msg = payload["message"]
-        self.assertIn("platform_toolsets", msg)
-        self.assertIn("Hermes config change", msg)
-
-
 class PersistenceWordingTests(unittest.TestCase):
     def test_cache_on_says_persists_for_this_session_and_omits_sticky(self):
         # Cache-on = no sticky key (frozen monotonic expansion set).

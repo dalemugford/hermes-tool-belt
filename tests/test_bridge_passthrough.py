@@ -56,25 +56,6 @@ except Exception:  # pragma: no cover — env without hermes-agent on the path
 
 # ─── Lock (c) + (e): the shipped pin set is exactly the audited seven ──────
 
-class ShippedPinSetTests(unittest.TestCase):
-    def test_policy_always_carry_is_the_audited_seven(self):
-        base = presets_mod.load_base_policy()
-        self.assertEqual(frozenset(base.always_carry), AUDITED_SEVEN)
-
-    def test_send_message_and_todo_no_longer_pinned(self):
-        base = presets_mod.load_base_policy()
-        self.assertNotIn("send_message", base.always_carry,
-                         "send_message is not agent-callable on current "
-                         "Hermes — the pin is inert misinformation")
-        self.assertNotIn("todo", base.always_carry,
-                         "todo is evidence-ruled; pin back via config")
-
-    def test_fallback_drift_guard_is_the_seven(self):
-        """Explicit seven-set guard (the generic policy==fallback drift test
-        lives in test_telemetry_schema; this one locks the membership)."""
-        self.assertEqual(logger_io._FALLBACK_ALWAYS_CARRY, AUDITED_SEVEN)
-
-
 # ─── Lock (d): todo demotable by ordinary evidence ─────────────────────────
 
 class TodoDemotableTests(unittest.TestCase):

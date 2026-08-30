@@ -183,14 +183,39 @@ def _parse_triggers(raw: Any) -> list[TriggerGroup]:
     return out
 
 
+#: Parsed-preset cache keyed by path, invalidated by (mtime_ns, size). The
+#: savings engine's session replay resolves the preset once per session and
+#: was re-parsing the same policy.yaml hundreds of times per report; the
+#: policy file changes rarely and the stat check keeps edits honest. Hits
+#: return a fresh Preset with copied lists so a caller mutating its copy
+#: can never contaminate later loads (compiled trigger groups are shared —
+#: they are immutable in practice).
+_PRESET_FILE_CACHE: dict[str, tuple[int, int, Preset]] = {}
+
+
 def load_preset_file(path: Path) -> Preset:
     """Read and parse a policy YAML into the 1.0 carrying model.
 
     Parses the v2 schema (``always_carry`` + ``carry``). A pre-1.0 policy that
     only has ``always_on`` is folded into ``carry`` so an un-migrated file still
-    loads. Raises on missing file or bad shape.
+    loads. Raises on missing file or bad shape. Cached per path by mtime/size.
     """
     import yaml  # type: ignore[import-untyped]
+    key = str(path)
+    try:
+        st = path.stat()
+        cached = _PRESET_FILE_CACHE.get(key)
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            p = cached[2]
+            return Preset(
+                name=p.name,
+                always_carry=list(p.always_carry),
+                carry=list(p.carry),
+                triggers=list(p.triggers),
+                no_narrowing=p.no_narrowing,
+            )
+    except OSError:
+        st = None  # missing file: fall through to the open() below and raise there
     with path.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     if not isinstance(data, dict):
@@ -216,13 +241,21 @@ def load_preset_file(path: Path) -> Preset:
     # always_carry wins every conflict — a tool named in both is a resident of A.
     carry = [t for t in carry if t not in set(always_carry)]
 
-    return Preset(
+    preset = Preset(
         name=name,
         always_carry=always_carry,
         carry=carry,
         triggers=_parse_triggers(data.get("triggers")),
         no_narrowing=no_narrowing,
     )
+    if st is not None:
+        _PRESET_FILE_CACHE[key] = (
+            st.st_mtime_ns, st.st_size,
+            Preset(name=preset.name, always_carry=list(preset.always_carry),
+                   carry=list(preset.carry), triggers=list(preset.triggers),
+                   no_narrowing=preset.no_narrowing),
+        )
+    return preset
 
 
 def load_base_policy() -> Preset:

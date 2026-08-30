@@ -33,6 +33,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import conftest  # noqa: F401
 import unittest
+import types
+from unittest import mock
 
 plugin = sys.modules["tool_belt_plugin"]
 EXPAND_TOOLS_NAME = plugin.expand_tools_mod.SCHEMA["name"]
@@ -158,6 +160,27 @@ class ExpandToolsRealBridgeTest(unittest.TestCase):
         self.assertNotIn("mcp__probe__t0", wire)  # MCP surface still deferred
         self.assertTrue(ts.BRIDGE_TOOL_NAMES & wire)  # bridge still active
 
+
+
+
+class PinFailOpenTest(unittest.TestCase):
+    """Fail-open lock (from the retired fake-bridge file): a broken/absent
+    ``tools.tool_search`` must never make the pin raise — the one case the
+    real-bridge tests above cannot produce in this environment."""
+
+    def test_fail_open_when_tool_search_unimportable(self) -> None:
+        # A non-package ``tools`` with no importable ``tool_search`` submodule
+        # makes ``import tools.tool_search`` raise — the pin must swallow it.
+        fake_tools = types.ModuleType("tools")  # no __path__ → not a package
+        patcher = mock.patch.dict(sys.modules, {"tools": fake_tools})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        sys.modules.pop("tools.tool_search", None)
+
+        try:
+            plugin._pin_expand_tools_visible()
+        except Exception as exc:  # pragma: no cover — the point of the test
+            self.fail(f"_pin_expand_tools_visible must fail open, raised: {exc!r}")
 
 if __name__ == "__main__":
     unittest.main()

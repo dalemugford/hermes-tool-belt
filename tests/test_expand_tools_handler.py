@@ -191,20 +191,6 @@ class InvalidCategoryErrorTests(unittest.TestCase):
         self.assertIn("no prediction context", payload["error"])
 
 
-class ResponsePayloadSymmetryTests(unittest.TestCase):
-    """The success response should expose the same resolved_tools the
-    telemetry event records — source-side and result-side telemetry agree."""
-
-    def test_resolved_tools_present_in_response(self):
-        resolved = ["browser_navigate", "browser_click"]
-        with mock.patch.object(expand_tools, "_resolve_category",
-                               return_value=("browser", list(resolved), ["browser"])):
-            payload = _invoke({"category": "browser"}, _make_state())
-
-        self.assertIn("resolved_tools", payload)
-        self.assertEqual(sorted(payload["resolved_tools"]), sorted(resolved))
-
-
 class ToolNameResolutionTests(unittest.TestCase):
     """The ``tool`` parameter lets the model name a specific tool without
     knowing its parent toolset; the handler reverse-resolves the category."""

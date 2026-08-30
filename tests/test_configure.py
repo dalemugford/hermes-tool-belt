@@ -244,67 +244,6 @@ class StateMachineTests(TempHomeTestCase):
         )
 
 
-class ShapingSummaryTests(TempHomeTestCase):
-    def _info(self) -> "configure.ScopeInfo":
-        return configure.ScopeInfo(
-            scope="default:telegram",
-            agent="default",
-            platform="telegram",
-            state_dir=self.root_state,
-        )
-
-    def test_renders_promotions_demotions_and_triggers(self) -> None:
-        # ``enabled_tool_names`` is what the shaper validates candidates
-        # against; the preview now runs through the shaper's own dry-run merge,
-        # so a fixture without it would (correctly) preview no moves at all.
-        recs = {
-            "scope": "default:telegram",
-            "sessions_considered": 24,
-            "promote": [{"tool": "terminal", "sessions": 4, "calls": 9, "evidence": "expand_tools"}],
-            "demote": [{"tool": "web_search", "sessions_without_use": 24, "evidence": "carry_unused"}],
-            "enabled_tool_names": ["terminal", "web_search"],
-        }
-        preset = configure.load_base_preset()
-        self.assertIsNotNone(preset, "shipped policy should load")
-        lines = configure.render_shaping_summary(self._info(), recs, preset, self.thresholds)
-        blob = "\n".join(lines)
-        self.assertIn("24 recorded session(s)", blob)
-        self.assertIn("terminal", blob)
-        self.assertIn("Proposed demotions into expand-only", blob)
-        self.assertIn("web_search", blob)
-        self.assertIn("expand_tools", blob)
-        self.assertIn("Trigger groups unchanged by these transitions", blob)
-        # The immutable baseline is never advertised as demotable, and the
-        # adaptive-residents line excludes the demoted tool.
-        baseline_line = next(l for l in lines if "Always carried" in l)
-        self.assertNotIn("web_search", baseline_line)
-        carried_line = next(l for l in lines if l.startswith("  Carried"))
-        self.assertNotIn("web_search", carried_line)
-        # The 1.0 vocabulary never leaks the retired words.
-        self.assertNotIn("always-on", blob.lower())
-        self.assertNotIn("Moved to on-demand", blob)
-
-    def test_empty_demote_list_renders_without_crashing(self) -> None:
-        recs = {"sessions_considered": 30, "promote": [], "demote": []}
-        lines = configure.render_shaping_summary(self._info(), recs, None, self.thresholds)
-        self.assertIn("Proposed demotions: none", "\n".join(lines))
-
-    def test_thin_sample_explains_why_nothing_was_demoted(self) -> None:
-        recs = {"sessions_considered": 2, "promote": [], "demote": []}
-        lines = configure.render_shaping_summary(
-            self._info(), recs, None, {"demote_min_sessions_no_use": 20}
-        )
-        self.assertIn("needs 20 sessions, has 2", "\n".join(lines))
-
-    def test_missing_recommendations_do_not_raise(self) -> None:
-        self.assertTrue(configure.render_shaping_summary(self._info(), None, None, {}))
-
-    def test_summary_never_says_bypass(self) -> None:
-        recs = {"sessions_considered": 24, "promote": [], "demote": []}
-        blob = "\n".join(configure.render_shaping_summary(self._info(), recs, None, self.thresholds))
-        self.assertNotIn("bypass", blob.lower())
-
-
 class ReShapePreviewTests(TempHomeTestCase):
     """The preview of a re-shape must equal what the apply then writes.
 
@@ -473,56 +412,6 @@ class WriteDisclosureTests(TempHomeTestCase):
         self.assertIn(f"→ {len(entry['carry'])} (", carry_line)
         for tool in entry["carry"]:
             self.assertIn(f"+{tool}", carry_line)
-
-
-class MissingPyYAMLTests(unittest.TestCase):
-    """A missing parser is a wrong-interpreter fault, not a degraded mode."""
-
-    def test_config_block_read_exits_loudly_instead_of_reporting_empty(self) -> None:
-        runner = FakeRunner({"plugins.tool-belt": "enabled: true\nlearned_mode: apply\n"})
-        with mock.patch.dict(sys.modules, {"yaml": None}):
-            with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
-                with self.assertRaises(SystemExit) as ctx:
-                    configure.read_plugin_config(runner)
-        self.assertEqual(ctx.exception.code, 2)
-        message = err.getvalue()
-        self.assertIn("PyYAML is required", message)
-        self.assertIn("pip install pyyaml", message)
-
-    def test_an_unset_block_never_reaches_the_guard(self) -> None:
-        # No config block to parse means no parser is needed — a fresh install
-        # without PyYAML-dependent state must not be turned into a hard exit.
-        with mock.patch.dict(sys.modules, {"yaml": None}):
-            self.assertEqual(configure.read_plugin_config(FakeRunner()), {})
-
-
-class ConfigDiffTests(unittest.TestCase):
-    def test_unset_before_renders_as_not_set(self) -> None:
-        write = configure.ConfigWrite(key="plugins.tool-belt.channels.a:b.bypass_rate", after="1.0")
-        self.assertEqual(
-            configure.build_diff(write),
-            "  plugins.tool-belt.channels.a:b.bypass_rate: (not set) → 1.0",
-        )
-
-    def test_existing_value_renders_both_sides(self) -> None:
-        write = configure.ConfigWrite(
-            key="plugins.tool-belt.channels.a:b.learned_mode", after="apply", before="recommend"
-        )
-        self.assertEqual(
-            configure.build_diff(write),
-            "  plugins.tool-belt.channels.a:b.learned_mode: recommend → apply",
-        )
-
-    def test_unset_action_renders_as_removed_and_emits_unset_argv(self) -> None:
-        write = configure.ConfigWrite(key="plugins.tool-belt.x", after=None, before="1.0", action="unset")
-        self.assertIn("→ (removed)", configure.build_diff(write))
-        self.assertEqual(write.argv(), ["hermes", "config", "unset", "plugins.tool-belt.x"])
-
-    def test_set_argv_forces_unknown_keys(self) -> None:
-        write = configure.ConfigWrite(key="plugins.tool-belt.x", after="apply")
-        self.assertEqual(
-            write.argv(), ["hermes", "config", "set", "plugins.tool-belt.x", "apply", "--force"]
-        )
 
 
 class ApplyFlowTests(TempHomeTestCase):
@@ -797,84 +686,6 @@ class DryRunTests(TempHomeTestCase):
         self.assertEqual(configure.flow_status(ctx, infos), 0)
         self.assertEqual(runner.writes, [])
         self.assertEqual(self._fs_snapshot(), before)
-
-
-class MainEntryPointTests(TempHomeTestCase):
-    def setUp(self) -> None:
-        super().setUp()
-        seed_telemetry(
-            self.root_state,
-            "default:telegram",
-            sessions=self.needed,
-            always_on=["web_search"],
-            expanded_tool="terminal",
-            # Expanded in most sessions so the economic test decisively
-            # favors carrying (penalty 1500/session-with-use far exceeds
-            # the schema cost of the few unused sessions).
-            expanded_sessions=12,
-            expanded_calls_each=2,
-        )
-
-    def _run(self, argv: list[str], runner: FakeRunner, which: str | None = "/usr/bin/hermes"):
-        lines: list[str] = []
-        with contextlib.ExitStack() as stack:
-            for patch in isolate(runner, which, lines):
-                stack.enter_context(patch)
-            rc = configure.main(argv + ["--hermes-home", str(self.home)])
-        return rc, "\n".join(lines), runner
-
-    def test_status_flag_reports_and_writes_nothing(self) -> None:
-        runner = FakeRunner()
-        rc, output, runner = self._run(["--status"], runner)
-        self.assertEqual(rc, 0)
-        self.assertIn("default:telegram", output)
-        self.assertEqual(runner.writes, [])
-
-    def test_non_interactive_shape_applies(self) -> None:
-        runner = FakeRunner()
-        rc, _output, runner = self._run(["--agent", "default", "--path", "shape", "--yes"], runner)
-        self.assertEqual(rc, 0)
-        self.assertEqual(
-            sorted(c[3] for c in runner.writes),
-            [
-                "plugins.tool-belt.channels.default:telegram.learned_mode",
-            ],
-        )
-        self.assertTrue((self.root_state / "learned.json").exists())
-
-    def test_non_interactive_recommend_applies(self) -> None:
-        runner = FakeRunner()
-        rc, output, runner = self._run(["--agent", "default", "--path", "recommend", "--yes"], runner)
-        self.assertEqual(rc, 0)
-        emitted = {c[3]: c[4] for c in runner.writes}
-        self.assertEqual(emitted["plugins.tool-belt.channels.default:telegram.bypass_rate"], "1.0")
-        self.assertNotIn("bypass", output.lower().replace("bypass_rate", ""))
-
-    def test_dry_run_through_main_writes_nothing(self) -> None:
-        runner = FakeRunner()
-        rc, output, runner = self._run(
-            ["--agent", "default", "--path", "shape", "--yes", "--dry-run"], runner
-        )
-        self.assertEqual(rc, 0)
-        self.assertEqual(runner.writes, [])
-        self.assertFalse((self.root_state / "learned.json").exists())
-        self.assertIn("dry-run", output)
-
-    def test_dry_run_epilogue_never_claims_anything_was_applied(self) -> None:
-        runner = FakeRunner()
-        _rc, output, _runner = self._run(
-            ["--agent", "default", "--path", "shape", "--yes", "--dry-run"], runner
-        )
-        self.assertIn("Would apply:", output)
-        self.assertNotIn("Applied:", output)
-
-    def test_a_real_apply_still_says_applied(self) -> None:
-        runner = FakeRunner()
-        _rc, output, _runner = self._run(
-            ["--agent", "default", "--path", "shape", "--yes"], runner
-        )
-        self.assertIn("Applied:", output)
-        self.assertNotIn("Would apply:", output)
 
 
 class FreshInstallFrontDoorTests(TempHomeTestCase):

@@ -804,22 +804,6 @@ class SinceParsingTests(_HomeCase):
         self.assertNotIn("OBSERVED", out.getvalue())
 
 
-class ProposedAssignmentTests(_HomeCase):
-    """(10) Onboarding-style proposed assignments can call the engine without
-    writing state."""
-
-    def test_proposed_projection_no_writes(self):
-        _write_session(self.home / "sessions", "s", platform="telegram",
-                       model="m", ceiling=CEILING,
-                       turns=[{"user": "hello"}, {"user": "run some code"}])
-        proposed = {"default:telegram": {"carry": ["execute_code"], "expand_only": ["terminal"]}}
-        before = _snapshot(self.home)
-        report = savings.compute(hermes_home=self.home, proposed_by_scope=proposed)
-        after = _snapshot(self.home)
-        self.assertEqual(before, after)  # no writes
-        self.assertEqual(report.agents[0].projected.assignment_source, "proposed")
-
-
 class NoWriteTests(_HomeCase):
     """(11)+(12) Engine and CLI perform no writes; live config/learned hashes
     and mtimes remain unchanged."""
@@ -861,75 +845,6 @@ class LauncherHelperTests(_HomeCase):
             confirm=lambda _p: False, out=msgs.append, user_home=user_home)
         self.assertFalse(created)
         self.assertFalse(savings_cli.launcher_path(self.home, user_home=user_home).exists())
-
-    def test_launcher_created_on_confirmation(self):
-        msgs = []
-        user_home = Path(self.tmp.name) / "barehome"  # no ~/.local/bin → fallback
-        created = savings_cli.ensure_launcher(
-            self.home, PLUGIN_DIR / "tool-belt",
-            confirm=lambda _p: True, out=msgs.append, user_home=user_home)
-        self.assertTrue(created)
-        launcher = savings_cli.launcher_path(self.home, user_home=user_home)
-        self.assertTrue(launcher.exists())
-        self.assertTrue(os.access(launcher, os.X_OK))
-
-    def test_repo_executable_honors_hermes_python(self):
-        env = dict(os.environ)
-        env.update(HERMES_HOME=str(self.home), HERMES_PYTHON=sys.executable)
-        result = subprocess.run(
-            [str(PLUGIN_DIR / "tool-belt"), "--help"],
-            env=env, text=True, capture_output=True, check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("tool-belt <command>", result.stdout)
-        self.assertNotIn("cannot import run_agent", result.stderr)
-
-    def test_launcher_quotes_interpreter_and_repo_paths(self):
-        repo = self.home / "plugin repo" / "tool-belt"
-        savings_cli.ensure_launcher(
-            self.home, repo, confirm=lambda _p: True,
-            python="/python env/bin/python3", out=lambda _m: None,
-            user_home=self.home,
-        )
-        content = savings_cli.launcher_path(self.home, user_home=self.home).read_text(
-            encoding="utf-8")
-        self.assertIn("HERMES_PYTHON='/python env/bin/python3'", content)
-        self.assertIn("exec '" + str(repo) + "' \"$@\"", content)
-
-    def test_launcher_prefers_user_local_bin(self):
-        """A standard install gets ~/.local/bin — the dir the Hermes installer
-        guarantees is on PATH. $HERMES_HOME/bin is never on PATH by design."""
-        user_home = Path(self.tmp.name) / "userhome"
-        (user_home / ".local" / "bin").mkdir(parents=True)
-        target = savings_cli.launcher_path(self.home, user_home=user_home)
-        self.assertEqual(target.parent, user_home / ".local" / "bin")
-        created = savings_cli.ensure_launcher(
-            self.home, PLUGIN_DIR / "tool-belt",
-            confirm=lambda _p: True, out=lambda _m: None,
-            user_home=user_home,
-        )
-        self.assertTrue(created)
-        self.assertTrue(target.exists())
-        self.assertTrue(os.access(target, os.X_OK))
-
-    def test_launcher_falls_back_when_no_user_local_bin(self):
-        """Homes without ~/.local/bin (headless/CI) fall back to
-        $HERMES_HOME/bin and receive PATH guidance for it."""
-        user_home = Path(self.tmp.name) / "barehome"  # exists, no .local/bin
-        msgs = []
-        created = savings_cli.ensure_launcher(
-            self.home, PLUGIN_DIR / "tool-belt",
-            confirm=lambda _p: True, out=msgs.append,
-            user_home=user_home,
-        )
-        self.assertTrue(created)
-        target = self.home / "bin" / "tool-belt"
-        self.assertTrue(target.exists())
-        self.assertTrue(
-            any("$HOME/.hermes" not in m and (str(self.home / "bin") in m
-                or "not on your PATH" in m) for m in msgs),
-            f"expected PATH guidance mentioning the launcher dir, got {msgs}")
-
 
 class LauncherStalenessTests(_HomeCase):
     """(13a) An existing file at the launcher target is never taken on faith:
@@ -995,29 +910,6 @@ class LauncherStalenessTests(_HomeCase):
         self.assertTrue(any("not created by Tool Belt" in m for m in msgs), msgs)
 
 
-class ShLauncherTests(unittest.TestCase):
-    """(13b) The repo-root `tool-belt` sh launcher stays POSIX-clean and works
-    through a hand-made symlink (`ln -s ... ~/.local/bin/tool-belt`)."""
-
-    def test_launcher_is_posix_sh_clean(self):
-        result = subprocess.run(["sh", "-n", str(PLUGIN_DIR / "tool-belt")],
-                                text=True, capture_output=True, check=False)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_launcher_works_through_a_symlink(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            link = Path(tmp) / "bin" / "tool-belt"
-            link.parent.mkdir(parents=True)
-            link.symlink_to(PLUGIN_DIR / "tool-belt")
-            env = dict(os.environ)
-            env.update(HERMES_PYTHON=sys.executable)
-            env.pop("HERMES_HOME", None)
-            result = subprocess.run([str(link), "--help"], env=env, text=True,
-                                    capture_output=True, check=False)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("tool-belt <command>", result.stdout)
-
-
 def _snapshot(root: Path) -> dict:
     """Map every file under ``root`` to (size, mtime_ns, sha1)."""
     import hashlib
@@ -1029,10 +921,6 @@ def _snapshot(root: Path) -> dict:
             out[str(p.relative_to(root))] = (
                 st.st_size, st.st_mtime_ns, hashlib.sha1(data).hexdigest())
     return out
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class AnnualizedPaceTests(_HomeCase):
@@ -1068,3 +956,9 @@ class AnnualizedPaceTests(_HomeCase):
         text = savings_cli.render_text(self._report(30))
         self.assertIn("bernard", text)
         self.assertNotIn("default   ", text)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+

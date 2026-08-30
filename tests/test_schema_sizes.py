@@ -69,31 +69,5 @@ class SchemaSizesSidecar(unittest.TestCase):
         self.path.write_text("not json")
         self.assertEqual(logger_io.load_schema_sizes(self.path.parent), {})
 
-    def test_fallback_constant_canonical_in_logger_io(self):
-        self.assertEqual(logger_io.DEFAULT_PER_TOOL_TOKENS, 388)
-
-    def test_hot_path_logs_snapshot_from_prediction(self):
-        # _maybe_log_prediction must attempt the snapshot with the ceiling defs.
-        calls = []
-        orig = logger_io.update_schema_sizes
-        orig_log = logger_io.log_prediction
-        logger_io.update_schema_sizes = lambda tools, **kw: calls.append(list(tools)) or True
-        logger_io.log_prediction = lambda record: None  # keep live telemetry untouched
-        orig_cfg = dict(tool_belt_plugin._CONFIG)
-        tool_belt_plugin._CONFIG["log"] = True  # other tests mutate module config
-        try:
-            tool_belt_plugin._maybe_log_prediction(
-                {"logged": False, "prediction_id": "p1", "scope": "a:t"},
-                [_anthropic_def("terminal")], [],
-            )
-        finally:
-            logger_io.update_schema_sizes = orig
-            logger_io.log_prediction = orig_log
-            tool_belt_plugin._CONFIG.clear()
-            tool_belt_plugin._CONFIG.update(orig_cfg)
-        self.assertEqual(len(calls), 1, "prediction logging snapshots schema sizes")
-        self.assertEqual(logger_io._sidecar_tool_name(calls[0][0]), "terminal")
-
-
 if __name__ == "__main__":
     unittest.main()

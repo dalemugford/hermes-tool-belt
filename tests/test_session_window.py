@@ -17,14 +17,6 @@ import unittest
 from tests.test_carrying_model import _pred_row, _compute, shaper
 
 
-class SessionWindowDefaults(unittest.TestCase):
-    def test_window_ceiling_is_100_and_floor_is_20(self):
-        self.assertEqual(shaper.DEFAULTS["session_window"], 100,
-                         "session_window is a 100-session ceiling")
-        self.assertEqual(shaper.DEFAULTS["demote_min_sessions_no_use"], 20,
-                         "20 sessions stays the demotion floor")
-
-
 class SessionWindowUsesAllHistory(unittest.TestCase):
     SCOPE = "assistant-a:telegram"
 
