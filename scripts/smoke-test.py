@@ -475,15 +475,37 @@ def _reset_plugin_state() -> None:
     plugin._CACHE_MODE_BY_SESSION.clear()
 
 
+# Tools the smoke scenarios treat as expand_only. Under the full-start
+# contract a scope with no learned state carries EVERYTHING enabled, so the
+# expand_tools recovery path would never fire and the expansion-credit
+# assertions would have nothing to bite on. Seeding these demotions makes the
+# temp homes look like an evidence-shaped install — which is exactly the state
+# in which expansion crediting matters.
+SMOKE_DEMOTED = ["browser_navigate", "browser_click", "custom_unknown_tool"]
+
+
+def _seed_demoted(state_dir: Path) -> None:
+    """Write a learned.json demoting SMOKE_DEMOTED for the telegram platform
+    scope (matches assistant-a:telegram via the platform fallback)."""
+    (state_dir / "learned.json").write_text(json.dumps({
+        "version": 2,
+        "scopes": {"telegram": {
+            "carry": [], "expand_only": list(SMOKE_DEMOTED), "shaping": {},
+        }},
+    }, indent=2) + "\n", encoding="utf-8")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         original_config = dict(plugin._CONFIG)
         off_home = Path(tmp) / "off" / "profiles" / "assistant-a"
         off_state = off_home / "state" / "tool-belt"
         off_state.mkdir(parents=True, exist_ok=True)
+        _seed_demoted(off_state)
         on_home = Path(tmp) / "on" / "profiles" / "assistant-a"
         on_state = on_home / "state" / "tool-belt"
         on_state.mkdir(parents=True, exist_ok=True)
+        _seed_demoted(on_state)
 
         try:
             # ──────── Block 1: cache-off (per-turn pipeline) ────────
