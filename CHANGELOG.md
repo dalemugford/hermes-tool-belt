@@ -10,6 +10,19 @@ The initial public capabilities of the plugin:
 
 ### Added
 
+- **In-process periodic auto-shaping.** Scopes whose `learned_mode` resolves
+  to `apply` are now shaped automatically by the plugin itself — triggered
+  from the session-end path, debounced to once per 24h per scope
+  (`auto_shape_interval_hours` to override), with the same evidence
+  thresholds as the shaper script. No system-level scheduler is needed;
+  `auto_shape: false` is the global opt-out. Observe/recommend scopes are
+  never auto-written. Each automatic apply is logged and recorded in the
+  scope's learned `shaping` block (`source: "auto"`, `applied_at`,
+  `last_auto_shape_at`); `configure --status` shows
+  `shaping applied (auto, <date>)`. The shaper's compute/merge core moved
+  into the shared package module `shaping.py`, with
+  `scripts/shape-ceiling.py` remaining as the CLI wrapper (flags, porcelain
+  JSON, and human output unchanged).
 - **`hermes tool-belt ...` subcommand.** `register(ctx)` now calls Hermes' `ctx.register_cli_command()`, so `hermes tool-belt savings` and `hermes tool-belt configure` work alongside the bare `tool-belt` launcher. Flags are forwarded verbatim to the same `savings_cli` entry point the launcher execs, so the two invocation forms cannot drift. Registration is optional and fail-open: on a Hermes without `register_cli_command`, the tool and hooks register exactly as before.
 - **Canonical savings CLI (`tool-belt savings`).** Reports observed and counterfactual token savings across all enabled agents or one selected agent, with deterministic JSON, full-schema replay, confidence-aware percentages, and dollars only for provably metered routes. The launcher honors `HERMES_PYTHON` and the local Hermes environment without importing runtime hooks. The session-input percentage is shown only against provider-reported usage; when historical sessions predate telemetry, only the explicitly-labeled schema-only reduction is shown (reconstructed context omits tool results, system prompt, and per-API-call accumulation, so it never backs a percentage).
 - **Guided onboarding (`scripts/configure.py`).** One command from install to a

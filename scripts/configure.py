@@ -1018,12 +1018,35 @@ def render_shaping_summary(
     return lines
 
 
+def _shaped_detail(info: ScopeInfo) -> str:
+    """Status detail for a shaped scope, naming an auto-apply when recorded.
+
+    The in-process auto-shape engine stamps ``source: "auto"`` and
+    ``applied_at`` into the scope's learned ``shaping`` block on each
+    automatic apply; surface that as ``shaping applied (auto, <date>)`` so an
+    operator can tell an automatic apply from a hand-run one. Read-only and
+    fail-open: any read problem falls back to the plain detail.
+    """
+    try:
+        doc = json.loads((info.state_dir / "learned.json").read_text(encoding="utf-8"))
+        entry = (doc.get("scopes") or {}).get(info.scope) or {}
+        shaping = entry.get("shaping") or entry.get("cache_aware") or {}
+        if isinstance(shaping, dict) and shaping.get("source") == "auto":
+            applied = str(shaping.get("applied_at") or "")[:10]
+            if applied:
+                return f"shaping applied (auto, {applied})"
+            return "shaping applied (auto)"
+    except Exception:
+        pass
+    return "shaping applied"
+
+
 def render_status_row(
     info: ScopeInfo, state: str, thresholds: dict[str, int]
 ) -> str:
     needed = required_sessions(thresholds)
     if state == STATE_SHAPED:
-        detail = "shaping applied"
+        detail = _shaped_detail(info)
     elif state == STATE_READY:
         detail = f"ready to shape ({info.sessions}/{needed} sessions)"
     elif state == STATE_OBSERVING:

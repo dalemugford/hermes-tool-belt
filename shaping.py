@@ -487,3 +487,182 @@ def merge_into_learned(
         learned.write_state(state, learned_path)
 
     return state, changed
+
+
+# ─── In-process auto-shape engine ───────────────────────────────────────────
+
+def _coerce_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in ("false", "0", "no", "off"):
+        return False
+    if text in ("true", "1", "yes", "on"):
+        return True
+    return default
+
+
+def auto_shape_interval_hours(plugin_config: dict[str, Any], scope: str) -> float:
+    """Resolve the per-scope debounce interval.
+
+    Lookup mirrors ``learned.learned_mode``: the scope's channel entry wins
+    (with the platform fallback from ``learned.scope_candidates``), then the
+    top-level ``auto_shape_interval_hours``, then the 24h default.
+    """
+    candidates: list[Any] = []
+    channels = plugin_config.get("channels") or {}
+    if isinstance(channels, dict):
+        for key in learned.scope_candidates(scope):
+            cfg = channels.get(key)
+            if isinstance(cfg, dict) and "auto_shape_interval_hours" in cfg:
+                candidates.append(cfg.get("auto_shape_interval_hours"))
+                break
+    candidates.append(plugin_config.get("auto_shape_interval_hours"))
+    for raw in candidates:
+        if raw is None:
+            continue
+        try:
+            parsed = float(raw)
+        except Exception:
+            continue
+        if parsed > 0:
+            return parsed
+    return AUTO_SHAPE_DEFAULT_INTERVAL_HOURS
+
+
+def auto_shape_run(
+    plugin_config: dict[str, Any],
+    state_dir: Path | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """One auto-shape pass over every eligible scope. Returns a run summary.
+
+    Called from the plugin's session-end path (never the request/dispatch
+    path). Eligibility per scope:
+
+      · ``learned_mode`` resolves to ``apply`` — the standing consent.
+        Observe/recommend scopes are never auto-written.
+      · The per-scope debounce interval has elapsed since the scope's
+        ``shaping.last_auto_shape_at`` (default 24h,
+        ``auto_shape_interval_hours`` to override).
+
+    Evidence thresholds are the shaper's own (``policy.yaml`` →
+    ``learning.shape_ceiling``, falling back to :data:`DEFAULTS`) — the auto
+    engine changes *when* shaping runs, never *what* it decides. An attempt
+    that finds nothing to change still stamps ``last_auto_shape_at`` (the
+    debounce record) and writes nothing else.
+
+    Persistence and metadata: on an actual assignment change the scope's
+    ``shaping`` block (learned schema v2) gains ``source: "auto"`` and
+    ``applied_at``; every attempted scope gets ``last_auto_shape_at``. All
+    writes go through ``learned.write_state`` (atomic rename + fsync), which
+    also makes a second *process* racing this one safe — last writer wins a
+    whole consistent document; no cross-process locking is built here. The
+    caller (``_maybe_auto_shape`` in ``__init__``) holds an in-process lock
+    so two session-ends in one gateway can't run concurrently.
+
+    Cache-on invariant: this function only writes ``learned.json``. It never
+    touches any live session state (frozen tool sets, sticky residency, cache
+    mode) — a live session keeps its frozen carrying; the new assignment is
+    picked up naturally when a future session resolves its preset.
+    """
+    now = time.time() if now is None else float(now)
+    summary: dict[str, Any] = {
+        "ran": False,
+        "attempted": [],
+        "applied": {},
+        "reason": "",
+    }
+
+    if not _coerce_bool(plugin_config.get("auto_shape"), default=True):
+        summary["reason"] = "auto_shape_disabled"
+        return summary
+
+    sd = Path(state_dir) if state_dir is not None else default_state_dir()
+    preds = load_jsonl(sd / "predictions.jsonl")
+    if not preds:
+        summary["reason"] = "no_predictions"
+        return summary
+
+    grouped = group_predictions_by_scope_session(preds)
+
+    learned_path = sd / "learned.json"
+    state = learned.normalize_state(_read_learned_doc(learned_path))
+    scopes_state = state.get("scopes") or {}
+
+    eligible: list[str] = []
+    for scope in sorted(grouped):
+        if learned.learned_mode(plugin_config, scope) != "apply":
+            continue  # no standing consent — never auto-write
+        entry = scopes_state.get(scope) or {}
+        shaping_meta = entry.get("shaping") if isinstance(entry, dict) else {}
+        last = None
+        if isinstance(shaping_meta, dict):
+            last = _parse_utc_iso(shaping_meta.get("last_auto_shape_at"))
+        interval_s = auto_shape_interval_hours(plugin_config, scope) * 3600.0
+        if last is not None and (now - last) < interval_s:
+            continue  # debounced
+        eligible.append(scope)
+
+    if not eligible:
+        summary["reason"] = "no_eligible_scopes"
+        return summary
+
+    thresholds = load_shape_ceiling_defaults()
+    calls_by_pred = index_tool_calls_by_prediction(load_jsonl(sd / "tool_calls.jsonl"))
+
+    per_scope = {
+        scope: compute_scope_recommendations(
+            scope=scope,
+            sessions=grouped[scope],
+            calls_by_pred=calls_by_pred,
+            window=thresholds["session_window"],
+            promote_min_sessions=thresholds["promote_min_sessions"],
+            promote_min_calls=thresholds["promote_min_calls"],
+            demote_min_sessions_no_use=thresholds["demote_min_sessions_no_use"],
+        )
+        for scope in eligible
+    }
+
+    state, changes = apply_recommendations(state, per_scope)
+    ts_iso = _utc_iso(now)
+
+    scopes = dict(state.get("scopes") or {})
+    for scope in eligible:
+        entry = dict(scopes.get(scope) or {"carry": [], "expand_only": [], "shaping": {}})
+        shaping_meta = entry.get("shaping")
+        shaping_meta = dict(shaping_meta) if isinstance(shaping_meta, dict) else {}
+        shaping_meta["last_auto_shape_at"] = ts_iso
+        if scope in changes:
+            shaping_meta["source"] = "auto"
+            shaping_meta["applied_at"] = ts_iso
+        entry["shaping"] = shaping_meta
+        scopes[scope] = entry
+    state["scopes"] = scopes
+    if changes:
+        state["updated_at"] = ts_iso
+
+    # One write covers both the applied assignments and the debounce stamps.
+    learned.write_state(state, learned_path)
+
+    for scope, delta in changes.items():
+        promoted = delta.get("promoted") or []
+        demoted = delta.get("demoted") or []
+        logger.info(
+            "tool-belt: auto-shaped %s: +%d carry%s, -%d to expand_only%s",
+            scope,
+            len(promoted),
+            f" ({', '.join(promoted)})" if promoted else "",
+            len(demoted),
+            f" ({', '.join(demoted)})" if demoted else "",
+        )
+
+    summary.update({
+        "ran": True,
+        "attempted": list(eligible),
+        "applied": changes,
+        "reason": "ok",
+    })
+    return summary

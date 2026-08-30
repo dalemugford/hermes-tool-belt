@@ -15,6 +15,10 @@
 # each scope's learned_mode).
 #
 # Safe to run by hand or from the scheduler appropriate to the host.
+#
+# NOTE: scopes with learned_mode "apply" are auto-shaped in-process by the
+# plugin at session end (see shaping.py); this script is optional and mainly
+# serves observe/recommend-mode analysis and reporting.
 set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -160,6 +160,11 @@ recreates each file on the next append.
 
 ### Run periodic analysis
 
+Scopes with `learned_mode: apply` are auto-shaped in-process by the plugin
+itself at session end (default once per 24h per scope; opt out with
+`auto_shape: false`), so this scheduled script is optional — useful mainly
+for observe/recommend-mode analysis and reports.
+
 ```bash
 scripts/daily-analysis.sh              # analyze + shape in dry-run (default)
 SHAPE_APPLY=1 scripts/daily-analysis.sh  # also let the shaper write learned.json

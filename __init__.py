@@ -99,6 +99,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from typing import Any
 
@@ -128,6 +129,12 @@ _CONFIG: dict[str, Any] = {
     "channels": {},
     "agent": "",
     "learned_mode": "recommend",
+    # In-process periodic auto-shaping (session-end trigger). True by
+    # default — automatic application for apply-mode scopes is the product
+    # promise; `auto_shape: false` is the global opt-out. Per-scope debounce
+    # interval (default 24h) overridable via `auto_shape_interval_hours`
+    # (top-level or channels.<scope>.).
+    "auto_shape": True,
     # Cache-off mode pipeline — sticky residency + per-turn predictor
     # lookback. Both are inert under cache-on (the default), where the
     # frozen tool set carries forward in-session expansions verbatim
@@ -249,6 +256,24 @@ _CACHE_MODE_BY_SESSION: dict[str, dict[str, Any]] = {}
 # session_key to the hook.
 _LAST_CANONICAL_BY_PLATFORM: dict[str, str] = {}
 
+# ─── Auto-shape engine state ──────────────────────────────────────────────
+# In-process throttle + lock for the session-end auto-shape trigger.
+#   "not_before" — earliest wall-clock time the next full engine pass may
+#     run. Comparing against it is the cheap guard: a single float compare
+#     before any file I/O or module import. The real per-scope debounce
+#     (default 24h, ``auto_shape_interval_hours``) is persisted in
+#     learned.json's ``shaping.last_auto_shape_at`` and enforced by
+#     ``shaping.auto_shape_run``.
+#   "lock" — two session-ends in this process must not run the engine
+#     concurrently. A second *gateway process* racing is already safe:
+#     learned.write_state is an atomic whole-document rename, so the last
+#     writer wins a consistent file; no cross-process locking is built.
+_AUTO_SHAPE = {"lock": threading.Lock(), "not_before": 0.0}
+# Re-run the (cheap) eligibility scan at most this often per process. The
+# scan itself reads telemetry files, so it is not free — but per-scope
+# debounce means a shorter recheck interval only costs reads, not writes.
+_AUTO_SHAPE_RECHECK_SECONDS = 900.0
+
 
 # ─── Config loading ────────────────────────────────────────────────────────
 
@@ -260,7 +285,10 @@ def _load_user_config() -> None:
         plugin_cfg = cfg_get(cfg, "plugins", "tool-belt", default={})
         if not isinstance(plugin_cfg, dict):
             return
-        for key in ("enabled", "log", "agent", "learned_mode", "bypass_rate", "cache_mode"):
+        for key in (
+            "enabled", "log", "agent", "learned_mode", "bypass_rate", "cache_mode",
+            "auto_shape", "auto_shape_interval_hours",
+        ):
             if key in plugin_cfg:
                 _CONFIG[key] = plugin_cfg[key]
         # "always_on_extra"/"always_off" are REMOVED pre-1.0 knobs: copied
@@ -2358,7 +2386,59 @@ def _on_session_end(session_id=None, **kwargs) -> None:
         _PRIOR_MESSAGES_BY_SESSION.pop(sid, None)
         # NOTE: do NOT evict _FROZEN_BY_SESSION or _CACHE_MODE_BY_SESSION
         # here — see this function's docstring for why.
+
+    # After the per-turn bookkeeping: the sanctioned between-session moment
+    # for the in-process auto-shape engine. Fail-open by construction — see
+    # _maybe_auto_shape.
+    _maybe_auto_shape()
     return None
+
+
+def _maybe_auto_shape() -> None:
+    """Periodic in-process auto-shaping trigger (session-end path only).
+
+    Applies shaping automatically for scopes whose ``learned_mode`` resolves
+    to ``apply`` — the operator's standing consent — without any system-level
+    scheduler. Everything heavy lives in ``shaping.auto_shape_run``; this
+    wrapper only does the cheap gating:
+
+      · single timestamp compare (``_AUTO_SHAPE["not_before"]``) before any
+        file I/O or import;
+      · global opt-out ``auto_shape: false`` (default true — automatic is
+        the product promise);
+      · non-blocking in-process lock so two session-ends can't run the
+        engine twice (a second gateway process is covered by learned.py's
+        atomic whole-document write — no cross-process locking here);
+      · lazy import of the shaping module, paid at session-end time, never
+        at plugin load.
+
+    FAIL-OPEN ABSOLUTELY: any exception is logged as a warning and never
+    propagates into the gateway. The engine only writes learned.json — live
+    sessions keep their frozen carrying untouched (cache-on invariant); the
+    new assignment applies to future sessions when their preset resolves at
+    session start.
+    """
+    try:
+        if not _CONFIG["enabled"]:
+            return
+        if _CONFIG.get("auto_shape", True) is False or str(
+            _CONFIG.get("auto_shape", True)
+        ).strip().lower() in ("false", "0", "no", "off"):
+            return
+        now = time.time()
+        if now < float(_AUTO_SHAPE["not_before"]):
+            return  # cheap guard: one float compare, no I/O
+        if not _AUTO_SHAPE["lock"].acquire(blocking=False):
+            return  # another session-end is already running the engine
+        try:
+            _AUTO_SHAPE["not_before"] = now + _AUTO_SHAPE_RECHECK_SECONDS
+            from . import shaping as shaping_mod  # lazy: session-end time only
+
+            shaping_mod.auto_shape_run(_CONFIG)
+        finally:
+            _AUTO_SHAPE["lock"].release()
+    except Exception as exc:
+        logger.warning("tool-belt: auto-shape pass failed (fail-open): %s", exc)
 
 
 # ─── Hook: on_session_reset ────────────────────────────────────────────────
