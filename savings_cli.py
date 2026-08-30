@@ -162,6 +162,15 @@ def render_text(report: _savings.SavingsReport) -> str:
         )
         _render_projection(out, a.projected, indent="    ")
 
+    if report.token_estimator == "chars-div-4":
+        out.append("")
+        out.append(
+            "  Note: counts are ~4-chars-per-token estimates. Install tiktoken"
+            " into the"
+        )
+        out.append(
+            "  Hermes environment (pip install tiktoken) for exact token counts."
+        )
     scope_label = "all enabled agents" if report.generated_for == "all" else f"agent {report.generated_for!r}"
     out.append("")
     out.append(f"  ({scope_label} · estimator {report.token_estimator} · {report.hermes_home})")

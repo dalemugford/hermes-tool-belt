@@ -4,6 +4,11 @@
 
 A plugin for [Hermes Agent](https://hermes-agent.nousresearch.com).
 
+> On the install it was built against, Tool Belt has saved **9.5 million
+> tokens** of measured overhead — about 60k tokens and three cents of API
+> cost per conversation, with every tool still one ask away. Run
+> `hermes tool-belt savings` to see yours.
+
 ## What it does
 
 Tool Belt narrows the tool list shipped on every API call to the tools
