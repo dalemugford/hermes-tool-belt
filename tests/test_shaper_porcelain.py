@@ -8,11 +8,8 @@ What is pinned here:
      this run rewrite learned.json".
   2. ``bootstrap.py`` consumes that document, never the human report — so
      rewording the report cannot change what bootstrap surfaces.
-  3. ``daily-analysis.sh`` defaults the shaper to ``--dry-run`` (consent),
-     restores the write under ``SHAPE_APPLY=1``, and logs from the JSON
-     marker rather than a grep against prose.
-  4. Neither script ever tells an operator to hand-edit a config file.
-  5. The operator scripts exit loudly when PyYAML is missing instead of
+  3. Neither script ever tells an operator to hand-edit a config file.
+  4. The operator scripts exit loudly when PyYAML is missing instead of
      degrading to a partial policy read.
 
 Everything runs against a temporary HERMES_HOME / state dir; the live
@@ -354,101 +351,6 @@ class MissingPyYAMLTests(unittest.TestCase):
         with self._no_yaml():
             preset = presets.load_base_policy()
         self.assertTrue(preset.no_narrowing)
-
-
-class DailyAnalysisConsentTests(unittest.TestCase):
-    """The scheduled script's dry-run default and JSON-marker branching."""
-
-    STUB_SHAPER = textwrap.dedent('''\
-        #!/usr/bin/env python3
-        """Stub shaper: records argv, emits a porcelain document."""
-        import json, os, sys
-        args = sys.argv[1:]
-        with open(os.environ["STUB_ARGV_LOG"], "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(args) + "\\n")
-        dry = "--dry-run" in args
-        path = args[args.index("--json-file") + 1] if "--json-file" in args else ""
-        doc = {
-            "schema": "tool-belt/shape-ceiling", "version": 1,
-            "dry_run": dry, "changed": True,
-            "wrote_learned_state": (not dry), "scopes": [],
-        }
-        if path:
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(doc, fh)
-        print("human prose that nothing may parse")
-        ''')
-
-    STUB_ANALYZER = textwrap.dedent('''\
-        #!/usr/bin/env python3
-        """Stub analyzer: emits the totals daily-analysis.sh summarizes."""
-        import json, sys
-        print(json.dumps({
-            "totals": {
-                "prediction_rows": 3, "scopes": 1, "expand_tools_events": 1,
-                "expansion_success_rate": 1.0,
-                "estimated_net_savings_tokens": 100,
-                "recommendation_candidates": 1,
-            },
-            "dampener_candidates": [],
-        }))
-        ''')
-
-    def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
-        self.addCleanup(shutil.rmtree, self.tmp, True)
-        self.plugin_dir = self.tmp / "plugin"
-        (self.plugin_dir / "scripts").mkdir(parents=True)
-        shutil.copy(PLUGIN_DIR / "scripts" / "daily-analysis.sh",
-                    self.plugin_dir / "scripts" / "daily-analysis.sh")
-        for name, body in (("scripts/shape-ceiling.py", self.STUB_SHAPER),
-                           ("analyze.py", self.STUB_ANALYZER)):
-            target = self.plugin_dir / name
-            target.write_text(body, encoding="utf-8")
-            target.chmod(target.stat().st_mode | stat.S_IEXEC)
-
-        self.home = self.tmp / "home"
-        state = self.home / "state" / "tool-belt"
-        state.mkdir(parents=True)
-        (state / "predictions.jsonl").write_text('{"scope":"a"}\n', encoding="utf-8")
-        self.argv_log = self.tmp / "argv.log"
-        self.summary = state / "cron-logs" / "daily-summary.log"
-
-    def _run(self, **env_extra) -> str:
-        env = dict(os.environ)
-        env.update({
-            "HERMES_HOME": str(self.home),
-            "HERMES_PYTHON": sys.executable,
-            "STUB_ARGV_LOG": str(self.argv_log),
-        })
-        env.update(env_extra)
-        result = subprocess.run(
-            ["bash", str(self.plugin_dir / "scripts" / "daily-analysis.sh")],
-            capture_output=True, text=True, env=env, check=False,
-        )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        return self.summary.read_text(encoding="utf-8")
-
-    def _shaper_argv(self) -> list[str]:
-        lines = [l for l in self.argv_log.read_text(encoding="utf-8").splitlines() if l]
-        self.assertEqual(len(lines), 1, "expected exactly one shaper invocation")
-        return json.loads(lines[0])
-
-    def test_defaults_to_dry_run_and_logs_pending(self):
-        summary = self._run()
-        argv = self._shaper_argv()
-        self.assertIn("--dry-run", argv)
-        self.assertIn("--json-file", argv)
-        self.assertIn("shape_pending", summary)
-        self.assertIn("SHAPE_APPLY=1", summary)
-        self.assertNotIn("learned.json updated", summary)
-
-    def test_shape_apply_opt_in_restores_the_write(self):
-        summary = self._run(SHAPE_APPLY="1")
-        argv = self._shaper_argv()
-        self.assertNotIn("--dry-run", argv)
-        self.assertIn("shape_ok (apply)", summary)
-        self.assertIn("learned.json updated", summary)
 
 
 if __name__ == "__main__":  # pragma: no cover

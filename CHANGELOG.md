@@ -90,6 +90,13 @@ The initial public capabilities of the plugin:
   the production schema by construction. The seeder doubles as an operator
   command for demoing onboarding by hand.
 
+### Removed
+
+- **`scripts/daily-analysis.sh`.** In-process auto-shaping replaces the
+  scheduled shaper run, and the analyzer reports it generated had no
+  scheduled consumer. Run `analyze.py` or `scripts/shape-ceiling.py`
+  directly for on-demand diagnostics.
+
 ### Changed
 
 - **Simplified `learned_mode` to two values: `recommend` and `apply`.** The

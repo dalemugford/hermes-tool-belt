@@ -34,7 +34,7 @@ Full quality gate:
 .venv/bin/python tests/run_tests.py
 .venv/bin/python scripts/smoke-test.py
 .venv/bin/python -m compileall -q .
-bash -n scripts/daily-analysis.sh
+bash -n scripts/rotate-telemetry.sh
 ```
 
 Expected:
@@ -44,7 +44,7 @@ Expected:
 | `tests/run_tests.py` | `OK` — 0 failures, 0 errors. The suite declares no conditional skips; a `skipped` line means something changed and needs explaining. |
 | `scripts/smoke-test.py` | Two blocks: `8/8 checks passed` (cache-off / attribution) and `5/5 checks passed` (cache-on freeze). |
 | `compileall -q .` | No output, exit 0. |
-| `bash -n scripts/daily-analysis.sh` | No output, exit 0. |
+| `bash -n scripts/rotate-telemetry.sh` | No output, exit 0. |
 
 The smoke test prints `tool-belt: cannot import run_agent` and unknown-tool
 drift warnings from its synthetic fixtures. Those are expected fixture noise,

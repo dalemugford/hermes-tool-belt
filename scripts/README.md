@@ -5,10 +5,8 @@ state lives under `$HERMES_HOME/state/tool-belt/`; generated reports and logs
 are not tracked by Git.
 
 Examples use `python3`; any Python 3 environment with PyYAML works. Set
-`HERMES_HOME` for a non-default Hermes home. `daily-analysis.sh` also accepts
-`HERMES_PYTHON` when a scheduler does not inherit the intended Python path.
-The root Hermes profile is labelled `default`; named profiles keep their
-directory names.
+`HERMES_HOME` for a non-default Hermes home. The root Hermes profile is
+labelled `default`; named profiles keep their directory names.
 
 ## Commands
 
@@ -23,7 +21,6 @@ directory names.
 | [`../tool-belt`](../tool-belt) `savings` | Canonical, read-only savings command. Reports every enabled agent (or one via `--agent`) with separately-labeled **observed** and **projected** cohorts; `--json` for a stable schema. Backed by [`../savings.py`](../savings.py). | The supported way to inspect savings. |
 | [`smoke-test.py`](smoke-test.py) | Exercises cache-on and cache-off behavior in isolated temporary state. | Before committing hook, freeze, expansion, or telemetry changes. |
 | [`rotate-telemetry.sh`](rotate-telemetry.sh) | Moves live JSONL telemetry into a timestamped archive without stopping the gateway. | Start a clean measurement window. |
-| [`daily-analysis.sh`](daily-analysis.sh) | Runs the analyzer and shaper for the root profile and named profiles with telemetry. | Run manually or from a scheduler. |
 | [`../tests/seed_sessions.py`](../tests/seed_sessions.py) | Populates a throwaway Hermes home with telemetry generated from the scripted conversations in `tests/scripts/`, using the real policy resolver and predictor. | Demo or debug onboarding without a live gateway: `.venv/bin/python tests/seed_sessions.py --home /tmp/demo-home`, then run `configure.py` against it with `HERMES_HOME` set. Requires the development environment from `CONTRIBUTING.md` (PyYAML). |
 
 Trigger-dampener regression coverage lives in
@@ -158,34 +155,10 @@ The script moves live `predictions.jsonl`, `tool_calls.jsonl`, and
 `$HERMES_HOME/state/tool-belt/archive/reset-<timestamp>[-<tag>]/`. The plugin
 recreates each file on the next append.
 
-### Run periodic analysis
+### Ongoing shaping and analysis
 
 Scopes with `learned_mode: apply` are auto-shaped in-process by the plugin
 itself at session end (default once per 24h per scope; opt out with
-`auto_shape: false`), so this scheduled script is optional — useful mainly
-for observe/recommend-mode analysis and reports.
-
-```bash
-scripts/daily-analysis.sh              # analyze + shape in dry-run (default)
-SHAPE_APPLY=1 scripts/daily-analysis.sh  # also let the shaper write learned.json
-```
-
-The shaper step runs with `--dry-run` by default: an unattended run reports
-what it would change and logs `shape_pending`, but never rewrites the
-`learned.json` you reviewed. Set `SHAPE_APPLY=1` to opt in to the write (its
-effect on the live loadout is still gated by each scope's `learned_mode`).
-
-Generated output is written to:
-
-- `reports/<profile>/` inside the local plugin checkout (ignored by Git)
-- `<state-dir>/learned_recommendations.json`
-- `<state-dir>/learned.json` — only under `SHAPE_APPLY=1`, and only when
-  shaping evidence changes
-- `$HERMES_HOME/state/tool-belt/cron-logs/` (per-run shaper log and its
-  machine-readable `*.shape.json`, kept when a run wrote or has changes
-  pending)
-
-Scheduler setup is environment-specific. Invoke `daily-analysis.sh` from the
-scheduler appropriate to the host; no machine-specific scheduler configuration
-is shipped in the repository. Set `HERMES_PYTHON` explicitly in sparse
-scheduler environments when `python3` is not the interpreter with PyYAML.
+`auto_shape: false`, interval via `auto_shape_interval_hours`). No scheduled
+task is needed. For on-demand diagnostics, run the analyzer or shaper
+directly: `python3 analyze.py`, `python3 scripts/shape-ceiling.py --dry-run`.
