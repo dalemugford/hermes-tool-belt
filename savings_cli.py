@@ -141,6 +141,25 @@ def render_text(report: _savings.SavingsReport) -> str:
             for label, model, rate in priced:
                 usd = total_net / 1_000_000 * rate
                 out.append(f"    {label:<16} ≈ ${usd:,.2f}  ({model})")
+        # Annualized pace: net saved / measured wall-clock span, projected to
+        # 12 months. Needs a week of history to say anything defensible.
+        first = min((a.observed.first_ts for a in measured
+                     if a.observed.first_ts > 0), default=0.0)
+        last = max((a.observed.last_ts for a in measured), default=0.0)
+        span_days = (last - first) / 86400.0
+        if total_net > 0 and span_days >= 7.0:
+            yearly = int(total_net * 365.0 / span_days)
+            usd_txt = ""
+            if priced:
+                lo = min(yearly / 1_000_000 * rate for _, _, rate in priced)
+                hi = max(yearly / 1_000_000 * rate for _, _, rate in priced)
+                usd_txt = f" (≈${lo:,.0f}–${hi:,.0f} at the rates above)"
+            out.append("")
+            out.append(
+                f"  At this pace ({span_days:.0f} days measured), 12 months of"
+                f" Tool Belt saves"
+            )
+            out.append(f"  ≈{_fmt_int(yearly)} tokens{usd_txt}.")
         out.append("")
         out.append("  PER AGENT")
         for a in measured:

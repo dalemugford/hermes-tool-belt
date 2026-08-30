@@ -1033,3 +1033,38 @@ def _snapshot(root: Path) -> dict:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AnnualizedPaceTests(_HomeCase):
+    """The 12-month pace line: shown from ≥7 days of measured span, absent
+    below (too little wall-clock history to project defensibly)."""
+
+    def _report(self, span_days):
+        obs = savings.ObservedCohort(
+            n_predictions=10, n_sessions=5,
+            realized_schema_token_reduction=100_000,
+            net_token_reduction=100_000,
+            first_ts=1_780_000_000.0,
+            last_ts=1_780_000_000.0 + span_days * 86400.0)
+        return savings.SavingsReport(
+            generated_for="all", cache_mode="on",
+            agents=[savings.AgentSavings(
+                agent="default", platforms=["a:t"], observed=obs,
+                projected=savings.ProjectedCohort(), display_name="bernard")],
+            hermes_home=str(self.home), token_estimator="tiktoken-cl100k")
+
+    def test_pace_line_present_with_enough_span(self):
+        text = savings_cli.render_text(self._report(30))
+        self.assertIn("At this pace (30 days measured)", text)
+        self.assertIn("12 months", text)
+        # 100k tokens over 30 days → ≈1,216,666/yr
+        self.assertIn("1,216,66", text)
+
+    def test_pace_line_absent_below_a_week(self):
+        text = savings_cli.render_text(self._report(3))
+        self.assertNotIn("At this pace", text)
+
+    def test_display_name_used_in_per_agent_block(self):
+        text = savings_cli.render_text(self._report(30))
+        self.assertIn("bernard", text)
+        self.assertNotIn("default   ", text)

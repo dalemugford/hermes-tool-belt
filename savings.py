@@ -488,6 +488,10 @@ class ObservedCohort:
     expansion_events: int = 0
     expansion_overhead: int = 0
     net_token_reduction: int = 0
+    # Wall-clock span of the measured traffic (epoch seconds; 0 when empty) —
+    # lets reports annualize the observed pace.
+    first_ts: float = 0.0
+    last_ts: float = 0.0
     cache_on: dict[str, Any] = field(default_factory=dict)
     cache_off: dict[str, Any] = field(default_factory=dict)
     pending: dict[str, Any] = field(default_factory=dict)
@@ -503,6 +507,8 @@ class ObservedCohort:
             "expansion_events": self.expansion_events,
             "expansion_overhead": self.expansion_overhead,
             "net_token_reduction": self.net_token_reduction,
+            "first_ts": self.first_ts,
+            "last_ts": self.last_ts,
             "cache_on": self.cache_on,
             "cache_off": self.cache_off,
             "pending": self.pending,
@@ -561,9 +567,17 @@ def compute_observed(
                     if classify_prediction_mode(p, api_last) in ("on", "off")) if k
     })
 
+    measured_ts = [
+        float(p.get("ts") or 0) for p in predictions
+        if classify_prediction_mode(p, api_last) in ("on", "off")
+        and float(p.get("ts") or 0) > 0
+    ]
+
     return ObservedCohort(
         n_predictions=n_pred,
         n_sessions=n_sess,
+        first_ts=min(measured_ts) if measured_ts else 0.0,
+        last_ts=max(measured_ts) if measured_ts else 0.0,
         realized_schema_token_reduction=realized,
         expansion_events=expand_events,
         expansion_overhead=overhead,
