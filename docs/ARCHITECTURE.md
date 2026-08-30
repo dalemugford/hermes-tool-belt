@@ -257,7 +257,7 @@ Defaults are inherited from `policy.yaml` under `learning.shape_ceiling`:
 ```yaml
 learning:
   shape_ceiling:
-    session_window: 20
+    session_window: 100
     promote_min_sessions: 2
     promote_min_calls: 3
     demote_min_sessions_no_use: 20

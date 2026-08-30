@@ -49,8 +49,13 @@ logger = logging.getLogger("tool_belt_plugin.shaping")
 
 # Thresholds — conservative defaults that won't fire on noise. These are the
 # shaper's evidence thresholds; the auto-shape engine reuses them unchanged.
+# ``session_window`` is a ceiling, not a target: the shaper uses ALL available
+# session history up to this many sessions. The floor is enforced separately by
+# ``demote_min_sessions_no_use`` — with fewer sessions than that, demotion never
+# fires. A wider window is strictly more conservative for demotion (evidence is
+# zero uses across the entire window, so one use anywhere protects the tool).
 DEFAULTS = {
-    "session_window": 20,
+    "session_window": 100,
     "promote_min_sessions": 2,
     "promote_min_calls": 3,
     "demote_min_sessions_no_use": 20,

@@ -353,7 +353,7 @@ description: >
 
 learning:
   shape_ceiling:
-    session_window: 20
+    session_window: 100
     promote_min_sessions: 2
     promote_min_calls: 3
     demote_min_sessions_no_use: 20
@@ -430,7 +430,7 @@ override per-run.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `session_window` | `20` | Look back at most this many recent sessions per scope. |
+| `session_window` | `100` | Ceiling on history the shaper reads — it uses all available sessions up to this many. `demote_min_sessions_no_use` is the floor: below that, demotion never fires. |
 | `promote_min_sessions` | `2` | A tool needs `expand_tools`-driven use across this many distinct sessions to promote. |
 | `promote_min_calls` | `3` | And this many total calls. |
 | `demote_min_sessions_no_use` | `20` | Window must contain this many sessions before any always-on tool can be demoted for non-use. |

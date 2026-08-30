@@ -723,7 +723,7 @@ def compute_recommendations(info: ScopeInfo, thresholds: dict[str, int]) -> dict
         scope=info.scope,
         sessions=sessions,
         calls_by_pred=calls_by_pred,
-        window=int(thresholds.get("session_window", 20)),
+        window=int(thresholds.get("session_window", 100)),
         promote_min_sessions=int(thresholds.get("promote_min_sessions", 2)),
         promote_min_calls=int(thresholds.get("promote_min_calls", 3)),
         demote_min_sessions_no_use=int(thresholds.get("demote_min_sessions_no_use", 20)),
