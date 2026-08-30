@@ -61,89 +61,85 @@ def _rate_basis_label(proj: _savings.ProjectedCohort) -> str:
     return "n/a"
 
 
+def _render_projection(out: list[str], proj: _savings.ProjectedCohort, indent: str) -> None:
+    """The projection lines for one agent — shown only while measured data
+    is insufficient (an estimate from replayed session history)."""
+    out.append(
+        f"{indent}estimated net savings: {_fmt_int(proj.net_token_reduction)} tok"
+        f"  (from {proj.sessions_analyzed} past session(s), confidence: {proj.confidence})"
+    )
+    if proj.net_input_reduction_pct is not None:
+        out.append(
+            f"{indent}net input reduction: {proj.net_input_reduction_pct:.1f}%"
+            f"  (denominator: {proj.denominator_source})"
+        )
+    elif proj.schema_reduction_pct is not None:
+        out.append(
+            f"{indent}schema-only reduction: {proj.schema_reduction_pct:.1f}%"
+            "  (not the session-input %)"
+        )
+    if proj.estimated_usd_savings is not None:
+        out.append(
+            f"{indent}est. USD savings: ${proj.estimated_usd_savings:.4f}"
+            f"  ({proj.usd_coverage} coverage, rate {_rate_basis_label(proj)})"
+        )
+
+
 def render_text(report: _savings.SavingsReport) -> str:
-    width = 74
-    line = "─" * width
+    """Lead with the one number users care about: net tokens actually saved.
+
+    Measured savings (from real traffic) are the headline. An agent's
+    projection appears only while it has no measured sessions yet — the two
+    are never summed, and the projection block disappears once real data
+    exists.
+    """
     out: list[str] = []
-    out.append("═" * width)
-    out.append("  Hermes Tool Belt — Savings")
-    out.append("═" * width)
-    scope_label = "all enabled agents" if report.generated_for == "all" else f"agent {report.generated_for!r}"
-    out.append(f"  Reporting: {scope_label}")
-    out.append(f"  Cache mode (projection): {report.cache_mode}")
-    out.append(f"  Token estimator: {report.token_estimator}")
-    out.append(f"  Hermes home: {report.hermes_home}")
     out.append("")
+    out.append("  Hermes Tool Belt — Savings")
+    out.append("  " + "─" * 40)
 
     if not report.agents:
         out.append("  No enabled/discovered agent profiles with telemetry or sessions.")
         out.append("")
         return "\n".join(out)
 
-    for a in report.agents:
-        obs = a.observed
-        proj = a.projected
-        out.append(f"┌{line}┐")
-        out.append(f"│  AGENT: {a.agent}".ljust(width + 1) + "│")
-        platforms = ", ".join(a.platforms) if a.platforms else "(none discovered)"
-        out.append(f"│    platforms: {platforms}".ljust(width + 1) + "│")
-        out.append(f"├{line}┤")
-        # OBSERVED
-        out.append("│  OBSERVED (realized — provider usage authoritative)".ljust(width + 1) + "│")
-        out.append(
-            f"│    schema tokens saved: {_fmt_int(obs.realized_schema_token_reduction)}"
-            f"  across {obs.n_predictions} turn(s), {obs.n_sessions} session(s)".ljust(width + 1) + "│"
-        )
-        out.append(
-            f"│    expand_tools overhead: −{_fmt_int(obs.expansion_overhead)}"
-            f"  ({obs.expansion_events} event(s))".ljust(width + 1) + "│"
-        )
-        out.append(f"│    net realized savings: {_fmt_int(obs.net_token_reduction)} tok".ljust(width + 1) + "│")
-        out.append("│".ljust(width + 1) + "│")
-        # PROJECTED
-        out.append("│  PROJECTED (counterfactual — not yet organic)".ljust(width + 1) + "│")
-        out.append(
-            f"│    sessions/turns analyzed: {proj.sessions_analyzed}/{proj.user_turns_analyzed}"
-            f"  · confidence: {proj.confidence}".ljust(width + 1) + "│"
-        )
-        out.append(f"│    gross schema reduction: {_fmt_int(proj.gross_schema_token_reduction)} tok".ljust(width + 1) + "│")
-        out.append(
-            f"│    est. expansion overhead: −{_fmt_int(proj.estimated_expansion_overhead)}"
-            f"  ({proj.expansion_events} event(s))".ljust(width + 1) + "│"
-        )
-        out.append(f"│    net projected reduction: {_fmt_int(proj.net_token_reduction)} tok".ljust(width + 1) + "│")
-        if proj.net_input_reduction_pct is not None:
-            out.append(
-                f"│    net input reduction: {proj.net_input_reduction_pct:.1f}%"
-                f"  (denominator: {proj.denominator_source})".ljust(width + 1) + "│"
-            )
-        elif proj.schema_reduction_pct is not None:
-            out.append(
-                f"│    schema-only reduction: {proj.schema_reduction_pct:.1f}%"
-                "  (not the session-input %)".ljust(width + 1) + "│"
-            )
-        if proj.estimated_usd_savings is not None:
-            out.append(
-                f"│    est. USD savings: ${proj.estimated_usd_savings:.4f}"
-                f"  ({proj.usd_coverage} coverage, rate {_rate_basis_label(proj)})".ljust(width + 1) + "│"
-            )
-        else:
-            out.append("│    est. USD savings: n/a (no known variable-cost route)".ljust(width + 1) + "│")
-        out.append(f"└{line}┘")
-        out.append("")
+    measured = [a for a in report.agents if a.observed.n_sessions > 0]
+    unmeasured = [a for a in report.agents if a.observed.n_sessions == 0]
 
-    # Aggregate
-    agg = report.to_json()["aggregate"]
-    out.append("  AGGREGATE (cohorts labeled separately — never summed together)")
-    out.append(
-        f"    observed net:  {_fmt_int(agg['observed']['net_token_reduction'])} tok"
-    )
-    proj_usd = agg["projected"]["estimated_usd_savings"]
-    usd_txt = f"${proj_usd:.4f} ({agg['projected']['usd_coverage']})" if proj_usd is not None else "n/a"
-    out.append(
-        f"    projected net: {_fmt_int(agg['projected']['net_token_reduction'])} tok"
-        f"  · est. USD: {usd_txt}  · counterfactual"
-    )
+    total_net = sum(a.observed.net_token_reduction for a in measured)
+    total_sessions = sum(a.observed.n_sessions for a in measured)
+    if measured:
+        out.append("")
+        out.append(f"  NET TOKENS SAVED: {_fmt_int(total_net)}")
+        out.append(f"  measured across {total_sessions} session(s) of real traffic")
+        out.append("")
+        for a in measured:
+            obs = a.observed
+            out.append(
+                f"    {a.agent:<12} {_fmt_int(obs.net_token_reduction):>12} tok"
+                f"   {obs.n_sessions} session(s)"
+            )
+        out.append("")
+        events = sum(a.observed.expansion_events for a in measured)
+        overhead = sum(a.observed.expansion_overhead for a in measured)
+        out.append(
+            "  Counted as: tool-definition tokens NOT sent (vs carrying every"
+        )
+        out.append(
+            f"  enabled tool), minus expand_tools fetch overhead"
+            f" (−{_fmt_int(overhead)} tok, {events} fetch(es))."
+        )
+
+    for a in unmeasured:
+        out.append("")
+        out.append(
+            f"  {a.agent}: no measured traffic yet — estimate from session history:"
+        )
+        _render_projection(out, a.projected, indent="    ")
+
+    scope_label = "all enabled agents" if report.generated_for == "all" else f"agent {report.generated_for!r}"
+    out.append("")
+    out.append(f"  ({scope_label} · estimator {report.token_estimator} · {report.hermes_home})")
     out.append("")
     return "\n".join(out)
 
