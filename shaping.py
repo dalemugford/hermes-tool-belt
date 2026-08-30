@@ -71,7 +71,7 @@ DEFAULTS = {
     # so the decision never consults a price table. k also absorbs the soft
     # costs (expansion latency, the risk the model doesn't reach for
     # expand_tools when it should).
-    "demote_k": 2.0,
+    "demote_k": 1.5,
 }
 
 #: Auto-shape per-scope debounce default: at most one auto run per scope per
@@ -315,7 +315,7 @@ def compute_scope_recommendations(
     promote_min_sessions: int,
     promote_min_calls: int,
     demote_min_sessions_no_use: int,
-    demote_k: float = 2.0,
+    demote_k: float = 1.5,
     schema_sizes: dict[str, int] | None = None,
     cache_mode: str | None = None,
     api_call_counts: dict[str, int] | None = None,
@@ -485,7 +485,7 @@ def compute_scope_recommendations(
 
     total_exposures = sum(session_exposures.values())
     sizes = schema_sizes or {}
-    k = float(demote_k) if demote_k and demote_k > 0 else 2.0
+    k = float(demote_k) if demote_k and demote_k > 0 else 1.5
 
     def _economics(tool_name: str, use_sessions: set[str]) -> tuple[int, int]:
         """(saving, penalty) in tokens for carrying vs expanding this tool."""

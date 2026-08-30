@@ -434,7 +434,7 @@ override per-run.
 | `promote_min_sessions` | `2` | Anti-flap gate: a tool needs `expand_tools`-driven use across this many distinct sessions to be a promote candidate. |
 | `promote_min_calls` | `3` | And this many total calls. Candidates then promote only when their observed expansion spend exceeds what carrying them would have cost. |
 | `demote_min_sessions_no_use` | `20` | Window must contain this many sessions before any carried tool can be demoted. |
-| `demote_k` | `2.0` | Economic safety factor: demote a carried tool only when carrying it costs more than k × what expanding it on demand would (token-denominated — no price table). |
+| `demote_k` | `1.5` | Economic safety factor: demote a carried tool only when carrying it costs more than k × what expanding it on demand would (token-denominated — no price table). |
 
 ### Authoring a new preset
 

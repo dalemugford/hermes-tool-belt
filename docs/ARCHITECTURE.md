@@ -287,7 +287,7 @@ learning:
     promote_min_sessions: 2
     promote_min_calls: 3
     demote_min_sessions_no_use: 20
-    demote_k: 2.0
+    demote_k: 1.5
 ```
 
 CLI flags override per-run. Output is merged into

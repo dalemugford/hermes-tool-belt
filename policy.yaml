@@ -25,7 +25,7 @@ learning:
     # Economic safety factor: demote a carried tool only when carrying it
     # costs more than k × what expanding it on demand would (token-
     # denominated — no price table; fewer tokens is always cheaper).
-    demote_k: 2.0
+    demote_k: 1.5
 
 # ── Resident partition (full-start contract, 2026-08-30) ─────────────────────
 # Hermes supplies the enabled built-in ceiling E each request. Tool Belt splits
