@@ -10,6 +10,23 @@ The initial public capabilities of the plugin:
 
 ### Added
 
+- **Audited always-carry pin set (2026-08-30 audit).** The shipped
+  `policy.yaml` `always_carry` is now exactly seven tools: `expand_tools`,
+  `tool_search`, `tool_describe`, `tool_call`, `clarify`, `skills_list`,
+  `skill_view`. Dropped: `send_message` (not agent-callable on current
+  Hermes — the pin was permanently inert) and `todo` (evidence-ruled;
+  users can pin it back via `plugins.tool-belt.always_carry`).
+- **Bridge tools join the pass-through.** Hermes' Tool Search bridge
+  (`tool_search`/`tool_describe`/`tool_call`) is now treated like MCP
+  pass-through: outside the built-in partition, never demotable, never
+  counted as adaptive carry, never listed in the expand-only manifest, and
+  never named by a shaper recommendation. Previously ordinary no-use
+  evidence could demote the bridge and silently sever ALL access to the
+  deferred MCP/plugin catalog. The policy pin remains as pure-data backup
+  for environments where `tools.tool_search` isn't importable — the mirror
+  image of `_pin_expand_tools_visible`, which protects `expand_tools`
+  against the bridge in the opposite direction. Bridge tools are recorded
+  in the pass-through telemetry field, not the carrying strata.
 - **Zero-config full-start default.** On a scope with no learned state,
   Tool Belt now carries **everything Hermes enables** — active == the
   enabled ceiling — and evidence-driven demotion (the existing no-use

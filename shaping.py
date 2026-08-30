@@ -225,6 +225,24 @@ def index_tool_calls_by_prediction(tool_calls: list[dict[str, Any]]) -> dict[str
     return out
 
 
+def _bridge_names() -> frozenset[str]:
+    """Tool Search bridge tool names — the shaper's never-recommend set.
+
+    Mirrors ``__init__._bridge_tool_names``: sourced from
+    ``tools.tool_search.BRIDGE_TOOL_NAMES`` when hermes-agent is importable,
+    fail-OPEN to the hardcoded triple otherwise so the guard never silently
+    vanishes in offline analysis.
+    """
+    try:
+        from tools.tool_search import BRIDGE_TOOL_NAMES  # type: ignore[import-not-found]
+        names = frozenset(str(n) for n in BRIDGE_TOOL_NAMES)
+        if names:
+            return names
+    except Exception:
+        pass
+    return frozenset({"tool_search", "tool_describe", "tool_call"})
+
+
 def compute_scope_recommendations(
     scope: str,
     sessions: dict[str, list[dict[str, Any]]],
@@ -287,6 +305,18 @@ def compute_scope_recommendations(
                     enabled_names.add(name)
 
     def _valid(tool_name: str, kind: str) -> bool:
+        # Assertion: Tool Search bridge tools are pass-through (outside the
+        # partition, see __init__._is_bridge_tool) and must never appear in a
+        # recommendation. Once passed through they never enter the evidence
+        # domains at all — this guard is defensive, for rows written before
+        # the pass-through (or by a foreign writer).
+        if tool_name in _bridge_names():
+            logger.warning(
+                "tool-belt: shaper rejecting %s candidate %r for scope %r — "
+                "Tool Search bridge tools are pass-through and never shaped",
+                kind, tool_name, scope,
+            )
+            return False
         if tool_name and tool_name in enabled_names:
             return True
         logger.warning(

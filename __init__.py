@@ -369,7 +369,11 @@ def _wrap_build_api_kwargs(original):
                 base_name = _base_tool_name(name)
                 # Hermes prefixes tool names with "mcp_" on the Claude Code
                 # OAuth path (anthropic_adapter.py). Strip it before matching.
-                if _is_mcp_tool(name) or _is_mcp_tool(base_name):
+                # Tool Search bridge tools are pass-through like MCP tools:
+                # they are the transport INTO the deferred catalog, not a
+                # shapeable built-in capability.
+                if (_is_mcp_tool(name) or _is_mcp_tool(base_name)
+                        or _is_bridge_tool(name) or _is_bridge_tool(base_name)):
                     mcp_passthrough_names.append(name)
                 else:
                     builtin_ceiling.add(base_name)
@@ -450,7 +454,13 @@ def _wrap_build_api_kwargs(original):
                 base_name = _base_tool_name(name)
                 # MCP/plugin tools pass through without narrowing — Tool Search
                 # owns their discovery; Tool Belt shapes built-in tools only.
-                if _is_mcp_tool(name) or _is_mcp_tool(base_name):
+                # The Tool Search bridge tools pass through for the same
+                # reason: demoting the bridge would silently sever ALL access
+                # to the deferred MCP/plugin catalog (mirror image of
+                # _pin_expand_tools_visible, which protects the other layer's
+                # hatch in the other direction).
+                if (_is_mcp_tool(name) or _is_mcp_tool(base_name)
+                        or _is_bridge_tool(name) or _is_bridge_tool(base_name)):
                     filtered.append(t)
                     continue
                 if base_name in active_set:
@@ -565,6 +575,41 @@ def _tool_name(tool: Any) -> str:
 def _base_tool_name(name: str) -> str:
     """Strip transport-specific prefixes for preset matching."""
     return name[4:] if name.startswith("mcp_") else name
+
+
+def _bridge_tool_names() -> frozenset[str]:
+    """Names of Hermes' Tool Search bridge tools (tiered-disclosure access
+    infrastructure): ``tool_search`` / ``tool_describe`` / ``tool_call``.
+
+    Sourced from ``tools.tool_search.BRIDGE_TOOL_NAMES`` so a upstream rename
+    tracks automatically; fail-OPEN to the hardcoded triple when hermes-agent
+    isn't importable (tests, offline analysis) so pass-through immunity never
+    silently vanishes.
+    """
+    try:
+        from tools.tool_search import BRIDGE_TOOL_NAMES  # type: ignore[import-not-found]
+        names = frozenset(str(n) for n in BRIDGE_TOOL_NAMES)
+        if names:
+            return names
+    except Exception:
+        pass
+    return frozenset({"tool_search", "tool_describe", "tool_call"})
+
+
+_BRIDGE_TOOL_NAMES: frozenset[str] = _bridge_tool_names()
+
+
+def _is_bridge_tool(name: str) -> bool:
+    """True for Hermes' Tool Search bridge tools.
+
+    The bridge is the transport for the deferred MCP/plugin catalog — tools
+    Tool Belt has explicitly disclaimed ownership of. Like MCP tools, the
+    bridge sits OUTSIDE the built-in partition: never demotable, never counted
+    as adaptive carry, never listed in the expand-only manifest. The
+    ``always_carry`` pin in policy.yaml is the pure-data backup for the case
+    where this structural check can't see ``tools.tool_search``.
+    """
+    return name in _BRIDGE_TOOL_NAMES
 
 
 def _is_mcp_tool(name: str) -> bool:
