@@ -61,6 +61,27 @@ The initial public capabilities of the plugin:
   need no special handling for the same reason, now regression-locked for
   already-shaped scopes). Fail-open throughout: no resolvable registry
   means no reconciliation.
+- **Learned trigger overlay (automatic anticipation).** Deterministic
+  trigger anticipation now learns automatically across arbitrary
+  installs/tools: an additive per-scope overlay stored in the scope's
+  learned `triggers` list (schema v2) unions with the shipped `policy.yaml`
+  trigger groups at preset resolution — the shipped file is never edited.
+  Two sources, both in the session-end auto pass: (a) the analyzer's
+  expansion-evidence keyword mining is auto-applied above a STRICT bar
+  (support ≥ 4, precision ≥ 0.90, ≤ 3 keywords per tool — stricter than the
+  recommend-only defaults); (b) a tool demoted with no trigger coverage
+  anywhere gets a conservative word-boundary name-token trigger (generic
+  tokens stoplisted, minimum length 4; skipped entirely when nothing
+  distinctive remains). The overlay is structurally activation-only — it
+  can only activate `expand_only` tools (`T = triggered ∩ X`), never
+  demote, disable, or touch `always_carry`, and can never reference a tool
+  outside the enabled ceiling. Exclude-keyword dampeners apply to overlay
+  triggers exactly as to policy ones (a mined entry inherits the covering
+  policy group's excludes). Inspectable: `configure --status` shows
+  "auto-learned triggers: N" per scope; a scope reset clears its overlay;
+  inventory reconciliation prunes entries for vanished tools. The hot path
+  stays model-free and deterministic — "A plugin promising to save you
+  tokens shouldn't quietly spend them."
 - **`hermes tool-belt ...` subcommand.** `register(ctx)` now calls Hermes' `ctx.register_cli_command()`, so `hermes tool-belt savings` and `hermes tool-belt configure` work alongside the bare `tool-belt` launcher. Flags are forwarded verbatim to the same `savings_cli` entry point the launcher execs, so the two invocation forms cannot drift. Registration is optional and fail-open: on a Hermes without `register_cli_command`, the tool and hooks register exactly as before.
 - **Canonical savings CLI (`tool-belt savings`).** Reports observed and counterfactual token savings across all enabled agents or one selected agent, with deterministic JSON, full-schema replay, confidence-aware percentages, and dollars only for provably metered routes. The launcher honors `HERMES_PYTHON` and the local Hermes environment without importing runtime hooks. The session-input percentage is shown only against provider-reported usage; when historical sessions predate telemetry, only the explicitly-labeled schema-only reduction is shown (reconstructed context omits tool results, system prompt, and per-API-call accumulation, so it never backs a percentage).
 - **Guided onboarding (`scripts/configure.py`).** One command from install to a

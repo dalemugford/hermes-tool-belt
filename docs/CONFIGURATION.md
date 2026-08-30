@@ -506,6 +506,24 @@ Per scope:
   demote|disable}}`. Disables a trigger group entirely. Currently
   written only by manual edits.
 
+> **Learned trigger overlay (schema v2, supersedes the above for triggers).**
+> Under the 1.0 carrying model a scope's learned entry may carry a
+> `triggers` list — an additive, auto-learned overlay of trigger groups
+> (`{name, tools, keywords, exclude_keywords, source}`) that UNIONS with the
+> shipped `policy.yaml` triggers at preset resolution; the shipped file is
+> never edited, and v1 `trigger_adjustments` are ignored. Entries are
+> written only by the session-end auto pass: keyword mining from expansion
+> evidence auto-applies above a strict bar (support ≥ 4, precision ≥ 0.90),
+> and a demotion with no trigger coverage mints a conservative name-token
+> trigger. The overlay is activation-only by construction — it can only
+> activate `expand_only` tools inside the enabled ceiling, never demote,
+> disable, or touch `always_carry`. `configure --status` shows
+> "auto-learned triggers: N" per scope; a scope reset clears the overlay;
+> inventory reconciliation prunes entries for vanished tools. The runtime
+> stays deterministic — overlay authorship is pure arithmetic, no model
+> calls anywhere: "A plugin promising to save you tokens shouldn't quietly
+> spend them."
+
 ### Global block
 
 ```json

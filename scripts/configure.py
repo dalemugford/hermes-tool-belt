@@ -1095,6 +1095,23 @@ def _shaped_detail(info: ScopeInfo) -> str:
     return "shaping applied"
 
 
+def _overlay_trigger_count(info: ScopeInfo) -> int:
+    """Number of auto-learned trigger-overlay entries for a scope.
+
+    Read-only and fail-open — a read problem simply reports zero. The overlay
+    lives in the scope's learned ``triggers`` list (never in policy.yaml).
+    """
+    try:
+        doc = json.loads((info.state_dir / "learned.json").read_text(encoding="utf-8"))
+        entry = (doc.get("scopes") or {}).get(info.scope) or {}
+        overlay = entry.get("triggers")
+        if isinstance(overlay, list):
+            return sum(1 for g in overlay if isinstance(g, dict))
+    except Exception:
+        pass
+    return 0
+
+
 def render_status_row(
     info: ScopeInfo, state: str, thresholds: dict[str, int]
 ) -> str:
@@ -1110,6 +1127,9 @@ def render_status_row(
         )
     else:
         detail = f"not configured ({info.sessions}/{needed} sessions)"
+    overlay_count = _overlay_trigger_count(info)
+    if overlay_count:
+        detail += f", auto-learned triggers: {overlay_count}"
     return f"  {info.scope:<28} {state:<10} {detail}"
 
 

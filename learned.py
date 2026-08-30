@@ -142,8 +142,52 @@ _KNOWN_SCOPE_KEYS = frozenset(
     {
         "always_on", "always_off", "cache_aware", "trigger_adjustments",  # v1
         "carry", "expand_only", "shaping",                                # v2
+        "triggers",                                                       # v2 overlay
     }
 )
+
+
+def _normalize_overlay_triggers(value: Any) -> list[dict[str, Any]]:
+    """Validate a scope's learned trigger-overlay list (Promise #5).
+
+    Each overlay entry is an *additive* trigger group learned from evidence —
+    it can only ever ACTIVATE an ``expand_only`` tool (``T = triggered ∩ X``
+    in ``carrying.resolve``), never demote, disable, or touch ``always_carry``.
+    Shipped ``policy.yaml`` triggers are never edited; the overlay unions with
+    them at preset resolution (``apply_to_preset``).
+
+    Accepted entry shape (unknown keys pass through untouched)::
+
+        {"name": str, "tools": [str, ...] non-empty,
+         "keywords": [regex-str, ...] non-empty,
+         "exclude_keywords": [regex-str, ...],       # optional dampeners
+         "source": "mined" | "name_tokens", "created_at": iso}
+
+    Entries without at least one tool and one keyword are dropped (warned) —
+    an overlay group that can't fire or can't activate anything is noise.
+    """
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for raw in value:
+        if not isinstance(raw, dict):
+            continue
+        entry = dict(raw)
+        tools = _string_list(entry.get("tools"))
+        keywords = _string_list(entry.get("keywords"))
+        if not tools or not keywords:
+            logger.warning(
+                "tool-belt: dropping malformed learned trigger overlay entry "
+                "%r — needs at least one tool and one keyword",
+                entry.get("name") or "<unnamed>",
+            )
+            continue
+        entry["name"] = str(entry.get("name") or f"auto:{tools[0]}")
+        entry["tools"] = tools
+        entry["keywords"] = keywords
+        entry["exclude_keywords"] = _string_list(entry.get("exclude_keywords"))
+        out.append(entry)
+    return out
 
 
 def _string_list(value: Any) -> list[str]:
@@ -222,6 +266,11 @@ def _normalize_scope_entry(entry: Any, *, warn_trigger_adjustments: bool = True)
     out["carry"] = carry
     out["expand_only"] = _reconcile_overlap(carry, expand_only)
     out["shaping"] = shaping
+    # Learned trigger overlay (Promise #5) — only kept when non-empty so
+    # untouched scopes stay byte-identical to their pre-overlay shape.
+    overlay = _normalize_overlay_triggers(entry.get("triggers"))
+    if overlay:
+        out["triggers"] = overlay
     return out
 
 
@@ -361,7 +410,11 @@ def write_state(state: dict[str, Any], path: Path | None = None) -> None:
 #: evidence plus their v1 spellings. Everything else in a scope dict (and
 #: every other scope) is unrelated metadata a reset must preserve.
 _ADAPTIVE_SCOPE_KEYS = frozenset(
-    {"carry", "expand_only", "shaping", "always_on", "always_off", "cache_aware"}
+    {"carry", "expand_only", "shaping", "always_on", "always_off", "cache_aware",
+     # The learned trigger overlay is adaptive state too: a scope reset clears
+     # its auto-learned triggers along with the carrying assignments. Shipped
+     # policy.yaml triggers live elsewhere and are untouched by a reset.
+     "triggers"}
 )
 
 
@@ -506,6 +559,45 @@ def config_always_carry(plugin_config: dict[str, Any], scope: str) -> list[str]:
     return list(dict.fromkeys(pins))
 
 
+def _compile_overlay_groups(
+    scoped: dict[str, Any], always_carry_set: set[str], scope: str
+) -> list[TriggerGroup]:
+    """Compile a scope's learned trigger overlay into runtime TriggerGroups.
+
+    Additive only: the compiled groups are appended to the shipped policy
+    triggers at resolution time — never replacing or editing them. The
+    overlay is structurally activation-only: a trigger group can only put a
+    tool into ``T = triggered ∩ X`` (see ``carrying.resolve``), so it cannot
+    demote, disable, or resurrect a tool outside the enabled ceiling ``E``;
+    an ``always_carry`` tool named here is filtered out (it is already
+    resident — activating it is meaningless). Exclude keywords (dampeners)
+    compile exactly like policy ones.
+    """
+    from .presets import _compile_keywords
+
+    groups: list[TriggerGroup] = []
+    for entry in _normalize_overlay_triggers(scoped.get("triggers")):
+        tools = [t for t in entry["tools"] if t not in always_carry_set]
+        if not tools:
+            continue
+        patterns = _compile_keywords(entry["keywords"])
+        if not patterns:
+            logger.warning(
+                "tool-belt: learned trigger overlay entry %r for scope %r has "
+                "no compilable keyword — skipped",
+                entry["name"], scope,
+            )
+            continue
+        groups.append(TriggerGroup(
+            name=entry["name"],
+            tools=tools,
+            keyword_patterns=patterns,
+            exclude_patterns=_compile_keywords(entry["exclude_keywords"]),
+            has_attachment=None,
+        ))
+    return groups
+
+
 def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -> LearnedMergeResult:
     """Merge config pins + the learned overlay into a resolved preset.
 
@@ -599,6 +691,12 @@ def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -
         for group in preset.triggers
     ]
 
+    # Learned trigger overlay (Promise #5): auto-learned groups UNION with the
+    # shipped policy triggers — additive, activation-only, per scope. The
+    # shipped policy.yaml is never edited.
+    overlay_groups = _compile_overlay_groups(scoped, always_carry_set, matched_scope or scope)
+    triggers.extend(overlay_groups)
+
     # Change log (telemetry): what moved relative to the full-start baseline
     # (everything enabled carried). Demotions are the shaping motion; explicit
     # carry entries record promotions/un-demotions.
@@ -610,7 +708,7 @@ def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -
     for tool in effective_demoted:
         changes.append(f"{tool}:expand_only")
 
-    if not changes:
+    if not changes and not overlay_groups:
         return LearnedMergeResult(
             preset=preset, mode=mode, policy_version=version, learned_scope=matched_scope,
         )

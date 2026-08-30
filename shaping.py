@@ -34,6 +34,7 @@ import calendar
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 from collections import Counter, defaultdict
@@ -66,6 +67,35 @@ AUTO_SHAPE_DEFAULT_INTERVAL_HOURS = 24.0
 #: tool that reappears within the grace resets the clock; after cleanup it
 #: starts a fresh journey (carried, full-start).
 INVENTORY_GRACE_DAYS = 7
+
+# ── Promise #5: learned trigger-overlay constants ───────────────────────────
+# Automatic application demands a stricter bar than the analyzer's
+# recommend-only mining defaults (support 3 / precision 0.8): candidates are
+# written into live trigger behavior with no human in the loop, so only
+# obviously-good patterns qualify. Design principle, Dale verbatim: "A plugin
+# promising to save you tokens shouldn't quietly spend them."
+#: Minimum expansion-evidence messages containing the n-gram before it can be
+#: auto-applied to the overlay.
+OVERLAY_MINE_MIN_SUPPORT = 4
+#: Minimum precision (evidence hits / (evidence hits + noise hits)) for
+#: auto-application.
+OVERLAY_MINE_MIN_PRECISION = 0.90
+#: At most this many auto-applied keywords per (scope, tool).
+OVERLAY_MINE_MAX_KEYWORDS_PER_TOOL = 3
+#: Name-token trigger derivation (source b): minimum token length and the
+#: generic-token stoplist. A token must be at least this long AND not in the
+#: stoplist to count as distinctive; if nothing distinctive remains the
+#: derivation is skipped entirely.
+OVERLAY_NAME_TOKEN_MIN_LEN = 4
+OVERLAY_NAME_TOKEN_STOPLIST = frozenset({
+    "get", "set", "run", "list", "create", "delete", "update", "new", "add",
+    "remove", "read", "write", "tool", "tools", "make", "fetch", "find",
+    "show", "start", "stop", "open", "close", "file", "files", "data",
+    "info", "status", "check", "view", "item", "items", "use", "call",
+    "exec", "execute", "query", "send", "post", "put", "edit", "save",
+    "load", "search", "name", "text", "path", "value", "count", "help",
+    "with", "from", "into", "over", "this", "that", "auto", "mode",
+})
 
 _PLUGIN_DIR = Path(__file__).resolve().parent
 _POLICY_PATH = _PLUGIN_DIR / "policy.yaml"
@@ -865,6 +895,260 @@ def reconcile_inventory(
     return summary
 
 
+# ─── Promise #5: learned trigger overlay (automatic anticipation) ───────────
+
+def name_token_keywords(tool: str) -> list[str]:
+    """Conservative word-boundary keyword regexes from a tool's name tokens.
+
+    Source (b) of the trigger overlay: when demotion moves a tool that no
+    policy or overlay trigger names, derive a trigger from its distinctive
+    name tokens so the tool is never invisible to deterministic anticipation.
+    Tokens are split on non-alphanumerics; generic tokens are filtered via
+    :data:`OVERLAY_NAME_TOKEN_STOPLIST` and the
+    :data:`OVERLAY_NAME_TOKEN_MIN_LEN` minimum; returns ``[]`` (skip the
+    derivation entirely) when nothing distinctive remains.
+    """
+    tokens = [t.lower() for t in re.split(r"[^A-Za-z0-9]+", str(tool or "")) if t]
+    distinctive = [
+        t for t in dict.fromkeys(tokens)
+        if len(t) >= OVERLAY_NAME_TOKEN_MIN_LEN
+        and t not in OVERLAY_NAME_TOKEN_STOPLIST
+        and not t.isdigit()
+    ]
+    return [rf"\b{re.escape(t)}\b" for t in distinctive]
+
+
+def _overlay_entries(scope_entry: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = scope_entry.get("triggers")
+    return [g for g in raw if isinstance(g, dict)] if isinstance(raw, list) else []
+
+
+def _tools_with_trigger_coverage(
+    policy_preset: Any, scope_entry: dict[str, Any]
+) -> set[str]:
+    """Tools any trigger (shipped policy OR overlay) already names."""
+    covered: set[str] = set()
+    for group in getattr(policy_preset, "triggers", None) or []:
+        covered |= {str(t) for t in getattr(group, "tools", []) or []}
+    for group in _overlay_entries(scope_entry):
+        covered |= {str(t) for t in group.get("tools") or []}
+    return covered
+
+
+def _existing_patterns_for_tool(
+    policy_preset: Any, scope_entry: dict[str, Any], tool: str
+) -> tuple[list[re.Pattern[str]], list[str]]:
+    """(compiled keyword patterns, raw exclude patterns) covering ``tool``.
+
+    The compiled patterns keep the miner from re-learning a keyword an
+    existing trigger already matches; the raw excludes are inherited onto a
+    new overlay entry for the tool so dampeners apply to overlay triggers
+    exactly as they do to the policy ones.
+    """
+    patterns: list[re.Pattern[str]] = []
+    excludes: list[str] = []
+    for group in getattr(policy_preset, "triggers", None) or []:
+        if tool in (getattr(group, "tools", []) or []):
+            patterns.extend(getattr(group, "keyword_patterns", []) or [])
+            excludes.extend(
+                p.pattern for p in (getattr(group, "exclude_patterns", []) or [])
+            )
+    for group in _overlay_entries(scope_entry):
+        if tool in (group.get("tools") or []):
+            for raw in group.get("keywords") or []:
+                try:
+                    patterns.append(re.compile(str(raw), flags=re.IGNORECASE))
+                except re.error:
+                    continue
+            excludes.extend(str(x) for x in group.get("exclude_keywords") or [])
+    return patterns, list(dict.fromkeys(excludes))
+
+
+def _expansion_previews_by_tool(
+    sessions: dict[str, list[dict[str, Any]]],
+    calls_by_pred: dict[str, list[dict[str, Any]]],
+) -> tuple[dict[str, list[str]], list[str]]:
+    """(per-tool expansion-evidence message previews, all previews) for a scope.
+
+    Evidence previews are the messages of predictions under which the model
+    reached a tool via ``expand_tools`` (``activated_by_expansion`` /
+    ``expansion_provided_access``) — the same evidence class the promote path
+    trusts. The full preview list is the noise denominator for precision.
+    """
+    by_tool: dict[str, list[str]] = defaultdict(list)
+    all_previews: list[str] = []
+    for plist in sessions.values():
+        for p in plist:
+            preview = str(p.get("message_preview") or "").strip()
+            if not preview:
+                continue
+            all_previews.append(preview)
+            evidence_tools: set[str] = set()
+            for tc in calls_by_pred.get(str(p.get("prediction_id") or ""), []):
+                if tc.get("tool_name") == "expand_tools":
+                    continue
+                if bool(tc.get("activated_by_expansion")) or bool(
+                    tc.get("expansion_provided_access")
+                ):
+                    name = str(tc.get("tool_name") or "")
+                    if name:
+                        evidence_tools.add(name)
+            for name in evidence_tools:
+                by_tool[name].append(preview)
+    return by_tool, all_previews
+
+
+def compute_overlay_updates(
+    scope: str,
+    scope_entry: dict[str, Any],
+    sessions: dict[str, list[dict[str, Any]]],
+    calls_by_pred: dict[str, list[dict[str, Any]]],
+    protected: set[str],
+    newly_demoted: list[str],
+    policy_preset: Any = None,
+) -> list[dict[str, Any]]:
+    """Compute additive overlay-trigger updates for one scope (no writes).
+
+    Source (a) — expansion-evidence mining: the analyzer's keyword miner
+    (``analyze._suggest_keywords_for_expand_only_tool`` — the exact code the
+    recommend-only flow uses) is run over live expansion-evidence previews
+    and auto-applied only above the STRICT bar
+    (:data:`OVERLAY_MINE_MIN_SUPPORT` / :data:`OVERLAY_MINE_MIN_PRECISION`),
+    at most :data:`OVERLAY_MINE_MAX_KEYWORDS_PER_TOOL` keywords per tool.
+
+    Source (b) — name-token derivation for tools just demoted with no
+    trigger coverage anywhere (:func:`name_token_keywords`).
+
+    Structural bounds: only ``expand_only`` (demoted) tools that are NOT
+    protected (``always_carry`` ∪ config pins) ever get an overlay entry —
+    the overlay can only ACTIVATE expand_only tools. Returns a list of
+    normalized overlay entries to merge into the scope's ``triggers`` list.
+    """
+    if policy_preset is None:
+        try:
+            from . import presets
+            policy_preset = presets.load_base_policy()
+        except Exception:  # pragma: no cover — policy load is fail-safe
+            policy_preset = None
+
+    expand_only = {str(t) for t in scope_entry.get("expand_only") or []}
+    eligible = expand_only - protected
+    if not eligible:
+        return []
+
+    updates: list[dict[str, Any]] = []
+    ts = _utc_iso()
+
+    # ── Source (a): strict-bar keyword mining from expansion evidence. ─────
+    previews_by_tool, all_previews = _expansion_previews_by_tool(sessions, calls_by_pred)
+    mined_tools: set[str] = set()
+    try:
+        from . import analyze as analyze_mod
+        miner = analyze_mod._suggest_keywords_for_expand_only_tool
+    except Exception as exc:  # pragma: no cover — analyzer is optional here
+        logger.warning("tool-belt: overlay keyword miner unavailable: %s", exc)
+        miner = None
+    if miner is not None:
+        for tool in sorted(eligible):
+            evidence = previews_by_tool.get(tool) or []
+            if len(evidence) < OVERLAY_MINE_MIN_SUPPORT:
+                continue
+            existing_patterns, inherited_excludes = _existing_patterns_for_tool(
+                policy_preset, scope_entry, tool,
+            )
+            evidence_set = set(evidence)
+            noise = [p for p in all_previews if p not in evidence_set]
+            try:
+                candidates = miner(
+                    expand_only_previews=evidence,
+                    noise_previews=noise,
+                    existing_patterns=existing_patterns,
+                    min_n=2,
+                    max_n=4,
+                    min_support=OVERLAY_MINE_MIN_SUPPORT,
+                    min_precision=OVERLAY_MINE_MIN_PRECISION,
+                    max_candidates=OVERLAY_MINE_MAX_KEYWORDS_PER_TOOL,
+                )
+            except Exception as exc:
+                logger.warning("tool-belt: overlay mining failed for %r/%r: %s",
+                               scope, tool, exc)
+                continue
+            keywords = [str(c.get("suggested_regex") or "") for c in candidates
+                        if str(c.get("suggested_regex") or "")]
+            if not keywords:
+                continue
+            mined_tools.add(tool)
+            updates.append({
+                "name": f"auto:{tool}",
+                "tools": [tool],
+                "keywords": keywords,
+                "exclude_keywords": inherited_excludes,
+                "source": "mined",
+                "created_at": ts,
+                "evidence": {
+                    "support": len(evidence),
+                    "min_precision": OVERLAY_MINE_MIN_PRECISION,
+                },
+            })
+
+    # ── Source (b): name-token triggers for uncovered fresh demotions. ─────
+    covered = _tools_with_trigger_coverage(policy_preset, scope_entry) | mined_tools
+    for tool in sorted({str(t) for t in newly_demoted} & eligible):
+        if tool in covered:
+            continue
+        keywords = name_token_keywords(tool)
+        if not keywords:
+            logger.info(
+                "tool-belt: no distinctive name tokens for demoted tool %r — "
+                "skipping auto trigger derivation (recoverable via "
+                "expand_tools only)", tool,
+            )
+            continue
+        updates.append({
+            "name": f"auto:{tool}",
+            "tools": [tool],
+            "keywords": keywords,
+            "exclude_keywords": [],
+            "source": "name_tokens",
+            "created_at": ts,
+        })
+    return updates
+
+
+def merge_overlay_updates(
+    scope_entry: dict[str, Any], updates: list[dict[str, Any]]
+) -> tuple[dict[str, Any], bool]:
+    """Merge computed overlay entries into a scope entry, in memory.
+
+    One overlay entry per (name) — an update for an existing entry extends
+    its ``keywords``/``exclude_keywords`` (deduplicated, order-preserving)
+    rather than duplicating the group. Returns ``(entry, changed)``.
+    """
+    if not updates:
+        return scope_entry, False
+    entry = dict(scope_entry)
+    overlay = [dict(g) for g in _overlay_entries(entry)]
+    by_name = {str(g.get("name") or ""): g for g in overlay}
+    changed = False
+    for update in updates:
+        existing = by_name.get(str(update.get("name") or ""))
+        if existing is None:
+            overlay.append(dict(update))
+            by_name[str(update.get("name") or "")] = overlay[-1]
+            changed = True
+            continue
+        for key in ("keywords", "exclude_keywords"):
+            merged = list(dict.fromkeys(
+                [*(existing.get(key) or []), *(update.get(key) or [])]
+            ))
+            if merged != list(existing.get(key) or []):
+                existing[key] = merged
+                changed = True
+    if changed:
+        entry["triggers"] = overlay
+    return entry, changed
+
+
 # ─── In-process auto-shape engine ───────────────────────────────────────────
 
 def _coerce_bool(value: Any, default: bool = True) -> bool:
@@ -1028,6 +1312,44 @@ def auto_shape_run(
         )
     ts_iso = _utc_iso(now)
 
+    # Promise #5: learned trigger overlay — automatic anticipation. Additive,
+    # per scope, activation-only; fail-open so an overlay problem never
+    # blocks the shaping write itself.
+    overlay_changed: dict[str, int] = {}
+    try:
+        from . import presets as presets_mod
+        policy_preset = presets_mod.load_base_policy()
+        scopes_now = state.get("scopes") or {}
+        for scope in eligible:
+            entry = scopes_now.get(scope)
+            if not isinstance(entry, dict):
+                continue
+            protected = effective_always_carry(plugin_config, scope)
+            newly_demoted = list((changes.get(scope) or {}).get("demoted") or [])
+            updates = compute_overlay_updates(
+                scope=scope,
+                scope_entry=entry,
+                sessions=grouped[scope],
+                calls_by_pred=calls_by_pred,
+                protected=protected,
+                newly_demoted=newly_demoted,
+                policy_preset=policy_preset,
+            )
+            new_entry, did_change = merge_overlay_updates(entry, updates)
+            if did_change:
+                scopes_now = dict(scopes_now)
+                scopes_now[scope] = new_entry
+                overlay_changed[scope] = len(updates)
+                logger.info(
+                    "tool-belt: auto-learned %d trigger overlay update(s) for %s: %s",
+                    len(updates), scope,
+                    ", ".join(sorted({str(u.get("name")) for u in updates})),
+                )
+        if overlay_changed:
+            state["scopes"] = scopes_now
+    except Exception as exc:
+        logger.warning("tool-belt: trigger-overlay learning failed (fail-open): %s", exc)
+
     scopes = dict(state.get("scopes") or {})
     for scope in eligible:
         entry = dict(scopes.get(scope) or {"carry": [], "expand_only": [], "shaping": {}})
@@ -1040,7 +1362,7 @@ def auto_shape_run(
         entry["shaping"] = shaping_meta
         scopes[scope] = entry
     state["scopes"] = scopes
-    if changes:
+    if changes or overlay_changed:
         state["updated_at"] = ts_iso
 
     # One write covers both the applied assignments and the debounce stamps.
@@ -1062,6 +1384,7 @@ def auto_shape_run(
         "ran": True,
         "attempted": list(eligible),
         "applied": changes,
+        "overlay": overlay_changed,
         "reason": "ok",
     })
     return summary
