@@ -180,6 +180,53 @@ class ScopeDiscoveryTests(TempHomeTestCase):
         self.assertEqual(configure.discover_scopes(missing), [])
 
 
+class AgentNameFilterTests(TempHomeTestCase):
+    """B1/M3/P3 locks: --agent must accept the agent name the tool itself
+    displays (plugins.tool-belt.agent), not only the profile directory name;
+    a filter miss on a populated install must name what exists and exit 2,
+    never claim the install is empty (or silently no-op a --dry-run). B2:
+    --platform comma-splits like the interactive prompt. No other tests
+    exercise the display-name filter or the flag normalization."""
+
+    def _root_with_configured_name(self, name="bernard"):
+        (self.home / "config.yaml").write_text(
+            f"plugins:\n  tool-belt:\n    agent: {name}\n", encoding="utf-8")
+        seed_telemetry(self.root_state, f"{name}:telegram", 3)
+
+    def test_filter_accepts_configured_agent_name(self) -> None:
+        self._root_with_configured_name("bernard")
+        hits = configure.discover_state_dirs(self.home, "bernard")
+        self.assertEqual([label for label, _ in hits], ["default"],
+                         "the displayed agent name selects its profile")
+        self.assertTrue(configure.discover_scopes(self.home, "bernard"))
+        self.assertEqual(configure.discover_state_dirs(self.home, "nosuch"), [])
+
+    def test_filter_miss_names_found_profiles_and_exits_2(self) -> None:
+        self._root_with_configured_name("bernard")
+        lines: list[str] = []
+        with mock.patch.object(configure.shutil, "which", return_value=None), \
+                mock.patch.object(configure, "prompt",
+                                  side_effect=configure.Abort), \
+                contextlib.redirect_stdout(io.StringIO()) as buf:
+            rc = configure.main(["--agent", "nosuch",
+                                 "--hermes-home", str(self.home)])
+        out = buf.getvalue()
+        self.assertEqual(rc, 2, "wrong --agent on a populated install is an "
+                                "error, not an empty install / silent no-op")
+        self.assertIn("No profile matching 'nosuch'", out)
+        self.assertIn("bernard", out, "the error names what DOES exist, "
+                                      "including the displayed agent name")
+        self.assertNotIn("install and", out,
+                         "must not tell a populated install to go install Hermes")
+
+    def test_platform_flag_comma_splits_like_the_prompt(self) -> None:
+        self.assertEqual(configure.split_platform_args(["telegram, slack"]),
+                         ["telegram", "slack"])
+        self.assertEqual(configure.split_platform_args(["cli"]), ["cli"])
+        self.assertIsNone(configure.split_platform_args(None))
+        self.assertIsNone(configure.split_platform_args([" , "]))
+
+
 class StateMachineTests(TempHomeTestCase):
     def _info(self, sessions: int) -> "configure.ScopeInfo":
         return configure.ScopeInfo(

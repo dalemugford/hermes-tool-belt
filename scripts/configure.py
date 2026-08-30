@@ -220,6 +220,39 @@ def default_hermes_home() -> Path:
     return Path(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
 
 
+def configured_agent_name(profile_home: Path) -> str:
+    """The profile's ``plugins.tool-belt.agent`` config value, or ''.
+
+    This is the agent name the tool's own output (status rows, savings
+    report) shows for the profile — e.g. ``bernard`` on a root profile whose
+    directory identity is ``default``. ``--agent`` must accept it too:
+    rejecting the exact string the tool itself prints is a first-run trap.
+    """
+    try:
+        yaml = require_yaml()
+        raw = yaml.safe_load((profile_home / "config.yaml").read_text(
+            encoding="utf-8")) or {}
+        name = ((raw.get("plugins") or {}).get("tool-belt") or {}).get("agent")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+    return ""
+
+
+def _filter_hits(profile_filter: str | None, dir_name: str,
+                 profile_home: Path) -> bool:
+    """``--agent``/``--reset`` match by profile directory name OR by the
+    configured agent name the UI displays for that profile."""
+    if not profile_filter:
+        return True
+    if dir_name == profile_filter:
+        return True
+    return configured_agent_name(profile_home) == profile_filter
+
+
 def discover_state_dirs(
     hermes_home: Path, profile_filter: str | None = None
 ) -> list[tuple[str, Path]]:
@@ -232,7 +265,7 @@ def discover_state_dirs(
     """
     out: list[tuple[str, Path]] = []
     root_state = hermes_home / "state" / "tool-belt"
-    if not profile_filter or profile_filter == "default":
+    if _filter_hits(profile_filter, "default", hermes_home):
         if root_state.is_dir() or (hermes_home / "sessions").is_dir():
             out.append(("default", root_state))
     profiles_dir = hermes_home / "profiles"
@@ -240,7 +273,7 @@ def discover_state_dirs(
         for child in sorted(profiles_dir.iterdir()):
             if not child.is_dir() or child.name == "default":
                 continue  # "default" under profiles/ is reserved by Hermes
-            if profile_filter and child.name != profile_filter:
+            if not _filter_hits(profile_filter, child.name, child):
                 continue
             p_state = child / "state" / "tool-belt"
             if p_state.is_dir() or (child / "sessions").is_dir():
@@ -1501,6 +1534,19 @@ def _ask_platforms(ctx: RunContext) -> list[str]:
     return [p.strip().lower() for p in answer.replace(" ", ",").split(",") if p.strip()]
 
 
+def split_platform_args(values: Sequence[str] | None) -> list[str] | None:
+    """Comma/space-split --platform values exactly like the interactive
+    prompt that teaches users to type "telegram, slack" (B2: a raw comma
+    value used to silently become one garbage scope named
+    ``agent:telegram,slack`` and could then receive real config writes)."""
+    if not values:
+        return None
+    return [p.strip().lower()
+            for v in values
+            for p in str(v).replace(" ", ",").split(",")
+            if p.strip()] or None
+
+
 def _print_no_profiles(ctx: RunContext) -> None:
     """Said only when ``discover_state_dirs`` genuinely found nothing."""
     ctx.out(f"\n  No Hermes profiles found under {ctx.hermes_home}.")
@@ -1592,7 +1638,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         ctx.plugin_config = read_plugin_config(ctx.runner)
 
     profile_filter = args.reset or args.agent
+    args.platform = split_platform_args(args.platform)
     infos = discover_scopes(hermes_home, profile_filter, args.platform)
+
+    # A filter that matches nothing on a populated install is a wrong NAME,
+    # not an empty install — say so, and name what exists (M3/P3: the generic
+    # "no profiles found" text told users with a typo to go install Hermes,
+    # and a --dry-run silently no-op'd with exit 0).
+    if profile_filter and not infos:
+        available = discover_state_dirs(hermes_home, None)
+        if available:
+            ctx.out(f"\n  No profile matching {profile_filter!r} under {hermes_home}.")
+            names = []
+            for label, state_dir in available:
+                phome = hermes_home if label == "default" else (
+                    hermes_home / "profiles" / label)
+                shown = configured_agent_name(phome)
+                names.append(f"{label} (agent: {shown})" if shown and shown != label
+                             else label)
+            ctx.out("  Profiles found: " + ", ".join(names))
+            ctx.out("  --agent accepts either the profile name or its configured "
+                    "agent name.")
+            return 2
 
     if args.status:
         return flow_status(ctx, infos)
