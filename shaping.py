@@ -33,6 +33,8 @@ from __future__ import annotations
 import calendar
 import json
 import logging
+import os
+import tempfile
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -57,6 +59,13 @@ DEFAULTS = {
 #: this many hours. Overridable via ``channels.<scope>.auto_shape_interval_hours``
 #: (or the top-level ``auto_shape_interval_hours``) in the plugin config.
 AUTO_SHAPE_DEFAULT_INTERVAL_HOURS = 24.0
+
+# ── Promise #4: inventory reconciliation constants ──────────────────────────
+#: Grace period between a tool's first observed absence from the install's
+#: registry and its automatic cleanup from learned state + config pins. A
+#: tool that reappears within the grace resets the clock; after cleanup it
+#: starts a fresh journey (carried, full-start).
+INVENTORY_GRACE_DAYS = 7
 
 _PLUGIN_DIR = Path(__file__).resolve().parent
 _POLICY_PATH = _PLUGIN_DIR / "policy.yaml"
@@ -546,6 +555,316 @@ def filter_protected_demotions(
     return out
 
 
+# ─── Promise #4: inventory reconciliation (auto cleanup) ────────────────────
+
+def registry_tool_names() -> set[str] | None:
+    """The install's full tool registry — every registered tool name.
+
+    This is the AUTHORITATIVE "does the tool exist on this install" question
+    (Promise #4): absence from one scope's platform ceiling is NOT absence
+    from the install — a tool excluded by ``platform_toolsets`` on Slack may
+    be fully present on Telegram. Only the registry answers install-wide.
+
+    Resolved the way the runtime can — Hermes' in-process ``tools.registry``
+    (the same import ``_is_mcp_tool`` in ``__init__`` uses). Returns ``None``
+    when the registry is unavailable or empty (outside a gateway process, or
+    before registration completes): the caller must FAIL OPEN and skip
+    reconciliation entirely rather than treat every tool as missing.
+    """
+    try:
+        from tools.registry import registry  # type: ignore[import-not-found]
+
+        names = {str(e.name) for e in registry.get_all_entries() if getattr(e, "name", "")}
+        return names or None
+    except Exception as exc:
+        logger.debug("tool-belt: tool registry unavailable (%s) — skipping "
+                     "inventory reconciliation", exc)
+        return None
+
+
+def _inventory_path(state_dir: Path) -> Path:
+    return state_dir / "inventory.json"
+
+
+def read_inventory(state_dir: Path) -> dict[str, Any]:
+    """Load the reconciliation sidecar; ``{"missing_since": {tool: iso}}``."""
+    try:
+        doc = json.loads(_inventory_path(state_dir).read_text(encoding="utf-8"))
+        if isinstance(doc, dict) and isinstance(doc.get("missing_since"), dict):
+            return {"missing_since": {
+                str(k): str(v) for k, v in doc["missing_since"].items()
+            }}
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.warning("tool-belt: unreadable inventory sidecar (%s) — starting fresh", exc)
+    return {"missing_since": {}}
+
+
+def _write_inventory(state_dir: Path, doc: dict[str, Any]) -> None:
+    target = _inventory_path(state_dir)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    text = json.dumps(doc, indent=2, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(prefix=target.name + ".", suffix=".tmp",
+                                    dir=str(target.parent))
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        tmp.replace(target)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _config_pin_tools(plugin_config: dict[str, Any]) -> set[str]:
+    """Every always_carry config pin, global and per-channel (all channels)."""
+    pins: set[str] = set()
+    raw = plugin_config.get("always_carry")
+    if isinstance(raw, list):
+        pins |= {str(t).strip() for t in raw if str(t).strip()}
+    channels = plugin_config.get("channels")
+    if isinstance(channels, dict):
+        for cfg in channels.values():
+            if isinstance(cfg, dict) and isinstance(cfg.get("always_carry"), list):
+                pins |= {str(t).strip() for t in cfg["always_carry"] if str(t).strip()}
+    return pins
+
+
+def _referenced_tools(state: dict[str, Any]) -> set[str]:
+    """Every concrete tool name learned state still references."""
+    out: set[str] = set()
+    scopes = state.get("scopes")
+    if not isinstance(scopes, dict):
+        return out
+    for entry in scopes.values():
+        if not isinstance(entry, dict):
+            continue
+        for key in ("carry", "expand_only"):
+            for t in entry.get(key) or []:
+                if str(t).strip():
+                    out.add(str(t))
+        shaping_meta = entry.get("shaping")
+        if isinstance(shaping_meta, dict):
+            for key in ("promote", "demote"):
+                for row in shaping_meta.get(key) or []:
+                    if isinstance(row, dict) and str(row.get("tool") or "").strip():
+                        out.add(str(row["tool"]))
+        for group in entry.get("triggers") or []:
+            if isinstance(group, dict):
+                for t in group.get("tools") or []:
+                    if str(t).strip():
+                        out.add(str(t))
+    return out
+
+
+def default_config_pin_remover(tool: str) -> bool:
+    """Remove ``tool`` from the profile's always_carry config pins on disk.
+
+    Routes through Hermes' own config-write machinery — the same primitives
+    ``hermes config set``/``unset`` use in-process (``hermes_cli.config.
+    get_config_path`` + ``require_readable_config_before_write`` +
+    ``utils.fast_safe_load``/``atomic_yaml_write`` — see
+    ``set_config_value``/``unset_config_value`` in ``hermes_cli/config.py``).
+    Outside a gateway process (tests, operator scripts) those modules are not
+    importable; an equivalent standalone path against ``$HERMES_HOME/
+    config.yaml`` with the same atomic-replace semantics is used instead.
+
+    Edits ``plugins.tool-belt.always_carry`` and every
+    ``plugins.tool-belt.channels.<scope>.always_carry`` list. Returns True
+    when the file changed. Raises on failure — the caller logs a warning and
+    skips (never propagates).
+    """
+    yaml = require_yaml()
+    loader: Any = None
+    writer: Any = None
+    config_path: Path | None = None
+    try:
+        from hermes_cli.config import (  # type: ignore[import-not-found]
+            get_config_path, require_readable_config_before_write,
+        )
+        from utils import atomic_yaml_write, fast_safe_load  # type: ignore[import-not-found]
+
+        config_path = get_config_path()
+        require_readable_config_before_write(config_path)
+        loader = fast_safe_load
+        writer = lambda p, d: atomic_yaml_write(p, d, sort_keys=False)  # noqa: E731
+    except (Exception, SystemExit) as exc:
+        if not isinstance(exc, ImportError):
+            raise RuntimeError(f"hermes config machinery refused the write: {exc}") from exc
+        # Standalone fallback: same semantics, no Hermes runtime available.
+        home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+        config_path = Path(home) / "config.yaml"
+        loader = yaml.safe_load
+
+        def writer(p: Path, data: Any) -> None:
+            text = yaml.safe_dump(data, default_flow_style=False, sort_keys=False)
+            fd, tmp_name = tempfile.mkstemp(prefix=p.name + ".", suffix=".tmp",
+                                            dir=str(p.parent))
+            tmp = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(text)
+                    f.flush()
+                    os.fsync(f.fileno())
+                tmp.replace(p)
+            except Exception:
+                tmp.unlink(missing_ok=True)
+                raise
+
+    if config_path is None or not config_path.exists():
+        return False
+    with config_path.open("r", encoding="utf-8") as f:
+        doc = loader(f) or {}
+    if not isinstance(doc, dict):
+        return False
+
+    changed = False
+    plugin_cfg = (doc.get("plugins") or {}).get("tool-belt") \
+        if isinstance(doc.get("plugins"), dict) else None
+    if isinstance(plugin_cfg, dict):
+        pins = plugin_cfg.get("always_carry")
+        if isinstance(pins, list) and tool in pins:
+            plugin_cfg["always_carry"] = [t for t in pins if t != tool]
+            changed = True
+        channels = plugin_cfg.get("channels")
+        if isinstance(channels, dict):
+            for cfg in channels.values():
+                if isinstance(cfg, dict):
+                    ch_pins = cfg.get("always_carry")
+                    if isinstance(ch_pins, list) and tool in ch_pins:
+                        cfg["always_carry"] = [t for t in ch_pins if t != tool]
+                        changed = True
+    if changed:
+        writer(config_path, doc)
+    return changed
+
+
+def reconcile_inventory(
+    plugin_config: dict[str, Any],
+    state_dir: Path,
+    now: float | None = None,
+    registry_names: set[str] | None = None,
+    config_pin_remover: Any = None,
+) -> dict[str, Any]:
+    """One inventory-reconciliation pass (Promise #4). Returns a summary.
+
+    Detects tools that learned state or config pins still reference but the
+    install's REGISTRY no longer contains (per-scope platform absence is NOT
+    missing — that distinction is load-bearing). First observed absence is
+    stamped into ``inventory.json``; after :data:`INVENTORY_GRACE_DAYS` of
+    continuous absence the tool is pruned automatically:
+
+      · learned.json references (carry / expand_only / shaping evidence /
+        trigger overlay) via ``learned.prune_tool`` + ``learned.write_state``;
+      · config always_carry pins via Hermes' own config-write machinery
+        (:func:`default_config_pin_remover`) — a machinery failure logs a
+        warning and skips that tool's pin, never propagates;
+      · one INFO log line per removal.
+
+    A tool that reappears in the registry within the grace resets the clock;
+    after cleanup nothing references it any more, so a later reappearance
+    starts a fresh journey (carried, by the full-start contract). Fail-open:
+    with no resolvable registry, nothing is touched.
+    """
+    now = time.time() if now is None else float(now)
+    summary: dict[str, Any] = {"status": "ok", "pruned": [], "tracking": []}
+
+    if registry_names is None:
+        registry_names = registry_tool_names()
+    if not registry_names:
+        summary["status"] = "registry_unavailable"
+        return summary
+
+    learned_path = state_dir / "learned.json"
+    state = learned.normalize_state(_read_learned_doc(learned_path))
+    pins = _config_pin_tools(plugin_config or {})
+    referenced = _referenced_tools(state) | pins
+
+    inventory = read_inventory(state_dir)
+    missing_since: dict[str, str] = inventory["missing_since"]
+    inv_changed = False
+
+    missing_now = {t for t in referenced if t not in registry_names}
+
+    # Reappeared (or no longer referenced anywhere): reset the clock.
+    for tool in [t for t in missing_since if t not in missing_now]:
+        if tool in registry_names:
+            logger.info(
+                "tool-belt: %r is back in the tool registry — absence clock "
+                "reset; it keeps its current journey", tool,
+            )
+        del missing_since[tool]
+        inv_changed = True
+
+    # Newly missing: start the grace clock.
+    for tool in sorted(missing_now):
+        if tool not in missing_since:
+            missing_since[tool] = _utc_iso(now)
+            inv_changed = True
+
+    grace_seconds = INVENTORY_GRACE_DAYS * 86400.0
+    expired = sorted(
+        tool for tool in missing_now
+        if (first := _parse_utc_iso(missing_since.get(tool))) is not None
+        and (now - first) >= grace_seconds
+    )
+
+    state_changed = False
+    for tool in expired:
+        state, pruned = learned.prune_tool(state, tool)
+        if pruned:
+            state_changed = True
+            logger.info(
+                "tool-belt: pruned vanished tool %r from learned state "
+                "(absent from the install's registry for %d+ days)",
+                tool, INVENTORY_GRACE_DAYS,
+            )
+        if tool in pins:
+            remover = config_pin_remover or default_config_pin_remover
+            try:
+                if remover(tool):
+                    logger.info(
+                        "tool-belt: removed stale always_carry config pin %r "
+                        "(tool absent from the install's registry for %d+ days)",
+                        tool, INVENTORY_GRACE_DAYS,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "tool-belt: could not remove stale config pin %r via the "
+                    "config-write machinery (%s) — skipped, will retry on a "
+                    "later pass", tool, exc,
+                )
+                continue  # keep the clock so a later pass retries the pin
+            # Keep the in-memory plugin config consistent for the rest of
+            # this process (the on-disk source of truth was just edited).
+            try:
+                raw = plugin_config.get("always_carry")
+                if isinstance(raw, list) and tool in raw:
+                    plugin_config["always_carry"] = [t for t in raw if t != tool]
+                channels = plugin_config.get("channels")
+                if isinstance(channels, dict):
+                    for cfg in channels.values():
+                        if isinstance(cfg, dict) and isinstance(cfg.get("always_carry"), list) \
+                                and tool in cfg["always_carry"]:
+                            cfg["always_carry"] = [t for t in cfg["always_carry"] if t != tool]
+            except Exception:
+                pass
+        del missing_since[tool]
+        inv_changed = True
+        summary["pruned"].append(tool)
+
+    summary["tracking"] = sorted(missing_since)
+
+    if state_changed:
+        learned.write_state(state, learned_path)
+    if inv_changed:
+        _write_inventory(state_dir, {"missing_since": missing_since})
+    return summary
+
+
 # ─── In-process auto-shape engine ───────────────────────────────────────────
 
 def _coerce_bool(value: Any, default: bool = True) -> bool:
@@ -638,6 +957,16 @@ def auto_shape_run(
         return summary
 
     sd = Path(state_dir) if state_dir is not None else default_state_dir()
+
+    # Promise #4: inventory reconciliation runs on every auto pass (before the
+    # evidence gates — cleanup is due even when no new telemetry landed).
+    # Fail-open: a reconciliation problem never blocks shaping.
+    try:
+        summary["inventory"] = reconcile_inventory(plugin_config, sd, now=now)
+    except Exception as exc:
+        logger.warning("tool-belt: inventory reconciliation failed (fail-open): %s", exc)
+        summary["inventory"] = {"status": "error"}
+
     preds = load_jsonl(sd / "predictions.jsonl")
     if not preds:
         summary["reason"] = "no_predictions"

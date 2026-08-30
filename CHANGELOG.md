@@ -45,6 +45,22 @@ The initial public capabilities of the plugin:
   into the shared package module `shaping.py`, with
   `scripts/shape-ceiling.py` remaining as the CLI wrapper (flags, porcelain
   JSON, and human output unchanged).
+- **Automatic inventory reconciliation.** The session-end auto pass now
+  reconciles learned state and config pins against the install's tool
+  REGISTRY (absence from one scope's platform ceiling is not "missing" —
+  the tool may be live on another platform). A referenced tool absent from
+  the registry has its first observed absence tracked
+  (`state/tool-belt/inventory.json`); after a 7-day grace it is pruned
+  automatically from `learned.json` (carry/expand-only assignments, shaping
+  evidence, trigger-overlay entries) and from `always_carry` config pins —
+  the config edit goes through Hermes' own config-write machinery
+  (in-process, atomic; a machinery failure logs a warning and skips, never
+  propagates), with one INFO line per removal. A tool that reappears within
+  the grace resets the clock; after cleanup a reappearing tool starts a
+  fresh journey — carried, per the full-start contract (newly added tools
+  need no special handling for the same reason, now regression-locked for
+  already-shaped scopes). Fail-open throughout: no resolvable registry
+  means no reconciliation.
 - **`hermes tool-belt ...` subcommand.** `register(ctx)` now calls Hermes' `ctx.register_cli_command()`, so `hermes tool-belt savings` and `hermes tool-belt configure` work alongside the bare `tool-belt` launcher. Flags are forwarded verbatim to the same `savings_cli` entry point the launcher execs, so the two invocation forms cannot drift. Registration is optional and fail-open: on a Hermes without `register_cli_command`, the tool and hooks register exactly as before.
 - **Canonical savings CLI (`tool-belt savings`).** Reports observed and counterfactual token savings across all enabled agents or one selected agent, with deterministic JSON, full-schema replay, confidence-aware percentages, and dollars only for provably metered routes. The launcher honors `HERMES_PYTHON` and the local Hermes environment without importing runtime hooks. The session-input percentage is shown only against provider-reported usage; when historical sessions predate telemetry, only the explicitly-labeled schema-only reduction is shown (reconstructed context omits tool results, system prompt, and per-API-call accumulation, so it never backs a percentage).
 - **Guided onboarding (`scripts/configure.py`).** One command from install to a

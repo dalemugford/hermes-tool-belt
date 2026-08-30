@@ -402,6 +402,74 @@ def reset_scope(state: dict[str, Any], scope: str) -> tuple[dict[str, Any], bool
     return new_state, changed
 
 
+def prune_tool(state: dict[str, Any], tool: str) -> tuple[dict[str, Any], bool]:
+    """Remove every learned reference to ``tool`` across all scopes, in memory.
+
+    Promise #4 (inventory reconciliation): a tool that has vanished from the
+    install's registry is cleaned out of learned state after the grace period.
+    Removes the tool from each scope's ``carry`` / ``expand_only`` lists, from
+    the recorded ``shaping`` promote/demote evidence rows, and from learned
+    trigger-overlay entries (an overlay entry whose ``tools`` list empties is
+    dropped entirely). Other tools, scopes, and metadata are untouched.
+    Returns ``(new_state, changed)``; no write happens here.
+    """
+    if not isinstance(state, dict):
+        return {}, False
+    tool = str(tool or "").strip()
+    scopes_in = state.get("scopes")
+    if not tool or not isinstance(scopes_in, dict):
+        return state, False
+
+    changed = False
+    new_scopes: dict[str, Any] = {}
+    for scope, entry in scopes_in.items():
+        if not isinstance(entry, dict):
+            new_scopes[scope] = entry
+            continue
+        new_entry = dict(entry)
+        for key in ("carry", "expand_only", "always_on", "always_off"):
+            values = new_entry.get(key)
+            if isinstance(values, list) and tool in values:
+                new_entry[key] = [t for t in values if t != tool]
+                changed = True
+        shaping = new_entry.get("shaping")
+        if isinstance(shaping, dict):
+            new_shaping = dict(shaping)
+            for key in ("promote", "demote"):
+                rows = new_shaping.get(key)
+                if isinstance(rows, list):
+                    kept = [r for r in rows
+                            if not (isinstance(r, dict) and r.get("tool") == tool)]
+                    if len(kept) != len(rows):
+                        new_shaping[key] = kept
+                        changed = True
+            new_entry["shaping"] = new_shaping
+        overlay = new_entry.get("triggers")
+        if isinstance(overlay, list):
+            kept_overlay: list[Any] = []
+            for group in overlay:
+                if isinstance(group, dict) and isinstance(group.get("tools"), list) \
+                        and tool in group["tools"]:
+                    remaining = [t for t in group["tools"] if t != tool]
+                    changed = True
+                    if remaining:
+                        g = dict(group)
+                        g["tools"] = remaining
+                        kept_overlay.append(g)
+                    # else: the overlay entry only activated the vanished tool
+                    # — drop it entirely.
+                else:
+                    kept_overlay.append(group)
+            new_entry["triggers"] = kept_overlay
+        new_scopes[scope] = new_entry
+
+    if not changed:
+        return state, False
+    new_state = dict(state)
+    new_state["scopes"] = new_scopes
+    return new_state, True
+
+
 def scope_state(state: dict[str, Any], scope: str) -> tuple[str, dict[str, Any]]:
     scopes = state.get("scopes") or {}
     if not isinstance(scopes, dict):
