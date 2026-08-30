@@ -145,8 +145,9 @@ def render_text(report: _savings.SavingsReport) -> str:
         out.append("  PER AGENT")
         for a in measured:
             obs = a.observed
+            name = a.display_name or a.agent
             out.append(
-                f"    {a.agent:<12} {_fmt_int(obs.net_token_reduction):>12} tok"
+                f"    {name:<12} {_fmt_int(obs.net_token_reduction):>12} tok"
                 f"   {obs.n_sessions} session(s)"
             )
         out.append("")
@@ -158,7 +159,8 @@ def render_text(report: _savings.SavingsReport) -> str:
     for a in unmeasured:
         out.append("")
         out.append(
-            f"  {a.agent}: no measured traffic yet — estimate from session history:"
+            f"  {a.display_name or a.agent}: no measured traffic yet — "
+            "estimate from session history:"
         )
         _render_projection(out, a.projected, indent="    ")
 

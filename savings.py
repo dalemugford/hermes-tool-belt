@@ -209,6 +209,27 @@ class AgentLocation:
     sessions_dir: Path       # <profile_home>/sessions
 
 
+def agent_display_name(profile_home: Path, fallback: str) -> str:
+    """Human name for a profile in reports.
+
+    Prefers the plugin config's own ``plugins.tool-belt.agent`` (the scope
+    agent name, e.g. ``bernard`` on a root profile whose directory identity is
+    ``default``); falls back to the profile name. Display-only — JSON output
+    and telemetry keep the canonical profile name.
+    """
+    config_path = profile_home / "config.yaml"
+    try:
+        import yaml
+
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        name = ((raw.get("plugins") or {}).get("tool-belt") or {}).get("agent")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    except Exception:
+        pass
+    return fallback
+
+
 def _tool_belt_explicitly_disabled(profile_home: Path) -> bool:
     """Return True only when profile config explicitly disables Tool Belt.
 
@@ -1357,6 +1378,9 @@ class AgentSavings:
     platforms: list[str]
     observed: ObservedCohort
     projected: ProjectedCohort
+    #: Human name for text rendering (config's scope agent name when set);
+    #: JSON keeps the canonical profile name in ``agent``.
+    display_name: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -1480,6 +1504,7 @@ def compute(
             platforms=scopes,
             observed=observed,
             projected=projected,
+            display_name=agent_display_name(loc.profile_home, loc.agent),
         ))
 
     return SavingsReport(
