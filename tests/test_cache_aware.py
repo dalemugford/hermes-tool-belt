@@ -952,3 +952,11 @@ class TokenEstimatorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def tearDownModule():
+    # This module's config seeders clear-and-replace the module _CONFIG; put
+    # the pristine in-code defaults back so later files see the real deploy
+    # state (hygiene debt found by the Tier-0 rebuild).
+    plugin._CONFIG.clear()
+    plugin._CONFIG.update(conftest.PRISTINE_CONFIG)

@@ -117,99 +117,22 @@ ALWAYS_CARRY = frozenset(
      "tool_search", "tool_describe", "tool_call"}
 )
 
-_EXPECTED_SIGNATURE = (
-    "carrying.resolve(enabled, always_carry, carry, triggered=(), expanded=(), "
-    "passthrough=(), prior_active=()) -> "
-    ".always_carry/.carry/.expand_only/.active/.passthrough/.warnings"
-)
-_MISSING_API_MSG = (
-    "v2 carrying-model API not implemented. Expected " + _EXPECTED_SIGNATURE + ". "
-    "This contract test is red until the Tool Belt 1.0 carrying partition ships."
-)
+# ─── Strict access to the shipped v2 surface ───────────────────────────────
+# The red-TDD lazy resolver and tolerant field aliases are retired: the API
+# shipped (carrying.resolve → CarryingModel). Aliases could mask a rename —
+# a renamed field must FAIL these contracts, not silently fall back.
 
-
-# ─── Lazy resolution of the expected v2 surface ────────────────────────────
-# We look in the documented home first, then a couple of plausible fallbacks,
-# so the contract pins BEHAVIOR rather than module layout. When nothing is
-# found the caller fails the test with a descriptive message.
-
-def _first_callable(candidates):
-    for modname, attrs in candidates:
-        try:
-            mod = importlib.import_module(modname)
-        except Exception:
-            continue
-        for attr in attrs:
-            fn = getattr(mod, attr, None)
-            if callable(fn):
-                return fn
-    return None
-
-
-def _resolve_carrying_api():
-    return _first_callable([
-        ("tool_belt_plugin.carrying", ("resolve", "resolve_carrying", "carrying_model")),
-        ("tool_belt_plugin", ("resolve_carrying", "carrying_model", "carrying_resolve")),
-        ("tool_belt_plugin.predictor", ("resolve_carrying", "carrying_model")),
-        ("tool_belt_plugin.presets", ("resolve_carrying", "carrying_model")),
-    ])
-
-
-def _resolve_learned_v2_normalizer():
-    return _first_callable([
-        ("tool_belt_plugin.learned", ("normalize_state", "normalize_to_v2", "to_v2")),
-        ("tool_belt_plugin.carrying", ("normalize_learned", "normalize_learned_state")),
-    ])
-
-
-def _resolve_telemetry_normalizer():
-    return _first_callable([
-        ("tool_belt_plugin.logger_io",
-         ("normalize_prediction_row", "normalize_row", "upgrade_row", "to_v2_row")),
-        ("tool_belt_plugin.analyze",
-         ("normalize_prediction_row", "normalize_row", "normalize_telemetry_row", "to_v2_row")),
-        ("tool_belt_plugin.carrying", ("normalize_telemetry_row", "normalize_row")),
-    ])
-
-
-# ─── Tolerant accessors over the (not-yet-defined) result shape ────────────
-
-def _get(result, *names):
-    """Read a field from a dict / namedtuple / dataclass-ish result."""
-    for name in names:
-        if isinstance(result, dict):
-            if name in result:
-                return result[name]
-        elif hasattr(result, name):
-            return getattr(result, name)
-    return None
-
-
-def _as_set(value):
-    """Coerce a name-collection to a set; leave a lone string as one name."""
-    if value is None:
-        return None
-    if isinstance(value, (set, frozenset)):
-        return set(value)
-    if isinstance(value, str):
-        return {value}
-    try:
-        return set(value)
-    except TypeError:
-        return None
-
+from tool_belt_plugin import carrying as _carrying_mod
+from tool_belt_plugin import logger_io as _logger_io_mod
 
 _Model = namedtuple("_Model", "A C X active passthrough warnings")
 
 
 def _read_model(raw):
     return _Model(
-        A=_as_set(_get(raw, "always_carry", "A")),
-        C=_as_set(_get(raw, "carry", "C")),
-        X=_as_set(_get(raw, "expand_only", "X", "expand")),
-        active=_as_set(_get(raw, "active", "active_tools", "allowed", "allowed_tool_names")),
-        passthrough=_as_set(_get(raw, "passthrough", "mcp_passthrough", "pass_through")),
-        warnings=_get(raw, "warnings", "warns", "warning"),
+        A=set(raw.always_carry), C=set(raw.carry), X=set(raw.expand_only),
+        active=set(raw.active), passthrough=set(raw.passthrough),
+        warnings=list(raw.warnings),
     )
 
 
@@ -265,16 +188,7 @@ class _CarryingContract(unittest.TestCase):
     """Base class: resolve the v2 partition API and normalize its result."""
 
     def _resolve_raw(self, **kwargs):
-        fn = _resolve_carrying_api()
-        if fn is None:
-            self.fail(_MISSING_API_MSG)
-        try:
-            return fn(**kwargs)
-        except TypeError as exc:
-            self.fail(
-                "v2 carrying API does not match the contract signature: "
-                f"{exc}\nExpected: {_EXPECTED_SIGNATURE}"
-            )
+        return _carrying_mod.resolve(**kwargs)
 
     def resolve(self, *, enabled, always_carry, carry, demoted=(), triggered=(),
                 expanded=(), passthrough=(), prior_active=()):
@@ -551,17 +465,11 @@ class LearnedV1NormalizationContract(unittest.TestCase):
 
             # Missing v2 behavior: a v1 document normalizes into the v2 shape
             # in memory (not discarded), mapping old always_on -> carry residency.
-            normalize = _resolve_learned_v2_normalizer()
-            if normalize is None:
-                self.fail(
-                    "v2 learned-state normalizer not implemented (expected e.g. "
-                    "tool_belt_plugin.learned.normalize_state(doc) -> v2 dict)"
-                )
-            v2 = normalize(v1_doc)
-            self.assertEqual(_get(v2, "version"), 2,
+            v2 = learned_mod.normalize_state(v1_doc)
+            self.assertEqual(v2.get("version"), 2,
                              "v1 learned state normalizes to v2 in memory")
-            scope = (_get(v2, "scopes") or {}).get("assistant-a:telegram") or {}
-            self.assertIn("web_extract", _as_set(_get(scope, "carry")) or set(),
+            scope = (v2.get("scopes") or {}).get("assistant-a:telegram") or {}
+            self.assertIn("web_extract", set(scope.get("carry") or ()),
                           "a v1 always_on entry becomes a v2 'carry' resident")
 
 

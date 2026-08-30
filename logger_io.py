@@ -427,13 +427,34 @@ def estimate_tokens(payload: Any) -> int:
         text = json.dumps(payload, ensure_ascii=False)
     except Exception:
         return 0
+    # Savings replay tokenizes the same schema lists thousands of times (one
+    # per turn, mostly identical) — memoize by content. Bounded: drop the
+    # oldest half when full.
     encoder, _ = _get_encoder()
+    # Estimator identity is part of the key: a count must never be served
+    # under a different estimator than the one that produced it (rows stamp
+    # tokens_estimator — the honesty contract).
+    key = (b"\x01" if encoder is not None else b"\x00") + hashlib.sha1(
+        text.encode("utf-8", errors="replace")).digest()
+    cached = _ESTIMATE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    tokens = None
     if encoder is not None:
         try:
-            return len(encoder.encode(text))
+            tokens = len(encoder.encode(text))
         except Exception:
             pass  # fall through to char heuristic
-    return max(0, len(text) // 4)
+    if tokens is None:
+        tokens = max(0, len(text) // 4)
+    if len(_ESTIMATE_CACHE) >= 4096:
+        for stale in list(_ESTIMATE_CACHE)[:2048]:
+            _ESTIMATE_CACHE.pop(stale, None)
+    _ESTIMATE_CACHE[key] = tokens
+    return tokens
+
+
+_ESTIMATE_CACHE: dict[bytes, int] = {}
 
 
 def _string_list(value: Any) -> list[str] | None:

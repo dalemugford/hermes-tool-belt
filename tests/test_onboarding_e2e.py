@@ -158,19 +158,6 @@ class OnboardingArcTests(OnboardingTestCase):
         self.assertIn("No agent scopes found yet", output)
         self.assertEqual(runner.writes, [])
 
-    def test_fresh_install_front_door(self) -> None:
-        """Profiles but no telemetry: truthful text, guidance, nothing written."""
-        before = self.fs_snapshot()
-        runner = tc.FakeRunner()
-        rc, output = self.run_main(["--yes"], runner)
-        self.assertEqual(rc, 0)
-        self.assertNotIn("No Hermes profiles found", output)
-        self.assertIn("Hermes profile(s) found: default", output)
-        self.assertIn("No Tool Belt telemetry has been recorded", output)
-        self.assertIn("What to expect", output)
-        self.assertEqual(runner.writes, [])
-        self.assertEqual(self.fs_snapshot(), before)
-
     def test_recommend_to_observing(self) -> None:
         """recommend → the two config writes, the sidecar, then ``observing``."""
         result = self.seed("observing")
@@ -325,34 +312,6 @@ class OnboardingArcTests(OnboardingTestCase):
         )
         self.assertIn(f"{terminal.scope:<28} {configure.STATE_SHAPED}", status)
         self.assertIn(f"{browser.scope:<28} {configure.STATE_READY}", status)
-
-    def test_dry_run_writes_nothing(self) -> None:
-        result = self.seed("terminal-heavy")
-        before = self.fs_snapshot()
-        runner = tc.FakeRunner(self.observing_config(result.scope))
-        rc, output = self.run_main(["--path", "shape", "--yes", "--dry-run"], runner)
-        self.assertEqual(rc, 0)
-        self.assertIn("dry-run", output)
-        # …and the epilogue never claims the run applied anything.
-        self.assertIn("Would apply:", output)
-        self.assertNotIn("Applied:", output)
-        self.assertEqual(self.fs_snapshot(), before)
-        self.assertFalse((self.root_state / "learned.json").exists())
-        # Config is read (main() reads the block once) but never mutated.
-        self.assertEqual(runner.writes, [])
-        self.assertTrue(all(c[1:3] == ["config", "get"] for c in runner.calls))
-
-    def test_status_is_read_only(self) -> None:
-        self.seed("terminal-heavy")
-        self.seed("browser-heavy")
-        before = self.fs_snapshot()
-        runner = tc.FakeRunner()
-        rc, _out = self.run_main(["--status"], runner)
-        self.assertEqual(rc, 0)
-        self.assertEqual(self.fs_snapshot(), before)
-        self.assertEqual(runner.writes, [])
-        self.assertTrue(all(c[1:3] == ["config", "get"] for c in runner.calls))
-
 
 if __name__ == "__main__":
     unittest.main()

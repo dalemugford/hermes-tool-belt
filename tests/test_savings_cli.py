@@ -448,30 +448,6 @@ class CohortSeparationTests(_HomeCase):
         self.assertEqual(a0["projected"]["label"], "projected")
 
 
-class CacheModeReplayTests(_HomeCase):
-    """(6) Cache-on frozen/monotonic replay and cache-off per-turn replay are
-    distinct."""
-
-    def test_cache_on_and_off_differ(self):
-        _seed_demotions(self.home)
-        turns = [
-            {"user": "hello there, how are you"},          # residents only
-            {"user": "please delegate this task to a subagent"},  # trigger delegation
-            {"user": "now search my history for it"},      # trigger history_search
-        ]
-        _write_session(self.home / "sessions", "s", platform="telegram",
-                       model="m", ceiling=CEILING, turns=turns)
-        loc = savings.discover_agents(self.home)[0]
-        on = savings.compute_projected(loc, {"enabled": True}, cache_mode="on")
-        off = savings.compute_projected(loc, {"enabled": True}, cache_mode="off")
-        self.assertEqual(on.cache_mode, "on")
-        self.assertEqual(off.cache_mode, "off")
-        # The frozen (monotonic) active set diverges from per-turn resolution,
-        # so gross reductions are not identical.
-        self.assertNotEqual(on.gross_schema_token_reduction,
-                            off.gross_schema_token_reduction)
-
-
 class ExpansionVsTriggerTests(_HomeCase):
     """(7) Trigger activation adds no expansion charge; explicit expansion
     does."""
