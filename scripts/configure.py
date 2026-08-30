@@ -730,6 +730,8 @@ def compute_recommendations(info: ScopeInfo, thresholds: dict[str, int]) -> dict
         demote_k=float(thresholds.get("demote_k", 2.0)),
         schema_sizes=shaper.load_schema_sizes(info.state_dir),
         cache_mode=shaper.read_cache_mode(info.state_dir, info.scope),
+        api_call_counts=shaper.index_api_call_counts(
+            shaper.load_jsonl(info.state_dir / "api_calls.jsonl")),
     )
 
 

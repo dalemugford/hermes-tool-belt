@@ -250,18 +250,24 @@ Demote evidence — the economic test (token-denominated by design; the
 decision never consults a price table, because fewer tokens is always
 cheaper on every route):
 
+`expand_tools` is sticky — expand once and the tool rides carried for the
+rest of the session — so a session *with* use costs about the same either
+way, plus one round-trip. Demotion only saves in sessions *without* use:
+
 ```
-carry_tokens  = schema_size(tool) × billable manifest exposures
-demote_tokens = non-trigger uses × 1500   (expand_tools round-trip)
-demote when carry_tokens > demote_k × demote_tokens
+saving  = schema_size(tool) × billable exposures in sessions WITHOUT use
+penalty = 1500 × sessions WITH use        (one expand_tools round-trip each)
+demote when saving > demote_k × penalty
+promote when penalty > saving             (after the anti-flap gates)
 ```
 
 - Per-tool schema sizes come from the `schema_sizes.json` sidecar
   (snapshotted in-process, since only the live gateway sees real tool
   definitions); unmeasured tools fall back to a 388-token average.
 - Billable exposures depend on the scope's locked prompt-cache mode:
-  cache **off** pays the manifest on every API call, cache **on** (or
-  unknown) roughly once per session — the conservative read.
+  cache **off** pays the manifest on every API call (counted per
+  prediction from `api_calls.jsonl`, min 1), cache **on** (or unknown)
+  roughly once per session — the conservative read.
 - Trigger-activated uses don't defend a carry slot: they stay free for a
   demoted tool.
 - A tool with zero uses is the limit case (`demote_tokens = 0`) — it

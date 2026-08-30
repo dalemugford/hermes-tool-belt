@@ -135,6 +135,7 @@ compute_scope_recommendations = _shaping.compute_scope_recommendations
 merge_into_learned = _shaping.merge_into_learned
 load_schema_sizes = _shaping.load_schema_sizes
 read_cache_mode = _shaping.read_cache_mode
+index_api_call_counts = _shaping.index_api_call_counts
 
 
 def _activation_hint(scopes: list[str]) -> str:
@@ -293,6 +294,7 @@ def main() -> int:
     grouped = group_predictions_by_scope_session(preds)
     calls_by_pred = index_tool_calls_by_prediction(tool_calls)
     schema_sizes = load_schema_sizes(state_dir)
+    api_counts = index_api_call_counts(load_jsonl(state_dir / "api_calls.jsonl"))
 
     per_scope: dict[str, dict[str, Any]] = {}
     for scope, sessions in grouped.items():
@@ -309,6 +311,7 @@ def main() -> int:
             demote_k=args.demote_k,
             schema_sizes=schema_sizes,
             cache_mode=read_cache_mode(state_dir, scope),
+            api_call_counts=api_counts,
         )
 
     if not per_scope:
@@ -333,10 +336,11 @@ def main() -> int:
             for d in recs["demote"]:
                 econ = ""
                 if "carry_tokens" in d:
-                    econ = (f"  carry≈{d['carry_tokens']}tok vs"
-                            f" expand≈{d['demote_tokens']}tok (k={d.get('k')})")
-                print(f"    - {d['tool']:<30} uses_in_window={d.get('uses_in_window', 0)}"
-                      f"  evidence={d['evidence']}{econ}", file=out)
+                    econ = (f"  saves≈{d['carry_tokens']}tok vs"
+                            f" ≈{d['demote_tokens']}tok in round-trips (k={d.get('k')})")
+                print(f"    - {d['tool']:<30} used_in={d.get('sessions_with_use', 0)}/"
+                      f"{d.get('sessions_with_use', 0) + d.get('sessions_without_use', 0)}"
+                      f" sessions  evidence={d['evidence']}{econ}", file=out)
         elif recs["sessions_considered"] < args.demote_min_sessions:
             print(f"  Demote: (skipped — only {recs['sessions_considered']} sessions, need ≥{args.demote_min_sessions})", file=out)
         else:

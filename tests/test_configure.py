@@ -323,7 +323,10 @@ class ReShapePreviewTests(TempHomeTestCase):
             sessions=self.needed,
             always_on=["web_search", "read_file"],
             expanded_tool="terminal",
-            expanded_sessions=3,
+            # Expanded in most sessions so the economic test decisively
+            # favors carrying (penalty 1500/session-with-use far exceeds
+            # the schema cost of the few unused sessions).
+            expanded_sessions=12,
             expanded_calls_each=2,
         )
         # An overlay that a previous shaping left behind: one adaptive resident
@@ -399,7 +402,10 @@ class WriteDisclosureTests(TempHomeTestCase):
             sessions=self.needed,
             always_on=["web_search", "read_file"],
             expanded_tool="terminal",
-            expanded_sessions=3,
+            # Expanded in most sessions so the economic test decisively
+            # favors carrying (penalty 1500/session-with-use far exceeds
+            # the schema cost of the few unused sessions).
+            expanded_sessions=12,
             expanded_calls_each=2,
         )
         return configure.discover_scopes(self.home)[0]
@@ -527,7 +533,10 @@ class ApplyFlowTests(TempHomeTestCase):
             sessions=self.needed,
             always_on=["web_search", "read_file"],
             expanded_tool="terminal",
-            expanded_sessions=3,
+            # Expanded in most sessions so the economic test decisively
+            # favors carrying (penalty 1500/session-with-use far exceeds
+            # the schema cost of the few unused sessions).
+            expanded_sessions=12,
             expanded_calls_each=2,
         )
         infos = configure.discover_scopes(self.home)
@@ -574,7 +583,10 @@ class ApplyFlowTests(TempHomeTestCase):
             sessions=self.needed,
             always_on=["web_search"],
             expanded_tool="terminal",
-            expanded_sessions=3,
+            # Expanded in most sessions so the economic test decisively
+            # favors carrying (penalty 1500/session-with-use far exceeds
+            # the schema cost of the few unused sessions).
+            expanded_sessions=12,
             expanded_calls_each=2,
         )
         info = next(i for i in configure.discover_scopes(self.home) if i.agent == "assistant-a")
@@ -637,7 +649,10 @@ class ResetFlowTests(TempHomeTestCase):
             sessions=self.needed,
             always_on=["web_search"],
             expanded_tool="terminal",
-            expanded_sessions=3,
+            # Expanded in most sessions so the economic test decisively
+            # favors carrying (penalty 1500/session-with-use far exceeds
+            # the schema cost of the few unused sessions).
+            expanded_sessions=12,
             expanded_calls_each=2,
         )
         info = configure.discover_scopes(self.home)[0]
@@ -731,7 +746,10 @@ class DryRunTests(TempHomeTestCase):
             sessions=self.needed,
             always_on=["web_search"],
             expanded_tool="terminal",
-            expanded_sessions=3,
+            # Expanded in most sessions so the economic test decisively
+            # favors carrying (penalty 1500/session-with-use far exceeds
+            # the schema cost of the few unused sessions).
+            expanded_sessions=12,
             expanded_calls_each=2,
         )
         return configure.discover_scopes(self.home)[0]
@@ -790,7 +808,10 @@ class MainEntryPointTests(TempHomeTestCase):
             sessions=self.needed,
             always_on=["web_search"],
             expanded_tool="terminal",
-            expanded_sessions=3,
+            # Expanded in most sessions so the economic test decisively
+            # favors carrying (penalty 1500/session-with-use far exceeds
+            # the schema cost of the few unused sessions).
+            expanded_sessions=12,
             expanded_calls_each=2,
         )
 
@@ -945,7 +966,10 @@ class DegradedModeTests(TempHomeTestCase):
             sessions=self.needed,
             always_on=["web_search"],
             expanded_tool="terminal",
-            expanded_sessions=3,
+            # Expanded in most sessions so the economic test decisively
+            # favors carrying (penalty 1500/session-with-use far exceeds
+            # the schema cost of the few unused sessions).
+            expanded_sessions=12,
             expanded_calls_each=2,
         )
 
