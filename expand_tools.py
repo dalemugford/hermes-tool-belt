@@ -413,6 +413,11 @@ def _handle_inner(args: dict, prediction_cv: Any, sticky_refresh_fn: Any = None)
     expansions.add(category)  # also store the category name itself
     expansions.update(activatable)
 
+    # Cache-on sessions carry no sticky key (the frozen expansion set is
+    # monotonic for the whole session); cache-off sessions do. This drives
+    # honest persistence wording below.
+    cache_on_session = not str(state.get("sticky_key") or "")
+
     expand_event = {
         "category": category,
         "resolved_tools": resolved,
@@ -455,10 +460,16 @@ def _handle_inner(args: dict, prediction_cv: Any, sticky_refresh_fn: Any = None)
         "already_available_tools": already_available_tools,
         "unavailable_tools": unavailable_tools,
         "message": _success_message(
-            category, new_additions, already_available_tools, unavailable_tools
+            category, new_additions, already_available_tools, unavailable_tools,
+            cache_on=cache_on_session,
         ),
     }
-    if sticky_event is not None:
+    # Sticky residency is a cache-off mechanism. On a cache-on session the
+    # expansion set is frozen monotonically for the whole session, so a
+    # ``sticky: {enabled: false}`` block would misstate what persists — the
+    # message carries the honest "persists for this session" wording instead
+    # and the sticky block is omitted (it stays in the telemetry event).
+    if sticky_event is not None and not cache_on_session:
         response["sticky"] = sticky_event
     return json.dumps(response)
 
@@ -468,15 +479,29 @@ def _success_message(
     new_additions: list[str],
     already_available: list[str],
     unavailable: list[str] | None = None,
+    cache_on: bool = False,
 ) -> str:
-    """Compose a message that matches what actually happened."""
+    """Compose a message that matches what actually happened.
+
+    Ceiling-excluded tools are named for what they are: the operator's
+    ``platform_toolsets`` ceiling excluded them from this scope, which Tool
+    Belt cannot restore — only a Hermes config change can. Persistence
+    wording is honest per cache mode: cache-on expansions persist for the
+    session (the frozen set is monotonic); cache-off persistence is the
+    sticky-residency mechanism, reported via the ``sticky`` block.
+    """
     unavailable = unavailable or []
     unavailable_note = ""
     if unavailable:
         unavailable_note = (
-            f" {len(unavailable)} tool(s) in {category!r} are not enabled for "
-            "this scope and could not be loaded."
+            f" {len(unavailable)} tool(s) in {category!r} are excluded from "
+            "this scope by the operator's `platform_toolsets` ceiling — Tool "
+            "Belt cannot restore them; enabling them requires a Hermes "
+            "config change."
         )
+    persist_note = (
+        " This expansion persists for this session." if cache_on else ""
+    )
     if not new_additions and already_available:
         return (
             f"Category {category!r} was already loaded "
@@ -485,16 +510,16 @@ def _success_message(
         )
     if not new_additions and unavailable:
         return (
-            f"No tools from category {category!r} could be loaded — "
-            f"{len(unavailable)} resolved tool(s) are not enabled for this scope."
+            f"No tools from category {category!r} could be loaded —"
+            f"{unavailable_note}"
         )
     if new_additions and already_available:
         return (
             f"Loaded {len(new_additions)} new tool(s) from category {category!r} "
             f"({len(already_available)} were already available).{unavailable_note} "
-            "They're available on the next tool call."
+            f"They're available on the next tool call.{persist_note}"
         )
     return (
         f"Loaded {len(new_additions)} tool(s) from category {category!r}.{unavailable_note} "
-        "They're available on the next tool call."
+        f"They're available on the next tool call.{persist_note}"
     )

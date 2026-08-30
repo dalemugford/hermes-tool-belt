@@ -324,7 +324,10 @@ class CeilingGateTests(unittest.TestCase):
 
         self.assertEqual(payload["tools_added"], [])
         self.assertEqual(payload["unavailable_tools"], ["image_generate"])
-        self.assertIn("not enabled for this scope", payload["message"].lower())
+        # Wording contract (auto-management wave): name the cause (the
+        # operator's platform_toolsets ceiling) and its fixability.
+        self.assertIn("platform_toolsets", payload["message"])
+        self.assertIn("hermes config change", payload["message"].lower())
 
     def test_no_ceiling_captured_treats_all_as_activatable(self):
         # Backward-compatible path: state without enabled_ceiling gates nothing.
