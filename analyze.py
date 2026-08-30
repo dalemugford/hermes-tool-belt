@@ -37,7 +37,7 @@ except ImportError:  # script mode
     import savings as _savings  # type: ignore[no-redef]
     from yaml_required import require_yaml  # type: ignore[no-redef]
 
-DEFAULT_PER_TOOL_TOKENS = 388
+DEFAULT_PER_TOOL_TOKENS = logger_io.DEFAULT_PER_TOOL_TOKENS  # canonical home: logger_io
 DEFAULT_MIN_EXPANSIONS = 2
 DEFAULT_PROMOTE_EXPAND_RATE = 0.50
 DEFAULT_PROMOTE_USE_RATE = 0.80

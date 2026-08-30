@@ -88,6 +88,122 @@ def api_calls_path() -> Path:
     return _state_dir() / "api_calls.jsonl"
 
 
+# ── Per-tool schema size sidecar ─────────────────────────────────────────────
+# The shaper's economic demotion test needs each tool's actual schema size in
+# tokens. Live tool definitions only exist in-process (the offline shaper CLI
+# has no registry), so the hot path snapshots them here, debounced. Token-
+# denominated by design: fewer tokens is always cheaper on every route, so the
+# decision never consults a price table.
+
+#: Average per-tool schema size (tokens) — the fallback for tools with no
+#: measured entry in the sidecar. Canonical home; analyze.py re-exports it.
+DEFAULT_PER_TOOL_TOKENS = 388
+
+SCHEMA_SIZES_FILENAME = "schema_sizes.json"
+SCHEMA_SIZES_DOC_VERSION = 1
+#: Refresh at most this often per process — the snapshot is stable between
+#: registry changes, and per-tool tokenization is not free on the hot path.
+SCHEMA_SIZES_REFRESH_SECONDS = 3600.0
+
+
+def schema_sizes_path() -> Path:
+    return _state_dir() / SCHEMA_SIZES_FILENAME
+
+
+def _sidecar_tool_name(tool: Any) -> str:
+    """Canonical tool name from Anthropic or OpenAI schema shapes."""
+    if not isinstance(tool, dict):
+        return ""
+    name = tool.get("name") or (tool.get("function", {}) or {}).get("name", "")
+    return str(name or "")
+
+
+def update_schema_sizes(
+    tools: list[Any],
+    path: Path | None = None,
+    now: float | None = None,
+) -> bool:
+    """Snapshot per-tool schema token sizes to ``schema_sizes.json``, debounced.
+
+    Merge semantics: tools in this ceiling overwrite their entry; tools absent
+    from it (another scope's tools, temporarily missing tools) keep their last
+    measured size — the sidecar converges on the install's full inventory.
+    Atomic write; returns True when a write happened. Never raises: sizing is
+    telemetry, not dispatch, and must not break the hot path.
+    """
+    try:
+        path = path or schema_sizes_path()
+        now = time.time() if now is None else now
+        sizes: dict[str, int] = {}
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                doc = json.load(fh)
+            # Debounce off the document's own measurement clock (mtime can
+            # differ from the injected ``now`` in tests and restores).
+            last = doc.get("measured_epoch")
+            if isinstance(last, (int, float)) and now - last < SCHEMA_SIZES_REFRESH_SECONDS:
+                return False
+            existing = doc.get("tools")
+            if isinstance(existing, dict):
+                sizes = {
+                    str(k): int(v) for k, v in existing.items()
+                    if isinstance(v, (int, float)) and v >= 0
+                }
+        except Exception:
+            sizes = {}
+        measured = 0
+        for tool in tools or []:
+            name = _sidecar_tool_name(tool)
+            if not name:
+                continue
+            tokens = estimate_tokens(tool)
+            if tokens > 0:
+                sizes[name] = tokens
+                measured += 1
+        if not measured:
+            return False
+        doc = {
+            "schema": "tool-belt/schema-sizes",
+            "version": SCHEMA_SIZES_DOC_VERSION,
+            "measured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+            "measured_epoch": now,
+            "estimator": token_estimator_name(),
+            "tools": dict(sorted(sizes.items())),
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(doc, fh, ensure_ascii=False, indent=1)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception as exc:  # pragma: no cover — telemetry must not break dispatch
+        logger.debug("tool-belt: schema-size snapshot failed: %s", exc)
+        return False
+
+
+def load_schema_sizes(state_dir: Path | None = None) -> dict[str, int]:
+    """Read the per-tool schema size snapshot; empty dict when absent/invalid.
+
+    Callers fall back to an average-size constant for tools with no measured
+    entry (``DEFAULT_PER_TOOL_TOKENS``).
+    """
+    path = (Path(state_dir) / SCHEMA_SIZES_FILENAME) if state_dir else schema_sizes_path()
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+        tools = doc.get("tools")
+        if isinstance(tools, dict):
+            return {
+                str(k): int(v) for k, v in tools.items()
+                if isinstance(v, (int, float)) and v > 0
+            }
+    except Exception:
+        pass
+    return {}
+
+
 def new_prediction_id() -> str:
     return uuid.uuid4().hex[:16]
 

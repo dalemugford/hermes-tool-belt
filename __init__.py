@@ -1205,6 +1205,10 @@ def _maybe_log_prediction(
             frozen_reuse_count=int(state.get("frozen_reuse_count", 0)),
         )
         logger_io.log_prediction(record)
+        # Per-tool schema size snapshot for the shaper's token-denominated
+        # demotion test. The ceiling defs only exist in-process; the sidecar
+        # write is debounced (1h) and never raises.
+        logger_io.update_schema_sizes(ceiling)
     except Exception as exc:
         logger.debug("tool-belt: log_prediction failed: %s", exc)
 
