@@ -110,9 +110,39 @@ def render_text(report: _savings.SavingsReport) -> str:
     total_sessions = sum(a.observed.n_sessions for a in measured)
     if measured:
         out.append("")
-        out.append(f"  NET TOKENS SAVED: {_fmt_int(total_net)}")
-        out.append(f"  measured across {total_sessions} session(s) of real traffic")
+        out.append(
+            f"  NET TOKENS SAVED: {_fmt_int(total_net)}"
+            f"  measured across {total_sessions} session(s) of real traffic."
+        )
+        per_session = total_net // total_sessions if total_sessions else 0
+        if per_session > 0:
+            out.append(
+                f"  Agent conversations use ≈{_fmt_int(per_session)} fewer"
+                " tokens with Tool Belt."
+            )
+        # Illustrative dollar equivalents at public input list prices. These
+        # are what the saved tokens would have billed on a metered API route —
+        # rates from PRICE_TABLE so the figure always carries its rate basis.
+        examples = [
+            ("OpenAI API", "gpt-5.5"),
+            ("Anthropic API", "claude-sonnet-4-6"),
+        ]
+        priced = [
+            (label, model, _savings.PRICE_TABLE[model]["input"])
+            for label, model in examples
+            if model in _savings.PRICE_TABLE
+        ]
+        if total_net > 0 and priced:
+            out.append("")
+            out.append(
+                f"  Estimated value at API list prices"
+                f" ({_savings.PRICE_TABLE_RATE_BASIS}, input rate):"
+            )
+            for label, model, rate in priced:
+                usd = total_net / 1_000_000 * rate
+                out.append(f"    {label:<16} ≈ ${usd:,.2f}  ({model})")
         out.append("")
+        out.append("  PER AGENT")
         for a in measured:
             obs = a.observed
             out.append(
