@@ -1115,7 +1115,7 @@ class ShaperMergeContract(unittest.TestCase):
             # "web" is a toolset/category, not a concrete enabled tool name.
             recs = self._recs(promote=["web", "web_extract"],
                               enabled=["web_extract", "clarify"])
-            with self.assertLogs("tool_belt_plugin.shape_ceiling", level="WARNING") as cm:
+            with self.assertLogs("tool_belt_plugin.shaping", level="WARNING") as cm:
                 shaper.merge_into_learned(tmp, {self.SCOPE: recs}, False)
             out = self._read(tmp)["scopes"][self.SCOPE]
             self.assertIn("web_extract", out["carry"])
@@ -1132,7 +1132,7 @@ class ShaperMergeContract(unittest.TestCase):
                 self.SCOPE: {"carry": [], "expand_only": []}}})
             recs = self._recs(promote=["web_extract"], demote=["read_file"],
                               enabled=[])  # empty enabled ceiling
-            with self.assertLogs("tool_belt_plugin.shape_ceiling", level="WARNING"):
+            with self.assertLogs("tool_belt_plugin.shaping", level="WARNING"):
                 shaper.merge_into_learned(tmp, {self.SCOPE: recs}, False)
             entry = self._read(tmp)["scopes"][self.SCOPE]
             # No candidate may enter a carrying list when nothing can be validated.

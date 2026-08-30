@@ -75,22 +75,17 @@ import importlib
 import importlib.util
 import json
 import logging
-import os
 import sys
 import time
-from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
-# Read every telemetry row through the centralized v1/v2 normalizer so the
-# shaper sees one canonical shape regardless of the on-disk schema version.
-# The normalizer also owns the residency reconstruction (``residency_inferred``)
-# the demote path depends on. Importing it puts the plugin dir on ``sys.path``
-# first; the module has no import-time relative deps, so it loads standalone.
+# The shaper's compute/merge implementation lives in the shared package module
+# ``shaping.py`` (loaded below via :func:`_load_shaping`); this script owns
+# only the CLI surface. Keeping the plugin dir on ``sys.path`` preserves the
+# historical standalone-import behavior for anything else loaded from here.
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PLUGIN_DIR))
-from logger_io import normalize_prediction_row, normalize_tool_call_row  # noqa: E402
-from yaml_required import require_yaml  # noqa: E402
 
 logger = logging.getLogger("tool_belt_plugin.shape_ceiling")
 
@@ -101,13 +96,15 @@ PORCELAIN_SCHEMA = "tool-belt/shape-ceiling"
 PORCELAIN_VERSION = 1
 
 
-def _load_learned():
-    """The plugin's ``learned`` module — sole owner of learned-state I/O.
+def _load_shaping():
+    """The shared shaping core — ``tool_belt_plugin.shaping``.
 
-    ``learned.py`` uses package-relative imports, so the hyphenated plugin
-    directory is registered as the ``tool_belt_plugin`` package first
-    (mirroring ``tests/conftest.py`` / ``configure.py`` so already-registered
-    module objects are reused).
+    The compute/merge implementation lives in the package module ``shaping.py``
+    (shared with the plugin runtime's in-process auto-shape engine); this
+    script is the CLI wrapper. ``shaping.py`` uses package-relative imports,
+    so the hyphenated plugin directory is registered as the
+    ``tool_belt_plugin`` package first (mirroring ``tests/conftest.py`` /
+    ``configure.py`` so already-registered module objects are reused).
     """
     name = "tool_belt_plugin"
     if name not in sys.modules:
@@ -121,417 +118,21 @@ def _load_learned():
         module = importlib.util.module_from_spec(spec)
         sys.modules[name] = module
         spec.loader.exec_module(module)
-    return importlib.import_module(f"{name}.learned")
-
-# The immutable always_carry surface is *never* a shaping target: shaping only
-# moves enabled built-ins between the adaptive ``carry`` and ``expand_only``
-# classes. always_carry is excluded from demotion by construction (candidates
-# are drawn only from the ``carry`` residency class, which the normalizer keeps
-# disjoint from always_carry) and pinned by an explicit assertion in
-# :func:`compute_scope_recommendations`.
-
-# Thresholds — conservative defaults that won't fire on noise.
-DEFAULTS = {
-    "session_window": 20,
-    "promote_min_sessions": 2,
-    "promote_min_calls": 3,
-    "demote_min_sessions_no_use": 20,
-}
-
-_POLICY_PATH = Path(__file__).resolve().parent.parent / "policy.yaml"
+    return importlib.import_module(f"{name}.shaping")
 
 
-def default_state_dir() -> Path:
-    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
-    return Path(home) / "state" / "tool-belt"
-
-
-def load_shape_ceiling_defaults(policy_path: Path = _POLICY_PATH) -> dict[str, int]:
-    """Load shaper defaults from ``policy.yaml``'s ``learning.shape_ceiling``.
-
-    PyYAML is required: :func:`yaml_required.require_yaml` exits loudly when
-    it is missing rather than degrading to a second, divergent parser. A
-    missing or malformed policy file still falls back to :data:`DEFAULTS` —
-    that is a policy-content question, not a wrong-interpreter one.
-    """
-    yaml = require_yaml()
-    try:
-        raw = policy_path.read_text(encoding="utf-8")
-    except Exception:
-        return dict(DEFAULTS)
-
-    try:
-        loaded = yaml.safe_load(raw) or {}
-    except Exception:
-        return dict(DEFAULTS)
-    if not isinstance(loaded, dict):
-        return dict(DEFAULTS)
-
-    learning = loaded.get("learning")
-    if isinstance(learning, dict):
-        shape = learning.get("shape_ceiling")
-        if isinstance(shape, dict):
-            return _merge_shape_defaults(shape)
-    return dict(DEFAULTS)
-
-
-def _merge_shape_defaults(overrides: dict[str, Any]) -> dict[str, int]:
-    merged = dict(DEFAULTS)
-    for key in ("session_window", "promote_min_sessions", "promote_min_calls", "demote_min_sessions_no_use"):
-        value = overrides.get(key)
-        if value is None:
-            continue
-        try:
-            parsed = int(value)
-        except Exception:
-            continue
-        if parsed > 0:
-            merged[key] = parsed
-    return merged
-
-
-def load_jsonl(path: Path) -> list[dict[str, Any]]:
-    if not path.exists():
-        return []
-    out: list[dict[str, Any]] = []
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                out.append(json.loads(line))
-            except Exception:
-                continue
-    return out
-
-
-def group_predictions_by_scope_session(
-    preds: list[dict[str, Any]],
-) -> dict[str, dict[str, list[dict[str, Any]]]]:
-    """Returns {scope: {session_id: [normalized preds-in-order]}}.
-
-    Every row is passed through :func:`normalize_prediction_row` first, so the
-    shaper works exclusively against the canonical v2 shape (``carry_tools``,
-    ``expand_only_tools``, ``residency`` / ``residency_inferred``, …). The
-    normalizer preserves the scope/session/prediction identity fields the
-    grouping reads, so v1, v2, and mixed streams group identically.
-    """
-    out: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
-    for raw in preds:
-        p = normalize_prediction_row(raw if isinstance(raw, dict) else {})
-        scope = str(p.get("scope") or "")
-        # Group by the Hermes internal session UUID, which rotates on /new,
-        # so a single long-lived chat yields the distinct-session count the
-        # demote threshold needs. Fall back to session_id (the session key)
-        # for older rows written before hermes_session_id existed.
-        sid = str(p.get("hermes_session_id") or p.get("session_id") or "")
-        if scope and sid:
-            out[scope][sid].append(p)
-    for scope, sessions in out.items():
-        for sid in sessions:
-            sessions[sid].sort(key=lambda p: p.get("ts", 0))
-    return out
-
-
-def index_tool_calls_by_prediction(tool_calls: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    """Index normalized tool-call rows by their ``prediction_id``.
-
-    Rows are normalized through :func:`normalize_tool_call_row` so the promote
-    path reads the canonical v2 expansion flags (``activated_by_expansion`` /
-    ``expansion_provided_access``) regardless of the on-disk version.
-    """
-    out: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for raw in tool_calls:
-        t = normalize_tool_call_row(raw if isinstance(raw, dict) else {})
-        pid = str(t.get("prediction_id") or "")
-        if pid:
-            out[pid].append(t)
-    return out
-
-
-def compute_scope_recommendations(
-    scope: str,
-    sessions: dict[str, list[dict[str, Any]]],
-    calls_by_pred: dict[str, list[dict[str, Any]]],
-    window: int,
-    promote_min_sessions: int,
-    promote_min_calls: int,
-    demote_min_sessions_no_use: int,
-) -> dict[str, Any]:
-    """Per-scope promote/demote analysis over canonical v2 rows.
-
-    Promote evidence: a tool-call row whose ``activated_by_expansion`` or
-    ``expansion_provided_access`` flag is set — direct evidence the model reached
-    for an ``expand_only`` tool via ``expand_tools`` (an in-turn expansion or a
-    sticky-carried use of an earlier one). Trigger activation is *never* promote
-    evidence: a trigger-activated expand_only tool carries neither flag. Count
-    distinct sessions per tool; promote when ≥ ``promote_min_sessions`` distinct
-    sessions AND ≥ ``promote_min_calls`` total calls.
-
-    Demote evidence: an adaptive ``carry`` resident (partition class C) that went
-    unused across the window. Only rows whose residency the normalizer could
-    reconstruct (``residency_inferred``) contribute carry candidates — a sparse
-    v1 row cannot drive demotion. always_carry is excluded by construction (it is
-    a distinct residency class) and pinned by an assertion below. Only fires when
-    the window has ≥ ``demote_min_sessions_no_use`` sessions.
-
-    Every candidate is validated against the concrete enabled tool names observed
-    for the scope; a toolset/category-only value can never be stored in a per-tool
-    carrying list (it is dropped with a warning).
-    """
-    session_ids_ordered = sorted(sessions.keys(), key=lambda sid: -max(
-        (p.get("ts", 0) for p in sessions[sid]), default=0
-    ))
-    recent_session_ids = session_ids_ordered[:window]
-    recent_sessions = {sid: sessions[sid] for sid in recent_session_ids}
-
-    # Concrete enabled tool names seen for THIS scope — the validation domain
-    # for candidate names. Union of every prediction tool list plus every
-    # tool-call name observed under this scope's own predictions (never the
-    # global call index: another agent's tools must not validate into this
-    # scope's carrying lists). A category/toolset name never appears here (it
-    # is a grouping key, not a concrete tool), so validating against this set
-    # rejects one.
-    enabled_names: set[str] = set()
-    # always_carry residents observed — the demote assertion's forbidden set.
-    always_carry_observed: set[str] = set()
-    for plist in recent_sessions.values():
-        for p in plist:
-            for field in (
-                "ceiling_tools", "always_carry_tools", "carry_tools",
-                "expand_only_tools", "active_tools",
-            ):
-                for t in (p.get(field) or []):
-                    enabled_names.add(str(t))
-            for t in (p.get("always_carry_tools") or []):
-                always_carry_observed.add(str(t))
-            for tc in calls_by_pred.get(p.get("prediction_id", ""), []):
-                name = str(tc.get("tool_name") or "")
-                if name:
-                    enabled_names.add(name)
-
-    def _valid(tool_name: str, kind: str) -> bool:
-        if tool_name and tool_name in enabled_names:
-            return True
-        logger.warning(
-            "tool-belt: shaper rejecting %s candidate %r for scope %r — not a "
-            "concrete enabled tool name (category/toolset names are never stored "
-            "in a per-tool carrying list)",
-            kind, tool_name, scope,
-        )
-        return False
-
-    # ── Promote signals (expand_only → carry). ────────────────────────────
-    sessions_with_tool: dict[str, set[str]] = defaultdict(set)
-    calls_for_tool: Counter[str] = Counter()
-    for sid, plist in recent_sessions.items():
-        for p in plist:
-            pid = p.get("prediction_id", "")
-            for tc in calls_by_pred.get(pid, []):
-                if tc.get("tool_name") == "expand_tools":
-                    continue
-                # Direct expansion/recovery evidence only. These flags are set
-                # exclusively when the tool was reached via expand_tools; a
-                # trigger activation leaves them unset.
-                evidence = (
-                    bool(tc.get("activated_by_expansion"))
-                    or bool(tc.get("expansion_provided_access"))
-                )
-                if not evidence:
-                    continue
-                tool_name = str(tc.get("tool_name") or "")
-                if not tool_name:
-                    continue
-                sessions_with_tool[tool_name].add(sid)
-                calls_for_tool[tool_name] += 1
-
-    promote: list[dict[str, Any]] = []
-    for tool_name, sids in sessions_with_tool.items():
-        if len(sids) >= promote_min_sessions and calls_for_tool[tool_name] >= promote_min_calls:
-            if not _valid(tool_name, "promote"):
-                continue
-            promote.append({
-                "tool": tool_name,
-                "sessions": len(sids),
-                "calls": calls_for_tool[tool_name],
-                "evidence": "expansion",
-            })
-    promote.sort(key=lambda x: (-int(x["sessions"]), -int(x["calls"]), str(x["tool"])))
-
-    # ── Demote signals (carry → expand_only). ─────────────────────────────
-    # Only adaptive carry residents from residency-inferred rows are demotable.
-    carry_observed: set[str] = set()
-    tools_called: set[str] = set()
-    for sid, plist in recent_sessions.items():
-        for p in plist:
-            if p.get("residency_inferred"):
-                residency = p.get("residency") or {}
-                carry_source = residency.get("carry") if isinstance(residency, dict) else None
-                if carry_source is None:
-                    carry_source = p.get("carry_tools") or []
-                for t in carry_source:
-                    carry_observed.add(str(t))
-            pid = p.get("prediction_id", "")
-            for tc in calls_by_pred.get(pid, []):
-                name = str(tc.get("tool_name") or "")
-                if name:
-                    tools_called.add(name)
-
-    demote: list[dict[str, Any]] = []
-    if len(recent_sessions) >= demote_min_sessions_no_use:
-        # Exclude the immutable always_carry surface by construction. For v2 rows
-        # the normalizer already keeps the ``carry`` residency class disjoint from
-        # always_carry, so this is a no-op. For *complete v1* rows the normalizer
-        # collapses every resident into ``carry`` (v1 had no immutable split), so
-        # an unused always_carry baseline resident would otherwise surface as a
-        # demote candidate. Subtracting the observed always_carry set here makes
-        # the exclusion genuinely by construction for both schema versions.
-        demote_candidates = (carry_observed - tools_called) - always_carry_observed
-        for tool_name in sorted(demote_candidates):
-            if not _valid(tool_name, "demote"):
-                continue
-            demote.append({
-                "tool": tool_name,
-                "sessions_without_use": len(recent_sessions),
-                "evidence": "carry_unused",
-            })
-
-    return {
-        "scope": scope,
-        "computed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "sessions_considered": len(recent_sessions),
-        "window_requested": window,
-        "promote": promote,
-        "demote": demote,
-        "enabled_tool_names": sorted(enabled_names),
-    }
-
-
-def merge_into_learned(
-    state_dir: Path,
-    per_scope: dict[str, dict[str, Any]],
-    dry_run: bool,
-) -> tuple[dict[str, Any], bool]:
-    """Merge shaping recommendations into ``learned.json`` as learned v2.
-
-    For each shaped scope the recommendations are applied as *moves* across the
-    adaptive ``carry`` ⇄ ``expand_only`` boundary, starting from the scope's
-    current assignment:
-
-      · a promotion moves its tool into ``carry`` and out of ``expand_only``;
-      · a demotion moves its tool into ``expand_only`` and out of ``carry``.
-
-    Promotions are applied after demotions so a tool named by both wins toward
-    carrying, and any residual overlap is reconciled toward carry. The current
-    assignment is read through ``learned.normalize_state`` — the central v1→v2
-    adapter — and only the canonical v2 keys (``carry`` / ``expand_only`` /
-    ``shaping``) are written; all v1 spelling stays inside ``learned.py``.
-    Every candidate is validated against the scope's concrete enabled tool
-    names — a category/toolset name is never written into a carrying list.
-
-    Other scopes and all unrelated metadata (top-level and per-scope) are
-    preserved, normalized to the v2 shape on write. Persistence goes through
-    ``learned.write_state`` (atomic, fsynced, version-stamped — the single
-    owner of learned-state writes). Returns the merged state and whether
-    anything changed.
-    """
-    learned = _load_learned()
-    learned_path = state_dir / "learned.json"
-    if learned_path.exists():
-        try:
-            existing = json.loads(learned_path.read_text(encoding="utf-8"))
-            if not isinstance(existing, dict):
-                existing = {}
-        except Exception:
-            existing = {}
-    else:
-        existing = {}
-
-    state = learned.normalize_state(existing)  # central v1→v2 adapter
-    scopes = dict(state.get("scopes") or {})
-
-    changed = False
-    for scope, recs in per_scope.items():
-        entry = dict(scopes.get(scope) or {})
-        enabled_names = set(recs.get("enabled_tool_names") or [])
-
-        def _accept(tool: str, kind: str) -> bool:
-            # An empty enabled ceiling means no candidate can be proven eligible:
-            # there is no concrete enabled tool set to validate against, so refuse
-            # every candidate (defense-in-depth for hand-built recs that bypass
-            # ``compute``, whose ``_valid`` already drops candidates when the
-            # enabled set is empty). Otherwise a candidate must be a concrete
-            # enabled tool name — a category/toolset name never enters a per-tool
-            # carrying list.
-            if enabled_names and tool and tool in enabled_names:
-                return True
-            logger.warning(
-                "tool-belt: refusing to write %s candidate %r into scope %r "
-                "carrying list — not a concrete enabled tool name",
-                kind, tool, scope,
-            )
-            return False
-
-        # The entry is already normalized to v2 (carry/expand_only/shaping).
-        carry_set = {str(t) for t in (entry.get("carry") or []) if str(t).strip()}
-        expand_set = {str(t) for t in (entry.get("expand_only") or []) if str(t).strip()}
-        prev_carry, prev_expand = set(carry_set), set(expand_set)
-
-        demote_tools = [str(d.get("tool") or "") for d in (recs.get("demote") or [])]
-        promote_tools = [str(p.get("tool") or "") for p in (recs.get("promote") or [])]
-
-        # Demotions first (carry → expand_only) …
-        for tool in demote_tools:
-            if not _accept(tool, "demote"):
-                continue
-            expand_set.add(tool)
-            carry_set.discard(tool)
-        # … then promotions (expand_only → carry), so carrying wins any tie.
-        for tool in promote_tools:
-            if not _accept(tool, "promote"):
-                continue
-            carry_set.add(tool)
-            expand_set.discard(tool)
-        # Reconcile any residual overlap toward carry (belt-and-braces).
-        expand_set -= carry_set
-
-        new_carry = sorted(carry_set)
-        new_expand = sorted(expand_set)
-
-        # Structural change detection ignores the recomputed timestamp.
-        prev_sig = (
-            sorted(prev_carry), sorted(prev_expand),
-            [(p.get("tool"), p.get("sessions"), p.get("calls"))
-             for p in ((entry.get("shaping") or {}).get("promote") or [])],
-            [(d.get("tool"), d.get("sessions_without_use"))
-             for d in ((entry.get("shaping") or {}).get("demote") or [])],
-        )
-        new_sig = (
-            new_carry, new_expand,
-            [(p["tool"], p["sessions"], p["calls"]) for p in recs["promote"]],
-            [(d["tool"], d["sessions_without_use"]) for d in recs["demote"]],
-        )
-        if prev_sig == new_sig:
-            continue  # no change for this scope
-
-        changed = True
-        # v2 canonical fields only — no v1 mirror; learned.py owns v1 spelling.
-        entry["carry"] = new_carry
-        entry["expand_only"] = new_expand
-        entry["shaping"] = recs
-        scopes[scope] = entry
-
-    state["scopes"] = scopes
-    if changed:
-        state["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-    if changed and not dry_run:
-        # learned.write_state is the single owner of learned-state persistence:
-        # unique-temp atomic write, fsync, normalize-on-write, v2 version stamp.
-        learned.write_state(state, learned_path)
-
-    return state, changed
+# Shared shaping core, re-exported under the script's historical names so
+# existing importers (configure.py's ``load_shaper()``, the test suite) keep
+# addressing the same single implementation.
+_shaping = _load_shaping()
+DEFAULTS = _shaping.DEFAULTS
+default_state_dir = _shaping.default_state_dir
+load_shape_ceiling_defaults = _shaping.load_shape_ceiling_defaults
+load_jsonl = _shaping.load_jsonl
+group_predictions_by_scope_session = _shaping.group_predictions_by_scope_session
+index_tool_calls_by_prediction = _shaping.index_tool_calls_by_prediction
+compute_scope_recommendations = _shaping.compute_scope_recommendations
+merge_into_learned = _shaping.merge_into_learned
 
 
 def _activation_hint(scopes: list[str]) -> str:
