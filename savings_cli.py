@@ -120,14 +120,9 @@ def render_text(report: _savings.SavingsReport) -> str:
                 f"   {obs.n_sessions} session(s)"
             )
         out.append("")
-        events = sum(a.observed.expansion_events for a in measured)
-        overhead = sum(a.observed.expansion_overhead for a in measured)
         out.append(
-            "  Counted as: tool-definition tokens NOT sent (vs carrying every"
-        )
-        out.append(
-            f"  enabled tool), minus expand_tools fetch overhead"
-            f" (−{_fmt_int(overhead)} tok, {events} fetch(es))."
+            "  Calculation: Unsent tool-definition tokens (vs carrying all), "
+            "minus expand_tools fetch overhead."
         )
 
     for a in unmeasured:
