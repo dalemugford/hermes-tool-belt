@@ -727,6 +727,9 @@ def compute_recommendations(info: ScopeInfo, thresholds: dict[str, int]) -> dict
         promote_min_sessions=int(thresholds.get("promote_min_sessions", 2)),
         promote_min_calls=int(thresholds.get("promote_min_calls", 3)),
         demote_min_sessions_no_use=int(thresholds.get("demote_min_sessions_no_use", 20)),
+        demote_k=float(thresholds.get("demote_k", 2.0)),
+        schema_sizes=shaper.load_schema_sizes(info.state_dir),
+        cache_mode=shaper.read_cache_mode(info.state_dir, info.scope),
     )
 
 
@@ -1048,10 +1051,19 @@ def render_shaping_summary(
         )
         lines.append(f"  Proposed promotions into carry: {detail}")
     if demoted_names:
+        uneconomic = sorted(
+            str(d.get("tool") or "") for d in demote
+            if d.get("evidence") == "carry_uneconomic"
+        )
         lines.append(
             f"  Proposed demotions into expand-only ({len(demoted_names)}): "
             + ", ".join(demoted_names)
         )
+        if uneconomic:
+            lines.append(
+                "    Of these, used but uneconomic to carry (cheaper to fetch "
+                "on demand): " + ", ".join(n for n in uneconomic if n)
+            )
         lines.append(
             "    Still fully available — the agent recovers any of these mid-session "
             "via triggers or expand_tools."
@@ -1065,7 +1077,9 @@ def render_shaping_summary(
             )
         else:
             lines.append(
-                "  Proposed demotions: none — every adaptive carry resident got used."
+                "  Proposed demotions: none — every adaptive carry resident "
+                "earns its slot (used enough that carrying costs less than "
+                "fetching on demand)."
             )
 
     lines.extend(_trigger_lines(preset))

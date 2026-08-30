@@ -42,7 +42,13 @@ from pathlib import Path
 from typing import Any
 
 from . import learned
-from .logger_io import normalize_prediction_row, normalize_tool_call_row
+from .logger_io import (
+    DEFAULT_PER_TOOL_TOKENS,
+    load_schema_sizes,
+    normalize_prediction_row,
+    normalize_tool_call_row,
+)
+from .savings import EXPAND_ROUND_TRIP_TOKENS
 from .yaml_required import require_yaml
 
 logger = logging.getLogger("tool_belt_plugin.shaping")
@@ -59,6 +65,13 @@ DEFAULTS = {
     "promote_min_sessions": 2,
     "promote_min_calls": 3,
     "demote_min_sessions_no_use": 20,
+    # Economic safety factor k: demote a carried tool only when carrying it
+    # costs more than k× what reaching for it on demand would. Token-
+    # denominated by design — fewer tokens is always cheaper on every route,
+    # so the decision never consults a price table. k also absorbs the soft
+    # costs (expansion latency, the risk the model doesn't reach for
+    # expand_tools when it should).
+    "demote_k": 2.0,
 }
 
 #: Auto-shape per-scope debounce default: at most one auto run per scope per
@@ -155,7 +168,7 @@ def load_shape_ceiling_defaults(policy_path: Path = _POLICY_PATH) -> dict[str, i
     return dict(DEFAULTS)
 
 
-def _merge_shape_defaults(overrides: dict[str, Any]) -> dict[str, int]:
+def _merge_shape_defaults(overrides: dict[str, Any]) -> dict[str, Any]:
     merged = dict(DEFAULTS)
     for key in ("session_window", "promote_min_sessions", "promote_min_calls", "demote_min_sessions_no_use"):
         value = overrides.get(key)
@@ -167,7 +180,35 @@ def _merge_shape_defaults(overrides: dict[str, Any]) -> dict[str, int]:
             continue
         if parsed > 0:
             merged[key] = parsed
+    k = overrides.get("demote_k")
+    if k is not None:
+        try:
+            parsed_k = float(k)
+        except Exception:
+            parsed_k = 0.0
+        if parsed_k > 0:
+            merged["demote_k"] = parsed_k
     return merged
+
+
+def read_cache_mode(state_dir: Path, scope: str) -> str | None:
+    """The scope's locked prompt-cache mode ('on'/'off'), or None when unknown.
+
+    Read from ``cache_mode_detection.json`` (written by the hot path's cache
+    detector). Unknown is treated by the economics as cache-on (fewest billable
+    exposures) — the conservative direction, biasing toward carrying.
+    """
+    try:
+        with (state_dir / "cache_mode_detection.json").open("r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+        entry = doc.get(scope)
+        if isinstance(entry, dict):
+            mode = entry.get("mode")
+            if mode in ("on", "off"):
+                return str(mode)
+    except Exception:
+        pass
+    return None
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -256,6 +297,9 @@ def compute_scope_recommendations(
     promote_min_sessions: int,
     promote_min_calls: int,
     demote_min_sessions_no_use: int,
+    demote_k: float = 2.0,
+    schema_sizes: dict[str, int] | None = None,
+    cache_mode: str | None = None,
 ) -> dict[str, Any]:
     """Per-scope promote/demote analysis over canonical v2 rows.
 
@@ -356,25 +400,41 @@ def compute_scope_recommendations(
                 sessions_with_tool[tool_name].add(sid)
                 calls_for_tool[tool_name] += 1
 
-    promote: list[dict[str, Any]] = []
+    # Candidates pass the anti-flap gates here; the economic side of the
+    # promotion test (observed expansion spend > what carrying would cost)
+    # is applied below, once billable exposures are known.
+    promote_candidates: list[str] = []
     for tool_name, sids in sessions_with_tool.items():
         if len(sids) >= promote_min_sessions and calls_for_tool[tool_name] >= promote_min_calls:
             if not _valid(tool_name, "promote"):
                 continue
-            promote.append({
-                "tool": tool_name,
-                "sessions": len(sids),
-                "calls": calls_for_tool[tool_name],
-                "evidence": "expansion",
-            })
-    promote.sort(key=lambda x: (-int(x["sessions"]), -int(x["calls"]), str(x["tool"])))
+            promote_candidates.append(tool_name)
 
-    # ── Demote signals (carry → expand_only). ─────────────────────────────
-    # Only adaptive carry residents from residency-inferred rows are demotable.
+    # ── Demote signals (carry → expand_only): the economic test. ──────────
+    # Demote a carried tool when carrying it costs more tokens than reaching
+    # for it on demand would, with safety factor k:
+    #
+    #     carry_tokens  = schema_size(tool) × billable manifest exposures
+    #     demote_tokens = non-trigger uses × EXPAND_ROUND_TRIP_TOKENS
+    #     demote when carry_tokens > k × demote_tokens
+    #
+    # Token-denominated by design — no price table. Zero uses makes
+    # demote_tokens 0, so the old binary unused-→-demote rule falls out as
+    # the limit case. Billable exposures depend on the scope's prompt-cache
+    # mode: cache off pays the manifest on every API call; cache on (or
+    # unknown — the conservative read) roughly once per session. Only
+    # adaptive carry residents from residency-inferred rows are demotable.
     carry_observed: set[str] = set()
     tools_called: set[str] = set()
+    # Uses that would need an expand_tools round-trip if the tool were not
+    # carried: everything except trigger activations (triggers stay free for
+    # a demoted tool). v1 rows without activation_source count as such uses —
+    # the conservative direction, biasing toward carrying.
+    demand_uses: Counter[str] = Counter()
+    prediction_count = 0
     for sid, plist in recent_sessions.items():
         for p in plist:
+            prediction_count += 1
             if p.get("residency_inferred"):
                 residency = p.get("residency") or {}
                 carry_source = residency.get("carry") if isinstance(residency, dict) else None
@@ -385,8 +445,37 @@ def compute_scope_recommendations(
             pid = p.get("prediction_id", "")
             for tc in calls_by_pred.get(pid, []):
                 name = str(tc.get("tool_name") or "")
-                if name:
-                    tools_called.add(name)
+                if not name:
+                    continue
+                tools_called.add(name)
+                if str(tc.get("activation_source") or "") != "trigger":
+                    demand_uses[name] += 1
+
+    exposures = prediction_count if cache_mode == "off" else len(recent_sessions)
+    sizes = schema_sizes or {}
+    k = float(demote_k) if demote_k and demote_k > 0 else 2.0
+
+    # ── Promotion finalization: the reversed inequality. ──────────────────
+    # Promote when the observed expansion spend exceeds what carrying the
+    # tool would have cost over the same window. Together with the k-scaled
+    # demote test this forms a hysteresis band — between the two thresholds
+    # a tool holds its current class, so assignments don't flap.
+    promote: list[dict[str, Any]] = []
+    for tool_name in promote_candidates:
+        size = int(sizes.get(tool_name, DEFAULT_PER_TOOL_TOKENS))
+        carry_tokens = size * exposures
+        expansion_tokens = calls_for_tool[tool_name] * EXPAND_ROUND_TRIP_TOKENS
+        if expansion_tokens <= carry_tokens:
+            continue  # expanding on demand is still the cheaper side — hold
+        promote.append({
+            "tool": tool_name,
+            "sessions": len(sessions_with_tool[tool_name]),
+            "calls": calls_for_tool[tool_name],
+            "carry_tokens": carry_tokens,
+            "expansion_tokens": expansion_tokens,
+            "evidence": "expansion",
+        })
+    promote.sort(key=lambda x: (-int(x["sessions"]), -int(x["calls"]), str(x["tool"])))
 
     demote: list[dict[str, Any]] = []
     if len(recent_sessions) >= demote_min_sessions_no_use:
@@ -397,14 +486,23 @@ def compute_scope_recommendations(
         # an unused always_carry baseline resident would otherwise surface as a
         # demote candidate. Subtracting the observed always_carry set here makes
         # the exclusion genuinely by construction for both schema versions.
-        demote_candidates = (carry_observed - tools_called) - always_carry_observed
-        for tool_name in sorted(demote_candidates):
+        for tool_name in sorted(carry_observed - always_carry_observed):
+            size = int(sizes.get(tool_name, DEFAULT_PER_TOOL_TOKENS))
+            carry_tokens = size * exposures
+            uses = int(demand_uses.get(tool_name, 0))
+            demote_tokens = uses * EXPAND_ROUND_TRIP_TOKENS
+            if carry_tokens <= k * demote_tokens:
+                continue  # carrying is (or may be) the cheaper side — hold
             if not _valid(tool_name, "demote"):
                 continue
             demote.append({
                 "tool": tool_name,
-                "sessions_without_use": len(recent_sessions),
-                "evidence": "carry_unused",
+                "sessions_without_use": len(recent_sessions) if uses == 0 else 0,
+                "uses_in_window": uses,
+                "carry_tokens": carry_tokens,
+                "demote_tokens": demote_tokens,
+                "k": k,
+                "evidence": "carry_unused" if uses == 0 else "carry_uneconomic",
             })
 
     return {
@@ -1317,6 +1415,7 @@ def auto_shape_run(
 
     thresholds = load_shape_ceiling_defaults()
     calls_by_pred = index_tool_calls_by_prediction(load_jsonl(sd / "tool_calls.jsonl"))
+    schema_sizes = load_schema_sizes(sd)
 
     per_scope = {
         scope: compute_scope_recommendations(
@@ -1327,6 +1426,9 @@ def auto_shape_run(
             promote_min_sessions=thresholds["promote_min_sessions"],
             promote_min_calls=thresholds["promote_min_calls"],
             demote_min_sessions_no_use=thresholds["demote_min_sessions_no_use"],
+            demote_k=thresholds["demote_k"],
+            schema_sizes=schema_sizes,
+            cache_mode=read_cache_mode(sd, scope),
         )
         for scope in eligible
     }

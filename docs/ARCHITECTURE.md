@@ -240,14 +240,34 @@ Promote evidence:
 - A tool call tagged `was_expanded: true` (the in-turn expansion path) or
   `expand_tools_used: true` (the sticky-carry path) is direct evidence
   the model reached for a tool that wasn't initially available.
-- A tool is promoted when it appears across `promote_min_sessions`
-  distinct sessions **and** receives `promote_min_calls` total calls
-  within the window.
+- A tool is promoted when it clears the anti-flap gates
+  (`promote_min_sessions` distinct sessions **and** `promote_min_calls`
+  total calls) **and** the economics favor carrying: the observed
+  expansion spend (`calls × 1500` tokens) exceeds what carrying the tool
+  would have cost over the same window.
 
-Demote evidence:
+Demote evidence — the economic test (token-denominated by design; the
+decision never consults a price table, because fewer tokens is always
+cheaper on every route):
 
-- A tool that appears in `always_on_tools` across the window but is
-  never actually called.
+```
+carry_tokens  = schema_size(tool) × billable manifest exposures
+demote_tokens = non-trigger uses × 1500   (expand_tools round-trip)
+demote when carry_tokens > demote_k × demote_tokens
+```
+
+- Per-tool schema sizes come from the `schema_sizes.json` sidecar
+  (snapshotted in-process, since only the live gateway sees real tool
+  definitions); unmeasured tools fall back to a 388-token average.
+- Billable exposures depend on the scope's locked prompt-cache mode:
+  cache **off** pays the manifest on every API call, cache **on** (or
+  unknown) roughly once per session — the conservative read.
+- Trigger-activated uses don't defend a carry slot: they stay free for a
+  demoted tool.
+- A tool with zero uses is the limit case (`demote_tokens = 0`) — it
+  always demotes, which is the old binary rule.
+- Between the demote and promote thresholds is a hysteresis band where a
+  tool holds its current class, so assignments don't flap.
 - Demotion fires only when the window contains at least
   `demote_min_sessions_no_use` sessions, so capability isn't pulled on
   thin evidence.
@@ -261,6 +281,7 @@ learning:
     promote_min_sessions: 2
     promote_min_calls: 3
     demote_min_sessions_no_use: 20
+    demote_k: 2.0
 ```
 
 CLI flags override per-run. Output is merged into

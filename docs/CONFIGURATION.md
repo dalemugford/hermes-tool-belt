@@ -431,9 +431,10 @@ override per-run.
 | Key | Default | Meaning |
 |---|---|---|
 | `session_window` | `100` | Ceiling on history the shaper reads — it uses all available sessions up to this many. `demote_min_sessions_no_use` is the floor: below that, demotion never fires. |
-| `promote_min_sessions` | `2` | A tool needs `expand_tools`-driven use across this many distinct sessions to promote. |
-| `promote_min_calls` | `3` | And this many total calls. |
-| `demote_min_sessions_no_use` | `20` | Window must contain this many sessions before any always-on tool can be demoted for non-use. |
+| `promote_min_sessions` | `2` | Anti-flap gate: a tool needs `expand_tools`-driven use across this many distinct sessions to be a promote candidate. |
+| `promote_min_calls` | `3` | And this many total calls. Candidates then promote only when their observed expansion spend exceeds what carrying them would have cost. |
+| `demote_min_sessions_no_use` | `20` | Window must contain this many sessions before any carried tool can be demoted. |
+| `demote_k` | `2.0` | Economic safety factor: demote a carried tool only when carrying it costs more than k × what expanding it on demand would (token-denominated — no price table). |
 
 ### Authoring a new preset
 

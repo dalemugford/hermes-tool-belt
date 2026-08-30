@@ -133,6 +133,8 @@ group_predictions_by_scope_session = _shaping.group_predictions_by_scope_session
 index_tool_calls_by_prediction = _shaping.index_tool_calls_by_prediction
 compute_scope_recommendations = _shaping.compute_scope_recommendations
 merge_into_learned = _shaping.merge_into_learned
+load_schema_sizes = _shaping.load_schema_sizes
+read_cache_mode = _shaping.read_cache_mode
 
 
 def _activation_hint(scopes: list[str]) -> str:
@@ -236,6 +238,9 @@ def main() -> int:
     ap.add_argument("--promote-min-sessions", type=int, default=defaults["promote_min_sessions"])
     ap.add_argument("--promote-min-calls", type=int, default=defaults["promote_min_calls"])
     ap.add_argument("--demote-min-sessions", type=int, default=defaults["demote_min_sessions_no_use"])
+    ap.add_argument("--demote-k", type=float, default=defaults["demote_k"],
+                    help="economic safety factor: demote only when carrying costs "
+                         "more than k x the on-demand expansion cost (tokens)")
     ap.add_argument("--dry-run", action="store_true", help="report only, don't write learned.json")
     ap.add_argument("--json", action="store_true",
                     help="emit the porcelain JSON document on stdout instead of prose")
@@ -252,6 +257,7 @@ def main() -> int:
         "promote_min_sessions": args.promote_min_sessions,
         "promote_min_calls": args.promote_min_calls,
         "demote_min_sessions_no_use": args.demote_min_sessions,
+        "demote_k": args.demote_k,
     }
 
     def emit_porcelain(
@@ -286,6 +292,7 @@ def main() -> int:
 
     grouped = group_predictions_by_scope_session(preds)
     calls_by_pred = index_tool_calls_by_prediction(tool_calls)
+    schema_sizes = load_schema_sizes(state_dir)
 
     per_scope: dict[str, dict[str, Any]] = {}
     for scope, sessions in grouped.items():
@@ -299,6 +306,9 @@ def main() -> int:
             promote_min_sessions=args.promote_min_sessions,
             promote_min_calls=args.promote_min_calls,
             demote_min_sessions_no_use=args.demote_min_sessions,
+            demote_k=args.demote_k,
+            schema_sizes=schema_sizes,
+            cache_mode=read_cache_mode(state_dir, scope),
         )
 
     if not per_scope:
@@ -321,7 +331,12 @@ def main() -> int:
         if recs["demote"]:
             print("  Demote:", file=out)
             for d in recs["demote"]:
-                print(f"    - {d['tool']:<30} sessions_without_use={d['sessions_without_use']}  evidence={d['evidence']}", file=out)
+                econ = ""
+                if "carry_tokens" in d:
+                    econ = (f"  carry≈{d['carry_tokens']}tok vs"
+                            f" expand≈{d['demote_tokens']}tok (k={d.get('k')})")
+                print(f"    - {d['tool']:<30} uses_in_window={d.get('uses_in_window', 0)}"
+                      f"  evidence={d['evidence']}{econ}", file=out)
         elif recs["sessions_considered"] < args.demote_min_sessions:
             print(f"  Demote: (skipped — only {recs['sessions_considered']} sessions, need ≥{args.demote_min_sessions})", file=out)
         else:
