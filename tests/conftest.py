@@ -9,8 +9,18 @@ distribution cannot break the scripts.
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 from pathlib import Path
+
+# Suite-wide sandbox: the runtime resolves its state dir from $HERMES_HOME at
+# call time, so any test that reaches a real logging path without pinning its
+# own home would append fixture rows to the OPERATOR'S live telemetry (found
+# live: 40 model='m' rows in ~/.hermes predictions.jsonl). Tests that need a
+# specific home still override this in their own setUp.
+_SANDBOX_HOME = tempfile.mkdtemp(prefix="tool-belt-tests-home-")
+os.environ["HERMES_HOME"] = _SANDBOX_HOME
 
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 _SCRIPTS_DIR = _PLUGIN_DIR / "scripts"
