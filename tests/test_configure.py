@@ -79,9 +79,11 @@ def isolate(runner: FakeRunner, which: str | None = "/usr/bin/hermes", sink: lis
     return patches
 
 
-def _write_jsonl(path: Path, rows: list[dict]) -> None:
+def _write_jsonl(path: Path, rows: list[dict], append: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    body = "".join(json.dumps(r) + "\n" for r in rows)
+    with path.open("a" if append else "w", encoding="utf-8") as fh:
+        fh.write(body)
 
 
 def seed_telemetry(
@@ -92,6 +94,7 @@ def seed_telemetry(
     expanded_tool: str | None = None,
     expanded_sessions: int = 0,
     expanded_calls_each: int = 0,
+    append: bool = False,
 ) -> None:
     """Write synthetic predictions/tool_calls for ``sessions`` distinct sessions."""
     preds: list[dict] = []
@@ -116,8 +119,8 @@ def seed_telemetry(
                         "was_expanded": True,
                     }
                 )
-    _write_jsonl(state_dir / "predictions.jsonl", preds)
-    _write_jsonl(state_dir / "tool_calls.jsonl", calls)
+    _write_jsonl(state_dir / "predictions.jsonl", preds, append=append)
+    _write_jsonl(state_dir / "tool_calls.jsonl", calls, append=append)
 
 
 def make_ctx(hermes_home: Path, runner: FakeRunner, **kwargs) -> "configure.RunContext":
@@ -227,49 +230,78 @@ class AgentNameFilterTests(TempHomeTestCase):
         self.assertIsNone(configure.split_platform_args([" , "]))
 
 
-class HubMenuTests(TempHomeTestCase):
-    """The hub v0: a numbered scope table with honest verbs, row-number
-    selection, and a loop that returns to a re-rendered table. No other test
-    drives the menu loop; these lock the row-number contract (no typed
-    labels), the read-only guarantee of 'preview', and clean exit."""
+class ConfigureModeFlowTests(TempHomeTestCase):
+    """configure = agent → channels → mode (learning/history/off). Locks the
+    three-step shape and each mode's learned_mode mapping. No other test
+    drives the top-level flow; these are its contract."""
 
-    def _seed_three_ready(self):
-        seed_telemetry(self.root_state, "default:telegram", self.needed)
-        seed_telemetry(self.root_state, "default:slack", self.needed)
+    def _seed_two_channels(self, agent="default"):
+        # always_on tools that never get called → real demotion evidence, so
+        # the history path produces a non-empty overlay to write.
+        seed_telemetry(self.root_state, f"{agent}:telegram", self.needed,
+                       always_on=["web_search", "read_file"])
+        seed_telemetry(self.root_state, f"{agent}:slack", self.needed,
+                       always_on=["web_search", "read_file"], append=True)
 
-    def _run_hub(self, keys: str):
+    def _run(self, keys: str):
         infos = configure.discover_scopes(self.home)
         lines: list[str] = []
         it = iter(keys.splitlines())
-        ctx = make_ctx(self.home, FakeRunner(),
-                       reader=lambda _p: next(it),
-                       out=lines.append,
+        runner = FakeRunner()
+        ctx = make_ctx(self.home, runner, assume_yes=False,
+                       reader=lambda _p: next(it), out=lines.append,
                        plugin_config={})
         rc = configure._menu(ctx, infos)
-        return rc, "\n".join(lines), ctx
+        return rc, "\n".join(lines), runner
 
-    def test_table_is_numbered_and_preview_is_read_only(self):
-        self._seed_three_ready()
-        rc, out, ctx = self._run_hub("preview\n1\nquit\n")
+    def test_off_writes_recommend_mode(self):
+        self._seed_two_channels()
+        # one agent (skipped), channels 'all', mode 3 (off), confirm y ×2
+        rc, out, runner = self._run("all\n3\ny\ny\n")
         self.assertEqual(rc, 0)
-        self.assertIn("#  scope", out, "a numbered table header is shown")
-        self.assertRegex(out, r"\n  1 ", "rows are numbered")
-        self.assertIn("preview only — nothing was written", out)
-        self.assertEqual(ctx.applied, [], "preview writes NOTHING")
+        keys = {c[3]: c[4] for c in runner.writes}
+        self.assertEqual(
+            keys.get("plugins.tool-belt.channels.default:slack.learned_mode"),
+            "recommend", "OFF sets learned_mode=recommend (overlay not applied)")
+        self.assertIn("Shaping is OFF", out)
 
-    def test_blank_cancels_selection_and_loop_returns(self):
-        self._seed_three_ready()
-        # preview -> blank (cancel) -> the table renders again -> quit
-        rc, out, _ = self._run_hub("preview\n\nquit\n")
+    def test_learning_writes_apply_without_history_run(self):
+        self._seed_two_channels()
+        # channels 'all', mode 1 (learning), confirm y ×2
+        rc, out, runner = self._run("all\n1\ny\ny\n")
         self.assertEqual(rc, 0)
-        self.assertEqual(out.count("#  scope"), 2,
-                         "cancelling an action returns to a re-rendered table")
+        keys = {c[3]: c[4] for c in runner.writes}
+        self.assertEqual(
+            keys.get("plugins.tool-belt.channels.default:telegram.learned_mode"),
+            "apply", "learning sets learned_mode=apply")
+        # No learned overlay written on the learning path (that's history's job).
+        self.assertFalse((self.root_state / "learned.json").exists(),
+                         "learning mode does NOT shape from history now")
+        self.assertIn("learning", out)
 
-    def test_reset_verb_absent_when_nothing_is_shaped(self):
-        self._seed_three_ready()
-        rc, out, _ = self._run_hub("quit\n")
-        self.assertNotIn("reset   —", out,
-                         "reset is offered only when a shaped scope exists")
+    def test_history_mode_delegates_to_shape(self):
+        self._seed_two_channels()
+        # channel 1 only, mode 2 (history), confirm ('y'), decline launcher.
+        rc, out, runner = self._run("1\n2\ny\nn\n")
+        self.assertEqual(rc, 0)
+        # flow_shape's epilogue is emitted ONLY on the history path — the
+        # faithful signal that mode 2 shapes from recorded history now,
+        # unlike learning (mode 1), which shows the learning message and
+        # runs no shaper. (A synthetic fixture can't drive the shaper's
+        # residency-demotion path; delegation is what this locks.)
+        self.assertIn("load a tighter tool set", out)
+        keys = {c[3]: c[4] for c in runner.writes}
+        self.assertEqual(
+            keys.get("plugins.tool-belt.channels.default:slack.learned_mode"),
+            "apply", "history also sets learned_mode=apply")
+
+    def test_blank_at_any_step_cancels_without_writing(self):
+        self._seed_two_channels()
+        for keys in ("\n", "all\n\n"):  # cancel at channels, cancel at mode
+            rc, out, runner = self._run(keys)
+            self.assertEqual(rc, 0)
+            self.assertEqual(runner.writes, [], "cancelling writes nothing")
+            self.assertIn("Nothing selected", out)
 
 
 class StateMachineTests(TempHomeTestCase):

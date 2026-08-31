@@ -1481,134 +1481,142 @@ def flow_status(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
     return 0
 
 
-def _hub_savings_headline(ctx: RunContext) -> str | None:
-    """The measured net-tokens-saved line for the hub's top — proof of life.
-
-    Read-only, best-effort: the savings engine over the real home. Returns
-    None (header omitted) when the engine or its data is unavailable, never
-    an approximation.
-    """
-    engine = load_savings_engine()
-    if engine is None:
-        return None
-    try:
-        report = engine.compute(hermes_home=ctx.hermes_home, cache_mode="on")
-    except Exception:
-        return None
-    net = sum(a.observed.net_token_reduction for a in report.agents
-              if a.observed.n_sessions > 0)
-    sessions = sum(a.observed.n_sessions for a in report.agents
-                   if a.observed.n_sessions > 0)
-    if net <= 0:
-        return None
-    return (f"  Net tokens saved so far: {net:,}  "
-            f"(measured across {sessions} session(s))")
-
-
-def _hub_table(ctx: RunContext, infos, states) -> None:
-    """Render the numbered scope table — the hub's home view."""
-    ctx.out("\n  #  scope                        state       detail")
-    for idx, info in enumerate(infos, 1):
-        row = render_status_row(info, states[info.scope], ctx.thresholds)
-        ctx.out(f"  {idx:<2}{row}")
-
-
-def _hub_pick_scope(ctx: RunContext, infos, verb: str):
-    """Ask for ONE scope by row number (kills the label-vs-profile trap)."""
-    if len(infos) == 1:
-        return infos[0]
+def _pick_one(ctx: RunContext, items: Sequence, render, prompt_label: str):
+    """Numbered single-pick. Returns the item, or None to cancel."""
+    if len(items) == 1:
+        return items[0]
+    ctx.out("")
+    for idx, item in enumerate(items, 1):
+        ctx.out(f"    {idx}. {render(item)}")
     while True:
-        answer = prompt(f"  {verb} which? (row number, or blank to cancel): ",
+        answer = prompt(f"  {prompt_label} (number, or blank to cancel): ",
                         ctx.reader)
         if not answer:
             return None
         try:
             idx = int(answer)
         except ValueError:
-            ctx.out("  Enter a row number from the table.")
+            ctx.out(f"    Enter a number 1–{len(items)}.")
             continue
-        if 1 <= idx <= len(infos):
-            return infos[idx - 1]
-        ctx.out(f"  Row number must be 1–{len(infos)}.")
+        if 1 <= idx <= len(items):
+            return items[idx - 1]
+        ctx.out(f"    Number must be 1–{len(items)}.")
 
 
-def _hub_preview(ctx: RunContext, info: ScopeInfo) -> None:
-    """Read-only picture for ONE scope: what shaping WOULD do + projection.
+def _pick_scopes(ctx: RunContext, infos: Sequence[ScopeInfo]) -> list[ScopeInfo]:
+    """Pick one, several, or all channels for the chosen agent."""
+    if len(infos) == 1:
+        return list(infos)
+    ctx.out("\n  Channels:")
+    for idx, info in enumerate(infos, 1):
+        ctx.out(f"    {idx}. {info.platform}  ({info.sessions} session(s))")
+    while True:
+        answer = prompt("  Numbers (comma-separated) or 'all', blank to cancel: ",
+                        ctx.reader).lower()
+        if not answer:
+            return []
+        if answer in {"all", "*"}:
+            return list(infos)
+        picked, ok = [], True
+        for part in answer.replace(" ", "").split(","):
+            if not part:
+                continue
+            try:
+                i = int(part)
+            except ValueError:
+                ok = False
+                break
+            if not 1 <= i <= len(infos):
+                ok = False
+                break
+            if infos[i - 1] not in picked:
+                picked.append(infos[i - 1])
+        if ok and picked:
+            return picked
+        ctx.out("    Enter numbers from the list, or 'all'.")
 
-    'preview' never writes — the verb means the same thing it says. The
-    projection runs on demand (a few seconds) with a progress line.
+
+def _plan_mode_write(info: ScopeInfo, settings: dict[str, Any],
+                     mode_value: str) -> ConfigWrite:
+    """A single learned_mode write for a scope (apply | recommend)."""
+    return ConfigWrite(
+        key=f"{info.config_prefix}.learned_mode",
+        after=mode_value,
+        before=settings.get("scope_learned_mode") or settings.get("learned_mode"),
+    )
+
+
+def _apply_mode(ctx: RunContext, infos: Sequence[ScopeInfo], mode: str) -> int:
+    """Set the shaping mode for the chosen scopes.
+
+    mode == "history"  → learned_mode: apply, and shape from existing sessions
+                          now (delegates to flow_shape).
+    mode == "learning" → learned_mode: apply; no history run — auto-shaping at
+                          session end handles it as usage accumulates.
+    mode == "off"      → learned_mode: recommend; the learned overlay is not
+                          applied (full-start carries everything) and
+                          auto-shaping skips the scope.
     """
-    preset = load_base_preset()
-    recs = compute_recommendations(info, ctx.thresholds)
-    ctx.out("")
-    for line in render_shaping_summary(info, recs, preset, ctx.thresholds):
-        ctx.out(line)
-    ctx.out("\n  Estimating savings for this scope… (a few seconds)")
-    try:
-        proposal = proposed_assignment(info, recs)
-    except Exception:
-        proposal = None
-    agent = _project_scope(info, proposal) if proposal else None
-    if agent is not None and agent.projected.net_token_reduction:
-        proj = agent.projected
-        ctx.out(f"  Projected: ≈{proj.net_token_reduction:,} fewer tokens over "
-                f"{proj.sessions_analyzed} analyzed session(s)"
-                + (f"  ({proj.net_input_reduction_pct:.0f}% of input)"
-                   if proj.net_input_reduction_pct is not None else ""))
-    else:
-        ctx.out("  Projection unavailable for this scope yet "
-                "(needs more recorded sessions).")
-    ctx.out("  (preview only — nothing was written)")
+    if mode == "history":
+        return flow_shape(ctx, infos)
+
+    after = "apply" if mode == "learning" else "recommend"
+    for info in infos:
+        settings = ctx.settings(info.scope)
+        write = _plan_mode_write(info, settings, after)
+        if mode == "learning":
+            extra = [
+                "    Shaping is ON (learning). Tool Belt will tighten this",
+                "    scope's loadout automatically as sessions accumulate;",
+                "    nothing changes until there's enough evidence.",
+            ]
+        else:
+            extra = [
+                "    Shaping is OFF. This scope carries the full tool set;",
+                "    the learned overlay is kept but not applied, and",
+                "    automatic shaping is paused for it.",
+            ]
+        if not _confirm_writes(ctx, f"Changes for {info.scope}:", [write], extra):
+            ctx.out(f"  Skipped {info.scope}. Nothing written.")
+            continue
+        ctx.applied.extend(apply_writes([write], ctx.runner, ctx.dry_run, ctx.out))
+    return 0
 
 
 def _menu(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
-    """The hub: a menu loop over a numbered scope table.
+    """configure = turn shaping on/off per agent, per channel.
 
-    Verbs are honest — 'preview' is always read-only, 'shape' always leads to
-    a disclosed write. Actions pick a scope by ROW NUMBER, never a typed
-    label. The loop always returns to a re-rendered table; blank/q/EOF exit.
+    Three steps: choose the agent, choose the channels, choose the mode
+    (on/learning · on/use-history · off). No dashboard — the savings report
+    answers "what did it do"; this only sets the mode. Every write is
+    disclosed and confirmed at the funnel bottom.
     """
+    agents = sorted({i.agent for i in infos})
+    agent = _pick_one(ctx, agents, lambda a: a, "Agent")
+    if agent is None:
+        ctx.out("\n  Nothing selected.")
+        return 0
+    agent_scopes = [i for i in infos if i.agent == agent]
+
+    selected = _pick_scopes(ctx, agent_scopes)
+    if not selected:
+        ctx.out("\n  Nothing selected.")
+        return 0
+
+    ctx.out(f"\n  Shaping mode for {agent} "
+            f"({', '.join(i.platform for i in selected)}):")
+    ctx.out("    1. On — learning    shape automatically from future usage")
+    ctx.out("    2. On — use history shape now from recorded sessions")
+    ctx.out("    3. Off              carry everything; don't shape")
+    modes = {"1": "learning", "2": "history", "3": "off"}
     while True:
-        states = {i.scope: classify_scope(i, ctx.settings(i.scope),
-                                          ctx.thresholds) for i in infos}
-        headline = _hub_savings_headline(ctx)
-        if headline:
-            ctx.out("\n" + headline)
-        _hub_table(ctx, infos, states)
-
-        shapeable = [i for i in infos
-                     if states[i.scope] in (STATE_READY, STATE_FRESH,
-                                            STATE_OBSERVING)]
-        shaped = [i for i in infos if states[i.scope] == STATE_SHAPED]
-        verbs = ["preview"]
-        if shapeable:
-            verbs.append("shape")
-        if shaped:
-            verbs.append("reset")
-        verbs.append("quit")
-
-        ctx.out("\n  preview — see what shaping would do (read-only)")
-        if "shape" in verbs:
-            ctx.out("  shape   — analyze history and apply (asks first)")
-        if "reset" in verbs:
-            ctx.out("  reset   — return a shaped scope to observation")
-        ctx.out("  quit")
-        choice = prompt_choice("  Action?", tuple(verbs), ctx.reader)
-
-        if choice == "quit":
+        answer = prompt("  Mode? [1/2/3, blank to cancel]: ", ctx.reader).strip()
+        if not answer:
+            ctx.out("\n  Nothing selected.")
             return 0
-        if choice == "preview":
-            info = _hub_pick_scope(ctx, infos, "Preview")
-            if info is not None:
-                _hub_preview(ctx, info)
-        elif choice == "shape":
-            info = _hub_pick_scope(ctx, shapeable, "Shape")
-            if info is not None:
-                flow_shape(ctx, [info])
-        elif choice == "reset":
-            info = _hub_pick_scope(ctx, shaped, "Reset")
-            if info is not None:
-                flow_reset(ctx, [info])
+        if answer in modes:
+            return _apply_mode(ctx, selected, modes[answer])
+        ctx.out("    Enter 1, 2, or 3.")
 
 
 def _ask_platforms(ctx: RunContext) -> list[str]:
