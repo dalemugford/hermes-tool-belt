@@ -183,3 +183,40 @@ class EconomicPromotion(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PinnedToolsNeverPromote(unittest.TestCase):
+    """A pinned (always_carry) tool is carried unconditionally — the shaper
+    must not 'promote' it into learned carry on stale pre-pin fetch evidence
+    (redundant learned.json entries that surface as confusing diff lines).
+    Symmetric with the demote arm's exclusion; no other test covers the
+    promote side of pin protection."""
+
+    SCOPE = "assistant-a:telegram"
+
+    def test_observed_pin_excluded_from_promotion(self):
+        E = ["clarify", "skills_list"]
+        preds, calls = [], []
+        for i in range(3):
+            pid = f"p{i}"
+            preds.append(_pred_row(
+                self.SCOPE, f"s{i}", pid,
+                ceiling=E, always_carry=["clarify", "skills_list"], carry=[],
+                active=E, ts=float(i),
+            ))
+            calls.append(_expansion_call(pid, "skills_list"))
+        recs = _compute(self.SCOPE, preds, calls, cache_mode="on")
+        self.assertNotIn("skills_list", {p["tool"] for p in recs["promote"]},
+                         "an observed always_carry tool never promotes")
+
+    def test_config_pin_stripped_by_protection_filter(self):
+        from tool_belt_plugin import shaping
+        per_scope = {self.SCOPE: {
+            "promote": [{"tool": "terminal", "sessions": 5, "calls": 20}],
+            "demote": [],
+        }}
+        cfg = {"always_carry": ["terminal"], "channels": {}}
+        out = shaping.filter_protected_demotions(cfg, per_scope)
+        self.assertEqual(out[self.SCOPE]["promote"], [],
+                         "a config-pinned tool never promotes (stale pre-pin "
+                         "evidence must not re-enter learned carry)")

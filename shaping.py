@@ -427,6 +427,13 @@ def compute_scope_recommendations(
         if len(sids) >= promote_min_sessions and calls_for_tool[tool_name] >= promote_min_calls:
             if not _valid(tool_name, "promote"):
                 continue
+            if tool_name in always_carry_observed:
+                # A pinned tool is carried unconditionally (class A) — a
+                # learned-carry promotion would be redundant noise in diffs
+                # and learned.json. The evidence is usually stale: fetches
+                # from before the tool was pinned. Symmetric with the demote
+                # arm's always_carry exclusion.
+                continue
             promote_candidates.append(tool_name)
 
     # ── The economic test, priced per SESSION. ────────────────────────────
@@ -752,8 +759,15 @@ def filter_protected_demotions(
                 "always_carry (policy baseline or config pin) is undemotable",
                 ", ".join(dropped), scope,
             )
+        # Promotions naming a pinned tool are redundant (class A already
+        # carries it) — usually stale pre-pin fetch evidence. Drop them so
+        # learned.json and the confirm diff never show a pinned tool moving.
+        promote = list(recs.get("promote") or [])
+        kept_promote = [p for p in promote
+                        if str(p.get("tool") or "") not in protected]
         new_recs = dict(recs)
         new_recs["demote"] = kept
+        new_recs["promote"] = kept_promote
         out[scope] = new_recs
     return out
 
