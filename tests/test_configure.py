@@ -295,13 +295,25 @@ class ConfigureModeFlowTests(TempHomeTestCase):
             keys.get("plugins.tool-belt.channels.default:slack.learned_mode"),
             "apply", "history also sets learned_mode=apply")
 
-    def test_blank_at_any_step_cancels_without_writing(self):
+    def test_cancel_walks_back_one_level_not_quit(self):
+        # Dale's back-navigation: ESC/blank steps up a level rather than
+        # abandoning the flow. Single agent → backing out of step-2 quits.
         self._seed_two_channels()
-        for keys in ("\n", "2\nall\n\n"):  # cancel at channels, cancel at mode
-            rc, out, runner = self._run(keys)
-            self.assertEqual(rc, 0)
-            self.assertEqual(runner.writes, [], "cancelling writes nothing")
-            self.assertIn("Nothing selected", out)
+        # blank at step-2 → quit (single agent, nothing above it).
+        rc, out, runner = self._run("\n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(runner.writes, [])
+        self.assertIn("Nothing selected", out)
+
+    def test_mode_cancel_returns_to_channel_pick(self):
+        # shaping → channels 'all' → blank at mode → back to channels →
+        # blank at channels → back to step-2 → blank → quit. Four blanks
+        # prove each level is a distinct step-back, and nothing is written.
+        self._seed_two_channels()
+        rc, out, runner = self._run("2\nall\n\n\n\n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(runner.writes, [], "walking back writes nothing")
+        self.assertIn("Nothing selected", out)
 
 
 class ProtectedToolsFlowTests(TempHomeTestCase):
@@ -326,7 +338,7 @@ class ProtectedToolsFlowTests(TempHomeTestCase):
 
     def test_policy_pins_shown_as_note_not_toggleable(self):
         self._seed()
-        rc, out, _ = self._run("1\nq\n")
+        rc, out, _ = self._run("1\nq\n\n")
         # The note appears AFTER choosing 'Protected tools' (Dale), and a
         # policy pin never appears as a toggle row.
         menu_part, picker = out.split("1. Protected tools", 1)
@@ -344,7 +356,7 @@ class ProtectedToolsFlowTests(TempHomeTestCase):
             "    always_carry:\n      - terminal\n", encoding="utf-8")
         seed_telemetry(self.root_state, "bernard:telegram", 3,
                        always_on=["web_search", "terminal"])
-        rc, out, _ = self._run("1\nq\n")
+        rc, out, _ = self._run("1\nq\n\n")
         self.assertRegex(out, r"\[x\]\s*\d+\. terminal",
                          "an existing config pin comes pre-checked")
 
@@ -359,7 +371,7 @@ class ProtectedToolsFlowTests(TempHomeTestCase):
 
     def test_cancel_writes_nothing(self):
         self._seed()
-        rc, out, runner = self._run("1\nq\n")
+        rc, out, runner = self._run("1\nq\n\n")
         self.assertEqual(rc, 0)
         self.assertEqual(runner.writes, [])
         self.assertIn("Nothing changed", out)
@@ -390,6 +402,31 @@ class SharedCursesContractTests(unittest.TestCase):
         params = inspect.signature(self.ui.curses_radiolist).parameters
         for name in ("title", "items", "selected", "cancel_returns"):
             self.assertIn(name, params, f"curses_radiolist lost `{name}`")
+
+    def test_widget_cancel_maps_to_back_navigation(self):
+        # The shared widgets signal ESC via their cancel_returns value; the
+        # adapter must translate that to None (single) / the _CURSES_CANCEL
+        # sentinel (multi) so callers walk BACK a level instead of writing.
+        class FakeUI:
+            @staticmethod
+            def curses_radiolist(title, items, selected=0, cancel_returns=None):
+                return cancel_returns
+            @staticmethod
+            def curses_checklist(title, items, selected, cancel_returns=None,
+                                 status_fn=None):
+                return cancel_returns
+        class _Ctx:
+            reader = staticmethod(lambda _p: "")
+            out = staticmethod(lambda _m: None)
+        with mock.patch.object(configure, "_hermes_curses", lambda: FakeUI):
+            # _pick_one maps the widget's -1 cancel to None (back).
+            self.assertIsNone(
+                configure._pick_one(_Ctx(), ["a", "b"], lambda x: x, "Pick"),
+                "radiolist cancel → None")
+            # _curses_multi passes the cancel sentinel straight through.
+            self.assertIs(
+                configure._curses_multi("t", ["a", "b"], {0}),
+                configure._CURSES_CANCEL, "checklist cancel → sentinel")
 
     def test_adapter_gates_on_tty(self):
         # Off a TTY (pipes, tests, --yes) the adapter must decline so the

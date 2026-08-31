@@ -1541,7 +1541,7 @@ def flow_protected(ctx: RunContext, agent: str,
     result = checkbox_picker(inventory, set(current), ctx.reader, ctx.out)
     if result is None:
         ctx.out("\n  Nothing changed.")
-        return 0
+        return _BACK
     new_pins = sorted(result)
     if new_pins == sorted(current):
         ctx.out("\n  No changes.")
@@ -1567,53 +1567,90 @@ def flow_protected(ctx: RunContext, agent: str,
     return 0
 
 
+#: Sentinel: a sub-menu returns this when the user cancelled OUT of it (ESC /
+#: blank), asking the caller to redisplay the previous menu rather than quit.
+_BACK = object()
+
+#: The three shaping modes, as (label, value) — label shown in the picker.
+_MODE_OPTIONS = [
+    ("On — learning     shape automatically from future usage", "learning"),
+    ("On — use history  shape now from recorded sessions", "history"),
+    ("Off               carry everything; don't shape", "off"),
+]
+
+_STEP2_OPTIONS = [
+    ("Protected tools", "protected"),
+    ("Tool shaping options", "shaping"),
+]
+
+
 def _menu(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
     """configure = turn shaping on/off per agent, per channel.
 
-    Three steps: choose the agent, choose the channels, choose the mode
-    (on/learning · on/use-history · off). No dashboard — the savings report
+    Choose the agent, then Protected tools or Tool shaping (channels, then
+    mode: learning / use-history / off). No dashboard — the savings report
     answers "what did it do"; this only sets the mode. Every write is
     disclosed and confirmed at the funnel bottom.
+
+    Cancelling (ESC on a picker, or a blank numbered answer) walks BACK one
+    level — mode→channels→step-2→agent→quit — rather than abandoning the
+    whole flow, so a mis-step costs one keystroke, not a restart.
     """
     agents = sorted({i.agent for i in infos})
-    agent = _pick_one(ctx, agents, lambda a: a, "Agent")
-    if agent is None:
-        ctx.out("\n  Nothing selected.")
-        return 0
-    agent_scopes = [i for i in infos if i.agent == agent]
-
-    ctx.out("\n    1. Protected tools")
-    ctx.out("    2. Tool shaping options")
     while True:
-        answer = prompt("  Option? [1/2, blank to cancel]: ", ctx.reader).strip()
-        if not answer:
+        agent = _pick_one(ctx, agents, lambda a: a, "Agent")
+        if agent is None:
             ctx.out("\n  Nothing selected.")
             return 0
-        if answer == "1":
-            return flow_protected(ctx, agent, agent_scopes)
-        if answer == "2":
-            break
-        ctx.out("    Enter 1 or 2.")
+        agent_scopes = [i for i in infos if i.agent == agent]
+        result = _agent_menu(ctx, agent, agent_scopes)
+        if result is _BACK:
+            if len(agents) == 1:
+                # Only one agent — backing out of its menu is quitting.
+                ctx.out("\n  Nothing selected.")
+                return 0
+            continue  # redisplay the agent picker
+        return result
 
-    selected = _pick_scopes(ctx, agent_scopes)
-    if not selected:
-        ctx.out("\n  Nothing selected.")
-        return 0
 
-    ctx.out(f"\n  Shaping mode for {agent} "
-            f"({', '.join(i.platform for i in selected)}):")
-    ctx.out("    1. On — learning    shape automatically from future usage")
-    ctx.out("    2. On — use history shape now from recorded sessions")
-    ctx.out("    3. Off              carry everything; don't shape")
-    modes = {"1": "learning", "2": "history", "3": "off"}
+def _agent_menu(ctx: RunContext, agent: str,
+                agent_scopes: Sequence[ScopeInfo]):
+    """Step 2: Protected tools or Tool shaping. Returns an int rc when an
+    action ran to completion, or ``_BACK`` when the user cancelled up to the
+    agent picker."""
     while True:
-        answer = prompt("  Mode? [1/2/3, blank to cancel]: ", ctx.reader).strip()
-        if not answer:
-            ctx.out("\n  Nothing selected.")
-            return 0
-        if answer in modes:
-            return _apply_mode(ctx, selected, modes[answer])
-        ctx.out("    Enter 1, 2, or 3.")
+        choice = _pick_one(ctx, _STEP2_OPTIONS, lambda o: o[0], "Option")
+        if choice is None:
+            return _BACK
+        if choice[1] == "protected":
+            result = flow_protected(ctx, agent, agent_scopes)
+            if result is _BACK:
+                continue  # picker cancelled — back to this menu
+            return result
+        result = _shaping_menu(ctx, agent, agent_scopes)
+        if result is _BACK:
+            continue  # channels/mode cancelled — back to this menu
+        return result
+
+
+def _shaping_menu(ctx: RunContext, agent: str,
+                  agent_scopes: Sequence[ScopeInfo]):
+    """Channels → mode. Returns an int rc when a mode was applied, or
+    ``_BACK`` to redisplay the step-2 menu."""
+    single_channel = len(agent_scopes) == 1
+    while True:
+        selected = _pick_scopes(ctx, agent_scopes)
+        if not selected:
+            return _BACK  # channel picker cancelled — up to step-2
+        picked = _pick_one(
+            ctx, _MODE_OPTIONS, lambda o: o[0],
+            f"Shaping mode for {agent} "
+            f"({', '.join(i.platform for i in selected)})")
+        if picked is None:
+            if single_channel:
+                return _BACK  # no channel step to fall back to
+            continue  # redisplay the channel picker
+        return _apply_mode(ctx, selected, picked[1])
 
 
 def _ask_platforms(ctx: RunContext) -> list[str]:
