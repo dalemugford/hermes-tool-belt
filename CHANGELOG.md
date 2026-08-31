@@ -6,6 +6,8 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ## [Unreleased]
 
+## [2026.8.31] - 2026-08-31
+
 The initial public capabilities of the plugin:
 
 ### Added
