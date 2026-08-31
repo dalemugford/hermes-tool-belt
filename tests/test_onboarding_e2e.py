@@ -317,8 +317,9 @@ class OnboardingArcTests(OnboardingTestCase):
             ["--status"],
             tc.FakeRunner({f"plugins.tool-belt.channels.{terminal.scope}.learned_mode": "apply"}),
         )
-        self.assertIn(f"{terminal.scope:<24} shaping ON (", status)
-        self.assertIn(f"{browser.scope:<24} shaping OFF (observing)", status)
+        self.assertIn(f"{terminal.scope:<24} shaping ON (1 carried", status)
+        # The untouched scope defaults ON and has no assignment: learning.
+        self.assertIn(f"{browser.scope:<24} shaping ON (learning)", status)
 
 if __name__ == "__main__":
     unittest.main()

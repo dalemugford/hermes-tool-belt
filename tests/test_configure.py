@@ -10,6 +10,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -1046,6 +1047,72 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(configure.prompt_multi_select(infos, reader), infos)
 
 
+class HermesHomeContainmentTests(TempHomeTestCase):
+    """Live-sweep catch: the `hermes` CLI resolves ITS home from
+    $HERMES_HOME, so a run pointed at --hermes-home must pin that env for
+    every hermes invocation — without the pin, a sandboxed run read and
+    WROTE the operator's real config.yaml."""
+
+    def test_hermes_calls_see_the_target_home_and_env_is_restored(self) -> None:
+        seed_telemetry(self.root_state, "default:telegram",
+                       sessions=self.needed, always_on=["web_search"],
+                       expanded_tool="terminal", expanded_sessions=12,
+                       expanded_calls_each=2)
+        runner = FakeRunner()
+        seen: list[str | None] = []
+
+        def spy(argv, **kwargs):
+            seen.append(os.environ.get("HERMES_HOME"))
+            return runner(argv, **kwargs)
+
+        prev = os.environ.get("HERMES_HOME")
+        with contextlib.ExitStack() as stack:
+            for patch in isolate(spy, "/usr/bin/hermes", []):
+                stack.enter_context(patch)
+            rc = configure.main(["--path", "shape", "--yes",
+                                 "--hermes-home", str(self.home)])
+        self.assertEqual(rc, 0)
+        self.assertTrue(runner.writes, "the shape path must reach config set")
+        self.assertEqual(set(seen), {str(self.home)})
+        self.assertEqual(os.environ.get("HERMES_HOME"), prev)
+
+
+class ResetArgvWiringTests(TempHomeTestCase):
+    """``--reset AGENT`` through ``main()``: the flow itself is covered by
+    ResetFlowTests, but nothing else proves the argv actually reaches
+    ``flow_reset`` (a dispatch typo would no-op with exit 0)."""
+
+    def test_reset_argv_reaches_the_reset_flow(self) -> None:
+        seed_telemetry(self.root_state, "default:telegram",
+                       sessions=self.needed, always_on=["web_search"],
+                       expanded_tool="terminal", expanded_sessions=12,
+                       expanded_calls_each=2)
+        info = configure.discover_scopes(self.home)[0]
+        ctx = make_ctx(self.home, FakeRunner(), assume_yes=True,
+                       thresholds=self.thresholds)
+        configure.flow_shape(ctx, [info])
+        learned_doc = self.root_state / "learned.json"
+        self.assertIn("default:telegram",
+                      json.loads(learned_doc.read_text())["scopes"])
+
+        runner = FakeRunner()
+        lines: list[str] = []
+        with contextlib.ExitStack() as stack:
+            for patch in isolate(runner, "/usr/bin/hermes", lines):
+                stack.enter_context(patch)
+            rc = configure.main(["--reset", "default", "--yes",
+                                 "--hermes-home", str(self.home)])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("default:telegram",
+                         json.loads(learned_doc.read_text()).get("scopes", {}))
+        modes = {c[3]: c[4] for c in runner.writes
+                 if c[3].endswith("learned_mode")}
+        self.assertEqual(
+            modes,
+            {"plugins.tool-belt.channels.default:telegram.learned_mode":
+             "recommend"})
+
+
 class InvocationEchoTests(TempHomeTestCase):
     """M5: guidance must echo the command form the user actually typed — a
     ``tool-belt`` launcher user has no ``scripts/configure.py`` path that
@@ -1138,8 +1205,17 @@ class StatusRowTests(TempHomeTestCase):
 
     def test_observation_row_shows_off(self) -> None:
         row = configure.render_status_row(
-            self._info(), configure.STATE_OBSERVING, self.thresholds)
+            self._info(), configure.STATE_OBSERVING, self.thresholds,
+            settings={"learned_mode": "recommend", "bypass_rate": "1.0"})
         self.assertIn("shaping OFF (observing)", row)
+
+    def test_unconfigured_scope_with_history_is_on_not_off(self) -> None:
+        # Live-sweep catch: shaping defaults ON, so a scope that merely has
+        # enough sessions to classify 'ready' must not render as OFF — only
+        # explicit observation settings turn a row OFF.
+        row = configure.render_status_row(
+            self._info(), configure.STATE_READY, self.thresholds, settings={})
+        self.assertIn("shaping ON (learning)", row)
 
     def test_configure_apply_stamps_source_and_applied_at(self) -> None:
         # Symmetry with the auto engine: a status read must not depend on

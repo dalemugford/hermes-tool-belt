@@ -1001,6 +1001,28 @@ class DispatchExitCodeTests(unittest.TestCase):
         self.assertIn("no command given", err.getvalue())
 
 
+class CacheModeFlagTests(_HomeCase):
+    """``--cache-mode`` through the CLI: the engine's off-mode math is
+    covered elsewhere, but nothing else proves the flag reaches
+    ``compute`` (or that a bad value is rejected by argparse)."""
+
+    def test_flag_reaches_compute_and_report(self):
+        _write_session(self.home / "sessions", "s", platform="telegram",
+                       model="m", ceiling=CEILING, turns=[{"user": "hello"}])
+        out = io.StringIO()
+        with redirect_stdout(out):
+            code = savings_cli.run(["--json", "--cache-mode", "off",
+                                    "--hermes-home", str(self.home)])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out.getvalue())["cache_mode"], "off")
+
+    def test_bad_value_is_rejected(self):
+        with redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                savings_cli.run(["--cache-mode", "sideways"])
+        self.assertEqual(caught.exception.code, 2)
+
+
 class SinceEchoTests(_HomeCase):
     """P5: the report must say which ``--since`` it honored, or the reader
     cannot tell whether their filter actually applied."""

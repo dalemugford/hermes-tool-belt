@@ -1146,16 +1146,30 @@ def _overlay_trigger_count(info: ScopeInfo) -> int:
 
 
 def render_status_row(
-    info: ScopeInfo, state: str, thresholds: dict[str, int], index: int = 1
+    info: ScopeInfo, state: str, thresholds: dict[str, int], index: int = 1,
+    settings: dict[str, Any] | None = None,
 ) -> str:
     """One "Agents" list row: ``N. scope  shaping ON/OFF (what's happening)``.
 
-    ON/OFF is the shaping mode (Off = the scope was put in observation);
-    the parenthetical is the outcome — learned carry/expansion counts once
-    an assignment exists, ``learning`` while one is still accumulating,
+    ON/OFF is the shaping mode and comes from the scope's SETTINGS, not its
+    readiness state: shaping defaults on, so an untouched scope with plenty
+    of history is ON (learning) — only a scope actually put in observation
+    (``learned_mode: recommend`` or a full-ceiling bypass) reads OFF. The
+    parenthetical is the outcome — learned carry/expansion counts once an
+    assignment exists, ``learning`` while one is still accumulating,
     ``observing`` when shaping is off.
     """
-    if state in (STATE_OBSERVING, STATE_READY):
+    settings = settings or {}
+    mode_val = settings.get("learned_mode")
+    bypass = settings.get("scope_bypass_rate")
+    if bypass is None:
+        bypass = settings.get("bypass_rate")
+    bypass_f = _to_float(bypass)
+    in_observation = (
+        (mode_val is not None and normalize_mode(mode_val) == "recommend")
+        or (bypass_f is not None and bypass_f >= OBSERVATION_BYPASS)
+    )
+    if in_observation:
         mode, detail = "OFF", "observing"
     else:
         assignment = current_assignment(info)
@@ -1460,8 +1474,10 @@ def flow_status(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
         return 0
     ctx.out("Agents")
     for index, info in enumerate(infos, 1):
-        state = classify_scope(info, ctx.settings(info.scope), ctx.thresholds)
-        ctx.out(render_status_row(info, state, ctx.thresholds, index=index))
+        settings = ctx.settings(info.scope)
+        state = classify_scope(info, settings, ctx.thresholds)
+        ctx.out(render_status_row(info, state, ctx.thresholds, index=index,
+                                  settings=settings))
     return 0
 
 
@@ -1951,6 +1967,23 @@ def main(argv: Sequence[str] | None = None, *,
     args = build_parser().parse_args(list(argv) if argv is not None else None)
     hermes_home = args.hermes_home or default_hermes_home()
 
+    # Sandbox containment: every `hermes config get/set` this run launches
+    # resolves ITS home from $HERMES_HOME, not from --hermes-home. Without
+    # this pin, a run pointed at a sandbox home read — and wrote — the
+    # operator's real config. Restored on exit so an in-process caller
+    # (tests, the tool-belt dispatcher) is left untouched.
+    prev_home_env = os.environ.get("HERMES_HOME")
+    os.environ["HERMES_HOME"] = str(hermes_home)
+    try:
+        return _main_with_home(args, hermes_home)
+    finally:
+        if prev_home_env is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = prev_home_env
+
+
+def _main_with_home(args: argparse.Namespace, hermes_home: Path) -> int:
     # Both of the PyYAML-dependent reads (the shaper's policy thresholds, then
     # the plugin config block) happen here, before a single line of the
     # conversation is printed — so a wrong-interpreter run exits 2 with the
