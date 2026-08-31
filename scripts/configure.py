@@ -1442,7 +1442,7 @@ def flow_recommend(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
             f"    · Once a scope reaches {needed} sessions, re-run this command; it will "
             "offer the shaping review."
         )
-        ctx.out("    · `python3 scripts/configure.py --status` shows progress at any time.")
+        ctx.out(f"    · `{cmd('--status')}` shows progress at any time.")
     return 0
 
 
@@ -1486,7 +1486,16 @@ def flow_status(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
     if not ctx.have_hermes:
         ctx.out("  `hermes` not on PATH — config values could not be read.")
     if not infos:
-        ctx.out("\n  No agent scopes found yet. Send a message through a gateway, then re-run.")
+        # Report what IS known: real profiles with no telemetry yet are a
+        # different state from an empty home, and --status should say which.
+        found = discover_state_dirs(ctx.hermes_home, None)
+        if found:
+            labels = ", ".join(label for label, _ in found)
+            ctx.out(f"\n  Hermes profile(s) found: {labels}.")
+            ctx.out("  No Tool Belt telemetry recorded for them yet — send a "
+                    "message through a gateway, then re-run.")
+        else:
+            ctx.out("\n  No agent scopes found yet. Send a message through a gateway, then re-run.")
         return 0
     ctx.out("")
     for info in infos:
@@ -1887,6 +1896,21 @@ def split_platform_args(values: Sequence[str] | None) -> list[str] | None:
             if p.strip()] or None
 
 
+#: The command form the user actually typed (set by :func:`main`); None means
+#: the script was run directly, so guidance echoes the script path itself.
+_PROG: str | None = None
+
+
+def cmd(args: str = "") -> str:
+    """Render a runnable re-invocation matching how *this* run was launched.
+
+    A user who typed ``tool-belt configure`` has no ``scripts/`` directory in
+    sight — guidance must echo the form they can actually run.
+    """
+    base = f"{_PROG} configure" if _PROG else "python3 scripts/configure.py"
+    return f"{base} {args}".rstrip()
+
+
 def _print_no_profiles(ctx: RunContext) -> None:
     """Said only when ``discover_state_dirs`` genuinely found nothing."""
     ctx.out(f"\n  No Hermes profiles found under {ctx.hermes_home}.")
@@ -1907,10 +1931,10 @@ def _print_fresh_install_guidance(ctx: RunContext) -> None:
     ctx.out("      install has none until you use your agents.")
     ctx.out(f"    · Once a scope reaches {needed} recorded session(s), re-running")
     ctx.out("      this command offers the shaping review.")
-    ctx.out("    · `python3 scripts/configure.py --status` shows the count at any time.")
+    ctx.out(f"    · `{cmd('--status')}` shows the count at any time.")
     ctx.out("    · To start observation mode now — before any telemetry exists —")
     ctx.out("      name the platforms you run:")
-    ctx.out("        python3 scripts/configure.py --platform telegram --platform slack")
+    ctx.out(f"        {cmd('--platform telegram --platform slack')}")
 
 
 def _recover_fresh_install(ctx: RunContext, profile_filter: str | None, args) -> list[ScopeInfo]:
@@ -1959,7 +1983,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, *,
+         prog: str | None = None) -> int:
+    global _PROG
+    _PROG = prog
     args = build_parser().parse_args(list(argv) if argv is not None else None)
     hermes_home = args.hermes_home or default_hermes_home()
 

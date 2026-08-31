@@ -960,6 +960,67 @@ class AnnualizedPaceTests(_HomeCase):
         self.assertNotIn("default   ", text)
 
 
+class LauncherPromptSuffixTests(_HomeCase):
+    """M2: ensure_launcher's questions must carry no pre-baked ``[y/N]`` —
+    configure's confirm wrapper appends the one suffix, so a baked-in one
+    rendered as the CLI's only doubled ``[y/N]  [y/n]:`` prompt."""
+
+    def test_confirm_question_has_no_baked_suffix(self):
+        asked: list[str] = []
+        user_home = Path(self.tmp.name) / "barehome"
+
+        def confirm(q: str) -> bool:
+            asked.append(q)
+            return False
+
+        savings_cli.ensure_launcher(
+            self.home, PLUGIN_DIR / "tool-belt",
+            confirm=confirm, out=lambda _s: None, user_home=user_home)
+        self.assertEqual(len(asked), 1)
+        self.assertNotIn("[y/N]", asked[0])
+        self.assertNotIn("[y/n]", asked[0])
+
+
+class DispatchExitCodeTests(unittest.TestCase):
+    """M6: bare ``tool-belt`` and ``tool-belt --help`` printed byte-identical
+    text under different exit codes; help must be 0/stdout and a missing
+    command a distinct error on stderr."""
+
+    def test_help_exits_zero_on_stdout(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(savings_cli.main(["--help"]), 0)
+        self.assertIn("usage: tool-belt", out.getvalue())
+        self.assertEqual(err.getvalue(), "")
+
+    def test_bare_invocation_is_a_distinct_error(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(savings_cli.main([]), 2)
+        self.assertEqual(out.getvalue(), "")
+        self.assertIn("no command given", err.getvalue())
+
+
+class SinceEchoTests(_HomeCase):
+    """P5: the report must say which ``--since`` it honored, or the reader
+    cannot tell whether their filter actually applied."""
+
+    def test_since_echoed_in_text_and_json(self):
+        _write_session(self.home / "sessions", "s", platform="telegram",
+                       model="m", ceiling=CEILING, turns=[{"user": "hello"}])
+        report = savings.compute(hermes_home=self.home, since="2026-01-01")
+        self.assertEqual(report.to_json()["since"], "2026-01-01")
+        self.assertIn("Window: since 2026-01-01",
+                      savings_cli.render_text(report))
+
+    def test_unbounded_report_shows_no_window_line(self):
+        _write_session(self.home / "sessions", "s", platform="telegram",
+                       model="m", ceiling=CEILING, turns=[{"user": "hello"}])
+        report = savings.compute(hermes_home=self.home)
+        self.assertIsNone(report.to_json()["since"])
+        self.assertNotIn("Window:", savings_cli.render_text(report))
+
+
 if __name__ == "__main__":
     unittest.main()
 

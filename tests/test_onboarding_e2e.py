@@ -151,11 +151,12 @@ class OnboardingArcTests(OnboardingTestCase):
     """The four-state machine and both onboarding paths, end to end."""
 
     def test_fresh_reporting(self) -> None:
-        """A home with no telemetry reports nothing and invents nothing."""
+        """A home with no telemetry names its profiles and invents nothing."""
         runner = tc.FakeRunner()
         rc, output = self.run_main(["--status"], runner)
         self.assertEqual(rc, 0)
-        self.assertIn("No agent scopes found yet", output)
+        self.assertIn("Hermes profile(s) found: default", output)
+        self.assertIn("No Tool Belt telemetry recorded", output)
         self.assertEqual(runner.writes, [])
 
     def test_recommend_to_observing(self) -> None:

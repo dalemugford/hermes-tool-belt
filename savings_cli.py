@@ -97,6 +97,8 @@ def render_text(report: _savings.SavingsReport) -> str:
     out.append("")
     out.append("  Hermes Tool Belt — Savings")
     out.append("  " + "─" * 40)
+    if report.since:
+        out.append(f"  Window: since {report.since}")
 
     if not report.agents:
         out.append("  No enabled/discovered agent profiles with telemetry or sessions.")
@@ -327,11 +329,11 @@ def ensure_launcher(
         else:
             detail = f"it points at a different plugin: {existing}"
         out(f"Launcher at {target} is stale — {detail}")
-        if not confirm(f"Refresh launcher at {target} to {desired_exec}? [y/N] "):
+        if not confirm(f"Refresh launcher at {target} to {desired_exec}?"):
             out("Skipped launcher refresh.")
             out(path_guidance(hermes_home))
             return False
-    elif not confirm(f"Create launcher at {target}? [y/N] "):
+    elif not confirm(f"Create launcher at {target}?"):
         out("Skipped launcher creation.")
         out(path_guidance(hermes_home))
         return False
@@ -410,7 +412,7 @@ def run(argv: list[str] | None = None, *, out: Callable[[str], None] | None = No
     return 0
 
 
-def _run_configure(argv: list[str]) -> int:
+def _run_configure(argv: list[str], prog: str | None = None) -> int:
     """Delegate to scripts/configure.py's main() without importing it eagerly."""
     import importlib.util
 
@@ -424,26 +426,40 @@ def _run_configure(argv: list[str]) -> int:
     # via sys.modules[cls.__module__], which is None until registration.
     sys.modules["tool_belt_configure"] = module
     spec.loader.exec_module(module)
-    return module.main(argv)
+    return module.main(argv, prog=prog)
 
 
-def main(argv: list[str] | None = None) -> int:
-    """Top-level ``tool-belt`` dispatch: dispatches ``savings`` and ``configure``."""
+def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
+    """Top-level ``tool-belt`` dispatch: dispatches ``savings`` and ``configure``.
+
+    ``prog`` is the command form the user actually typed (e.g. ``tool-belt``
+    or ``hermes tool-belt``) so downstream guidance echoes a runnable command
+    instead of a repo-relative script path. When None it is inferred from
+    ``sys.argv[0]`` (the launcher installs under the name ``tool-belt``).
+    """
     argv = list(sys.argv[1:] if argv is None else argv)
-    if not argv or argv[0] in ("-h", "--help"):
-        print(
-            "usage: tool-belt <command> [options]\n"
-            "\n"
-            "commands:\n"
-            "  savings     read-only token-savings report\n"
-            "  configure   interactive onboarding (shape/recommend tool loadouts)"
-        )
-        return 0 if argv else 1
+    if prog is None and Path(sys.argv[0] or "").name == "tool-belt":
+        prog = "tool-belt"
+    usage = (
+        "usage: tool-belt <command> [options]\n"
+        "\n"
+        "commands:\n"
+        "  savings     read-only token-savings report\n"
+        "  configure   interactive onboarding (shape/recommend tool loadouts)"
+    )
+    if argv and argv[0] in ("-h", "--help"):
+        print(usage)
+        return 0
+    if not argv:
+        # Help is not an error; a missing command is — and must not print
+        # byte-identical text under a different exit code.
+        print(f"error: no command given\n{usage}", file=sys.stderr)
+        return 2
     command, rest = argv[0], argv[1:]
     if command == "savings":
         return run(rest)
     if command == "configure":
-        return _run_configure(rest)
+        return _run_configure(rest, prog=prog)
     print(f"error: unknown command {command!r} (known: savings, configure)", file=sys.stderr)
     return 2
 

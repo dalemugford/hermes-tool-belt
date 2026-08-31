@@ -145,8 +145,9 @@ class PassThroughTest(unittest.TestCase):
         args = top.parse_args(argv)
         seen: dict[str, list[str]] = {}
 
-        def _fake_main(argv_in):
+        def _fake_main(argv_in, **kwargs):
             seen["argv"] = list(argv_in)
+            seen["prog"] = kwargs.get("prog")
             return 0
 
         sc = importlib.import_module(_SAVINGS_CLI_MODULE)
@@ -160,6 +161,21 @@ class PassThroughTest(unittest.TestCase):
         )
         self.assertEqual(["savings", "--json", "--agent", "default"], forwarded)
         self.assertEqual(0, rc)
+
+    def test_prog_names_the_hermes_invocation_form(self) -> None:
+        # M5: guidance downstream echoes how the user got here.
+        top = _hermes_parser()
+        args = top.parse_args(["tool-belt", "configure"])
+        seen: dict[str, object] = {}
+
+        def _fake_main(argv_in, **kwargs):
+            seen["prog"] = kwargs.get("prog")
+            return 0
+
+        sc = importlib.import_module(_SAVINGS_CLI_MODULE)
+        with mock.patch.object(sc, "main", _fake_main):
+            args.func(args)
+        self.assertTrue(str(seen["prog"]).endswith(" tool-belt"), seen["prog"])
 
     def test_configure_flags_pass_through(self) -> None:
         forwarded, _ = self._dispatch(["tool-belt", "configure", "--status"])
@@ -192,28 +208,28 @@ class ExitStatusTest(unittest.TestCase):
             return cli.tool_belt_command(args)
 
     def test_return_code_propagates(self) -> None:
-        self.assertEqual(2, self._handler(lambda argv: 2))
+        self.assertEqual(2, self._handler(lambda argv, **kw: 2))
 
     def test_system_exit_code_propagates(self) -> None:
-        def _boom(argv):
+        def _boom(argv, **kw):
             raise SystemExit(3)
 
         self.assertEqual(3, self._handler(_boom))
 
     def test_system_exit_message_becomes_exit_1(self) -> None:
-        def _boom(argv):
+        def _boom(argv, **kw):
             raise SystemExit("bad news")
 
         self.assertEqual(1, self._handler(_boom))
 
     def test_system_exit_none_is_success(self) -> None:
-        def _clean(argv):
+        def _clean(argv, **kw):
             raise SystemExit(None)
 
         self.assertEqual(0, self._handler(_clean))
 
     def test_non_int_return_is_success(self) -> None:
-        self.assertEqual(0, self._handler(lambda argv: None))
+        self.assertEqual(0, self._handler(lambda argv, **kw: None))
 
 
 if __name__ == "__main__":

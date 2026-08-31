@@ -1046,5 +1046,57 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(configure.prompt_multi_select(infos, reader), infos)
 
 
+class InvocationEchoTests(TempHomeTestCase):
+    """M5: guidance must echo the command form the user actually typed — a
+    ``tool-belt`` launcher user has no ``scripts/configure.py`` path that
+    means anything to them."""
+
+    def _run(self, prog: str | None):
+        runner = FakeRunner()
+        lines: list[str] = []
+        with contextlib.ExitStack() as stack:
+            for patch in isolate(runner, "/usr/bin/hermes", lines):
+                stack.enter_context(patch)
+            rc = configure.main(["--yes", "--hermes-home", str(self.home)],
+                                prog=prog)
+        return rc, "\n".join(lines)
+
+    def test_launcher_invocation_echoes_tool_belt_form(self) -> None:
+        _rc, output = self._run("tool-belt")
+        self.assertIn("tool-belt configure --status", output)
+        self.assertNotIn("scripts/configure.py", output)
+
+    def test_direct_script_run_echoes_script_form(self) -> None:
+        _rc, output = self._run(None)
+        self.assertIn("python3 scripts/configure.py --status", output)
+
+
+class StatusFreshInstallTests(TempHomeTestCase):
+    """P2: ``--status`` on a home with real profiles but zero telemetry must
+    name what it found instead of the empty-home 'No agent scopes' text."""
+
+    def _status(self, home: Path):
+        runner = FakeRunner()
+        lines: list[str] = []
+        with contextlib.ExitStack() as stack:
+            for patch in isolate(runner, "/usr/bin/hermes", lines):
+                stack.enter_context(patch)
+            rc = configure.main(["--status", "--hermes-home", str(home)])
+        return rc, "\n".join(lines)
+
+    def test_status_names_known_profiles_without_telemetry(self) -> None:
+        rc, output = self._status(self.home)
+        self.assertEqual(rc, 0)
+        self.assertIn("Hermes profile(s) found: default", output)
+        self.assertNotIn("No agent scopes found yet", output)
+
+    def test_status_on_truly_empty_home_still_says_no_scopes(self) -> None:
+        empty = Path(self.tmp.name) / "empty home"
+        empty.mkdir()
+        rc, output = self._status(empty)
+        self.assertEqual(rc, 0)
+        self.assertIn("No agent scopes found yet", output)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1412,6 +1412,8 @@ class SavingsReport:
     agents: list[AgentSavings]
     hermes_home: str
     token_estimator: str
+    #: The raw --since value this report honored; None = all recorded history.
+    since: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         # Aggregate token totals are complete across every agent; USD sums only
@@ -1442,6 +1444,7 @@ class SavingsReport:
             "cache_mode": self.cache_mode,
             "hermes_home": self.hermes_home,
             "token_estimator": self.token_estimator,
+            "since": self.since,
             "agents": [a.to_json() for a in self.agents],
             "aggregate": {
                 "observed": {
@@ -1527,4 +1530,5 @@ def compute(
         agents=agents,
         hermes_home=str(home),
         token_estimator=token_estimator_name(),
+        since=since,
     )

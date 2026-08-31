@@ -97,8 +97,11 @@ def tool_belt_command(args: argparse.Namespace) -> int:
         print(f"error: tool-belt CLI is unavailable: {exc}", file=sys.stderr)
         return 1
 
+    from pathlib import Path
+
+    host = Path(sys.argv[0] or "").name or "hermes"
     try:
-        rc = savings_cli.main(argv)
+        rc = savings_cli.main(argv, prog=f"{host} tool-belt")
     except KeyboardInterrupt:
         print("", file=sys.stderr)
         return 130
