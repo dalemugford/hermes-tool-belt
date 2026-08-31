@@ -468,6 +468,11 @@ def compute_scope_recommendations(
     # demote arm must price it; a first-message fire is free (it lands in
     # the freeze snapshot before anything is cached).
     late_trigger_sessions: dict[str, set[str]] = defaultdict(set)
+    # Sessions in which each tool was actually observed CARRIED — demotion
+    # saving is only real where the schema was actually being shipped, so a
+    # tool carried in part of the window (or absent from bypass sessions)
+    # must not be credited savings for the whole window.
+    carried_sessions: dict[str, set[str]] = defaultdict(set)
     api_counts = api_call_counts or {}
     session_exposures: dict[str, int] = {}
     for sid, plist in recent_sessions.items():
@@ -491,6 +496,7 @@ def compute_scope_recommendations(
                     carry_source = p.get("carry_tools") or []
                 for t in carry_source:
                     carry_observed.add(str(t))
+                    carried_sessions[str(t)].add(sid)
             pid = p.get("prediction_id", "")
             for tc in calls_by_pred.get(pid, []):
                 name = str(tc.get("tool_name") or "")
@@ -505,13 +511,31 @@ def compute_scope_recommendations(
     sizes = schema_sizes or {}
     k = float(demote_k) if demote_k and demote_k > 0 else 1.5
 
-    def _economics(tool_name: str, use_sessions: set[str]) -> tuple[int, int]:
-        """(saving, penalty) in tokens for carrying vs expanding this tool."""
+    def _economics(
+        tool_name: str, use_sessions: set[str],
+        session_pool: set[str] | None = None,
+    ) -> tuple[int, int]:
+        """(saving, penalty) in tokens for carrying vs expanding this tool.
+
+        ``session_pool`` bounds the saving side: the demote arm passes the
+        sessions the tool was actually carried in (schema shipped nowhere
+        else); the promote arm leaves it None — a promoted tool would be
+        carried in every future session, so the whole window prices its
+        marginal cost.
+        """
         size = int(sizes.get(tool_name, DEFAULT_PER_TOOL_TOKENS))
+        if session_pool is None:
+            pool_exposures = total_exposures
+            use_pool = use_sessions
+        else:
+            pool_exposures = sum(
+                session_exposures.get(sid, 0) for sid in session_pool
+            )
+            use_pool = use_sessions & session_pool
         exposures_with_use = sum(
-            session_exposures.get(sid, 0) for sid in use_sessions
+            session_exposures.get(sid, 0) for sid in use_pool
         )
-        saving = size * max(0, total_exposures - exposures_with_use)
+        saving = size * max(0, pool_exposures - exposures_with_use)
         penalty = EXPAND_ROUND_TRIP_TOKENS * len(use_sessions)
         return saving, penalty
 
@@ -546,7 +570,9 @@ def compute_scope_recommendations(
         # the exclusion genuinely by construction for both schema versions.
         for tool_name in sorted(carry_observed - always_carry_observed):
             use_sessions = demand_use_sessions.get(tool_name, set())
-            saving, penalty = _economics(tool_name, use_sessions)
+            saving, penalty = _economics(
+                tool_name, use_sessions,
+                session_pool=carried_sessions.get(tool_name, set()))
             # Under prompt caching, a demoted tool's LATE trigger fire is not
             # free: it mutates the frozen tool list and busts the provider
             # prefix cache. Charge one round-trip per such session (sessions
@@ -706,6 +732,47 @@ def _read_learned_doc(learned_path: Path) -> dict[str, Any]:
     return {}
 
 
+AUTO_SHAPE_STAMP_FILE = "auto_shape_stamp.json"
+
+
+def _read_auto_shape_stamps(state_dir: Path) -> dict[str, str]:
+    """Per-scope auto-shape debounce stamps ({scope: iso-ts}). Fail-open."""
+    try:
+        doc = json.loads((state_dir / AUTO_SHAPE_STAMP_FILE).read_text(
+            encoding="utf-8"))
+        if isinstance(doc, dict):
+            return {str(k): str(v) for k, v in doc.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def _write_auto_shape_stamps(state_dir: Path, stamps: dict[str, str]) -> None:
+    """Persist the debounce sidecar. Best-effort — a failed write only means
+    the next pass re-runs the (idempotent) shaping compute early."""
+    try:
+        path = state_dir / AUTO_SHAPE_STAMP_FILE
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(stamps, indent=1, sort_keys=True),
+                       encoding="utf-8")
+        tmp.replace(path)
+    except Exception as exc:
+        logger.debug("tool-belt: auto-shape stamp write failed: %s", exc)
+
+
+def _doc_version_too_new(doc: Any) -> bool:
+    """True when a learned document declares a schema newer than this build.
+
+    ``load_state`` already refuses such documents on the read side; the
+    writers must refuse symmetrically or a future-schema file would be
+    silently re-stamped v2 on the next pass, destroying its version marker.
+    """
+    try:
+        return int((doc or {}).get("version", 0) or 0) > learned.LEARNED_VERSION
+    except Exception:
+        return False
+
+
 def merge_into_learned(
     state_dir: Path,
     per_scope: dict[str, dict[str, Any]],
@@ -722,7 +789,13 @@ def merge_into_learned(
     anything changed.
     """
     learned_path = state_dir / "learned.json"
-    state = learned.normalize_state(_read_learned_doc(learned_path))
+    raw_doc = _read_learned_doc(learned_path)
+    if _doc_version_too_new(raw_doc):
+        logger.warning(
+            "tool-belt: learned.json at %s has a newer schema version than "
+            "this build understands — refusing to rewrite it", learned_path)
+        return learned.normalize_state(raw_doc), False
+    state = learned.normalize_state(raw_doc)
     state, changes = apply_recommendations(state, per_scope)
     changed = bool(changes)
 
@@ -1487,8 +1560,18 @@ def auto_shape_run(
     grouped = group_predictions_by_scope_session(preds)
 
     learned_path = sd / "learned.json"
-    state = learned.normalize_state(_read_learned_doc(learned_path))
+    raw_doc = _read_learned_doc(learned_path)
+    if _doc_version_too_new(raw_doc):
+        summary["reason"] = "learned_schema_too_new"
+        return summary
+    state = learned.normalize_state(raw_doc)
     scopes_state = state.get("scopes") or {}
+
+    # Debounce stamps live in their own sidecar so a nothing-changed pass
+    # never rewrites learned.json (rewriting widened the cross-process
+    # last-writer-wins window into a routine event). Pre-sidecar installs
+    # fall back to the stamp in the scope's shaping meta once.
+    stamps = _read_auto_shape_stamps(sd)
 
     eligible: list[str] = []
     for scope in sorted(grouped):
@@ -1496,8 +1579,8 @@ def auto_shape_run(
             continue  # no standing consent — never auto-write
         entry = scopes_state.get(scope) or {}
         shaping_meta = entry.get("shaping") if isinstance(entry, dict) else {}
-        last = None
-        if isinstance(shaping_meta, dict):
+        last = _parse_utc_iso(stamps.get(scope))
+        if last is None and isinstance(shaping_meta, dict):
             last = _parse_utc_iso(shaping_meta.get("last_auto_shape_at"))
         interval_s = auto_shape_interval_hours(plugin_config, scope) * 3600.0
         if last is not None and (now - last) < interval_s:
@@ -1584,23 +1667,27 @@ def auto_shape_run(
     except Exception as exc:
         logger.warning("tool-belt: trigger-overlay learning failed (fail-open): %s", exc)
 
-    scopes = dict(state.get("scopes") or {})
+    # Debounce stamps go to the sidecar for EVERY attempted scope; learned.json
+    # is written only when an assignment or overlay actually changed, so a
+    # quiet pass can never clobber a concurrent operator write.
     for scope in eligible:
-        entry = dict(scopes.get(scope) or {"carry": [], "expand_only": [], "shaping": {}})
-        shaping_meta = entry.get("shaping")
-        shaping_meta = dict(shaping_meta) if isinstance(shaping_meta, dict) else {}
-        shaping_meta["last_auto_shape_at"] = ts_iso
-        if scope in changes:
+        stamps[scope] = ts_iso
+    _write_auto_shape_stamps(sd, stamps)
+
+    if changes or overlay_changed:
+        scopes = dict(state.get("scopes") or {})
+        for scope in changes:
+            entry = dict(scopes.get(scope) or {"carry": [], "expand_only": [], "shaping": {}})
+            shaping_meta = entry.get("shaping")
+            shaping_meta = dict(shaping_meta) if isinstance(shaping_meta, dict) else {}
+            shaping_meta["last_auto_shape_at"] = ts_iso
             shaping_meta["source"] = "auto"
             shaping_meta["applied_at"] = ts_iso
-        entry["shaping"] = shaping_meta
-        scopes[scope] = entry
-    state["scopes"] = scopes
-    if changes or overlay_changed:
+            entry["shaping"] = shaping_meta
+            scopes[scope] = entry
+        state["scopes"] = scopes
         state["updated_at"] = ts_iso
-
-    # One write covers both the applied assignments and the debounce stamps.
-    learned.write_state(state, learned_path)
+        learned.write_state(state, learned_path)
 
     for scope, delta in changes.items():
         promoted = delta.get("promoted") or []

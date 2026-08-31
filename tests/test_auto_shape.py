@@ -187,6 +187,36 @@ class SessionEndAutoApplyTests(AutoShapeBase):
         self.assertEqual(plugin._FROZEN_BY_SESSION["live-key"], snapshot)
 
 
+class FutureSchemaGuardTests(AutoShapeBase):
+    """load_state refuses a learned.json newer than this build; the WRITERS
+    must refuse symmetrically or a future-schema file would be re-stamped v2
+    on the next pass, destroying its version marker."""
+
+    def test_auto_pass_never_rewrites_a_future_schema_doc(self):
+        seed_state_dir(self.state_dir)
+        path = self.state_dir / "learned.json"
+        original = json.dumps({"version": 3, "scopes": {},
+                               "from_the_future": True})
+        path.write_text(original, encoding="utf-8")
+        shaping = _shaping_mod()
+        result = shaping.auto_shape_run(self.config, self.state_dir)
+        self.assertEqual(result.get("reason"), "learned_schema_too_new")
+        self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+    def test_configure_merge_refuses_a_future_schema_doc(self):
+        path = self.state_dir / "learned.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        original = json.dumps({"version": 3, "scopes": {}})
+        path.write_text(original, encoding="utf-8")
+        shaping = _shaping_mod()
+        _state, changed = shaping.merge_into_learned(
+            self.state_dir,
+            {SCOPE: {"promote": [{"tool": "read_file"}], "demote": []}},
+            dry_run=False)
+        self.assertFalse(changed)
+        self.assertEqual(path.read_text(encoding="utf-8"), original)
+
+
 class EngineDebounceTests(AutoShapeBase):
     """Engine-level clock control for the debounce and attempt-recording."""
 
@@ -222,21 +252,22 @@ class EngineDebounceTests(AutoShapeBase):
         self.assertTrue(later["ran"])
         self.assertIn(SCOPE, later["attempted"])
 
-    def test_below_threshold_records_attempt_writes_nothing_else(self):
+    def test_below_threshold_leaves_learned_untouched_but_still_debounces(self):
         # One session: below promote_min_sessions (2) — no recommendation.
+        # A nothing-changed pass must NOT rewrite learned.json (rewriting
+        # made the cross-process last-writer-wins window a routine event);
+        # the attempt lands in the debounce sidecar and still gates the
+        # next run.
         seed_state_dir(self.state_dir, sessions=1)
         shaping = _shaping_mod()
         result = shaping.auto_shape_run(self.config, self.state_dir)
         self.assertTrue(result["ran"])
         self.assertEqual(result["applied"], {})
-        doc = self.learned_doc()
-        entry = doc["scopes"][SCOPE]
-        self.assertEqual(entry["carry"], [])
-        self.assertEqual(entry["expand_only"], [])
-        self.assertTrue(entry["shaping"]["last_auto_shape_at"])
-        self.assertNotIn("source", entry["shaping"])
-        self.assertNotIn("applied_at", entry["shaping"])
-        # The recorded attempt is exactly what debounces the next run.
+        self.assertIsNone(self.learned_doc(),
+                          "a quiet pass writes no learned.json")
+        stamps = shaping._read_auto_shape_stamps(self.state_dir)
+        self.assertIn(SCOPE, stamps)
+        # The sidecar stamp is exactly what debounces the next run.
         again = shaping.auto_shape_run(self.config, self.state_dir)
         self.assertFalse(again["ran"])
 

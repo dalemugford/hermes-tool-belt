@@ -97,6 +97,26 @@ class EconomicDemotion(unittest.TestCase):
                         schema_sizes={"browser_exec": 2000}, cache_mode="off")
         self.assertNotIn("browser_exec", {d["tool"] for d in recs["demote"]})
 
+    def test_saving_counted_only_where_the_tool_was_carried(self):
+        # browser_exec carried in 10 of 30 sessions (zero use): demotion can
+        # only save schema where the schema was actually shipped — 2000×10,
+        # not 2000×30. Fails on the union-of-carries math.
+        preds, calls = [], []
+        for i in range(30):
+            pid = f"p{i}"
+            carry = (["browser_exec", "terminal"] if i < 10 else ["terminal"])
+            preds.append(_pred_row(
+                self.SCOPE, f"s{i}", pid,
+                ceiling=self.E, always_carry=["clarify"], carry=carry,
+                active=self.E, ts=float(i),
+            ))
+            calls.append(_use_call(pid, "terminal"))
+        recs = _compute(self.SCOPE, preds, calls, window=100,
+                        schema_sizes={"browser_exec": 2000}, cache_mode="on")
+        entry = {d["tool"]: d for d in recs["demote"]}
+        self.assertIn("browser_exec", entry)
+        self.assertEqual(entry["browser_exec"]["carry_tokens"], 2000 * 10)
+
     def _late_trigger_sessions(self, n, trigger_sessions):
         """n sessions of TWO predictions; in the named sessions the SECOND
         prediction records a trigger activation of ``browser_exec``."""

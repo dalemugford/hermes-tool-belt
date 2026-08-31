@@ -555,9 +555,17 @@ def compute_observed(
 
     # Realized reduction: the narrowed cohorts only (bypass never narrows;
     # pending is not yet classified). expand_tools overhead is observed, not
-    # estimated per-turn — it applies to the cache-off net figure.
+    # estimated per-turn — and it is charged over the SAME cohorts whose
+    # savings are summed: an expansion in a bypass or pending session has no
+    # counted saving to net against.
     realized = on.get("saved_tokens_total", 0) + off.get("saved_tokens_total", 0)
-    expand_events = _count_expand_events(tool_calls)
+    counted_pids = {
+        str(p.get("prediction_id") or "") for p in predictions
+        if classify_prediction_mode(p, api_last) in ("on", "off")
+    }
+    expand_events = _count_expand_events(
+        [t for t in tool_calls
+         if str(t.get("prediction_id") or "") in counted_pids])
     overhead = expand_events * EXPAND_ROUND_TRIP_TOKENS
     net = realized - overhead
 

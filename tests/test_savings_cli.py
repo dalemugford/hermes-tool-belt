@@ -448,6 +448,34 @@ class CohortSeparationTests(_HomeCase):
         self.assertEqual(a0["projected"]["label"], "projected")
 
 
+class BypassExpansionOverheadTests(_HomeCase):
+    """Expansion overhead is charged over the SAME cohorts whose savings are
+    summed — an expand_tools row in a bypass session has no counted saving
+    to net against, so it must not reduce the headline."""
+
+    def test_bypass_expansion_does_not_reduce_net(self):
+        state = self.home / "state" / "tool-belt"
+        _write_observed(state, "default:telegram")
+        baseline = savings.compute_observed(state).net_token_reduction
+        # A bypass prediction (never narrowed) with an expansion on it.
+        with (state / "predictions.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "schema_version": 2, "ts": 1780000003.0,
+                "prediction_id": "byp1", "session_id": "default:telegram:S9",
+                "scope": "default:telegram", "policy_source": "bypass",
+                "bypassed": True, "ceiling_count": 40, "narrowed_count": 40,
+                "ceiling_tokens": 10000, "narrowed_tokens": 10000,
+            }) + "\n")
+        with (state / "tool_calls.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps({
+                "schema_version": 2, "ts": 1780000004.0,
+                "prediction_id": "byp1", "scope": "default:telegram",
+                "tool_name": "expand_tools", "source": "gateway",
+            }) + "\n")
+        self.assertEqual(savings.compute_observed(state).net_token_reduction,
+                         baseline)
+
+
 class ExpansionVsTriggerTests(_HomeCase):
     """(7) Trigger activation adds no expansion charge; explicit expansion
     does."""
