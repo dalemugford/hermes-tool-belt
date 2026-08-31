@@ -17,8 +17,9 @@ What this validates (mechanical, not behavioral):
     · First dispatch under cache-on freezes the tool set
     · Subsequent dispatches reuse the frozen snapshot (frozen_reuse=true)
     · expand_tools mid-session propagates to the frozen snapshot
-    · on_session_end does NOT evict the freeze (per-turn hook)
-    · on_session_reset DOES evict the freeze (true reset)
+    · on_session_end does NOT evict the freeze, sticky, or lookback
+      (per-turn hook — session-scoped state must survive it)
+    · on_session_reset DOES evict freeze + sticky + lookback (true reset)
     · Cache-mode detection captures per-call telemetry
 
 What this does NOT validate:
@@ -359,19 +360,28 @@ def run_cache_off_assertions(state_dir: Path, check: Check) -> None:
         f"sticky residency does not leak across sessions "
         f"(victim session expansion credits: {len(victim_expanded)})")
 
-    # ─── Session_end eviction ───
-    # After all scenarios completed, _STICKY_BY_KEY must be empty (every
-    # session called on_session_end).
-    remaining_sticky = list(plugin._STICKY_BY_KEY.keys())
-    check.assert_(not remaining_sticky,
-        f"on_session_end fully evicts sticky state "
-        f"(remaining sticky_keys: {len(remaining_sticky)})")
-
-    # ─── prior_messages also evicted ───
-    remaining_lookback = list(plugin._PRIOR_MESSAGES_BY_SESSION.keys())
-    check.assert_(not remaining_lookback,
-        f"on_session_end evicts lookback prior-message buffer "
-        f"(remaining session entries: {len(remaining_lookback)})")
+    # ─── Session lifecycle (M2 contract) ───
+    # on_session_end fires PER TURN, so session-scoped sticky residency and
+    # lookback history must SURVIVE it (evicting them per turn defeated both
+    # features); only on_session_reset clears them. Sticky additionally
+    # self-decays on its TTL. Prove both halves on a fresh probe session.
+    probe = _canonical_key("reset-probe", "telegram")
+    probe_sticky = plugin._sticky_key_for_session(probe)
+    plugin._STICKY_BY_KEY[probe_sticky] = {
+        "browser": {"tools": {"browser_navigate"}, "remaining_turns": 3}}
+    plugin._PRIOR_MESSAGES_BY_SESSION[probe] = ["remember me"]
+    with mock.patch.dict(os.environ, {"HERMES_SESSION_KEY": probe}, clear=False):
+        plugin._on_session_end(session_id=probe)
+    check.assert_(
+        probe_sticky in plugin._STICKY_BY_KEY
+        and probe in plugin._PRIOR_MESSAGES_BY_SESSION,
+        "on_session_end LEAVES session-scoped sticky/lookback (per-turn hook)")
+    plugin._on_session_reset(session_id="reset-probe-new-uuid",
+                             platform="telegram", session_key=probe)
+    check.assert_(probe_sticky not in plugin._STICKY_BY_KEY,
+        "on_session_reset evicts sticky residency")
+    check.assert_(probe not in plugin._PRIOR_MESSAGES_BY_SESSION,
+        "on_session_reset evicts lookback prior-message buffer")
 
 
 # ────────────────────────────────────────────────────────────────────────
