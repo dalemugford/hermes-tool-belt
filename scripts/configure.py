@@ -1689,50 +1689,69 @@ def checkbox_picker(
 
 
 def _checkbox_picker_tty(items: Sequence[str], state: set[str]) -> set[str] | None:
-    """Raw-terminal spacebar picker. TTY-only; caller handles fallback."""
+    """Raw-terminal spacebar picker with a scrolling viewport.
+
+    TTY-only; caller handles fallback. Renders a window sized to the
+    terminal (a 50-tool inventory must work in a 30-row window — redrawing
+    the full list would scroll off-screen and clamp the cursor-up, which
+    made navigation look dead).
+    """
+    import os
+    import shutil as _shutil
     import termios
     import tty
 
-    cursor = 0
-    write = sys.stdout.write
+    fd = sys.stdin.fileno()
     n = len(items)
+    rows = _shutil.get_terminal_size().lines
+    height = max(3, min(n, rows - 4))
+    cursor, top = 0, 0
+    write = sys.stdout.write
+    drawn = False
 
-    def render(first: bool) -> None:
-        if not first:
-            write(f"\x1b[{n + 1}A")  # cursor up over the list + hint
-        for i, item in enumerate(items):
+    def render() -> None:
+        nonlocal drawn, top
+        if cursor < top:
+            top = cursor
+        elif cursor >= top + height:
+            top = cursor - height + 1
+        if drawn:
+            write(f"\x1b[{height + 1}A")
+        drawn = True
+        for i in range(top, top + height):
+            item = items[i]
             mark = "x" if item in state else " "
             pointer = ">" if i == cursor else " "
             write(f"\x1b[2K  {pointer} [{mark}] {item}\n")
-        write("\x1b[2K    space toggle · ↑/↓ move · enter done · q cancel\n")
+        above = f" ↑{top}" if top > 0 else ""
+        below = f" ↓{n - top - height}" if top + height < n else ""
+        write(f"\x1b[2K    space toggle · ↑/↓ move · enter done · "
+              f"q cancel  ({cursor + 1}/{n}{above}{below})\n")
         sys.stdout.flush()
 
-    render(first=True)
-    fd = sys.stdin.fileno()
+    render()
     old = termios.tcgetattr(fd)
     try:
-        tty.setraw(fd)
         while True:
-            ch = sys.stdin.read(1)
+            tty.setraw(fd)
+            try:
+                ch = os.read(fd, 1).decode(errors="ignore")
+                if ch == "\x1b":  # arrow keys: ESC [ A/B
+                    seq = os.read(fd, 2).decode(errors="ignore")
+                    ch = {"[A": "k", "[B": "j"}.get(seq, "")
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
             if ch in ("\r", "\n"):
                 return state
             if ch in ("q", "\x03", "\x04"):  # q / Ctrl-C / Ctrl-D
                 return None
             if ch == " ":
                 state.symmetric_difference_update({items[cursor]})
-            elif ch in ("j",):
+            elif ch == "j":
                 cursor = min(cursor + 1, n - 1)
-            elif ch in ("k",):
+            elif ch == "k":
                 cursor = max(cursor - 1, 0)
-            elif ch == "\x1b":  # arrow keys: ESC [ A/B
-                seq = sys.stdin.read(2)
-                if seq == "[B":
-                    cursor = min(cursor + 1, n - 1)
-                elif seq == "[A":
-                    cursor = max(cursor - 1, 0)
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-            render(first=False)
-            tty.setraw(fd)
+            render()
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
