@@ -60,7 +60,7 @@ LEARNED_VERSION = 2
 #                         (--write-recommendations) and the shaper for human
 #                         review.
 _ALLOWED_MODES = {"recommend", "apply"}
-#: The zero-config default (Promise #2, 2026-08-30 — flipped from "recommend").
+#: The zero-config default (full-start contract).
 DEFAULT_MODE = "apply"
 # ``learned_mode`` accepts the pre-1.0 spellings "off"/"auto"/"audit" as aliases
 # for "recommend"/"apply" ("off" behaved like recommend at runtime; "auto" and
@@ -150,7 +150,7 @@ _KNOWN_SCOPE_KEYS = frozenset(
 
 
 def _normalize_overlay_triggers(value: Any) -> list[dict[str, Any]]:
-    """Validate a scope's learned trigger-overlay list (Promise #5).
+    """Validate a scope's learned trigger-overlay list.
 
     Each overlay entry is an *additive* trigger group learned from evidence —
     it can only ever ACTIVATE an ``expand_only`` tool (``T = triggered ∩ X``
@@ -268,7 +268,7 @@ def _normalize_scope_entry(entry: Any, *, warn_trigger_adjustments: bool = True)
     out["carry"] = carry
     out["expand_only"] = _reconcile_overlap(carry, expand_only)
     out["shaping"] = shaping
-    # Learned trigger overlay (Promise #5) — only kept when non-empty so
+    # Learned trigger overlay — only kept when non-empty so
     # untouched scopes stay byte-identical to their pre-overlay shape.
     overlay = _normalize_overlay_triggers(entry.get("triggers"))
     if overlay:
@@ -460,7 +460,7 @@ def reset_scope(state: dict[str, Any], scope: str) -> tuple[dict[str, Any], bool
 def prune_tool(state: dict[str, Any], tool: str) -> tuple[dict[str, Any], bool]:
     """Remove every learned reference to ``tool`` across all scopes, in memory.
 
-    Promise #4 (inventory reconciliation): a tool that has vanished from the
+    Inventory reconciliation: a tool that has vanished from the
     install's registry is cleaned out of learned state after the grace period.
     Removes the tool from each scope's ``carry`` / ``expand_only`` lists, from
     the recorded ``shaping`` promote/demote evidence rows, and from learned
@@ -693,7 +693,7 @@ def apply_to_preset(preset: Preset, plugin_config: dict[str, Any], scope: str) -
         for group in preset.triggers
     ]
 
-    # Learned trigger overlay (Promise #5): auto-learned groups UNION with the
+    # Learned trigger overlay: auto-learned groups UNION with the
     # shipped policy triggers — additive, activation-only, per scope. The
     # shipped policy.yaml is never edited.
     overlay_groups = _compile_overlay_groups(scoped, always_carry_set, matched_scope or scope)

@@ -11,7 +11,7 @@ per-message active set. It is the single authority for the locked algebra::
     R = expanded  ∩ X                        # explicitly expanded expand_only
     active = A ∪ C ∪ T ∪ R ∪ passthrough ∪ (prior_active ∩ (E ∪ passthrough))
 
-This is the *full-start* contract (Promise #2, 2026-08-30): with no learned
+This is the *full-start* contract: with no learned
 state (``demoted`` empty), every enabled tool is carried — ``active == E`` —
 and only evidence-driven demotion moves a tool into ``expand_only``. Unknown
 enabled built-ins are CARRIED until demoted. ``carry`` is the explicit

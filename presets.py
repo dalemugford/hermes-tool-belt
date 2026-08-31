@@ -1,7 +1,7 @@
 """Tool-policy loading and per-scope override resolution (Tool Belt 1.0).
 
 There's one policy YAML (``policy.yaml`` at the plugin root). Under the
-full-start contract (Promise #2, 2026-08-30) it declares the structural
+full-start contract it declares the structural
 ``always_carry`` baseline plus trigger groups:
 
   - ``always_carry``: immutable residents. They win every conflict and are

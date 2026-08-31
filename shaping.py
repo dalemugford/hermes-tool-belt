@@ -79,14 +79,14 @@ DEFAULTS = {
 #: (or the top-level ``auto_shape_interval_hours``) in the plugin config.
 AUTO_SHAPE_DEFAULT_INTERVAL_HOURS = 24.0
 
-# ── Promise #4: inventory reconciliation constants ──────────────────────────
+# ── Inventory-reconciliation constants ──────────────────────────
 #: Grace period between a tool's first observed absence from the install's
 #: registry and its automatic cleanup from learned state + config pins. A
 #: tool that reappears within the grace resets the clock; after cleanup it
 #: starts a fresh journey (carried, full-start).
 INVENTORY_GRACE_DAYS = 7
 
-# ── Promise #5: learned trigger-overlay constants ───────────────────────────
+# ── Learned trigger-overlay constants ───────────────────────────
 # Automatic application demands a stricter bar than the analyzer's
 # recommend-only mining defaults (support 3 / precision 0.8): candidates are
 # written into live trigger behavior with no human in the loop, so only
@@ -787,13 +787,13 @@ def filter_protected_demotions(
     return out
 
 
-# ─── Promise #4: inventory reconciliation (auto cleanup) ────────────────────
+# ─── Inventory reconciliation (auto cleanup) ────────────────────
 
 def registry_tool_names() -> set[str] | None:
     """The install's full tool registry — every registered tool name.
 
     This is the AUTHORITATIVE "does the tool exist on this install" question
-    (Promise #4): absence from one scope's platform ceiling is NOT absence
+    : absence from one scope's platform ceiling is NOT absence
     from the install — a tool excluded by ``platform_toolsets`` on Slack may
     be fully present on Telegram. Only the registry answers install-wide.
 
@@ -981,7 +981,7 @@ def reconcile_inventory(
     registry_names: set[str] | None = None,
     config_pin_remover: Any = None,
 ) -> dict[str, Any]:
-    """One inventory-reconciliation pass (Promise #4). Returns a summary.
+    """One inventory-reconciliation pass. Returns a summary.
 
     Detects tools that learned state or config pins still reference but the
     install's REGISTRY no longer contains (per-scope platform absence is NOT
@@ -1097,7 +1097,7 @@ def reconcile_inventory(
     return summary
 
 
-# ─── Promise #5: learned trigger overlay (automatic anticipation) ───────────
+# ─── Learned trigger overlay (automatic anticipation) ───────────
 
 def name_token_keywords(tool: str) -> list[str]:
     """Conservative word-boundary keyword regexes from a tool's name tokens.
@@ -1444,7 +1444,7 @@ def auto_shape_run(
 
     sd = Path(state_dir) if state_dir is not None else default_state_dir()
 
-    # Promise #4: inventory reconciliation runs on every auto pass (before the
+    # Inventory reconciliation runs on every auto pass (before the
     # evidence gates — cleanup is due even when no new telemetry landed).
     # Fail-open: a reconciliation problem never blocks shaping.
     try:
@@ -1520,7 +1520,7 @@ def auto_shape_run(
         )
     ts_iso = _utc_iso(now)
 
-    # Promise #5: learned trigger overlay — automatic anticipation. Additive,
+    # Learned trigger overlay — automatic anticipation. Additive,
     # per scope, activation-only; fail-open so an overlay problem never
     # blocks the shaping write itself.
     overlay_changed: dict[str, int] = {}

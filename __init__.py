@@ -129,12 +129,13 @@ _CONFIG: dict[str, Any] = {
     # (the `plugins.enabled` list already gates whether the plugin loads at
     # all). `plugins.tool-belt.enabled: false` is the explicit opt-out; an
     # UNSET key must not silently disable every hook while register() still
-    # exposes expand_tools (2026-08-30 live incident).
+    # exposes expand_tools (seen live: a dangling expand_tools with no
+    # narrowing behind it).
     "enabled": True,
     "log": True,
     "channels": {},
     "agent": "",
-    # Zero-config default (Promise #2, 2026-08-30): evidence-driven shaping
+    # Zero-config default (full-start contract): evidence-driven shaping
     # applies automatically. `learned_mode: recommend` is the documented
     # opt-in observe/trial mode; explicit configs win as always.
     "learned_mode": "apply",

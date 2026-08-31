@@ -183,7 +183,7 @@ def normalize_mode(value: Any) -> str:
             pass
     mode = str(value or "").strip().lower()
     mode = {"off": "recommend", "auto": "apply", "audit": "apply"}.get(mode, mode)
-    # Default flipped to "apply" (Promise #2): matches learned.DEFAULT_MODE.
+    # Default is "apply" (full-start contract): matches learned.DEFAULT_MODE.
     return mode if mode in {"recommend", "apply"} else "apply"
 
 
