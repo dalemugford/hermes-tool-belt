@@ -209,11 +209,10 @@ class OnboardingArcTests(OnboardingTestCase):
         entry = self.learned()["scopes"][result.scope]
         self.assertIn("execute_code", entry["carry"])
         self.assertEqual(entry["shaping"]["scope"], result.scope)
-        self.assertIn("execute_code", output)
 
         # The confirmed-apply epilogue speaks the 1.0 vocabulary: the retired
         # "moved to on-demand" phrasing must never resurface in any flow.
-        self.assertIn("moved to expand-only", output)
+        self.assertIn("Tools available by expansion:", output)
         self.assertNotIn("moved to on-demand", output)
 
         self.assertEqual(
@@ -240,17 +239,17 @@ class OnboardingArcTests(OnboardingTestCase):
         entry = self.learned()["scopes"][result.scope]
         lines = output.splitlines()
         carry_line = next(
-            l for l in lines if f"learned.json[{result.scope}].carry:" in l
+            l for l in lines if "Tools carried:" in l
         )
         expand_line = next(
-            l for l in lines if f"learned.json[{result.scope}].expand_only:" in l
+            l for l in lines if "Tools available by expansion:" in l
         )
-        self.assertIn(f"→ {len(entry['carry'])} (", carry_line)
-        self.assertIn(f"→ {len(entry['expand_only'])} (", expand_line)
-        for tool in entry["carry"]:
-            self.assertIn(f"+{tool}", carry_line)
-        for tool in entry["expand_only"]:
-            self.assertIn(f"+{tool}", expand_line)
+        # Compact diff: the disclosed COUNTS equal what landed on disk.
+        self.assertTrue(carry_line.rstrip().endswith(f"→ {len(entry['carry'])}"),
+                        carry_line)
+        self.assertTrue(
+            expand_line.rstrip().endswith(f"→ {len(entry['expand_only'])}"),
+            expand_line)
 
     def test_demote_arm_named_profile(self) -> None:
         """A chat-only agent in a named profile demotes its unused carry residents.

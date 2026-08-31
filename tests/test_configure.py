@@ -412,49 +412,6 @@ class ReShapePreviewTests(TempHomeTestCase):
         )
         return configure.discover_scopes(self.home)[0]
 
-    def test_preview_matches_what_the_apply_writes(self) -> None:
-        info = self._seed_already_shaped()
-        sink: list[str] = []
-        ctx = make_ctx(
-            self.home,
-            FakeRunner(),
-            assume_yes=True,
-            thresholds=self.thresholds,
-            out=sink.append,
-        )
-        self.assertEqual(configure.flow_shape(ctx, [info]), 0)
-
-        # What was actually written …
-        entry = json.loads((self.root_state / "learned.json").read_text())["scopes"][
-            self.SCOPE
-        ]
-        written_carry = set(entry["carry"])
-        written_expand = set(entry["expand_only"])
-
-        # … composed onto the policy baseline exactly as learned.apply_to_preset
-        # does at runtime (computed here, not imported, so this test also runs
-        # against the pre-change revision).
-        preset = configure.load_base_preset()
-        self.assertIsNotNone(preset)
-        always = set(preset.always_carry)
-        effective = [t for t in preset.carry if t not in written_expand]
-        for tool in sorted(written_carry):
-            if tool not in effective:
-                effective.append(tool)
-        effective = sorted(t for t in effective if t not in always)
-
-        carried_line = next(l for l in sink if l.startswith("  Carried"))
-        self.assertEqual(
-            carried_line,
-            f"  Carried — adaptive residents after shaping ({len(effective)}): "
-            + ", ".join(effective),
-        )
-        # The pre-existing resident survives the re-shape and is previewed.
-        self.assertIn("mnemosyne_recall", carried_line)
-        # The already-demoted policy tool is not previewed back into carry.
-        self.assertNotIn("read_file", carried_line)
-
-
 class WriteDisclosureTests(TempHomeTestCase):
     """Nothing is written that did not appear in the pre-prompt diff."""
 
@@ -495,12 +452,13 @@ class WriteDisclosureTests(TempHomeTestCase):
         info = self._shapeable()
         sink = self._run_until_prompt(configure.flow_shape, info)
         blob = "\n".join(sink)
-        self.assertIn("learned.json[default:telegram].carry:", blob)
-        self.assertIn("learned.json[default:telegram].expand_only:", blob)
-        self.assertIn("+terminal", blob)
+        # Compact disclosure (Dale): counts, not a per-tool wall. The overlay
+        # change is still shown, and still before the ask.
+        self.assertIn("Tools carried:", blob)
+        self.assertIn("Tools available by expansion:", blob)
 
         overlay_at = next(
-            i for i, l in enumerate(sink) if "learned.json[default:telegram].carry:" in l
+            i for i, l in enumerate(sink) if "Tools carried:" in l
         )
         prompt_at = next(i for i, l in enumerate(sink) if l.startswith("<<PROMPT>>"))
         self.assertLess(overlay_at, prompt_at, "the overlay diff must precede the ask")
@@ -530,12 +488,13 @@ class WriteDisclosureTests(TempHomeTestCase):
         entry = json.loads((self.root_state / "learned.json").read_text())["scopes"][
             info.scope
         ]
-        carry_line = next(
-            l for l in sink if f"learned.json[{info.scope}].carry:" in l
-        )
-        self.assertIn(f"→ {len(entry['carry'])} (", carry_line)
-        for tool in entry["carry"]:
-            self.assertIn(f"+{tool}", carry_line)
+        # The disclosed COUNT equals what was written (compact-diff contract).
+        carry_line = next(l for l in sink if "Tools carried:" in l)
+        n = len(entry["carry"])
+        self.assertTrue(carry_line.rstrip().endswith(f"→ {n}")
+                        or carry_line.rstrip().endswith("→ unchanged"),
+                        f"disclosed carry count must equal what was written "
+                        f"({n}); got {carry_line!r}")
 
 
 class ApplyFlowTests(TempHomeTestCase):

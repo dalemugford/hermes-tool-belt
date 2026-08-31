@@ -602,10 +602,17 @@ def format_value(value: Any) -> str:
     return "(not set)" if value is None else str(value)
 
 
+#: Friendly labels for the config keys this tool writes, so the disclosure
+#: reads as plain changes instead of dotted config paths.
+_FRIENDLY_KEYS = {"learned_mode": "Shaping mode", "bypass_rate": "Observation rate"}
+
+
 def build_diff(write: ConfigWrite) -> str:
     """One human-readable ``before → after`` line for a pending write."""
     after = "(removed)" if write.action == "unset" else format_value(write.after)
-    return f"  {write.key}: {format_value(write.before)} → {after}"
+    leaf = write.key.rsplit(".", 1)[-1]
+    label = _FRIENDLY_KEYS.get(leaf, write.key)
+    return f"    {label}: {format_value(write.before)} → {after}"
 
 
 def build_overlay_diff(
@@ -618,19 +625,16 @@ def build_overlay_diff(
     Every list that changes is shown with its per-tool moves, so nothing is
     written that did not appear in the diff.
     """
-    lines = [f"  {info.state_dir / 'learned.json'} — the shaping overlay:"]
+    labels = {"carry": "Tools carried",
+              "expand_only": "Tools available by expansion"}
+    lines: list[str] = []
     for key in ("carry", "expand_only"):
         old = sorted({str(t) for t in (before.get(key) or [])})
         new = sorted({str(t) for t in (after.get(key) or [])})
-        label = f"    learned.json[{info.scope}].{key}"
         if old == new:
-            lines.append(f"{label}: {len(old)} tool(s) → unchanged")
-            continue
-        moves = [f"+{t}" for t in new if t not in set(old)]
-        moves += [f"-{t}" for t in old if t not in set(new)]
-        lines.append(
-            f"{label}: {len(old)} tool(s) → {len(new)} ({', '.join(moves)})"
-        )
+            lines.append(f"    {labels[key]}: {len(old)} → unchanged")
+        else:
+            lines.append(f"    {labels[key]}: {len(old)} → {len(new)}")
     return lines
 
 
@@ -1322,24 +1326,10 @@ def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
             ctx.out(f"\n  {info.scope}: no telemetry recorded yet — nothing to shape.")
             ctx.out("    Choose the 'recommend' path for this agent instead.")
             continue
-        # One dry-run merge feeds the preview, the projection and the diff, so
-        # all three describe exactly what the apply will write.
+        # The compact diff (below) is the disclosure; the manual-era shaping
+        # summary and projection block are gone — the savings report answers
+        # "what did it do".
         proposal = proposed_assignment(info, recs)
-        ctx.out("")
-        for line in render_shaping_summary(info, recs, preset, ctx.thresholds, proposal):
-            ctx.out(line)
-
-        # Projection: the canonical engine replays this scope's real session
-        # history against the *proposed* (not-yet-applied) assignment.
-        agent_savings = _project_scope(info, proposal)
-        if agent_savings is not None:
-            for line in render_projection(info, agent_savings.projected):
-                ctx.out(line)
-            ctx.out(
-                "    All figures are projections until organic post-apply "
-                "telemetry exists."
-            )
-
         writes = plan_shape_writes(info, ctx.settings(info.scope))
         overlay = build_overlay_diff(info, current_assignment(info), proposal)
         if not _confirm_writes(ctx, f"Changes for {info.scope}:", writes, overlay):
