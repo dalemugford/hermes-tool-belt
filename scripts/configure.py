@@ -1540,12 +1540,10 @@ def flow_protected(ctx: RunContext, agent: str,
     ctx.out(f"\n  Protected tools for {agent} — always carried, never shaped.")
     result = checkbox_picker(inventory, set(current), ctx.reader, ctx.out)
     if result is None:
-        ctx.out("\n  Nothing changed.")
-        return _BACK
+        return _BACK  # picker cancelled — back to step-2, silently
     new_pins = sorted(result)
     if new_pins == sorted(current):
-        ctx.out("\n  No changes.")
-        return 0
+        return _BACK  # nothing toggled — back to step-2, silently
 
     added = sorted(set(new_pins) - set(current))
     removed = sorted(set(current) - set(new_pins))
@@ -1561,8 +1559,7 @@ def flow_protected(ctx: RunContext, agent: str,
         extra.append("    No longer protected (back to shaping): "
                      + ", ".join(removed))
     if not _confirm_writes(ctx, f"Changes for {agent}:", [write], extra):
-        ctx.out("  Skipped. Nothing written.")
-        return 0
+        return _BACK  # declined at the confirm — back to step-2, silently
     ctx.applied.extend(apply_writes([write], ctx.runner, ctx.dry_run, ctx.out))
     return 0
 
@@ -1600,15 +1597,12 @@ def _menu(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
     while True:
         agent = _pick_one(ctx, agents, lambda a: a, "Agent")
         if agent is None:
-            ctx.out("\n  Nothing selected.")
-            return 0
+            return 0  # main()'s epilogue reports "nothing written"
         agent_scopes = [i for i in infos if i.agent == agent]
         result = _agent_menu(ctx, agent, agent_scopes)
         if result is _BACK:
             if len(agents) == 1:
-                # Only one agent — backing out of its menu is quitting.
-                ctx.out("\n  Nothing selected.")
-                return 0
+                return 0  # single agent — backing out is quitting
             continue  # redisplay the agent picker
         return result
 

@@ -303,7 +303,9 @@ class ConfigureModeFlowTests(TempHomeTestCase):
         rc, out, runner = self._run("\n")
         self.assertEqual(rc, 0)
         self.assertEqual(runner.writes, [])
-        self.assertIn("Nothing selected", out)
+        # Intermediate back-steps are silent — main()'s epilogue is the one
+        # exit line, so a bare escape leaves no stacked "Nothing ..." noise.
+        self.assertNotIn("Nothing selected", out)
 
     def test_mode_cancel_returns_to_channel_pick(self):
         # shaping → channels 'all' → blank at mode → back to channels →
@@ -313,7 +315,6 @@ class ConfigureModeFlowTests(TempHomeTestCase):
         rc, out, runner = self._run("2\nall\n\n\n\n")
         self.assertEqual(rc, 0)
         self.assertEqual(runner.writes, [], "walking back writes nothing")
-        self.assertIn("Nothing selected", out)
 
 
 class ProtectedToolsFlowTests(TempHomeTestCase):
@@ -374,7 +375,9 @@ class ProtectedToolsFlowTests(TempHomeTestCase):
         rc, out, runner = self._run("1\nq\n\n")
         self.assertEqual(rc, 0)
         self.assertEqual(runner.writes, [])
-        self.assertIn("Nothing changed", out)
+        # Cancelling the picker steps back silently — no stacked exit lines.
+        self.assertNotIn("Nothing changed", out)
+        self.assertNotIn("Nothing selected", out)
 
 
 class SharedCursesContractTests(unittest.TestCase):
