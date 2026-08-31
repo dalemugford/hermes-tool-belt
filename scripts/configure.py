@@ -632,9 +632,33 @@ def build_overlay_diff(
         old = sorted({str(t) for t in (before.get(key) or [])})
         new = sorted({str(t) for t in (after.get(key) or [])})
         if old == new:
-            lines.append(f"    {labels[key]}: {len(old)} → unchanged")
+            lines.append(f"    :: {labels[key]}: {len(old)} → unchanged")
+            continue
+        old_names = f" ({', '.join(old)})" if 0 < len(old) <= 3 else ""
+        lines.append(f"    :: {labels[key]}: {len(old)}{old_names} → {len(new)}")
+        if len(new) <= 10:
+            # Small result: list the full new membership.
+            for tool in new:
+                lines.append(f"       - {tool}")
         else:
-            lines.append(f"    {labels[key]}: {len(old)} → {len(new)}")
+            # Large result: list just the moves, capped, so the screen stays
+            # readable even on a first shape that moves everything at once.
+            added = [t for t in new if t not in set(old)]
+            removed = [t for t in old if t not in set(new)]
+            shown = 0
+            for tool in added:
+                if shown >= 10:
+                    break
+                lines.append(f"       + {tool}")
+                shown += 1
+            for tool in removed:
+                if shown >= 10:
+                    break
+                lines.append(f"       - {tool}")
+                shown += 1
+            hidden = len(added) + len(removed) - shown
+            if hidden > 0:
+                lines.append(f"       … and {hidden} more")
     return lines
 
 
