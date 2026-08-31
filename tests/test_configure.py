@@ -1097,6 +1097,56 @@ class StatusFreshInstallTests(TempHomeTestCase):
         self.assertEqual(rc, 0)
         self.assertIn("No agent scopes found yet", output)
 
+    def test_status_header_carries_no_sessions_needed_noise(self) -> None:
+        # The 20-session threshold is per-row context for unshaped scopes;
+        # as a header over already-shaped rows it read as nonsense.
+        _rc, output = self._status(self.home)
+        self.assertNotIn("Sessions needed", output)
+
+
+class ShapedStatusDetailTests(TempHomeTestCase):
+    """A shaped row must say what shaping DID (counts + apply stamp) — the
+    state column already says "shaped", so the old "shaping applied" detail
+    repeated it and told the operator nothing."""
+
+    def _entry(self, shaping: dict) -> configure.ScopeInfo:
+        state_dir = self.root_state
+        (state_dir / "learned.json").write_text(json.dumps({
+            "version": 2,
+            "scopes": {"default:cli": {
+                "carry": ["read_file"],
+                "expand_only": ["a", "b", "c"],
+                "shaping": shaping,
+            }},
+        }), encoding="utf-8")
+        return configure.ScopeInfo(scope="default:cli", agent="default",
+                                   platform="cli", state_dir=state_dir)
+
+    def test_auto_apply_shows_counts_date_and_auto(self) -> None:
+        info = self._entry({"source": "auto", "applied_at": "2026-08-31T11:01:24Z"})
+        self.assertEqual(configure._shaped_detail(info),
+                         "1 carried, 3 by expansion — applied 2026-08-31 (auto)")
+
+    def test_configure_apply_shows_counts_and_date_without_auto(self) -> None:
+        info = self._entry({"source": "configure",
+                            "applied_at": "2026-08-30T09:00:00Z"})
+        self.assertEqual(configure._shaped_detail(info),
+                         "1 carried, 3 by expansion — applied 2026-08-30")
+
+    def test_configure_apply_stamps_source_and_applied_at(self) -> None:
+        # Symmetry with the auto engine: a status read must not depend on
+        # which arm did the applying.
+        info = configure.ScopeInfo(scope="default:cli", agent="default",
+                                   platform="cli", state_dir=self.root_state)
+        recs = {"promote": [{"tool": "read_file", "sessions": 3, "calls": 5}],
+                "demote": []}
+        changed = configure.write_learned_overlay(info, recs, dry_run=False)
+        self.assertTrue(changed)
+        doc = json.loads((self.root_state / "learned.json").read_text())
+        meta = doc["scopes"]["default:cli"]["shaping"]
+        self.assertEqual(meta["source"], "configure")
+        self.assertTrue(meta["applied_at"])
+
 
 if __name__ == "__main__":
     unittest.main()

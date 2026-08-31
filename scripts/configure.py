@@ -803,7 +803,7 @@ def write_learned_overlay(
     itself persists through ``learned.write_state`` (the single writer)."""
     shaper = load_shaper()
     _state, changed = shaper.merge_into_learned(
-        info.state_dir, {info.scope: recs}, dry_run
+        info.state_dir, {info.scope: recs}, dry_run, source="configure"
     )
     return changed
 
@@ -1150,23 +1150,29 @@ def render_shaping_summary(
 
 
 def _shaped_detail(info: ScopeInfo) -> str:
-    """Status detail for a shaped scope, naming an auto-apply when recorded.
+    """Status detail for a shaped scope: what shaping did, when, and by whom.
 
-    The in-process auto-shape engine stamps ``source: "auto"`` and
-    ``applied_at`` into the scope's learned ``shaping`` block on each
-    automatic apply; surface that as ``shaping applied (auto, <date>)`` so an
-    operator can tell an automatic apply from a hand-run one. Read-only and
-    fail-open: any read problem falls back to the plain detail.
+    The state column already says "shaped" — repeating "shaping applied" here
+    said nothing. Show the outcome (learned carry / expand-only counts) and
+    the apply stamp; both the auto engine and configure's own apply write
+    ``source`` + ``applied_at`` into the scope's ``shaping`` block. Read-only
+    and fail-open: any read problem falls back to a plain detail.
     """
     try:
         doc = json.loads((info.state_dir / "learned.json").read_text(encoding="utf-8"))
         entry = (doc.get("scopes") or {}).get(info.scope) or {}
+        carry = entry.get("carry") if isinstance(entry.get("carry"), list) else []
+        expand = (entry.get("expand_only")
+                  if isinstance(entry.get("expand_only"), list) else [])
+        parts = f"{len(carry)} carried, {len(expand)} by expansion"
         shaping = entry.get("shaping") or entry.get("cache_aware") or {}
-        if isinstance(shaping, dict) and shaping.get("source") == "auto":
-            applied = str(shaping.get("applied_at") or "")[:10]
+        if isinstance(shaping, dict):
+            applied = str(shaping.get("applied_at")
+                          or shaping.get("computed_at") or "")[:10]
             if applied:
-                return f"shaping applied (auto, {applied})"
-            return "shaping applied (auto)"
+                suffix = " (auto)" if shaping.get("source") == "auto" else ""
+                return f"{parts} — applied {applied}{suffix}"
+        return parts
     except Exception:
         pass
     return "shaping applied"
@@ -1478,10 +1484,8 @@ def flow_reset(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
 
 def flow_status(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
     """Read-only. Never writes anything, ever."""
-    needed = required_sessions(ctx.thresholds)
     ctx.out("Tool Belt — configuration status")
     ctx.out(f"  Hermes home: {ctx.hermes_home}")
-    ctx.out(f"  Sessions needed before shaping: {needed}")
     ctx.out("  " + _always_carried_line(ctx.plugin_config))
     if not ctx.have_hermes:
         ctx.out("  `hermes` not on PATH — config values could not be read.")

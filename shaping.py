@@ -684,6 +684,7 @@ def merge_into_learned(
     state_dir: Path,
     per_scope: dict[str, dict[str, Any]],
     dry_run: bool,
+    source: str | None = None,
 ) -> tuple[dict[str, Any], bool]:
     """Merge shaping recommendations into ``learned.json`` as learned v2.
 
@@ -701,6 +702,20 @@ def merge_into_learned(
 
     if changed:
         state["updated_at"] = _utc_iso()
+        # Stamp how/when this apply happened, symmetric with the auto
+        # engine's source:"auto" — a status read must not depend on which
+        # arm did the applying.
+        if source:
+            scopes = dict(state.get("scopes") or {})
+            for scope in per_scope:
+                entry = dict(scopes.get(scope) or {})
+                meta = entry.get("shaping")
+                meta = dict(meta) if isinstance(meta, dict) else {}
+                meta["source"] = source
+                meta["applied_at"] = state["updated_at"]
+                entry["shaping"] = meta
+                scopes[scope] = entry
+            state["scopes"] = scopes
 
     if changed and not dry_run:
         learned.write_state(state, learned_path)
