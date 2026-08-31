@@ -365,6 +365,39 @@ class ProtectedToolsFlowTests(TempHomeTestCase):
         self.assertIn("Nothing changed", out)
 
 
+class SharedCursesContractTests(unittest.TestCase):
+    """configure borrows hermes_cli.curses_ui's pickers on a real terminal.
+    That module is internal to Hermes, not a documented plugin API, so pin
+    the exact call surface we depend on: an upstream rename fails HERE (in
+    the hermes-venv run) instead of silently dropping us to the numbered
+    fallback in the field. Skips on a bare clone without hermes_cli."""
+
+    def setUp(self):
+        try:
+            from hermes_cli import curses_ui
+        except Exception:
+            self.skipTest("hermes_cli not importable (bare clone)")
+        self.ui = curses_ui
+
+    def test_checklist_accepts_the_kwargs_we_pass(self):
+        import inspect
+        params = inspect.signature(self.ui.curses_checklist).parameters
+        for name in ("title", "items", "selected", "cancel_returns", "status_fn"):
+            self.assertIn(name, params, f"curses_checklist lost `{name}`")
+
+    def test_radiolist_accepts_the_kwargs_we_pass(self):
+        import inspect
+        params = inspect.signature(self.ui.curses_radiolist).parameters
+        for name in ("title", "items", "selected", "cancel_returns"):
+            self.assertIn(name, params, f"curses_radiolist lost `{name}`")
+
+    def test_adapter_gates_on_tty(self):
+        # Off a TTY (pipes, tests, --yes) the adapter must decline so the
+        # numbered path — the one the rest of the suite drives — runs.
+        self.assertIsNone(configure._hermes_curses(),
+                          "adapter must return None without a TTY")
+
+
 class StateMachineTests(TempHomeTestCase):
     def _info(self, sessions: int) -> "configure.ScopeInfo":
         return configure.ScopeInfo(

@@ -1222,10 +1222,78 @@ def flow_status(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
     return 0
 
 
+# ── Shared Hermes curses pickers (optional, TTY-only) ─────────────────────────
+# configure runs three ways — the ``tool-belt`` launcher, ``hermes tool-belt
+# configure``, and ``python3 scripts/configure.py`` — and only some have
+# ``hermes_cli`` importable; pipes/tests/--yes have no TTY at all. When the
+# shared curses UI is available on a real terminal we borrow it so configure
+# looks and feels like the rest of the Hermes CLI (arrow keys, live counts,
+# proper terminal restore). Otherwise every picker degrades to the numbered
+# reader path the tests drive — a cosmetic enhancement, never a dependency.
+
+#: Unique sentinel handed to the curses pickers as their cancel value, so an
+#: ESC is distinguishable by identity from a real (possibly unchanged) result.
+_CURSES_CANCEL: set = set()
+
+
+def _hermes_curses():
+    """Return ``hermes_cli.curses_ui`` when usable here, else ``None``."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return None
+    try:
+        from hermes_cli import curses_ui  # type: ignore
+        return curses_ui
+    except Exception:
+        return None
+
+
+def _curses_single(title: str, labels: Sequence[str]) -> int | None:
+    """Single-select via the shared radio list. None = unavailable/cancel.
+
+    Returns the chosen index, ``-1`` on user cancel, or ``None`` when the
+    shared UI can't be used (caller then runs its own numbered path).
+    """
+    ui = _hermes_curses()
+    if ui is None:
+        return None
+    try:
+        idx = ui.curses_radiolist(title, list(labels), selected=0,
+                                  cancel_returns=-1)
+    except Exception:
+        return None
+    return idx
+
+
+def _curses_multi(title: str, labels: Sequence[str], checked: set[int],
+                  status_fn=None) -> set[int] | None:
+    """Multi-select via the shared checklist. None = unavailable.
+
+    Returns the chosen index set, the :data:`_CURSES_CANCEL` sentinel on user
+    cancel, or ``None`` when the shared UI can't be used.
+    """
+    ui = _hermes_curses()
+    if ui is None:
+        return None
+    try:
+        return ui.curses_checklist(title, list(labels), set(checked),
+                                   cancel_returns=_CURSES_CANCEL,
+                                   status_fn=status_fn)
+    except Exception:
+        return None
+
+
 def _pick_one(ctx: RunContext, items: Sequence, render, prompt_label: str):
-    """Numbered single-pick. Returns the item, or None to cancel."""
+    """Single-pick. Returns the item, or None to cancel.
+
+    Uses the shared Hermes radio list on a real terminal; falls back to a
+    numbered prompt everywhere else (pipes, tests, no ``hermes_cli``).
+    """
     if len(items) == 1:
         return items[0]
+    labels = [render(item) for item in items]
+    picked = _curses_single(f"{prompt_label}:", labels)
+    if picked is not None:
+        return None if picked < 0 else items[picked]
     ctx.out("")
     for idx, item in enumerate(items, 1):
         ctx.out(f"    {idx}. {render(item)}")
@@ -1245,9 +1313,20 @@ def _pick_one(ctx: RunContext, items: Sequence, render, prompt_label: str):
 
 
 def _pick_scopes(ctx: RunContext, infos: Sequence[ScopeInfo]) -> list[ScopeInfo]:
-    """Pick one, several, or all channels for the chosen agent."""
+    """Pick one, several, or all channels for the chosen agent.
+
+    Uses the shared Hermes checklist on a real terminal (all channels
+    pre-checked — configuring every channel is the common case); falls back
+    to a numbered/'all' prompt everywhere else.
+    """
     if len(infos) == 1:
         return list(infos)
+    labels = [f"{i.platform}  ({i.sessions} session(s))" for i in infos]
+    chosen = _curses_multi("Channels:", labels, set(range(len(infos))))
+    if chosen is not None:
+        if chosen is _CURSES_CANCEL:
+            return []
+        return [infos[i] for i in sorted(chosen)]
     ctx.out("\n  Channels:")
     for idx, info in enumerate(infos, 1):
         ctx.out(f"    {idx}. {info.platform}  ({info.sessions} session(s))")
@@ -1378,15 +1457,24 @@ def checkbox_picker(
 ) -> set[str] | None:
     """Toggle a set of items; returns the final set, or None on cancel.
 
-    On a real TTY: an in-place list — arrow keys / j/k to move, SPACE to
-    toggle, Enter to accept, q to cancel. Anywhere else (pipes, tests,
-    --yes automation): a numbered toggle loop with the same semantics.
+    On a real TTY: the shared Hermes checklist (arrow keys, SPACE toggle,
+    a live "N protected" count). Anywhere else (pipes, tests, --yes
+    automation) or without ``hermes_cli``: a numbered toggle loop with the
+    same semantics.
     """
-    if sys.stdin.isatty() and sys.stdout.isatty():
-        try:
-            return _checkbox_picker_tty(items, set(checked))
-        except Exception:
-            pass  # raw-mode failed (odd terminal) — fall through
+    item_list = list(items)
+
+    def _status(sel: set[int]) -> str:
+        return f"{len(sel)} protected"
+
+    chosen = _curses_multi(
+        "Protected tools", item_list,
+        {i for i, name in enumerate(item_list) if name in checked},
+        status_fn=_status)
+    if chosen is not None:
+        if chosen is _CURSES_CANCEL:
+            return None
+        return {item_list[i] for i in chosen}
     state = set(checked)
     while True:
         out("")
@@ -1413,74 +1501,6 @@ def checkbox_picker(
                 state.symmetric_difference_update({item})
             else:
                 out(f"    Out of range: {i}")
-
-
-def _checkbox_picker_tty(items: Sequence[str], state: set[str]) -> set[str] | None:
-    """Raw-terminal spacebar picker with a scrolling viewport.
-
-    TTY-only; caller handles fallback. Renders a window sized to the
-    terminal (a 50-tool inventory must work in a 30-row window — redrawing
-    the full list would scroll off-screen and clamp the cursor-up, which
-    made navigation look dead).
-    """
-    import os
-    import shutil as _shutil
-    import termios
-    import tty
-
-    fd = sys.stdin.fileno()
-    n = len(items)
-    rows = _shutil.get_terminal_size().lines
-    height = max(3, min(n, rows - 4))
-    cursor, top = 0, 0
-    write = sys.stdout.write
-    drawn = False
-
-    def render() -> None:
-        nonlocal drawn, top
-        if cursor < top:
-            top = cursor
-        elif cursor >= top + height:
-            top = cursor - height + 1
-        if drawn:
-            write(f"\x1b[{height + 1}A")
-        drawn = True
-        for i in range(top, top + height):
-            item = items[i]
-            mark = "x" if item in state else " "
-            pointer = ">" if i == cursor else " "
-            write(f"\x1b[2K  {pointer} [{mark}] {item}\n")
-        above = f" ↑{top}" if top > 0 else ""
-        below = f" ↓{n - top - height}" if top + height < n else ""
-        write(f"\x1b[2K    space toggle · ↑/↓ move · enter done · "
-              f"q cancel  ({cursor + 1}/{n}{above}{below})\n")
-        sys.stdout.flush()
-
-    render()
-    old = termios.tcgetattr(fd)
-    try:
-        while True:
-            tty.setraw(fd)
-            try:
-                ch = os.read(fd, 1).decode(errors="ignore")
-                if ch == "\x1b":  # arrow keys: ESC [ A/B
-                    seq = os.read(fd, 2).decode(errors="ignore")
-                    ch = {"[A": "k", "[B": "j"}.get(seq, "")
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
-            if ch in ("\r", "\n"):
-                return state
-            if ch in ("q", "\x03", "\x04"):  # q / Ctrl-C / Ctrl-D
-                return None
-            if ch == " ":
-                state.symmetric_difference_update({items[cursor]})
-            elif ch == "j":
-                cursor = min(cursor + 1, n - 1)
-            elif ch == "k":
-                cursor = max(cursor - 1, 0)
-            render()
-    finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
 def flow_protected(ctx: RunContext, agent: str,
