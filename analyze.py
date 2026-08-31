@@ -48,7 +48,7 @@ DEFAULT_TRIGGER_MIN_FIRES = 3
 # and the next API call resends system + messages + widened tool list. The
 # largest term is "extra full API request body," dominated by message history
 # and the widened tool schemas. 1500 is a conservative single-call estimate;
-# tune via --expand-round-trip-tokens once we have a measured baseline. The
+# tune via --expand-round-trip-tokens to a measured baseline. The
 # value is single-sourced in the canonical savings engine so the analyzer, the
 # savings report, and the projection all charge the same per-event overhead.
 DEFAULT_EXPAND_ROUND_TRIP_TOKENS = _savings.EXPAND_ROUND_TRIP_TOKENS

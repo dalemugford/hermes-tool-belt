@@ -83,8 +83,9 @@ LIFECYCLE
       - cross-session lock persistence to cache_mode_detection.json
 
   · on_session_end (fires per-turn — Hermes' hook semantics)
-      - sticky + lookback eviction only; freeze + cache-mode state stay
+      - sticky + lookback eviction; freeze + cache-mode state stay
         because this hook fires after every turn, not just at session end
+      - then the debounced in-process auto-shape pass (_maybe_auto_shape)
 
   · on_session_reset (true /reset or /new)
       - evict all per-session state

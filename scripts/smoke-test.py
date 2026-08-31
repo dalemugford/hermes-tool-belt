@@ -63,8 +63,9 @@ logger_io = importlib.import_module("tool_belt_plugin.logger_io")
 
 # Minimal but realistic-shaped Hermes tools payload. Each entry is the
 # Anthropic-format dict the plugin sees in kwargs["tools"]. Names cover
-# every category referenced by policy.yaml plus a few unlisted enabled tools
-# to exercise their derived expand-only path.
+# the trigger categories the scenarios exercise (file, shell, browser,
+# delegation, code execution) plus a few unlisted enabled tools to exercise
+# their derived expand-only path.
 SYNTHETIC_TOOLS = [
     # always_carry / carry per policy
     {"name": "session_search", "description": "x", "input_schema": {}},
@@ -131,7 +132,7 @@ TARGETED_SCENARIOS: list[Scenario] = [
         # Simulate a case where it is already in the initial active set.
         # Use write_file: it's trigger-gated, fires on "save". Then we
         # call expand_tools(file) which re-adds the same tool. The
-        # post_tool_call for write_file must NOT show expand_tools_used.
+        # post_tool_call for write_file must NOT show expansion_provided_access.
         ("save these notes please", [
             "write_file",                # initially available via trigger
             "expand_tools(file)",        # redundant expansion
@@ -350,7 +351,7 @@ def run_cache_off_assertions(state_dir: Path, check: Check) -> None:
         f"(found {len(legit)} browser_navigate expansion-driven calls)")
 
     # ─── Cross-session isolation ───
-    # The "victim" session must have zero expand_tools_used flags despite
+    # The "victim" session must have zero expansion_provided_access flags despite
     # the prior session having expanded browser on the same scope.
     victim_calls = [c for c in calls if c.get("session_id", "").endswith("isolation-2-victim")]
     victim_expanded = [c for c in victim_calls if c.get("expansion_provided_access") is True]

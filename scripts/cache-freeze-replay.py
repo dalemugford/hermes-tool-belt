@@ -5,7 +5,7 @@ the cache cost of tool-list mutations.
 Why the matched counterfactual matters
 ======================================
 
-The ``tokens_saved_via_narrowing`` ledger reports schema-token savings
+The ``tokens_saved`` ledger (predictions.jsonl) reports schema-token savings
 without netting out the cache-miss penalty that mutation-driven narrowing
 imposes on the conversation history prefix. Under cache-on providers
 (Anthropic + OpenAI auto-cache) that penalty can dominate the savings on
@@ -416,10 +416,11 @@ def main() -> int:
     print("  Under session-start freeze:")
     print(f"    matches frozen hash:        {result['matches_freeze']:>4} calls  (cached avg: {result['avg_cache_read_when_matches']:,.0f})")
     print(f"    expand-driven mutations:    {result['expand_driven_mutations']:>4} calls  (accepted — model paid)")
+    print(f"    trigger-driven mutations:   {result['trigger_driven_mutations']:>4} calls  (accepted — trigger fired)")
     print(f"    would_break mutations:      {result['would_break_mutations']:>4} calls  (cached avg: {result['avg_cache_read_when_would_break']:,.0f})")
     print()
     print(f"  Freeze eliminates {result['freeze_eliminates_pct_of_mutations'] * 100:.1f}% of currently-observed mutations.")
-    print("  The remainder is expand_tools-driven and is the accepted cost of the safety valve.")
+    print("  The remainder is expansion- and trigger-driven — the accepted cost of the safety valves.")
 
     if cf.get("per_model"):
         print()

@@ -149,7 +149,7 @@ def _activation_hint(scopes: list[str]) -> str:
     agents = sorted({(s.split(":", 1)[0] or s) for s in scopes if s}) or ["<agent>"]
     lines = [
         "\nRecommendations are written but inert until the scope's learned_mode is 'apply'.",
-        "  Guided:  python3 scripts/configure.py --agent %s --path shape" % agents[0],
+        "  Guided:  python3 scripts/configure.py --agent %s --mode history" % agents[0],
     ]
     if len(agents) > 1:
         lines.append("           (repeat per agent: %s)" % ", ".join(agents[1:]))

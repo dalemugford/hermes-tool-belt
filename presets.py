@@ -34,8 +34,9 @@ Per-scope narrowing is driven by the learned overlay (``learned.py``). The old
 config-level ``always_on_extra`` / ``always_off`` promote-and-disable knobs are
 gone: a detected legacy value is warned about, never silently applied.
 
-The "kill switch" — disable narrowing entirely for a scope — is
-``bypass_rate: 1.0`` (handled in ``__init__.py``).
+To turn shaping off for a scope, use `tool-belt configure` → mode off
+(``learned_mode: recommend`` — full-start carries everything).
+``bypass_rate: 1.0`` remains as an internal full-observation override.
 """
 
 from __future__ import annotations
@@ -290,9 +291,10 @@ def resolve_preset(plugin_config: dict[str, Any], channel: str) -> Preset:
     :func:`_warn_legacy_disable_inputs`), never applied.
 
     Returns a fully-resolved :class:`Preset`. Never raises; falls back to a
-    no-narrowing preset on any failure so sessions don't break. To disable
-    narrowing intentionally on a scope, set ``bypass_rate: 1.0`` — that path is
-    handled in ``__init__.py``.
+    no-narrowing preset on any failure so sessions don't break. To turn
+    shaping off intentionally, use configure's off mode (``learned_mode:
+    recommend``); ``bypass_rate: 1.0`` is the internal full-observation
+    override, handled in ``__init__.py``.
     """
     try:
         return _resolve_preset_inner(plugin_config, channel)

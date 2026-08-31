@@ -24,7 +24,7 @@ What harvest CAN validate:
 
 What harvest CANNOT validate (counterfactual):
   · Actual token savings (the model historically saw the full toolset)
-  · expand_tools_used round-trip frequency (no narrowing was active)
+  · expansion_provided_access round-trip frequency (no narrowing was active)
   · bypass cohort comparison (no bypass existed)
 
 Privacy invariants (enforced by code, not vibes):

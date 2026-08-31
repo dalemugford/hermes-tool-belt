@@ -305,7 +305,7 @@ def main() -> int:
     # config file — configure.py and scripts/README.md forbid it.
     print()
     print("  To activate cache-on recommendations:")
-    print("    1. Guided:  python3 scripts/configure.py --agent <agent> --path shape")
+    print("    1. Guided:  python3 scripts/configure.py --agent <agent> --mode history")
     print("       Direct:   hermes config set "
           "plugins.tool-belt.channels.<scope>.learned_mode apply")
     print("    2. Then write them: python3 scripts/shape-ceiling.py (without --dry-run)")

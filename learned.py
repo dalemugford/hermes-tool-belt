@@ -2,7 +2,8 @@
 
 The learned layer is deliberately small and inspectable: a JSON file under
 ``$HERMES_HOME/state/tool-belt/learned.json``. Prediction only reads from it;
-the analyzer or an explicit user action writes it.
+the shaper (manual or in-process auto-shape), the configure flows, and
+inventory reconciliation write it.
 
 Schema (v2)::
 
@@ -25,7 +26,8 @@ never rewrites the file. The v1 → v2 field mapping is: ``always_on → carry``
 immutable under the 1.0 model.
 
 This module is the sole owner of learned-state persistence: every writer
-(the shaper, configure flows, the analyzer) routes through :func:`write_state`
+(the shaper — manual and auto-shape — configure flows, and inventory
+reconciliation) routes through :func:`write_state`
 (atomic, normalize-on-write, version-stamped) and every scope reset through
 :func:`reset_scope`. All v1 spelling lives in this module's adapter — no
 script writes or mirrors the v1 keys.
@@ -299,10 +301,9 @@ def normalize_state(doc: Any) -> dict[str, Any]:
         for scope, entry in scopes.items():
             out["scopes"][str(scope)] = _normalize_scope_entry(entry)
 
-    # Preserve a normalized global block only if it carries something. NOTE:
-    # this block is inert today — no consumer reads it (scope_state /
-    # apply_to_preset look at ``scopes`` only). Retained pending the global
-    # fallback decision; do not wire it in this pass.
+    # Preserve a normalized global block only if it carries something.
+    # NOTE: inert today — no consumer reads it (scope_state /
+    # apply_to_preset look at ``scopes`` only).
     global_raw = doc.get("global")
     if isinstance(global_raw, dict):
         g = _normalize_scope_entry(global_raw, warn_trigger_adjustments=False)
@@ -373,8 +374,9 @@ def state_hash() -> str:
 def write_state(state: dict[str, Any], path: Path | None = None) -> None:
     """Atomically persist learned state as schema v2 — the single writer.
 
-    Every production write of ``learned.json`` (shaper merge, configure flows,
-    analyzer recommendations) routes through here. The document is normalized
+    Every production write of ``learned.json`` (shaper merge — manual and
+    auto-shape — configure flows, inventory reconciliation) routes through
+    here. The document is normalized
     on write: v1 spellings are renamed to their v2 fields, a ``carry`` ∩
     ``expand_only`` overlap resolves toward carrying, unrelated scopes and
     metadata are preserved, and the version is stamped to v2.

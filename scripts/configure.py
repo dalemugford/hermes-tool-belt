@@ -5,25 +5,19 @@ Run this after ``hermes plugins install dalemugford/hermes-tool-belt``::
 
     python3 scripts/configure.py
 
-The command is a conversation, not a form. Every invocation detects the
-current state of each agent/platform scope and offers the right next step:
+configure is a mode-setter: choose the agent, choose its channels, choose the
+shaping mode —
 
-  fresh      — nothing configured yet; pick a path
-  observing  — the scope is collecting telemetry in recommend mode
-  ready      — enough sessions collected; shaping can be reviewed and applied
-  shaped     — the learned overlay is live for this scope
+  On (learning)     ``learned_mode: apply``; auto-shaping tightens the
+                    loadout as future sessions accumulate.
+  On (use history)  ``learned_mode: apply`` and shape from the recorded
+                    sessions right now (review/confirm/apply).
+  Off               ``learned_mode: recommend``; the scope carries the full
+                    tool set, the learned overlay is kept but not applied.
 
-Two paths are offered on a fresh scope:
-
-  Shape now         Read the history you already have, show exactly what would
-                    change per agent, and — only after you confirm — write the
-                    learned overlay and switch that scope to ``learned_mode:
-                    apply``.
-
-  Recommend first   Leave the tool set untouched while telemetry accumulates
-                    (observation mode). Re-run this command later; it reports
-                    how many more sessions each scope needs and offers the
-                    same review/confirm/apply step once the data is there.
+The agent step also offers a Protected-tools picker that pins tools as
+always-carried (``plugins.tool-belt.always_carry``). ``--status`` classifies
+each scope (fresh / observing / ready / shaped) for reporting only.
 
 Config is written **only** through ``hermes config set`` / ``hermes config
 unset``. Hermes owns ``config.yaml``; this script never edits it directly.
@@ -498,8 +492,8 @@ def classify_scope(
 ) -> str:
     """Which of the four states this scope is in.
 
-    ``learned_mode`` now DEFAULTS to ``apply`` (full-start contract), so an
-    unset mode no longer implies "shaped": fresh means everything is active
+    ``learned_mode`` defaults to ``apply`` (full-start contract), so an
+    unset mode does not imply "shaped": fresh means everything is active
     and telemetry is accumulating. A scope counts as shaped when the operator
     set ``apply`` explicitly, or when a learned carrying assignment exists on
     disk (evidence-driven shaping has landed, hand-run or auto).
@@ -1073,9 +1067,8 @@ def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
             ctx.out(f"\n  {info.scope}: no telemetry recorded yet — nothing to shape.")
             ctx.out("    Choose the 'recommend' path for this agent instead.")
             continue
-        # The compact diff (below) is the disclosure; the manual-era shaping
-        # summary and projection block are gone — the savings report answers
-        # "what did it do".
+        # The compact diff (below) is the whole disclosure; the savings
+        # report answers "what did it do".
         proposal = proposed_assignment(info, recs)
         writes = plan_shape_writes(info, ctx.settings(info.scope))
         overlay = build_overlay_diff(info, current_assignment(info), proposal)
@@ -1371,8 +1364,8 @@ def agent_tool_inventory(infos: Sequence[ScopeInfo]) -> list[str]:
             if str(row.get("scope") or "") in scopes:
                 # ceiling_tools on v2 rows; resident/active fields cover
                 # sparse v1 telemetry so old installs still get a list.
-                for field in ("ceiling_tools", "active_tools", "always_on_tools"):
-                    for t in (row.get(field) or []):
+                for row_key in ("ceiling_tools", "active_tools", "always_on_tools"):
+                    for t in (row.get(row_key) or []):
                         tools.add(str(t))
     return sorted(tools)
 

@@ -440,7 +440,7 @@ def main(argv: list[str] | None = None, *, prog: str | None = None) -> int:
         "\n"
         "commands:\n"
         "  savings     read-only token-savings report\n"
-        "  configure   interactive onboarding (shape/recommend tool loadouts)"
+        "  configure   set per-agent shaping mode (learning / history / off) and protected tools"
     )
     if argv and argv[0] in ("-h", "--help"):
         print(usage)
