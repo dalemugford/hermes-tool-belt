@@ -1071,6 +1071,33 @@ class SinceEchoTests(_HomeCase):
         self.assertNotIn("Window:", savings_cli.render_text(report))
 
 
+class ColorGatingTests(_HomeCase):
+    """render_text may color a real TTY, but piped/captured output (and hence
+    --json and every test) must stay plain — the report is parsed by eyes AND
+    by pipes. Guards against an unconditional-color regression."""
+
+    def _report(self):
+        _write_observed(self.home / "state" / "tool-belt", "default:telegram")
+        _write_session(self.home / "sessions", "s", platform="telegram",
+                       model="m", ceiling=CEILING, turns=[{"user": "hello"}])
+        return savings.compute(hermes_home=self.home)
+
+    def test_captured_render_has_no_ansi(self):
+        # sys.stdout is a StringIO here (not a TTY), so should_use_color()
+        # is False and the text must carry no escape sequences.
+        text = savings_cli.render_text(self._report())
+        self.assertNotIn("\x1b[", text)
+        self.assertIn("NET TOKENS SAVED", text)
+
+    def test_json_never_colored(self):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            savings_cli.run(["--json", "--hermes-home", str(self.home)])
+        payload = out.getvalue()
+        self.assertNotIn("\x1b[", payload)
+        json.loads(payload)  # still valid JSON
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -49,6 +49,30 @@ except ImportError:  # pragma: no cover - standalone load (direct exec)
 
 # ─── Human rendering ──────────────────────────────────────────────────────────
 
+# Optional shared ANSI styling. hermes_cli.colors.color() self-gates on
+# NO_COLOR / TERM=dumb / stdout.isatty(), so piped output, --json, and tests
+# (StringIO) all render plain automatically; only a real terminal gets color.
+try:  # pragma: no cover - trivial import shim
+    from hermes_cli.colors import Colors as _Colors, color as _color
+except Exception:  # standalone launcher without hermes_cli on the path
+    class _Colors:  # noqa: N801
+        RESET = BOLD = DIM = GREEN = CYAN = YELLOW = ""
+
+    def _color(text, *codes):  # type: ignore[misc]
+        return text
+
+
+def _b(text: str) -> str:
+    return _color(text, _Colors.BOLD)
+
+
+def _dim(text: str) -> str:
+    return _color(text, _Colors.DIM)
+
+
+def _green(text: str) -> str:
+    return _color(text, _Colors.GREEN)
+
 
 def _fmt_int(n: int) -> str:
     return f"{n:,}"
@@ -95,10 +119,10 @@ def render_text(report: _savings.SavingsReport) -> str:
     """
     out: list[str] = []
     out.append("")
-    out.append("  Hermes Tool Belt — Savings")
-    out.append("  " + "─" * 40)
+    out.append("  " + _b("Hermes Tool Belt — Savings"))
+    out.append(_dim("  " + "─" * 40))
     if report.since:
-        out.append(f"  Window: since {report.since}")
+        out.append(_dim(f"  Window: since {report.since}"))
 
     if not report.agents:
         out.append("  No enabled/discovered agent profiles with telemetry or sessions.")
@@ -113,14 +137,16 @@ def render_text(report: _savings.SavingsReport) -> str:
     if measured:
         out.append("")
         out.append(
-            f"  NET TOKENS SAVED: {_fmt_int(total_net)}"
-            f"  measured across {total_sessions} session(s) of real traffic."
+            "  " + _b("NET TOKENS SAVED:") + " "
+            + _color(_fmt_int(total_net), _Colors.BOLD, _Colors.GREEN)
+            + f"  measured across {total_sessions} session(s) of real traffic."
         )
         per_session = total_net // total_sessions if total_sessions else 0
         if per_session > 0:
             out.append(
-                f"  Agent conversations use ≈{_fmt_int(per_session)} fewer"
-                " tokens with Tool Belt."
+                "  Agent conversations use "
+                + _green(f"≈{_fmt_int(per_session)} fewer")
+                + " tokens with Tool Belt."
             )
         # Illustrative dollar equivalents at public input list prices. These
         # are what the saved tokens would have billed on a metered API route —
@@ -142,7 +168,8 @@ def render_text(report: _savings.SavingsReport) -> str:
             )
             for label, model, rate in priced:
                 usd = total_net / 1_000_000 * rate
-                out.append(f"    {label:<16} ≈ ${usd:,.2f}  ({model})")
+                out.append(f"    {label:<16} " + _green(f"≈ ${usd:,.2f}")
+                           + _dim(f"  ({model})"))
         # Annualized pace: net saved / measured wall-clock span, projected to
         # 12 months. Needs a week of history to say anything defensible.
         first = min((a.observed.first_ts for a in measured
@@ -161,21 +188,22 @@ def render_text(report: _savings.SavingsReport) -> str:
                 f"  At this pace ({span_days:.0f} days measured), 12 months of"
                 f" Tool Belt saves"
             )
-            out.append(f"  ≈{_fmt_int(yearly)} tokens{usd_txt}.")
+            out.append("  " + _green(f"≈{_fmt_int(yearly)} tokens") + f"{usd_txt}.")
         out.append("")
-        out.append("  PER AGENT")
+        out.append("  " + _b("PER AGENT"))
         for a in measured:
             obs = a.observed
             name = a.display_name or a.agent
             out.append(
-                f"    {name:<12} {_fmt_int(obs.net_token_reduction):>12} tok"
-                f"   {obs.n_sessions} session(s)"
+                "    " + _b(f"{name:<12}") + " "
+                + _green(f"{_fmt_int(obs.net_token_reduction):>12} tok")
+                + _dim(f"   {obs.n_sessions} session(s)")
             )
         out.append("")
-        out.append(
+        out.append(_dim(
             "  Calculation: Unsent tool-definition tokens (vs carrying all), "
             "minus expand_tools fetch overhead."
-        )
+        ))
 
     for a in unmeasured:
         out.append("")
@@ -196,7 +224,7 @@ def render_text(report: _savings.SavingsReport) -> str:
         )
     scope_label = "all enabled agents" if report.generated_for == "all" else f"agent {report.generated_for!r}"
     out.append("")
-    out.append(f"  ({scope_label} · estimator {report.token_estimator} · {report.hermes_home})")
+    out.append(_dim(f"  ({scope_label} · estimator {report.token_estimator} · {report.hermes_home})"))
     out.append("")
     return "\n".join(out)
 
