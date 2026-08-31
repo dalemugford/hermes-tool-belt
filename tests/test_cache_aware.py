@@ -61,6 +61,7 @@ def _reset_plugin_state() -> None:
     plugin._PRIOR_MESSAGES_BY_SESSION.clear()
     plugin._FROZEN_BY_SESSION.clear()
     plugin._CACHE_MODE_BY_SESSION.clear()
+    plugin._CACHE_DECISION_BY_SESSION.clear()
     plugin._LAST_CANONICAL_BY_PLATFORM.clear()
     plugin._DETECTION_CACHE.clear()
     plugin._DETECTION_CACHE_LOADED = False
@@ -96,6 +97,22 @@ class ResolveCacheModeTests(unittest.TestCase):
         plugin._CONFIG["cache_mode"] = "auto"
         plugin._DETECTION_CACHE["assistant-a:telegram"] = {"mode": "on"}
         self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="assistant-a:telegram"), "on")
+
+    def test_decision_is_pinned_for_the_sessions_lifetime(self):
+        # A detection lock landing MID-SESSION must not flip the current
+        # session's path: granted expansions would vanish and the freeze
+        # entry would orphan. The lock applies to the next session only.
+        plugin._CONFIG["cache_mode"] = "auto"
+        scope = "assistant-a:telegram"
+        self.assertEqual(
+            plugin._resolve_cache_mode_for_session("pin-sid", scope=scope), "on")
+        plugin._DETECTION_CACHE[scope] = {"mode": "off"}
+        self.assertEqual(
+            plugin._resolve_cache_mode_for_session("pin-sid", scope=scope), "on",
+            "mid-session lock must not flip the live session")
+        self.assertEqual(
+            plugin._resolve_cache_mode_for_session("next-sid", scope=scope), "off",
+            "the NEXT session honors the lock")
 
 
 class FreezeSnapshotTests(unittest.TestCase):

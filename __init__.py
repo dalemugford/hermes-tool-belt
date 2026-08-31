@@ -222,6 +222,11 @@ _PRIOR_MESSAGES_BY_SESSION: dict[str, list[str]] = {}
 # Frozen tool-set decisions per canonical session key. Evicted on session
 # reset and context compaction; the per-turn on_session_end hook preserves it.
 _FROZEN_BY_SESSION: dict[str, dict[str, Any]] = {}
+#: Cache-mode decision pinned at a session's FIRST dispatch. Without the pin,
+#: a detection lock landing mid-session flips the current session's path —
+#: granted expansions vanish and the freeze entry leaks. Evicted with the
+#: freeze on session reset.
+_CACHE_DECISION_BY_SESSION: dict[str, str] = {}
 
 # Cross-session detection cache. Persisted JSON at
 # ``~/.hermes/state/tool-belt/cache_mode_detection.json``. Keyed by
@@ -330,9 +335,16 @@ def _load_user_config() -> None:
 # ─── The narrowing patch ───────────────────────────────────────────────────
 
 def _wrap_build_api_kwargs(original):
-    """Wrap AIAgent._build_api_kwargs to narrow tools per API call."""
-    def wrapped(self, api_messages):
-        kwargs = original(self, api_messages)
+    """Wrap AIAgent._build_api_kwargs to narrow tools per API call.
+
+    The wrapper must accept and forward every extra argument the host may
+    pass (the deployed gateway calls ``_build_api_kwargs(api_messages,
+    tools_for_api=...)`` on cache-plan branches): a fixed two-argument
+    signature raises TypeError at call BINDING — before the fail-open
+    try/except can engage — turning narrowing into an API-call crash.
+    """
+    def wrapped(self, api_messages, *args, **call_kwargs):
+        kwargs = original(self, api_messages, *args, **call_kwargs)
         if not _CONFIG["enabled"]:
             return kwargs
 
@@ -1238,6 +1250,7 @@ def _wrap_compress_context(original):
             if session_key and session_key in _FROZEN_BY_SESSION:
                 _FROZEN_BY_SESSION.pop(session_key, None)
                 _CACHE_MODE_BY_SESSION.pop(session_key, None)
+                _CACHE_DECISION_BY_SESSION.pop(session_key, None)
                 evicted_keys.append(session_key)
             # Defensive: also try the AIAgent's session_id (UUID) in case
             # the canonical environment key is unavailable.
@@ -1245,6 +1258,7 @@ def _wrap_compress_context(original):
             if aid and aid != session_key and aid in _FROZEN_BY_SESSION:
                 _FROZEN_BY_SESSION.pop(aid, None)
                 _CACHE_MODE_BY_SESSION.pop(aid, None)
+                _CACHE_DECISION_BY_SESSION.pop(aid, None)
                 evicted_keys.append(aid)
             if evicted_keys:
                 logger.info(
@@ -1502,20 +1516,23 @@ def _resolve_cache_mode_for_session(session_id: str, scope: str = "") -> str:
         prefix-cache stability.
 
     Mid-session switching is intentionally not supported — switching
-    itself busts the cache. The per-session detection telemetry from
-    ``_CACHE_MODE_BY_SESSION`` is for the analyzer and the NEXT session,
-    never for this one.
+    itself busts the cache. The decision is therefore PINNED at the
+    session's first dispatch (``_CACHE_DECISION_BY_SESSION``): a detection
+    lock landing mid-session applies to the NEXT session, never this one.
     """
+    sid = str(session_id or "")
+    if sid and sid in _CACHE_DECISION_BY_SESSION:
+        return _CACHE_DECISION_BY_SESSION[sid]
     mode = str(_CONFIG.get("cache_mode") or "auto").lower()
-    if mode == "off":
-        return "off"
-    if mode == "on":
-        return "on"
-    # auto: consult the cross-session cache; default "on" on a miss.
-    cached = _cached_detection_mode(scope)
-    if cached in ("on", "off"):
-        return cached
-    return "on"
+    if mode in ("on", "off"):
+        decision = mode
+    else:
+        # auto: consult the cross-session cache; default "on" on a miss.
+        cached = _cached_detection_mode(scope)
+        decision = cached if cached in ("on", "off") else "on"
+    if sid:
+        _CACHE_DECISION_BY_SESSION[sid] = decision
+    return decision
 
 
 def _freeze_session_snapshot(
@@ -2610,6 +2627,7 @@ def _on_session_reset(session_id=None, **kwargs) -> None:
     for sid in eviction_ids:
         _FROZEN_BY_SESSION.pop(sid, None)
         _CACHE_MODE_BY_SESSION.pop(sid, None)
+        _CACHE_DECISION_BY_SESSION.pop(sid, None)
         sticky_key = _sticky_key_for_session(sid)
         if sticky_key:
             _STICKY_BY_KEY.pop(sticky_key, None)

@@ -109,6 +109,26 @@ class NeverEmpty(unittest.TestCase):
                                 "active == ∅ is the forbidden fail state")
 
 
+class HostSignatureForwarding(unittest.TestCase):
+    """The deployed gateway calls _build_api_kwargs(api_messages,
+    tools_for_api=...) on cache-plan branches; a fixed two-argument wrapper
+    raises TypeError at call BINDING — before fail-open can engage — so the
+    wrapper must accept and forward arbitrary host args."""
+
+    def test_extra_host_kwargs_are_forwarded(self):
+        seen: dict = {}
+
+        def original(_self, _msgs, tools_for_api=None):
+            seen["tools_for_api"] = tools_for_api
+            return {"tools": [], "model": "m"}
+
+        wrapped = plugin._wrap_build_api_kwargs(original)
+        with mock.patch.dict(plugin._CONFIG, {"enabled": True}):
+            out = wrapped(object(), [], tools_for_api=["decorated-copy"])
+        self.assertEqual(seen["tools_for_api"], ["decorated-copy"])
+        self.assertIn("tools", out)
+
+
 class WrapperFailOpen(unittest.TestCase):
     """An exception at ANY internal seam of the wrapped _build_api_kwargs
     returns the original kwargs unchanged — the gateway never sees the error."""
