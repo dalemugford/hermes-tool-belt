@@ -199,16 +199,29 @@ evidence. The same reasoning applies to any tool your agent's own
 instructions (SOUL/system prompt) tell it to use habitually: if your
 directives insist on a tool, pin it.
 
-### `bypass_rate`
+### `bypass_rate` (internal testing feature)
 
-Type: `float` in `[0.0, 1.0]`. Default: `0.0`.
+Type: `float` in `[0.0, 1.0]`. Default: `0.0`. **Not surfaced by
+`configure` — leave it at 0.0 unless you are validating Tool Belt.**
 
 Fraction of sessions (deterministic by `sha1(scope|session_id)`) that
 bypass narrowing and ship the full tool ceiling. Bypassed sessions
 still run the predictor (so telemetry is preserved) but
 `policy_source` is stamped `bypass` and `allowed_tool_names` widens to
-the ceiling. Use `1.0` to disable narrowing on a scope without
-disabling the plugin.
+the ceiling.
+
+Why you don't need it: savings are measured *directly* — every narrowed
+turn records `ceiling_tokens − narrowed_tokens`, so no control cohort is
+required, and bypassed sessions are excluded from the savings headline
+(they never narrow). A standing bypass fraction therefore only *spends*
+tokens (each bypassed session ships the full manifest at full price)
+without improving any measurement. Its legitimate uses are temporary:
+validating prediction quality on a critical agent before trusting
+shaping (set a small rate, watch whether bypassed sessions use tools
+narrowing would have hidden, then set it back to 0.0), and A/B trials
+during Tool Belt development. `1.0` effectively disables narrowing on a
+scope without disabling the plugin — observation mode uses this
+internally.
 
 Per-scope override: `channels.<scope>.bypass_rate`. See
 [`_bypass_rate_for_scope`](../__init__.py).

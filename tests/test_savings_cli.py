@@ -822,6 +822,32 @@ class LauncherHelperTests(_HomeCase):
         self.assertFalse(created)
         self.assertFalse(savings_cli.launcher_path(self.home, user_home=user_home).exists())
 
+class LauncherSandboxContainmentTests(_HomeCase):
+    """Interactivity-audit fix: a non-default hermes_home must NEVER resolve
+    the launcher into the real user's ~/.local/bin — every write stays inside
+    the Hermes home it was pointed at. Only the true default install
+    (~/.hermes) may prefer ~/.local/bin. No other test guards the sandbox
+    boundary of the CLI's one write-outside-state surface."""
+
+    def test_custom_home_stays_inside_itself(self):
+        fake_user_home = Path(self.tmp.name) / "userhome"
+        (fake_user_home / ".local" / "bin").mkdir(parents=True)
+        custom = Path(self.tmp.name) / "staging hermes home"
+        custom.mkdir()
+        target = savings_cli.launcher_path(custom, user_home=fake_user_home)
+        self.assertEqual(target, custom / "bin" / "tool-belt",
+                         "a sandboxed/staging home must not reach ~/.local/bin")
+
+    def test_default_home_prefers_local_bin(self):
+        fake_user_home = Path(self.tmp.name) / "userhome2"
+        (fake_user_home / ".local" / "bin").mkdir(parents=True)
+        default_home = fake_user_home / ".hermes"
+        default_home.mkdir()
+        target = savings_cli.launcher_path(default_home, user_home=fake_user_home)
+        self.assertEqual(target,
+                         fake_user_home / ".local" / "bin" / "tool-belt")
+
+
 class LauncherStalenessTests(_HomeCase):
     """(13a) An existing file at the launcher target is never taken on faith:
     the baked-in absolute exec path must still exist and still be ours."""

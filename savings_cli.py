@@ -237,14 +237,27 @@ def launcher_path(hermes_home: Path, *, user_home: Path | None = None) -> Path:
 
     Prefers ``~/.local/bin`` — the directory the Hermes installer itself
     guarantees is on PATH (it links ``hermes`` there and appends it to the
-    shell profile). Falls back to ``$HERMES_HOME/bin`` only when
-    ``~/.local/bin`` does not exist (headless/CI homes, custom installs);
-    that directory is deliberately NOT on PATH by Hermes convention.
+    shell profile). Falls back to ``$HERMES_HOME/bin`` when ``~/.local/bin``
+    does not exist (headless/CI homes); that directory is deliberately NOT
+    on PATH by Hermes convention.
+
+    Sandbox containment: when ``hermes_home`` is NOT the user's default
+    install home (``~/.hermes``) — a test fixture, a staging copy, a custom
+    ``HERMES_HOME`` — every write stays inside it. The interactivity audit
+    found that a ``HERMES_HOME``-scoped run could still read (and offer to
+    overwrite) the real operator's ``~/.local/bin/tool-belt``; a command
+    whose every other write is scoped to the Hermes home must not be the
+    one exception.
     """
     home = user_home or Path.home()
-    local_bin = home / ".local" / "bin"
-    if local_bin.is_dir():
-        return local_bin / "tool-belt"
+    try:
+        is_default_home = Path(hermes_home).resolve() == (home / ".hermes").resolve()
+    except OSError:
+        is_default_home = False
+    if is_default_home:
+        local_bin = home / ".local" / "bin"
+        if local_bin.is_dir():
+            return local_bin / "tool-belt"
     return Path(hermes_home) / "bin" / "tool-belt"
 
 
