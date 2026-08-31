@@ -185,20 +185,27 @@ class OnboardingArcTests(OnboardingTestCase):
         _rc, output = self.run_main(
             ["--status"], tc.FakeRunner(self.observing_config(result.scope))
         )
-        self.assertIn(configure.STATE_OBSERVING, output)
-        self.assertIn(f"{result.sessions}/{self.needed} sessions", output)
+        self.assertIn("shaping OFF (observing)", output)
 
     def test_threshold_crossing_to_ready(self) -> None:
-        """The same config at 20 sessions reads ``ready`` instead."""
+        """The same config at 20 sessions classifies ``ready`` — the state
+        machine still gates the shaping offer even though the status row
+        renders both observation states as ``shaping OFF (observing)``."""
         result = self.seed("chat-heavy")
         self.assertGreaterEqual(result.sessions, self.needed)
 
         runner = tc.FakeRunner(self.observing_config(result.scope))
         rc, output = self.run_main(["--status"], runner)
         self.assertEqual(rc, 0)
-        self.assertIn(configure.STATE_READY, output)
-        self.assertIn(f"{result.sessions}/{self.needed} sessions", output)
+        self.assertIn("shaping OFF (observing)", output)
         self.assertEqual(runner.writes, [])
+        infos = {i.scope: i for i in configure.discover_scopes(self.home)}
+        settings = configure.scope_settings(
+            result.scope, configure.read_plugin_config(runner), runner)
+        self.assertEqual(
+            configure.classify_scope(infos[result.scope], settings,
+                                     self.thresholds),
+            configure.STATE_READY)
 
     def test_shape_spine(self) -> None:
         """shape → overlay on disk, ``learned_mode: apply``, bypass off, ``shaped``."""
@@ -228,7 +235,7 @@ class OnboardingArcTests(OnboardingTestCase):
             ["--status"],
             tc.FakeRunner({f"plugins.tool-belt.channels.{result.scope}.learned_mode": "apply"}),
         )
-        self.assertIn(configure.STATE_SHAPED, status)
+        self.assertIn("shaping ON (", status)
 
     def test_overlay_write_is_disclosed_and_matches_what_lands_on_disk(self) -> None:
         """The terminal diff names every tool the overlay write then contains."""
@@ -310,8 +317,8 @@ class OnboardingArcTests(OnboardingTestCase):
             ["--status"],
             tc.FakeRunner({f"plugins.tool-belt.channels.{terminal.scope}.learned_mode": "apply"}),
         )
-        self.assertIn(f"{terminal.scope:<28} {configure.STATE_SHAPED}", status)
-        self.assertIn(f"{browser.scope:<28} {configure.STATE_READY}", status)
+        self.assertIn(f"{terminal.scope:<24} shaping ON (", status)
+        self.assertIn(f"{browser.scope:<24} shaping OFF (observing)", status)
 
 if __name__ == "__main__":
     unittest.main()

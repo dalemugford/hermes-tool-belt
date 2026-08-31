@@ -976,32 +976,6 @@ def _project_scope(info: "ScopeInfo", proposal: dict[str, list[str]]):
     return None
 
 
-def _always_carried_line(plugin_config: dict[str, Any] | None) -> str:
-    """One-line always-carried summary, showing config pins distinctly.
-
-    e.g. ``Always carried: 6 policy + 2 pinned (web_search, terminal)``.
-    Config pins come from ``plugins.tool-belt.always_carry`` (global; scope
-    entries add more per scope). Never raises.
-    """
-    policy_count = 0
-    try:
-        preset = load_base_preset()
-        policy_count = len(list(getattr(preset, "always_carry", []) or []))
-    except Exception:
-        pass
-    pins: list[str] = []
-    try:
-        learned = load_learned()
-        if learned is not None:
-            pins = list(learned.config_always_carry(plugin_config or {}, ""))
-    except Exception:
-        pins = []
-    if pins:
-        return (f"Always carried: {policy_count} policy + {len(pins)} pinned "
-                f"({', '.join(sorted(pins))})")
-    return f"Always carried: {policy_count} policy (no config pins)"
-
-
 def _preset_baselines(preset: Any) -> tuple[list[str], list[str]]:
     """``(always_carry, carry)`` from the shipped policy preset, defensively."""
     always_carry: list[str] = []
@@ -1149,33 +1123,9 @@ def render_shaping_summary(
     return lines
 
 
-def _shaped_detail(info: ScopeInfo) -> str:
-    """Status detail for a shaped scope: what shaping did, when, and by whom.
-
-    The state column already says "shaped" — repeating "shaping applied" here
-    said nothing. Show the outcome (learned carry / expand-only counts) and
-    the apply stamp; both the auto engine and configure's own apply write
-    ``source`` + ``applied_at`` into the scope's ``shaping`` block. Read-only
-    and fail-open: any read problem falls back to a plain detail.
-    """
-    try:
-        doc = json.loads((info.state_dir / "learned.json").read_text(encoding="utf-8"))
-        entry = (doc.get("scopes") or {}).get(info.scope) or {}
-        carry = entry.get("carry") if isinstance(entry.get("carry"), list) else []
-        expand = (entry.get("expand_only")
-                  if isinstance(entry.get("expand_only"), list) else [])
-        parts = f"{len(carry)} carried, {len(expand)} by expansion"
-        shaping = entry.get("shaping") or entry.get("cache_aware") or {}
-        if isinstance(shaping, dict):
-            applied = str(shaping.get("applied_at")
-                          or shaping.get("computed_at") or "")[:10]
-            if applied:
-                suffix = " (auto)" if shaping.get("source") == "auto" else ""
-                return f"{parts} — applied {applied}{suffix}"
-        return parts
-    except Exception:
-        pass
-    return "shaping applied"
+def _truthy(value: Any) -> bool:
+    """Config truthiness for values that may arrive as YAML bools or strings."""
+    return str(value).strip().lower() in ("true", "1", "yes", "on")
 
 
 def _overlay_trigger_count(info: ScopeInfo) -> int:
@@ -1196,24 +1146,29 @@ def _overlay_trigger_count(info: ScopeInfo) -> int:
 
 
 def render_status_row(
-    info: ScopeInfo, state: str, thresholds: dict[str, int]
+    info: ScopeInfo, state: str, thresholds: dict[str, int], index: int = 1
 ) -> str:
-    needed = required_sessions(thresholds)
-    if state == STATE_SHAPED:
-        detail = _shaped_detail(info)
-    elif state == STATE_READY:
-        detail = f"ready to shape ({info.sessions}/{needed} sessions)"
-    elif state == STATE_OBSERVING:
-        detail = (
-            f"observing — {info.sessions}/{needed} sessions, "
-            f"{remaining_sessions(info, thresholds)} to go"
-        )
+    """One "Agents" list row: ``N. scope  shaping ON/OFF (what's happening)``.
+
+    ON/OFF is the shaping mode (Off = the scope was put in observation);
+    the parenthetical is the outcome — learned carry/expansion counts once
+    an assignment exists, ``learning`` while one is still accumulating,
+    ``observing`` when shaping is off.
+    """
+    if state in (STATE_OBSERVING, STATE_READY):
+        mode, detail = "OFF", "observing"
     else:
-        detail = f"not configured ({info.sessions}/{needed} sessions)"
+        assignment = current_assignment(info)
+        carry, expand = assignment["carry"], assignment["expand_only"]
+        mode = "ON"
+        if carry or expand:
+            detail = f"{len(carry)} carried, {len(expand)} by expansion"
+        else:
+            detail = "learning"
     overlay_count = _overlay_trigger_count(info)
     if overlay_count:
         detail += f", auto-learned triggers: {overlay_count}"
-    return f"  {info.scope:<28} {state:<10} {detail}"
+    return f"    {index}. {info.scope:<24} shaping {mode} ({detail})"
 
 
 # ────────────────────────────────── prompting ────────────────────────────────
@@ -1484,11 +1439,13 @@ def flow_reset(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
 
 def flow_status(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
     """Read-only. Never writes anything, ever."""
-    ctx.out("Tool Belt — configuration status")
-    ctx.out(f"  Hermes home: {ctx.hermes_home}")
-    ctx.out("  " + _always_carried_line(ctx.plugin_config))
-    if not ctx.have_hermes:
-        ctx.out("  `hermes` not on PATH — config values could not be read.")
+    if ctx.have_hermes:
+        # The plugin's in-code default is enabled: an absent key means ON.
+        value = ctx.plugin_config.get("enabled")
+        enabled = True if value is None else _truthy(value)
+        ctx.out(f"Tool Belt: {'enabled' if enabled else 'disabled'}")
+    else:
+        ctx.out("Tool Belt: state unknown — `hermes` not on PATH")
     if not infos:
         # Report what IS known: real profiles with no telemetry yet are a
         # different state from an empty home, and --status should say which.
@@ -1501,10 +1458,10 @@ def flow_status(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
         else:
             ctx.out("\n  No agent scopes found yet. Send a message through a gateway, then re-run.")
         return 0
-    ctx.out("")
-    for info in infos:
+    ctx.out("Agents")
+    for index, info in enumerate(infos, 1):
         state = classify_scope(info, ctx.settings(info.scope), ctx.thresholds)
-        ctx.out(render_status_row(info, state, ctx.thresholds))
+        ctx.out(render_status_row(info, state, ctx.thresholds, index=index))
     return 0
 
 

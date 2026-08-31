@@ -1097,41 +1097,49 @@ class StatusFreshInstallTests(TempHomeTestCase):
         self.assertEqual(rc, 0)
         self.assertIn("No agent scopes found yet", output)
 
-    def test_status_header_carries_no_sessions_needed_noise(self) -> None:
-        # The 20-session threshold is per-row context for unshaped scopes;
-        # as a header over already-shaped rows it read as nonsense.
+    def test_status_header_carries_no_stale_noise(self) -> None:
+        # Dale's status spec: 'Tool Belt: enabled/disabled' + 'Agents' rows.
+        # The sessions-needed threshold and the global always-carried summary
+        # (pins are per agent) read as nonsense in a fleet header.
         _rc, output = self._status(self.home)
         self.assertNotIn("Sessions needed", output)
+        self.assertNotIn("Always carried", output)
+        # The plugin's in-code default is enabled — an unset key must not
+        # report the deployed default as 'disabled'.
+        self.assertTrue(output.startswith("Tool Belt: enabled"),
+                        output.splitlines()[0])
 
 
-class ShapedStatusDetailTests(TempHomeTestCase):
-    """A shaped row must say what shaping DID (counts + apply stamp) — the
-    state column already says "shaped", so the old "shaping applied" detail
-    repeated it and told the operator nothing."""
+class StatusRowTests(TempHomeTestCase):
+    """An agent row reads ``N. scope  shaping ON/OFF (outcome)`` — mode plus
+    what shaping did (counts), is doing (learning), or that the scope is in
+    observation (OFF)."""
 
-    def _entry(self, shaping: dict) -> configure.ScopeInfo:
-        state_dir = self.root_state
-        (state_dir / "learned.json").write_text(json.dumps({
-            "version": 2,
-            "scopes": {"default:cli": {
-                "carry": ["read_file"],
-                "expand_only": ["a", "b", "c"],
-                "shaping": shaping,
-            }},
-        }), encoding="utf-8")
+    def _info(self, entry: dict | None = None) -> configure.ScopeInfo:
+        if entry is not None:
+            (self.root_state / "learned.json").write_text(json.dumps({
+                "version": 2, "scopes": {"default:cli": entry},
+            }), encoding="utf-8")
         return configure.ScopeInfo(scope="default:cli", agent="default",
-                                   platform="cli", state_dir=state_dir)
+                                   platform="cli", state_dir=self.root_state)
 
-    def test_auto_apply_shows_counts_date_and_auto(self) -> None:
-        info = self._entry({"source": "auto", "applied_at": "2026-08-31T11:01:24Z"})
-        self.assertEqual(configure._shaped_detail(info),
-                         "1 carried, 3 by expansion — applied 2026-08-31 (auto)")
+    def test_shaped_row_shows_on_with_counts(self) -> None:
+        info = self._info({"carry": ["read_file"],
+                           "expand_only": ["a", "b", "c"], "shaping": {}})
+        row = configure.render_status_row(
+            info, configure.STATE_SHAPED, self.thresholds, index=2)
+        self.assertIn("2. default:cli", row)
+        self.assertIn("shaping ON (1 carried, 3 by expansion)", row)
 
-    def test_configure_apply_shows_counts_and_date_without_auto(self) -> None:
-        info = self._entry({"source": "configure",
-                            "applied_at": "2026-08-30T09:00:00Z"})
-        self.assertEqual(configure._shaped_detail(info),
-                         "1 carried, 3 by expansion — applied 2026-08-30")
+    def test_fresh_row_shows_on_learning(self) -> None:
+        row = configure.render_status_row(
+            self._info(), configure.STATE_FRESH, self.thresholds)
+        self.assertIn("shaping ON (learning)", row)
+
+    def test_observation_row_shows_off(self) -> None:
+        row = configure.render_status_row(
+            self._info(), configure.STATE_OBSERVING, self.thresholds)
+        self.assertIn("shaping OFF (observing)", row)
 
     def test_configure_apply_stamps_source_and_applied_at(self) -> None:
         # Symmetry with the auto engine: a status read must not depend on
