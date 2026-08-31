@@ -1597,6 +1597,204 @@ def _apply_mode(ctx: RunContext, infos: Sequence[ScopeInfo], mode: str) -> int:
     return 0
 
 
+def read_config_pins(profile_home: Path) -> list[str]:
+    """The profile's ``plugins.tool-belt.always_carry`` config pins.
+
+    Read directly from config.yaml (read-only; every WRITE still goes through
+    ``hermes config set`` — Hermes owns the file).
+    """
+    try:
+        yaml = require_yaml()
+        raw = yaml.safe_load((profile_home / "config.yaml").read_text(
+            encoding="utf-8")) or {}
+        pins = ((raw.get("plugins") or {}).get("tool-belt") or {}).get("always_carry")
+        if isinstance(pins, list):
+            return [str(p) for p in pins if str(p).strip()]
+    except SystemExit:
+        raise
+    except Exception:
+        pass
+    return []
+
+
+def agent_tool_inventory(infos: Sequence[ScopeInfo]) -> list[str]:
+    """Every tool observed in the agent's recorded ceilings, sorted.
+
+    Union of ``ceiling_tools`` across recent prediction rows for the agent's
+    scopes — a single row can be a tiny internal session, so no one row is
+    trusted alone.
+    """
+    shaper = load_shaper()
+    tools: set[str] = set()
+    seen_dirs: set[Path] = set()
+    scopes = {i.scope for i in infos}
+    for info in infos:
+        if info.state_dir in seen_dirs:
+            continue
+        seen_dirs.add(info.state_dir)
+        rows = shaper.load_jsonl(info.state_dir / "predictions.jsonl")
+        for row in rows[-400:]:
+            if str(row.get("scope") or "") in scopes:
+                # ceiling_tools on v2 rows; resident/active fields cover
+                # sparse v1 telemetry so old installs still get a list.
+                for field in ("ceiling_tools", "active_tools", "always_on_tools"):
+                    for t in (row.get(field) or []):
+                        tools.add(str(t))
+    return sorted(tools)
+
+
+def checkbox_picker(
+    items: Sequence[str],
+    checked: set[str],
+    reader: Callable[[str], str],
+    out: Callable[[str], None],
+) -> set[str] | None:
+    """Toggle a set of items; returns the final set, or None on cancel.
+
+    On a real TTY: an in-place list — arrow keys / j/k to move, SPACE to
+    toggle, Enter to accept, q to cancel. Anywhere else (pipes, tests,
+    --yes automation): a numbered toggle loop with the same semantics.
+    """
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            return _checkbox_picker_tty(items, set(checked))
+        except Exception:
+            pass  # raw-mode failed (odd terminal) — fall through
+    state = set(checked)
+    while True:
+        out("")
+        for idx, item in enumerate(items, 1):
+            mark = "x" if item in state else " "
+            out(f"    [{mark}] {idx:>2}. {item}")
+        answer = prompt(
+            "  Toggle (numbers, comma-separated) — blank when done, q to cancel: ",
+            reader).lower()
+        if answer == "q":
+            return None
+        if not answer:
+            return state
+        for part in answer.replace(" ", ",").split(","):
+            if not part:
+                continue
+            try:
+                i = int(part)
+            except ValueError:
+                out(f"    Not a number: {part}")
+                continue
+            if 1 <= i <= len(items):
+                item = items[i - 1]
+                state.symmetric_difference_update({item})
+            else:
+                out(f"    Out of range: {i}")
+
+
+def _checkbox_picker_tty(items: Sequence[str], state: set[str]) -> set[str] | None:
+    """Raw-terminal spacebar picker. TTY-only; caller handles fallback."""
+    import termios
+    import tty
+
+    cursor = 0
+    write = sys.stdout.write
+    n = len(items)
+
+    def render(first: bool) -> None:
+        if not first:
+            write(f"\x1b[{n + 1}A")  # cursor up over the list + hint
+        for i, item in enumerate(items):
+            mark = "x" if item in state else " "
+            pointer = ">" if i == cursor else " "
+            write(f"\x1b[2K  {pointer} [{mark}] {item}\n")
+        write("\x1b[2K    space toggle · ↑/↓ move · enter done · q cancel\n")
+        sys.stdout.flush()
+
+    render(first=True)
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch in ("\r", "\n"):
+                return state
+            if ch in ("q", "\x03", "\x04"):  # q / Ctrl-C / Ctrl-D
+                return None
+            if ch == " ":
+                state.symmetric_difference_update({items[cursor]})
+            elif ch in ("j",):
+                cursor = min(cursor + 1, n - 1)
+            elif ch in ("k",):
+                cursor = max(cursor - 1, 0)
+            elif ch == "\x1b":  # arrow keys: ESC [ A/B
+                seq = sys.stdin.read(2)
+                if seq == "[B":
+                    cursor = min(cursor + 1, n - 1)
+                elif seq == "[A":
+                    cursor = max(cursor - 1, 0)
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            render(first=False)
+            tty.setraw(fd)
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
+def flow_protected(ctx: RunContext, agent: str,
+                   infos: Sequence[ScopeInfo]) -> int:
+    """Manage the agent's protected (always-carried) tools.
+
+    Policy pins are shown as a note and are not toggleable (union-only:
+    users add pins, never remove shipped ones). The toggle list is the
+    agent's observed tool inventory; checked = current config pins. The
+    result is written to ``plugins.tool-belt.always_carry`` via
+    ``hermes config set`` after the usual disclosed confirm.
+    """
+    profile_home = (ctx.hermes_home if agent == "default"
+                    else ctx.hermes_home / "profiles" / agent)
+    preset = load_base_preset()
+    policy_pins = sorted(preset.always_carry) if preset else []
+    current = read_config_pins(profile_home)
+
+    inventory = [t for t in agent_tool_inventory(infos)
+                 if t not in set(policy_pins)]
+    # Pins for tools not currently in the ceiling still count (inert-but-kept).
+    for pin in current:
+        if pin not in inventory and pin not in set(policy_pins):
+            inventory.append(pin)
+    inventory.sort()
+    if not inventory:
+        ctx.out("\n  No tool inventory recorded for this agent yet — run a "
+                "session first.")
+        return 0
+
+    ctx.out(f"\n  Protected tools for {agent} — always carried, never shaped.")
+    result = checkbox_picker(inventory, set(current), ctx.reader, ctx.out)
+    if result is None:
+        ctx.out("\n  Nothing changed.")
+        return 0
+    new_pins = sorted(result)
+    if new_pins == sorted(current):
+        ctx.out("\n  No changes.")
+        return 0
+
+    added = sorted(set(new_pins) - set(current))
+    removed = sorted(set(current) - set(new_pins))
+    write = ConfigWrite(
+        key=f"{CONFIG_PREFIX}.always_carry",
+        after=json.dumps(new_pins),
+        before=json.dumps(sorted(current)) if current else None,
+    )
+    extra = []
+    if added:
+        extra.append("    Now protected: " + ", ".join(added))
+    if removed:
+        extra.append("    No longer protected (back to shaping): "
+                     + ", ".join(removed))
+    if not _confirm_writes(ctx, f"Changes for {agent}:", [write], extra):
+        ctx.out("  Skipped. Nothing written.")
+        return 0
+    ctx.applied.extend(apply_writes([write], ctx.runner, ctx.dry_run, ctx.out))
+    return 0
+
+
 def _menu(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
     """configure = turn shaping on/off per agent, per channel.
 
@@ -1611,6 +1809,23 @@ def _menu(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
         ctx.out("\n  Nothing selected.")
         return 0
     agent_scopes = [i for i in infos if i.agent == agent]
+
+    preset = load_base_preset()
+    if preset and preset.always_carry:
+        ctx.out("\n  Note: Tool Belt will always carry: "
+                + ", ".join(sorted(preset.always_carry)))
+    ctx.out("\n    1. Protected tools")
+    ctx.out("    2. Tool shaping options")
+    while True:
+        answer = prompt("  Option? [1/2, blank to cancel]: ", ctx.reader).strip()
+        if not answer:
+            ctx.out("\n  Nothing selected.")
+            return 0
+        if answer == "1":
+            return flow_protected(ctx, agent, agent_scopes)
+        if answer == "2":
+            break
+        ctx.out("    Enter 1 or 2.")
 
     selected = _pick_scopes(ctx, agent_scopes)
     if not selected:

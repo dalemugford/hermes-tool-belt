@@ -257,7 +257,7 @@ class ConfigureModeFlowTests(TempHomeTestCase):
     def test_off_writes_recommend_mode(self):
         self._seed_two_channels()
         # one agent (skipped), channels 'all', mode 3 (off), confirm y ×2
-        rc, out, runner = self._run("all\n3\ny\ny\n")
+        rc, out, runner = self._run("2\nall\n3\ny\ny\n")
         self.assertEqual(rc, 0)
         keys = {c[3]: c[4] for c in runner.writes}
         self.assertEqual(
@@ -268,7 +268,7 @@ class ConfigureModeFlowTests(TempHomeTestCase):
     def test_learning_writes_apply_without_history_run(self):
         self._seed_two_channels()
         # channels 'all', mode 1 (learning), confirm y ×2
-        rc, out, runner = self._run("all\n1\ny\ny\n")
+        rc, out, runner = self._run("2\nall\n1\ny\ny\n")
         self.assertEqual(rc, 0)
         keys = {c[3]: c[4] for c in runner.writes}
         self.assertEqual(
@@ -282,7 +282,7 @@ class ConfigureModeFlowTests(TempHomeTestCase):
     def test_history_mode_delegates_to_shape(self):
         self._seed_two_channels()
         # channel 1 only, mode 2 (history), confirm ('y'), decline launcher.
-        rc, out, runner = self._run("1\n2\ny\nn\n")
+        rc, out, runner = self._run("2\n1\n2\ny\nn\n")
         self.assertEqual(rc, 0)
         # flow_shape's epilogue is emitted ONLY on the history path — the
         # faithful signal that mode 2 shapes from recorded history now,
@@ -297,11 +297,58 @@ class ConfigureModeFlowTests(TempHomeTestCase):
 
     def test_blank_at_any_step_cancels_without_writing(self):
         self._seed_two_channels()
-        for keys in ("\n", "all\n\n"):  # cancel at channels, cancel at mode
+        for keys in ("\n", "2\nall\n\n"):  # cancel at channels, cancel at mode
             rc, out, runner = self._run(keys)
             self.assertEqual(rc, 0)
             self.assertEqual(runner.writes, [], "cancelling writes nothing")
             self.assertIn("Nothing selected", out)
+
+
+class ProtectedToolsFlowTests(TempHomeTestCase):
+    """Step-2 'Protected tools': spacebar/numbered picker over the agent's
+    observed inventory; policy pins excluded (union-only, not toggleable);
+    result written to plugins.tool-belt.always_carry via the disclosed
+    confirm. No other test drives the pin-management flow."""
+
+    def _seed(self):
+        seed_telemetry(self.root_state, "default:telegram", 3,
+                       always_on=["web_search", "read_file", "terminal"])
+
+    def _run(self, keys: str):
+        infos = configure.discover_scopes(self.home)
+        lines: list[str] = []
+        it = iter(keys.splitlines())
+        runner = FakeRunner()
+        ctx = make_ctx(self.home, runner, reader=lambda _p: next(it),
+                       out=lines.append, plugin_config={})
+        rc = configure._menu(ctx, infos)
+        return rc, "\n".join(lines), runner
+
+    def test_policy_pins_shown_as_note_not_toggleable(self):
+        self._seed()
+        rc, out, _ = self._run("1\nq\n")
+        self.assertIn("Note: Tool Belt will always carry:", out)
+        self.assertIn("clarify", out.split("Protected tools")[0],
+                      "policy pins appear in the note")
+        picker = out.split("Protected tools", 1)[1]
+        self.assertNotRegex(picker, r"\[ \]\s*\d+\. clarify",
+                            "a policy pin is never a toggle row")
+
+    def test_toggle_and_confirm_writes_always_carry(self):
+        self._seed()
+        # option 1, toggle row 1, done (blank), confirm y
+        rc, out, runner = self._run("1\n1\n\ny\n")
+        self.assertEqual(rc, 0)
+        keys = {c[3]: c[4] for c in runner.writes}
+        self.assertIn("plugins.tool-belt.always_carry", keys)
+        self.assertIn("Now protected:", out)
+
+    def test_cancel_writes_nothing(self):
+        self._seed()
+        rc, out, runner = self._run("1\nq\n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(runner.writes, [])
+        self.assertIn("Nothing changed", out)
 
 
 class StateMachineTests(TempHomeTestCase):
