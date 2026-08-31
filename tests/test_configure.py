@@ -327,12 +327,26 @@ class ProtectedToolsFlowTests(TempHomeTestCase):
     def test_policy_pins_shown_as_note_not_toggleable(self):
         self._seed()
         rc, out, _ = self._run("1\nq\n")
-        self.assertIn("Note: Tool Belt will always carry:", out)
-        self.assertIn("clarify", out.split("Protected tools")[0],
-                      "policy pins appear in the note")
-        picker = out.split("Protected tools", 1)[1]
+        # The note appears AFTER choosing 'Protected tools' (Dale), and a
+        # policy pin never appears as a toggle row.
+        menu_part, picker = out.split("1. Protected tools", 1)
+        self.assertNotIn("Note: Tool Belt will always carry:", menu_part)
+        self.assertIn("Note: Tool Belt will always carry:", picker)
         self.assertNotRegex(picker, r"\[ \]\s*\d+\. clarify",
                             "a policy pin is never a toggle row")
+
+    def test_existing_pins_preselected_root_profile_with_display_name(self):
+        # Bernard's shape: ROOT profile whose configured agent name differs
+        # from the directory identity — pins must still preselect (the
+        # profile home comes from the scope's state dir, never the name).
+        (self.home / "config.yaml").write_text(
+            "plugins:\n  tool-belt:\n    agent: bernard\n"
+            "    always_carry:\n      - terminal\n", encoding="utf-8")
+        seed_telemetry(self.root_state, "bernard:telegram", 3,
+                       always_on=["web_search", "terminal"])
+        rc, out, _ = self._run("1\nq\n")
+        self.assertRegex(out, r"\[x\]\s*\d+\. terminal",
+                         "an existing config pin comes pre-checked")
 
     def test_toggle_and_confirm_writes_always_carry(self):
         self._seed()

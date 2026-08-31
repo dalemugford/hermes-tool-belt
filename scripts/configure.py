@@ -1747,10 +1747,16 @@ def flow_protected(ctx: RunContext, agent: str,
     result is written to ``plugins.tool-belt.always_carry`` via
     ``hermes config set`` after the usual disclosed confirm.
     """
-    profile_home = (ctx.hermes_home if agent == "default"
-                    else ctx.hermes_home / "profiles" / agent)
+    # Profile home from the scope's state dir (<home>/state/tool-belt) —
+    # never from the agent NAME, which for a root profile is the configured
+    # display name (e.g. 'bernard'), not a profiles/ directory.
+    profile_home = (infos[0].state_dir.parent.parent if infos
+                    else ctx.hermes_home)
     preset = load_base_preset()
     policy_pins = sorted(preset.always_carry) if preset else []
+    if policy_pins:
+        ctx.out("\n  Note: Tool Belt will always carry: "
+                + ", ".join(policy_pins))
     current = read_config_pins(profile_home)
 
     inventory = [t for t in agent_tool_inventory(infos)
@@ -1810,10 +1816,6 @@ def _menu(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
         return 0
     agent_scopes = [i for i in infos if i.agent == agent]
 
-    preset = load_base_preset()
-    if preset and preset.always_carry:
-        ctx.out("\n  Note: Tool Belt will always carry: "
-                + ", ".join(sorted(preset.always_carry)))
     ctx.out("\n    1. Protected tools")
     ctx.out("    2. Tool shaping options")
     while True:
