@@ -153,15 +153,6 @@ def load_base_preset():
         return None
 
 
-def load_savings_engine():
-    """The canonical savings engine — the single source of projection math."""
-    try:
-        _load_plugin_package()
-        return importlib.import_module("tool_belt_plugin.savings")
-    except Exception:
-        return None
-
-
 def require_yaml():
     """PyYAML, or a loud exit — the shared operator-script policy.
 
@@ -214,7 +205,6 @@ class ScopeInfo:
     platform: str
     state_dir: Path
     sessions: int = 0
-    inferred: bool = False  # no telemetry yet; platform came from the user
 
     @property
     def config_prefix(self) -> str:
@@ -308,7 +298,7 @@ def discover_scopes(
     """Discover every ``agent:platform`` scope this install knows about.
 
     Platforms come from the scopes actually recorded in each profile's
-    ``predictions.jsonl``. A profile with no telemetry yet yields one inferred
+    ``predictions.jsonl``. A profile with no telemetry yet yields one assumed
     scope per ``platform_hint`` entry (the caller asks the user), or none.
     """
     out: list[ScopeInfo] = []
@@ -342,7 +332,6 @@ def discover_scopes(
                         platform=platform,
                         state_dir=state_dir,
                         sessions=0,
-                        inferred=True,
                     )
                 )
     return out
@@ -902,99 +891,6 @@ def remove_learned_scope(info: ScopeInfo, dry_run: bool = False) -> bool:
 # ────────────────────────────────── rendering ────────────────────────────────
 
 
-def render_projection(info: "ScopeInfo", projection) -> list[str]:
-    """Render the projected-savings preview for one scope's proposal.
-
-    ``projection`` is a canonical ``ProjectedCohort`` from the savings engine —
-    its math is never duplicated here. Presentation follows the engine's
-    confidence discipline: unsupported figures are suppressed, never guessed.
-    """
-    lines = [
-        f"  Projected savings for {info.scope} — counterfactual, "
-        f"{projection.sessions_analyzed} session(s) analyzed, "
-        f"confidence: {projection.confidence}"
-    ]
-    lines.append(
-        f"    gross schema reduction: {projection.gross_schema_token_reduction:,} tok"
-    )
-    if projection.expansion_events:
-        lines.append(
-            f"    est. expansion overhead: −{projection.estimated_expansion_overhead:,} tok "
-            f"({projection.expansion_events} event(s))"
-        )
-    lines.append(f"    net projected reduction: {projection.net_token_reduction:,} tok")
-    if projection.net_input_reduction_pct is not None:
-        lines.append(
-            f"    net input reduction: {projection.net_input_reduction_pct:.1f}% "
-            f"(denominator: {projection.denominator_source})"
-        )
-    elif projection.schema_reduction_pct is not None:
-        lines.append(
-            f"    schema-only reduction: {projection.schema_reduction_pct:.1f}% "
-            "(not the session-input %)"
-        )
-    if projection.estimated_usd_savings is not None:
-        rate = next(
-            (m.rate_basis for m in projection.models if m.cost_class == "known"),
-            "n/a",
-        )
-        lines.append(
-            f"    estimated USD savings: ${projection.estimated_usd_savings:.4f} "
-            f"({projection.usd_coverage} coverage, rate {rate})"
-        )
-    else:
-        lines.append("    estimated USD savings: n/a (no known variable-cost route)")
-    return lines
-
-
-def _project_scope(info: "ScopeInfo", proposal: dict[str, list[str]]):
-    """Run the canonical savings engine over this scope with the proposal.
-
-    Returns ``None`` when the engine or the scope's session history is
-    unavailable — the preview is then simply omitted, never approximated.
-    """
-    engine = load_savings_engine()
-    if engine is None:
-        return None
-    try:
-        report = engine.compute(
-            hermes_home=default_hermes_home(),
-            cache_mode="on",
-            proposed_by_scope={info.scope: {
-                "carry": list(proposal.get("carry") or []),
-                "expand_only": list(proposal.get("expand_only") or []),
-            }},
-        )
-    except Exception:
-        return None
-    for a in report.agents:
-        if a.projected.sessions_analyzed and info.scope in (
-            getattr(a.projected, "scopes", None) or ()
-        ):
-            return a
-    # Fallback: the proposal's scope governs — take the agent whose projection
-    # consumed sessions under the proposed key (the engine keys by session
-    # scope, not profile name, so the proposal reaches the right cohort).
-    for a in report.agents:
-        if a.projected.sessions_analyzed:
-            return a
-    return None
-
-
-def _preset_baselines(preset: Any) -> tuple[list[str], list[str]]:
-    """``(always_carry, carry)`` from the shipped policy preset, defensively."""
-    always_carry: list[str] = []
-    carry: list[str] = []
-    if preset is not None:
-        raw = getattr(preset, "always_carry", None)
-        if isinstance(raw, list):
-            always_carry = [str(t) for t in raw]
-        raw = getattr(preset, "carry", None)
-        if isinstance(raw, list):
-            carry = [str(t) for t in raw]
-    return always_carry, carry
-
-
 def _trigger_lines(preset: Any) -> list[str]:
     """The "trigger groups unchanged" line, or nothing when there are none."""
     triggers = list(getattr(preset, "triggers", []) or []) if preset is not None else []
@@ -1008,124 +904,6 @@ def _trigger_lines(preset: Any) -> list[str]:
         f"  Trigger groups unchanged by these transitions ({len(rows)}): "
         + ", ".join(rows)
     ]
-
-
-def _effective_carried(
-    always_carry: Sequence[str], policy_carry: Sequence[str], proposal: dict[str, list[str]]
-) -> list[str]:
-    """Adaptive residents once ``proposal`` is the live overlay.
-
-    Mirrors ``learned.apply_to_preset``'s precedence — ``(policy carry −
-    learned expand_only) ∪ learned carry`` minus the immutable
-    ``always_carry`` — over the overlay the shaper's merge would actually
-    write. The promote/demote move algebra itself is never recomputed here;
-    it arrives already resolved in ``proposal``.
-    """
-    expand_set = {str(t) for t in (proposal.get("expand_only") or [])}
-    always_set = {str(t) for t in always_carry}
-    carried = [t for t in policy_carry if t not in expand_set]
-    for tool in proposal.get("carry") or []:
-        if tool not in carried:
-            carried.append(str(tool))
-    return [t for t in carried if t not in always_set]
-
-
-def render_shaping_summary(
-    info: "ScopeInfo",
-    recs: dict[str, Any] | None,
-    preset: Any = None,
-    thresholds: dict[str, int] | None = None,
-    proposal: dict[str, list[str]] | None = None,
-) -> list[str]:
-    """Plain-language description of what shaping would do to one scope.
-
-    Presents the Tool Belt 1.0 carrying model in its own vocabulary:
-
-      * Always carried — the immutable policy baseline; never shaped.
-      * Carried        — the effective adaptive residents after this shaping.
-      * Proposed promotions into carry and demotions into expand-only — the
-        demoted tools stay recoverable via triggers or ``expand_tools``, and
-        are never disabled.
-      * Trigger groups, which those transitions never touch.
-
-    ``proposal`` is the assignment the apply would write —
-    ``proposed_assignment()``, i.e. the shaper's own dry-run merge. It is
-    computed here when the caller does not supply it. Because it starts from
-    the scope's *existing* overlay, a re-shape previews the same result the
-    apply will write; nothing about the move algebra is recomputed locally.
-
-    Never raises on thin or empty input — an unshapeable scope simply says so.
-    """
-    thresholds = thresholds or {}
-    recs = recs or {}
-    promote = [p for p in (recs.get("promote") or []) if isinstance(p, dict)]
-    demote = [d for d in (recs.get("demote") or []) if isinstance(d, dict)]
-    considered = int(recs.get("sessions_considered") or 0)
-
-    lines = [f"{info.scope} — from {considered} recorded session(s)"]
-
-    base_always_carry, base_carry = _preset_baselines(preset)
-
-    demoted_names = sorted(str(d.get("tool") or "") for d in demote)
-    demoted_names = [n for n in demoted_names if n]
-    promoted_names = sorted(str(p.get("tool") or "") for p in promote)
-    promoted_names = [name for name in promoted_names if name]
-
-    if proposal is None:
-        try:
-            proposal = proposed_assignment(info, recs)
-        except Exception:
-            proposal = {"carry": [], "expand_only": []}
-    carried = _effective_carried(base_always_carry, base_carry, proposal)
-
-    lines.append(f"  Always carried — permanent baseline ({len(base_always_carry)}): "
-                 + (", ".join(sorted(base_always_carry)) if base_always_carry else "none"))
-    if carried:
-        lines.append(f"  Carried — adaptive residents after shaping ({len(carried)}): "
-                     + ", ".join(sorted(carried)))
-    else:
-        lines.append("  Carried — adaptive residents: unchanged from the shipped policy")
-    if promoted_names:
-        detail = ", ".join(
-            f"{p['tool']} (asked for in {p.get('sessions', 0)} session(s))"
-            for p in promote
-            if p.get("tool")
-        )
-        lines.append(f"  Proposed promotions into carry: {detail}")
-    if demoted_names:
-        uneconomic = sorted(
-            str(d.get("tool") or "") for d in demote
-            if d.get("evidence") == "carry_uneconomic"
-        )
-        lines.append(
-            f"  Proposed demotions into expand-only ({len(demoted_names)}): "
-            + ", ".join(demoted_names)
-        )
-        if uneconomic:
-            lines.append(
-                "    Of these, used but uneconomic to carry (cheaper to fetch "
-                "on demand): " + ", ".join(n for n in uneconomic if n)
-            )
-        lines.append(
-            "    Still fully available — the agent recovers any of these mid-session "
-            "via triggers or expand_tools."
-        )
-    else:
-        min_demote = int(thresholds.get("demote_min_sessions_no_use", 0) or 0)
-        if min_demote and considered < min_demote:
-            lines.append(
-                f"  Proposed demotions: none yet — needs {min_demote} sessions, "
-                f"has {considered}."
-            )
-        else:
-            lines.append(
-                "  Proposed demotions: none — every adaptive carry resident "
-                "earns its slot (used enough that carrying costs less than "
-                "fetching on demand)."
-            )
-
-    lines.extend(_trigger_lines(preset))
-    return lines
 
 
 def _truthy(value: Any) -> bool:
@@ -1216,40 +994,6 @@ def confirm(message: str, reader: Callable[[str], str] = _default_reader) -> boo
     return prompt_choice(message, ("y", "n"), reader) == "y"
 
 
-def prompt_multi_select(
-    infos: Sequence[ScopeInfo], reader: Callable[[str], str] = _default_reader
-) -> list[ScopeInfo]:
-    """Numbered multi-select. ``all`` selects everything; blank re-prompts."""
-    if len(infos) == 1:
-        return list(infos)
-    print("\n  Which agents should this cover?")
-    for idx, info in enumerate(infos, 1):
-        print(f"    {idx}. {info.scope}  ({info.sessions} session(s) recorded)")
-    while True:
-        answer = prompt("  Numbers (comma-separated) or 'all': ", reader).lower()
-        if answer in {"all", "*"}:
-            return list(infos)
-        picked: list[ScopeInfo] = []
-        ok = True
-        for part in answer.replace(" ", "").split(","):
-            if not part:
-                continue
-            try:
-                index = int(part)
-            except ValueError:
-                ok = False
-                break
-            if not 1 <= index <= len(infos):
-                ok = False
-                break
-            candidate = infos[index - 1]
-            if candidate not in picked:
-                picked.append(candidate)
-        if ok and picked:
-            return picked
-        print("  Please enter numbers from the list, or 'all'.")
-
-
 # ───────────────────────────────── degraded mode ─────────────────────────────
 
 
@@ -1322,7 +1066,6 @@ def _confirm_writes(
 
 def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
     """Path 1 — read the history, show the shaping, apply on confirmation."""
-    preset = load_base_preset()
     shaped_any = False
     for info in infos:
         recs = compute_recommendations(info, ctx.thresholds)

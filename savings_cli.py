@@ -28,7 +28,7 @@ import os
 import shlex
 import sys
 from pathlib import Path
-from typing import Any, Callable
+from typing import Callable
 
 try:  # package context
     from . import savings as _savings
@@ -227,11 +227,6 @@ def _launcher_exec_target(content: str) -> str | None:
             return None
         return parts[0] if parts else None
     return None
-
-
-def user_local_bin() -> Path:
-    """The user-level bin dir the Hermes installer guarantees is on PATH."""
-    return Path.home() / ".local" / "bin"
 
 
 def launcher_path(hermes_home: Path, *, user_home: Path | None = None) -> Path:

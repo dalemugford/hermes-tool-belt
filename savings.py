@@ -614,7 +614,6 @@ class HistoricalSession:
     provider: str
     api_mode: str
     tool_defs: dict[str, Any]          # name -> full provider tool definition
-    tool_order: list[str]              # ceiling order as recorded
     turns: list[dict[str, Any]]        # user/assistant rows in order
     schemas_complete: bool = True      # every recorded entry has description + schema
 
@@ -675,14 +674,10 @@ def parse_session_full(session_file: Path, agent: str) -> HistoricalSession | No
         _definition_is_complete(entry) for entry in recorded_defs
     )
     tool_defs: dict[str, Any] = {}
-    tool_order: list[str] = []
     for entry in recorded_defs:
         name = _def_name(entry)
-        if name is None:
-            continue
-        if name not in tool_defs:
+        if name is not None and name not in tool_defs:
             tool_defs[name] = entry
-            tool_order.append(name)
 
     turns = [row for row in lines if row.get("role") in ("user", "assistant")]
     if not any(t.get("role") == "user" for t in turns):
@@ -696,7 +691,6 @@ def parse_session_full(session_file: Path, agent: str) -> HistoricalSession | No
         provider=str(meta.get("provider") or ""),
         api_mode=str(meta.get("api_mode") or meta.get("billing") or ""),
         tool_defs=tool_defs,
-        tool_order=tool_order,
         turns=turns,
         schemas_complete=schemas_complete,
     )
@@ -1374,11 +1368,6 @@ def _api_call_evidence(
             conflicting=len(seen_providers) > 1 or len(seen_modes) > 1,
         )
     return dict(tokens_by_session), routes
-
-
-def _provider_input_by_session(state_dir: Path, since_ts: float = 0.0) -> dict[str, int]:
-    """Summed provider-reported ``input_tokens`` per session (denominator only)."""
-    return _api_call_evidence(state_dir, since_ts)[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════════

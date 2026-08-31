@@ -174,7 +174,6 @@ class ScopeDiscoveryTests(TempHomeTestCase):
     def test_platform_hint_used_when_no_telemetry(self) -> None:
         infos = configure.discover_scopes(self.home, platform_hint=["telegram", "cli"])
         self.assertEqual([i.scope for i in infos], ["default:telegram", "default:cli"])
-        self.assertTrue(all(i.inferred for i in infos))
         # ...and no hint means no invented scopes.
         self.assertEqual(configure.discover_scopes(self.home), [])
 
@@ -1013,38 +1012,6 @@ class PromptTests(unittest.TestCase):
         answers = iter(["maybe", "", "y"])
         with mock.patch("builtins.print"):
             self.assertTrue(configure.confirm("ok?", lambda _p: next(answers)))
-
-    def test_multi_select_accepts_numbers_and_all(self) -> None:
-        infos = [
-            configure.ScopeInfo(scope=f"a{i}:cli", agent=f"a{i}", platform="cli", state_dir=Path("/tmp"))
-            for i in range(3)
-        ]
-        with mock.patch("builtins.print"):
-            self.assertEqual(
-                [i.scope for i in configure.prompt_multi_select(infos, lambda _p: "1,3")],
-                ["a0:cli", "a2:cli"],
-            )
-            self.assertEqual(len(configure.prompt_multi_select(infos, lambda _p: "all")), 3)
-
-    def test_multi_select_reprompts_on_garbage(self) -> None:
-        infos = [
-            configure.ScopeInfo(scope=f"a{i}:cli", agent=f"a{i}", platform="cli", state_dir=Path("/tmp"))
-            for i in range(2)
-        ]
-        answers = iter(["nope", "9", "2"])
-        with mock.patch("builtins.print"):
-            self.assertEqual(
-                [i.scope for i in configure.prompt_multi_select(infos, lambda _p: next(answers))],
-                ["a1:cli"],
-            )
-
-    def test_single_scope_needs_no_selection(self) -> None:
-        infos = [configure.ScopeInfo(scope="a:cli", agent="a", platform="cli", state_dir=Path("/tmp"))]
-
-        def reader(_prompt: str) -> str:
-            raise AssertionError("should not prompt for a single scope")
-
-        self.assertEqual(configure.prompt_multi_select(infos, reader), infos)
 
 
 class ModeFlagTests(TempHomeTestCase):
