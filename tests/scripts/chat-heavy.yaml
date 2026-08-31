@@ -1,24 +1,30 @@
 # Demote arm — a conversational agent with almost no tool use.
 #
-# Demotion needs always-on tools that are NOT protected, and
-# `analyze.effective_protected_always_on` shields every name in policy.yaml's
-# always_on list. So the demote targets are pinned by config instead:
-# `always_on_extra` is resolved by the real `presets.resolve_preset`, lands in
-# each row's `always_on_tools`, and — because `calls` never names them —
-# goes 20 sessions without a single use.
+# Demotion needs resident tools that are NOT structurally protected. Under the
+# 1.0 carrying model the config-level `always_on_extra` promote knob is gone
+# (`presets.resolve_preset` only warns about a stale value now), so it can no
+# longer pin demote targets. Instead the fixture models the still-demotable
+# class: adaptive `carry` residents (v2 partition class C) that go unused. The
+# seeder maps these `unknown_kept` fixture tools into `carry_tools` on every
+# prediction row; the shaper demotes an unused one to expand_only
+# (shape-ceiling.py demote path).
 #
-# `image_generate` and `cronjob` are ordinary trigger-gated tools, neither in
-# BASE_PROTECTED_ALWAYS_ON nor in policy.yaml always_on, so both are legal
-# demote candidates.
+# `weather_lookup` and `unit_convert` are named nowhere in policy.yaml (not in
+# always_carry/carry, not in any trigger group); the seeder folds them into
+# `carry_tools`, so under the 1.0 model they are ordinary adaptive residents.
+# Because `calls` never names them they go 20 sessions unused and demote to
+# expand_only — as does every other unused `carry` resident. Shaping only ever
+# moves tools between `carry` and `expand_only`; the immutable `always_carry`
+# surface is excluded from demotion by construction (no protected-mirror list
+# is consulted any more).
 name: chat-heavy
 agent: testagent
 platform: slack
 profile: null
 sessions: 20
-config:
-  always_on_extra:
-    - image_generate
-    - cronjob
+unknown_kept:
+  - weather_lookup
+  - unit_convert
 turns:
   - user: "what did we decide about pricing yesterday?"
     expect_triggers: [history_search]

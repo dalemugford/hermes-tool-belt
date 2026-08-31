@@ -36,7 +36,6 @@ def _load_script(module_name: str, filename: str):
 bootstrap = _load_script("tool_belt_bootstrap_portability", "bootstrap.py")
 harvest = _load_script("tool_belt_harvest_portability", "harvest-replay.py")
 cache_replay = _load_script("tool_belt_cache_replay_portability", "cache-freeze-replay.py")
-drift = _load_script("tool_belt_drift_portability", "check-tool-drift.py")
 savings = _load_script("tool_belt_savings_portability", "savings-report.py")
 shape = _load_script("tool_belt_shape_portability", "shape-ceiling.py")
 
@@ -121,37 +120,8 @@ class StatePathPortabilityTests(unittest.TestCase):
                 self.assertEqual(learned.state_dir(), expected)
                 self.assertEqual(logger_io._state_dir(), expected)
                 self.assertEqual(cache_replay.default_state_dir(), expected)
-                self.assertEqual(drift.default_state_dir(), expected)
                 self.assertEqual(savings.default_state_dir(), expected)
                 self.assertEqual(shape.default_state_dir(), expected)
-
-    def test_daily_analysis_handles_spaced_home_and_missing_state(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            hermes_home = Path(tmp) / "custom hermes home"
-            (hermes_home / "profiles" / "default" / "state" / "tool-belt").mkdir(
-                parents=True
-            )
-            env = {
-                **os.environ,
-                "HERMES_HOME": str(hermes_home),
-                "HERMES_PYTHON": sys.executable,
-            }
-            result = subprocess.run(
-                ["bash", str(PLUGIN_DIR / "scripts" / "daily-analysis.sh")],
-                capture_output=True,
-                text=True,
-                check=False,
-                env=env,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            summary = (
-                hermes_home
-                / "state"
-                / "tool-belt"
-                / "cron-logs"
-                / "daily-summary.log"
-            ).read_text()
-            self.assertEqual(summary.count("[default]  no_telemetry"), 1)
 
 
 if __name__ == "__main__":

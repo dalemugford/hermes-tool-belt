@@ -26,8 +26,9 @@ compare against some hypothetical "best case" — we compare against what
 your agent *would* have sent if Tool Belt weren't installed.
 
 The arithmetic is exact: every row, `ceiling - narrowed == tokens_saved`.
-There's a one-line cross-check in [scripts/savings-report.py](../scripts/savings-report.py)
-if you want to verify on your own data.
+The observed-cohort math lives in [savings.py](../savings.py) (`cohort_stats`)
+and `./tool-belt savings --json` emits the per-cohort totals if you want to
+verify on your own data.
 
 ### Which tokenizer
 
@@ -190,14 +191,37 @@ jq -s --slurpfile api ~/.hermes/state/tool-belt/api_calls.jsonl \
   ~/.hermes/state/tool-belt/predictions.jsonl
 ```
 
-Same approach for `cache-off`. The savings report just packages this
-into a single command:
+Same approach for `cache-off`. The canonical command packages this into a
+single read-only report:
 
 ```bash
-python3 scripts/savings-report.py
-python3 scripts/savings-report.py --scope default:telegram
-python3 scripts/savings-report.py --since 2026-05-15
-python3 scripts/savings-report.py --json   # machine-readable
+./tool-belt savings                      # every enabled agent + aggregate
+./tool-belt savings --agent=default      # one agent, all its platforms
+./tool-belt savings --json               # stable machine-readable schema
+./tool-belt savings --since 2026-05-15
+```
+
+`tool-belt savings` reports two separately-labeled cohorts that are **never
+summed together**:
+
+- **Observed** — realized savings from organic telemetry (provider-returned
+  usage is authoritative). This is what actually happened.
+- **Projected** — a counterfactual replay of historical Hermes sessions through
+  the current effective (or a caller-supplied proposed) carrying assignment.
+  Every projected figure is labeled counterfactual until matched by organic
+  post-apply telemetry, carries a confidence (high/medium/low), and shows a USD
+  estimate only for a **known** metered route — a subscription/OAuth route (even
+  for a model with a public list price) never shows dollars and falls back to a
+  net input-reduction percentage.
+
+The engine lives in [`savings.py`](../savings.py) and is the single home for the
+price table, the token estimator, and the expand-round-trip overhead constant.
+`scripts/cache-freeze-replay.py` imports the price table from it and the
+deprecated `scripts/savings-report.py` re-exports its observed-cohort math, so
+there is no duplicate table or constant:
+
+```bash
+python3 scripts/savings-report.py --json   # deprecated compatibility wrapper
 ```
 
 ## Field reference (predictions.jsonl)
@@ -235,7 +259,9 @@ The fields most relevant to savings:
 - **Predictor false-positives cost `expand_tools` round-trips.** When the
   model needs a tool we didn't ship, it has to ask. We log every event
   and subtract a ~1500-token estimate from the cache-off net figure. The
-  estimate is configurable in [analyze.py](../analyze.py) (`--expand-round-trip-tokens`).
+  estimate is single-sourced as `EXPAND_ROUND_TRIP_TOKENS` in
+  [savings.py](../savings.py) and configurable per run via
+  [analyze.py](../analyze.py)'s `--expand-round-trip-tokens`.
 - **Cohort splits are noisy on small samples.** A few sessions per mode is
   enough to make the per-turn average wobble. The total `tokens_saved`
   is robust; the per-turn average is noisier.

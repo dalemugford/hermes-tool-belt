@@ -1,16 +1,11 @@
 """The ``expand_tools`` meta-tool — model's recourse when a category was
 gated out of the current turn.
 
-NEW DESIGN (post-cached-agent fix):
-  expand_tools no longer mutates ``agent.tools`` directly. Instead it
-  appends a category to the prediction state's ``expansions`` set
-  (stored in a ContextVar, mutable in place). The patched
-  ``_build_api_kwargs`` reads this set on the next API call and unions
-  the category's tools into the allowed set.
-
-  This works regardless of whether the AIAgent was freshly constructed
-  or pulled from the gateway's per-session cache — narrowing happens at
-  request-build time, not at agent construction time.
+Appends the requested category to the prediction state's ``expansions`` set (a
+ContextVar mutated in place). ``_build_api_kwargs`` unions that set into the
+allowed tools on the next API call, so expansion works whether the AIAgent was
+freshly constructed or served from the gateway's per-session cache — narrowing
+happens at request-build time, not at agent construction time.
 """
 
 from __future__ import annotations
@@ -18,6 +13,7 @@ from __future__ import annotations
 import difflib
 import json
 import logging
+from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -30,9 +26,10 @@ SCHEMA = {
         "'browser' for web automation, 'image_gen' for drawing, 'cronjob' for "
         "scheduling, 'tts' for text-to-speech, 'delegation' for spawning subagents, "
         "'code_execution' for batch processing scripts. After calling, the new "
-        "tools are available on the very next tool call and may remain available "
-        "briefly during the same active task. Expanded tools are ephemeral; call "
-        "this again if a needed tool is absent later. Cheap and safe to call "
+        "tools are available on the very next tool call and usually stay "
+        "available — often for the rest of the session, at minimum for the "
+        "next few turns. If a tool you need is ever absent, simply call this "
+        "again. Cheap and safe to call "
         "preemptively if you're unsure whether a tool is loaded. "
         "Accepts a 'category' (toolset name) or a 'tool' (specific tool name). "
         "If you know the tool name but not its category, pass it as 'tool' and "
@@ -71,6 +68,120 @@ def _available_toolset_names() -> list[str]:
         return list(get_toolset_names() or [])
     except Exception:
         return []
+
+
+# ─── Expand-only discoverability manifest ───────────────────────────────────
+#
+# Lets the model *discover* which enabled built-in tools live in the
+# ``expand_only`` stratum ``X`` without carrying their full schemas. A compact,
+# deterministic, name-only manifest is appended to a per-request CLONE of the
+# carried ``expand_tools`` description — the registered SCHEMA object is never
+# mutated. Grouping uses Hermes' live toolset table; names with no known
+# category land in an explicitly labeled ungrouped bucket.
+
+_UNGROUPED_LABEL = "(ungrouped)"
+
+_MANIFEST_HEADER = (
+    "Enabled expand-only tools (full schemas omitted this turn to save "
+    "context). A trigger may auto-activate one when your message needs it; "
+    "otherwise call expand_tools(tool=NAME) — or expand_tools(category=NAME) — "
+    "to load it explicitly. Grouped by toolset:"
+)
+
+
+def _build_category_index() -> dict[str, set[str]]:
+    """Return ``{category: {tool_name, ...}}`` from the live toolset table.
+
+    Best-effort: an unresolvable toolset is skipped, and a missing ``toolsets``
+    module yields an empty index (every name then falls to the ungrouped bucket).
+    """
+    index: dict[str, set[str]] = {}
+    available = _available_toolset_names()
+    try:
+        from toolsets import resolve_toolset  # type: ignore[import-not-found]
+    except Exception:
+        return index
+    for cat in available:
+        try:
+            tools = resolve_toolset(cat) or []
+        except Exception:
+            continue
+        members = {str(t) for t in tools if t}
+        if members:
+            index[str(cat)] = members
+    return index
+
+
+def build_expand_only_manifest(
+    expand_only_names: Iterable[Any] | None,
+    *,
+    category_index: dict[str, set[str]] | None = None,
+) -> str:
+    """Compose the compact, deterministic expand-only manifest text.
+
+    ``expand_only_names`` is the effective stratum ``X = E − (always_carry ∪
+    carry)`` — already built-in-only (MCP/plugin pass-through names are excluded
+    upstream). Names are grouped by toolset category (a name with no known
+    category is placed under an explicitly labeled ungrouped bucket, sorted
+    last). Groups and names sort deterministically, so the manifest is stable
+    across differently ordered source schema lists. Returns ``""`` when there
+    are no expand-only names.
+
+    ``category_index`` (``{category: {tool_name}}``) may be injected for tests;
+    when ``None`` it is resolved from the live toolset table.
+    """
+    names = sorted({str(n) for n in (expand_only_names or []) if n})
+    if not names:
+        return ""
+
+    if category_index is None:
+        category_index = _build_category_index()
+
+    # Reverse map tool -> category. Iterate categories in sorted order so a
+    # tool that (pathologically) belongs to more than one toolset resolves to
+    # a single, deterministic category.
+    tool_to_cat: dict[str, str] = {}
+    for cat in sorted(category_index):
+        for tool in category_index[cat]:
+            tool_to_cat.setdefault(str(tool), str(cat))
+
+    groups: dict[str, list[str]] = {}
+    for name in names:
+        cat = tool_to_cat.get(name, _UNGROUPED_LABEL)
+        groups.setdefault(cat, []).append(name)
+
+    # Known categories alphabetical; the ungrouped bucket always sorts last.
+    def _group_key(cat: str) -> tuple[int, str]:
+        return (1, "") if cat == _UNGROUPED_LABEL else (0, cat)
+
+    lines = [_MANIFEST_HEADER]
+    for cat in sorted(groups, key=_group_key):
+        members = ", ".join(sorted(groups[cat]))
+        lines.append(f"{cat}: {members}")
+    return "\n".join(lines)
+
+
+def augment_schema_with_manifest(schema: Any, manifest_text: str) -> Any:
+    """Return a per-request CLONE of ``schema`` with ``manifest_text`` appended
+    to its description. The input schema object is never mutated.
+
+    Handles both the Anthropic tool shape (top-level ``description``) and the
+    OpenAI shape (``function.description``). When ``manifest_text`` is empty the
+    original object is returned unchanged.
+    """
+    if not manifest_text or not isinstance(schema, dict):
+        return schema
+    clone = dict(schema)
+    fn = clone.get("function")
+    if isinstance(fn, dict):
+        fn_clone = dict(fn)
+        base = str(fn_clone.get("description") or "")
+        fn_clone["description"] = (base + "\n\n" + manifest_text).strip()
+        clone["function"] = fn_clone
+    else:
+        base = str(clone.get("description") or "")
+        clone["description"] = (base + "\n\n" + manifest_text).strip()
+    return clone
 
 
 def _resolve_category(category: str) -> tuple[str, list[str], list[str]]:
@@ -197,7 +308,7 @@ def _not_found_message(category: str, available: list[str]) -> str:
     return " ".join(parts)
 
 
-def make_handler(prediction_cv, sticky_refresh_fn=None):
+def make_handler(prediction_cv: Any, sticky_refresh_fn: Any = None):
     """Build the handler closure with access to the prediction ContextVar.
 
     The handler appends the requested category to the contextvar's
@@ -207,9 +318,9 @@ def make_handler(prediction_cv, sticky_refresh_fn=None):
     in-memory residency for the active scope.
     """
 
-    def handle(args: dict, **kwargs) -> str:
+    def handle(args: dict, **_kwargs) -> str:
         try:
-            return _handle_inner(args, kwargs, prediction_cv, sticky_refresh_fn)
+            return _handle_inner(args, prediction_cv, sticky_refresh_fn)
         except Exception as exc:
             logger.warning("expand_tools handler error: %s", exc)
             return json.dumps({
@@ -220,7 +331,7 @@ def make_handler(prediction_cv, sticky_refresh_fn=None):
     return handle
 
 
-def _handle_inner(args: dict, kwargs: dict, prediction_cv, sticky_refresh_fn=None) -> str:
+def _handle_inner(args: dict, prediction_cv: Any, sticky_refresh_fn: Any = None) -> str:
     raw_category = str(args.get("category") or "").strip()
     raw_tool = str(args.get("tool") or "").strip()
 
@@ -267,36 +378,53 @@ def _handle_inner(args: dict, kwargs: dict, prediction_cv, sticky_refresh_fn=Non
             "error": _not_found_message(raw_category, available),
         })
 
-    initial_allowed = set(state.get("initial_allowed_tools") or [])
-    cut_tools = set(state.get("cut_tools") or [])
+    initial_active = set(state.get("initial_active_tools") or [])
 
-    # Append to the contextvar's expansions set — mutable in place
+    # Ceiling gate: the enabled built-in ceiling ``E`` is captured on the first
+    # request of the turn (state["enabled_ceiling"]). A tool that resolves
+    # globally but is absent from ``E`` is not enabled for THIS scope — it can
+    # never be activated here, so it is reported "unavailable", never "added".
+    # When the ceiling hasn't been captured (e.g. no prediction/narrowing path
+    # ran), we can't gate — treat every resolved tool as activatable.
+    enabled_ceiling = state.get("enabled_ceiling")
+    if enabled_ceiling is None:
+        activatable = list(resolved)
+        unavailable_tools: list[str] = []
+    else:
+        ceiling_set = set(enabled_ceiling)
+        activatable = [t for t in resolved if t in ceiling_set]
+        unavailable_tools = [t for t in resolved if t not in ceiling_set]
+
+    # Append to the contextvar's expansions set — mutable in place. Only
+    # ceiling-present (activatable) tools are added; a ceiling-absent tool
+    # must not leak into the active set on the next request.
     expansions = state.setdefault("expansions", set())
     if not isinstance(expansions, set):
         expansions = set(expansions or [])
         state["expansions"] = expansions
 
     # Honest accounting: a tool counts as "newly added by this call" only
-    # if it wasn't already on the model's initial allowed list and wasn't
-    # already carried in from a prior expand_tools invocation. The previous
-    # logic only checked the second condition, so re-expanding a category
-    # that overlapped the initial allowed set would falsely report the
-    # overlap as "added".
-    already_available_tools = [t for t in resolved if t in initial_allowed]
-    recovered_cut_tools = [t for t in resolved if t in cut_tools]
+    # if it's activatable here, wasn't already on the model's initial active
+    # list, and wasn't already carried in from a prior expand_tools call.
+    already_available_tools = [t for t in activatable if t in initial_active]
     new_additions = [
-        t for t in resolved
-        if t not in initial_allowed and t not in expansions
+        t for t in activatable
+        if t not in initial_active and t not in expansions
     ]
     expansions.add(category)  # also store the category name itself
-    expansions.update(resolved)
+    expansions.update(activatable)
+
+    # Cache-on sessions carry no sticky key (the frozen expansion set is
+    # monotonic for the whole session); cache-off sessions do. This drives
+    # honest persistence wording below.
+    cache_on_session = not str(state.get("sticky_key") or "")
 
     expand_event = {
         "category": category,
         "resolved_tools": resolved,
         "tools_added": new_additions,
-        "recovered_cut_tools": recovered_cut_tools,
         "already_available_tools": already_available_tools,
+        "unavailable_tools": unavailable_tools,
         "triggers_fired": list(state.get("triggers_fired") or []),
     }
     sticky_event = None
@@ -321,38 +449,78 @@ def _handle_inner(args: dict, kwargs: dict, prediction_cv, sticky_refresh_fn=Non
     state["pending_expansion"] = expand_event
 
     logger.info(
-        "expand_tools: category=%s added=%d already=%d (expansions size=%d)",
-        category, len(new_additions), len(already_available_tools), len(expansions),
+        "expand_tools: category=%s added=%d already=%d unavailable=%d (expansions size=%d)",
+        category, len(new_additions), len(already_available_tools),
+        len(unavailable_tools), len(expansions),
     )
     response = {
         "success": True,
         "category": category,
         "resolved_tools": resolved,
         "tools_added": new_additions,
-        "recovered_cut_tools": recovered_cut_tools,
         "already_available_tools": already_available_tools,
-        "message": _success_message(category, new_additions, already_available_tools),
+        "unavailable_tools": unavailable_tools,
+        "message": _success_message(
+            category, new_additions, already_available_tools, unavailable_tools,
+            cache_on=cache_on_session,
+        ),
     }
-    if sticky_event is not None:
+    # Sticky residency is a cache-off mechanism. On a cache-on session the
+    # expansion set is frozen monotonically for the whole session, so a
+    # ``sticky: {enabled: false}`` block would misstate what persists — the
+    # message carries the honest "persists for this session" wording instead
+    # and the sticky block is omitted (it stays in the telemetry event).
+    if sticky_event is not None and not cache_on_session:
         response["sticky"] = sticky_event
     return json.dumps(response)
 
 
-def _success_message(category: str, new_additions: list[str], already_available: list[str]) -> str:
-    """Compose a message that matches what actually happened."""
+def _success_message(
+    category: str,
+    new_additions: list[str],
+    already_available: list[str],
+    unavailable: list[str] | None = None,
+    cache_on: bool = False,
+) -> str:
+    """Compose a message that matches what actually happened.
+
+    Ceiling-excluded tools are named for what they are: the operator's
+    ``platform_toolsets`` ceiling excluded them from this scope, which Tool
+    Belt cannot restore — only a Hermes config change can. Persistence
+    wording is honest per cache mode: cache-on expansions persist for the
+    session (the frozen set is monotonic); cache-off persistence is the
+    sticky-residency mechanism, reported via the ``sticky`` block.
+    """
+    unavailable = unavailable or []
+    unavailable_note = ""
+    if unavailable:
+        unavailable_note = (
+            f" {len(unavailable)} tool(s) in {category!r} are excluded from "
+            "this scope by the operator's `platform_toolsets` ceiling — Tool "
+            "Belt cannot restore them; enabling them requires a Hermes "
+            "config change."
+        )
+    persist_note = (
+        " This expansion persists for this session." if cache_on else ""
+    )
     if not new_additions and already_available:
         return (
             f"Category {category!r} was already loaded "
-            f"({len(already_available)} tool(s)); no new tools added. "
+            f"({len(already_available)} tool(s)); no new tools added.{unavailable_note} "
             "Make the call you wanted to make."
+        )
+    if not new_additions and unavailable:
+        return (
+            f"No tools from category {category!r} could be loaded —"
+            f"{unavailable_note}"
         )
     if new_additions and already_available:
         return (
             f"Loaded {len(new_additions)} new tool(s) from category {category!r} "
-            f"({len(already_available)} were already available). "
-            "They're available on the next tool call."
+            f"({len(already_available)} were already available).{unavailable_note} "
+            f"They're available on the next tool call.{persist_note}"
         )
     return (
-        f"Loaded {len(new_additions)} tool(s) from category {category!r}. "
-        "They're available on the next tool call."
+        f"Loaded {len(new_additions)} tool(s) from category {category!r}.{unavailable_note} "
+        f"They're available on the next tool call.{persist_note}"
     )

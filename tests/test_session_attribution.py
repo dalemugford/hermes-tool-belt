@@ -320,11 +320,11 @@ class PostToolCallAttributionRecoveryTests(unittest.TestCase):
         self.assertEqual(row["scope"], "assistant-a:telegram")
 
 
-class SessionEndCleanupTests(unittest.TestCase):
-    """The pre-dispatch path keys sticky/lookback state by the canonical
-    session key. Hermes' ``on_session_end`` hands us the AIAgent's
-    uuid-style ``session_id`` — without the env-var fallback the plugin
-    would leave stale per-session entries behind."""
+class SessionEndKeepsSessionStateTests(unittest.TestCase):
+    """``on_session_end`` fires PER TURN, so sticky residency and lookback
+    history — session-scoped features with their own decay/trim bounds —
+    must SURVIVE it; evicting them per turn defeated both features. True
+    cleanup belongs to ``_on_session_reset`` only."""
 
     AGENT_SESSION_ID = "20260516_123456_deadbeef"
 
@@ -348,62 +348,42 @@ class SessionEndCleanupTests(unittest.TestCase):
         plugin._PRIOR_MESSAGES_BY_SESSION[canonical_key] = ["hello"]
         return sticky_key
 
-    def test_evicts_canonical_state_when_env_key_present(self):
+    def test_sticky_and_lookback_survive_the_per_turn_hook(self):
         sticky_key = self._seed_state(REAL_KEY_TELEGRAM)
         with mock.patch.dict(
             os.environ, {"HERMES_SESSION_KEY": REAL_KEY_TELEGRAM}, clear=False
         ):
-            plugin._on_session_end(session_id=self.AGENT_SESSION_ID)
-        self.assertNotIn(sticky_key, plugin._STICKY_BY_KEY)
-        self.assertNotIn(REAL_KEY_TELEGRAM, plugin._PRIOR_MESSAGES_BY_SESSION)
+            plugin._on_session_end(session_id=self.AGENT_SESSION_ID,
+                                   session_key=REAL_KEY_TELEGRAM)
+        self.assertIn(sticky_key, plugin._STICKY_BY_KEY)
+        self.assertIn(REAL_KEY_TELEGRAM, plugin._PRIOR_MESSAGES_BY_SESSION)
 
-    def test_evicts_canonical_state_via_explicit_kwarg(self):
+    def test_session_reset_still_evicts_them(self):
         sticky_key = self._seed_state(REAL_KEY_TELEGRAM)
-        with mock.patch.dict(os.environ, {"HERMES_SESSION_KEY": ""}, clear=False):
-            plugin._on_session_end(
-                session_id=self.AGENT_SESSION_ID,
-                session_key=REAL_KEY_TELEGRAM,
-            )
+        plugin._on_session_reset(session_id="new-uuid",
+                                 session_key=REAL_KEY_TELEGRAM)
         self.assertNotIn(sticky_key, plugin._STICKY_BY_KEY)
         self.assertNotIn(REAL_KEY_TELEGRAM, plugin._PRIOR_MESSAGES_BY_SESSION)
-
-    def test_also_evicts_uuid_keyed_state(self):
-        # UUID-keyed state is a supported defensive fallback and must be
-        # cleaned up alongside canonical-key state.
-        uuid_sticky = self._seed_state(self.AGENT_SESSION_ID)
-        with mock.patch.dict(os.environ, {"HERMES_SESSION_KEY": ""}, clear=False):
-            plugin._on_session_end(session_id=self.AGENT_SESSION_ID)
-        self.assertNotIn(uuid_sticky, plugin._STICKY_BY_KEY)
-        self.assertNotIn(self.AGENT_SESSION_ID, plugin._PRIOR_MESSAGES_BY_SESSION)
 
 
 class AnalyzerExcludesDegradedModeTests(unittest.TestCase):
-    def test_load_preset_excludes_returns_status_no_yaml(self):
-        import builtins
-        real_import = builtins.__import__
-
-        def fake_import(name, *args, **kwargs):
-            if name == "yaml":
-                raise ImportError("yaml unavailable")
-            return real_import(name, *args, **kwargs)
-
-        with mock.patch.dict(sys.modules, {"yaml": None}):
-            with mock.patch.object(builtins, "__import__", fake_import):
-                out, status = analyze._load_preset_excludes(Path(plugin.__file__).parent)
-        self.assertEqual(out, {})
-        self.assertEqual(status, "no_yaml")
-        self.assertIn("PyYAML is not installed", analyze._EXCLUDES_STATUS_MESSAGE["no_yaml"])
-
     def test_load_preset_excludes_returns_status_no_policy(self):
         out, status = analyze._load_preset_excludes(Path(tempfile.mkdtemp()))
         self.assertEqual(out, {})
         self.assertEqual(status, "no_policy")
 
-    def test_load_preset_always_on_falls_back_without_pyyaml(self):
-        tools, status = analyze._load_preset_always_on(Path(plugin.__file__).parent)
+    def test_load_preset_always_carry_reads_the_shipped_policy(self):
+        # (Formerly named for a no-PyYAML fallback it never exercised; the
+        # fallback is gone — see tests/test_shaper_porcelain.py for the
+        # loud-exit path.)
+        tools, status = analyze._load_preset_always_carry(Path(plugin.__file__).parent)
         self.assertEqual(status, "ok")
-        self.assertIn("mnemosyne_recall", tools)
-        self.assertIn("process", tools)
+        # always_carry holds only the immutable residents; adaptive carry tools
+        # (mnemosyne_recall, process) are NOT part of the immutable set.
+        self.assertIn("clarify", tools)
+        self.assertIn("expand_tools", tools)
+        self.assertNotIn("mnemosyne_recall", tools)
+        self.assertNotIn("process", tools)
 
     def test_dampener_candidates_emits_warning_when_degraded(self):
         stat = analyze.ScopeStats(scope="assistant-a:telegram")
@@ -535,8 +515,8 @@ class TriggerFpLateBoundTpTests(unittest.TestCase):
 
 
 class TriggerKeywordSuggesterTests(unittest.TestCase):
-    """The trigger-keyword suggester mines cut-tool message previews
-    for candidate keywords that would have fired a trigger to cover the
+    """The trigger-keyword suggester mines expand_only-tool message previews
+    for candidate keywords that would have fired a trigger to activate the
     tool. Symmetric inverse of dampener mining; must filter the same
     pollution patterns (stop-words, existing-pattern overlap)."""
 
@@ -548,22 +528,22 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
             dampener_max_n=4,
             dampener_min_precision=0.6,
             dampener_max_candidates=5,
-            harvest_min_cuts=2,
+            harvest_min_expand_only_calls=2,
             expand_round_trip_tokens=1500,
             per_tool_tokens=388,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
 
-    def _make_stats(self, *, scope="assistant-a:telegram", cut_previews,
-                    all_previews, was_cut_count):
+    def _make_stats(self, *, scope="assistant-a:telegram", expand_only_previews,
+                    all_previews, was_expand_only_count):
         from collections import Counter
         stat = analyze.ScopeStats(scope=scope)
         stat.harvest_predictions = len(all_previews)
         stat.harvest_all_previews = list(all_previews)
-        for tool, previews in cut_previews.items():
-            stat.harvest_cut_previews[tool] = list(previews)
-            stat.harvest_was_cut[tool] = was_cut_count.get(tool, len(previews))
+        for tool, previews in expand_only_previews.items():
+            stat.harvest_expand_only_previews[tool] = list(previews)
+            stat.harvest_was_expand_only[tool] = was_expand_only_count.get(tool, len(previews))
         return {scope: stat}
 
     def test_surfaces_content_words_filters_stopwords(self):
@@ -585,9 +565,9 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
             "and the next thing is to ask",
         ] * 5
         stats = self._make_stats(
-            cut_previews={"deploy_tool": cut_msgs},
+            expand_only_previews={"deploy_tool": cut_msgs},
             all_previews=cut_msgs + noise,
-            was_cut_count={"deploy_tool": 5},
+            was_expand_only_count={"deploy_tool": 5},
         )
         with mock.patch.object(analyze, "_load_preset_triggers",
                                return_value=({}, "ok")):
@@ -611,9 +591,9 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
             "shell": {"tools": ["terminal"], "keyword_patterns": []},
         }
         stats = self._make_stats(
-            cut_previews={"terminal": cut_msgs},
+            expand_only_previews={"terminal": cut_msgs},
             all_previews=cut_msgs + ["random unrelated message"] * 10,
-            was_cut_count={"terminal": 4},
+            was_expand_only_count={"terminal": 4},
         )
         with mock.patch.object(analyze, "_load_preset_triggers",
                                return_value=(triggers, "ok")):
@@ -627,9 +607,9 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
         # new group, named by the tool's underscore prefix.
         cut_msgs = ["please screenshot the page"] * 4
         stats = self._make_stats(
-            cut_previews={"browser_snapshot": cut_msgs},
+            expand_only_previews={"browser_snapshot": cut_msgs},
             all_previews=cut_msgs + ["chat about lunch"] * 10,
-            was_cut_count={"browser_snapshot": 4},
+            was_expand_only_count={"browser_snapshot": 4},
         )
         with mock.patch.object(analyze, "_load_preset_triggers",
                                return_value=({}, "ok")):
@@ -651,9 +631,9 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
             },
         }
         stats = self._make_stats(
-            cut_previews={"deploy_tool": cut_msgs},
+            expand_only_previews={"deploy_tool": cut_msgs},
             all_previews=cut_msgs + ["random"] * 10,
-            was_cut_count={"deploy_tool": 4},
+            was_expand_only_count={"deploy_tool": 4},
         )
         with mock.patch.object(analyze, "_load_preset_triggers",
                                return_value=(triggers, "ok")):
@@ -665,116 +645,6 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
             for c in rows[0]["candidates"]:
                 self.assertFalse(triggers["deploy"]["keyword_patterns"][0].search(c["pattern"]),
                     f"existing-pattern overlap leaked: {c['pattern']!r}")
-
-
-class HarvestRecommendationTests(unittest.TestCase):
-    """The analyzer's harvest-aware recommendation generator should
-    surface per-tool promotion candidates from was_cut signal, with
-    clear actions for the three regimes (net-positive promote,
-    frequent-but-net-negative broaden, sparse keep)."""
-
-    def _harvest_row(self, *, pid, scope, tool=None, was_cut=False):
-        if tool is None:
-            return {
-                "prediction_id": pid,
-                "session_id": f"harvest:{pid[:4]}",
-                "scope": scope,
-                "agent": scope.split(":")[0],
-                "platform": scope.split(":")[1],
-                "policy_source": "harvest",
-                "message_preview": f"msg-{pid}",
-                "ceiling_count": 30, "narrowed_count": 15,
-                "ceiling_tokens": 100, "narrowed_tokens": 50,
-            }
-        return {
-            "prediction_id": pid,
-            "session_id": f"harvest:{pid[:4]}",
-            "scope": scope,
-            "tool_name": tool,
-            "was_cut": was_cut,
-            "policy_source": "harvest",
-        }
-
-    def _args(self, **overrides):
-        defaults = dict(
-            expand_round_trip_tokens=1500,
-            per_tool_tokens=388,
-            harvest_min_cuts=3,
-        )
-        defaults.update(overrides)
-        return SimpleNamespace(**defaults)
-
-    def test_net_positive_surfaces_as_promote(self):
-        # 100 predictions, 50 was_cut for tool X → cost = 50*1500 = 75k
-        # carry = 100*388 = 38.8k → net +36.2k → promote
-        preds = [self._harvest_row(pid=f"p{i:03d}", scope="assistant-a:telegram") for i in range(100)]
-        calls = [self._harvest_row(pid=f"p{i:03d}", scope="assistant-a:telegram",
-                                   tool="terminal", was_cut=True) for i in range(50)]
-        stats = analyze.collect_stats(preds, calls)
-        rows = analyze.harvest_recommendation_rows(stats, self._args())
-        terminal_rec = next((r for r in rows if r["item"] == "terminal"), None)
-        self.assertIsNotNone(terminal_rec)
-        self.assertEqual(terminal_rec["action"], "promote_always_on")
-        self.assertGreater(terminal_rec["metrics"]["net_savings_tokens"], 0)
-
-    def test_frequent_but_net_negative_surfaces_as_broaden(self):
-        # 1000 predictions (carry = 388k), 150 was_cut for X (rt = 225k)
-        # → net -163k but cut_rate = 15% (above 10% threshold) → broaden
-        preds = [self._harvest_row(pid=f"p{i:04d}", scope="assistant-a:telegram") for i in range(1000)]
-        calls = [self._harvest_row(pid=f"p{i:04d}", scope="assistant-a:telegram",
-                                   tool="patch", was_cut=True) for i in range(150)]
-        stats = analyze.collect_stats(preds, calls)
-        rows = analyze.harvest_recommendation_rows(stats, self._args())
-        patch_rec = next((r for r in rows if r["item"] == "patch"), None)
-        self.assertIsNotNone(patch_rec)
-        self.assertEqual(patch_rec["action"], "broaden_trigger_recall")
-        self.assertLess(patch_rec["metrics"]["net_savings_tokens"], 0)
-
-    def test_sparse_cuts_keep_gated(self):
-        # 1000 predictions, only 5 was_cut → cut_rate 0.5%, net very
-        # negative → keep_gated
-        preds = [self._harvest_row(pid=f"p{i:04d}", scope="assistant-a:telegram") for i in range(1000)]
-        calls = [self._harvest_row(pid=f"p{i:04d}", scope="assistant-a:telegram",
-                                   tool="browser_vision", was_cut=True) for i in range(5)]
-        stats = analyze.collect_stats(preds, calls)
-        rows = analyze.harvest_recommendation_rows(stats, self._args())
-        rec = next((r for r in rows if r["item"] == "browser_vision"), None)
-        self.assertIsNotNone(rec)
-        self.assertEqual(rec["action"], "keep_gated")
-
-    def test_below_min_cuts_does_not_surface(self):
-        # 1 was_cut < harvest_min_cuts=3 → no rec emitted
-        preds = [self._harvest_row(pid="p001", scope="assistant-a:telegram")]
-        calls = [self._harvest_row(pid="p001", scope="assistant-a:telegram",
-                                   tool="cronjob", was_cut=True)]
-        stats = analyze.collect_stats(preds, calls)
-        rows = analyze.harvest_recommendation_rows(stats, self._args())
-        self.assertFalse([r for r in rows if r["item"] == "cronjob"])
-
-    def test_no_harvest_rows_no_output(self):
-        # Live data only (no policy_source=harvest) → empty output
-        preds = [{
-            "prediction_id": "p1", "session_id": "live-s1", "scope": "assistant-a:telegram",
-            "policy_source": "preset", "message_preview": "x",
-            "ceiling_count": 1, "narrowed_count": 1, "ceiling_tokens": 1, "narrowed_tokens": 1,
-        }]
-        calls = [{"prediction_id": "p1", "session_id": "live-s1", "scope": "assistant-a:telegram",
-                  "tool_name": "terminal", "was_cut": True, "policy_source": "preset"}]
-        stats = analyze.collect_stats(preds, calls)
-        rows = analyze.harvest_recommendation_rows(stats, self._args())
-        self.assertFalse(rows, "live-only telemetry must not produce harvest recs")
-
-    def test_harvest_skips_tools_pinned_always_on_by_policy(self):
-        preds = [self._harvest_row(pid=f"p{i:03d}", scope="assistant-a:telegram") for i in range(100)]
-        calls = [self._harvest_row(pid=f"p{i:03d}", scope="assistant-a:telegram",
-                                   tool="terminal", was_cut=True) for i in range(50)]
-        stats = analyze.collect_stats(preds, calls)
-        rows = analyze.harvest_recommendation_rows(
-            stats,
-            self._args(),
-            protected_always_on={"terminal"},
-        )
-        self.assertFalse([r for r in rows if r["item"] == "terminal"])
 
 
 class RecommendationRowProtectionTests(unittest.TestCase):
@@ -791,16 +661,45 @@ class RecommendationRowProtectionTests(unittest.TestCase):
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
 
-    def test_policy_always_on_tool_is_not_flagged_for_demote(self):
+    def test_policy_always_carry_tool_is_not_flagged_for_demote(self):
         stat = analyze.ScopeStats(scope="assistant-a:telegram")
         stat.predictions = 25
-        stat.always_on_carry_turns = Counter({"mnemosyne_recall": 25})
+        stat.carry_turns = Counter({"mnemosyne_recall": 25})
         rows = analyze.recommendation_rows(
             {"assistant-a:telegram": stat},
             self._args(),
-            protected_always_on={"mnemosyne_recall"},
+            immutable_always_carry={"mnemosyne_recall"},
         )
         self.assertFalse([r for r in rows if r.get("item") == "mnemosyne_recall"])
+
+    def test_category_recommendation_never_writes_category_into_carry(self):
+        """An ``expanded_category`` recommendation carries a toolset/category
+        name in ``item`` — never a per-tool identifier — so its proposed learned
+        patch must not inject that category string into a per-tool ``carry`` or
+        ``expand_only`` list (Phase-6 invariant). The row stays advisory-only."""
+        stat = analyze.ScopeStats(scope="assistant-a:telegram")
+        stat.predictions = 10
+        # Strong promote signal: expands often, always used downstream.
+        stat.expansions_by_category = Counter({"filesystem": 8})
+        stat.used_expansion_event_ids_by_category["filesystem"] = {
+            f"e{i}" for i in range(8)
+        }
+        rows = analyze.recommendation_rows(
+            {"assistant-a:telegram": stat},
+            self._args(),
+            immutable_always_carry=set(),
+        )
+        category_rows = [r for r in rows if r.get("kind") == "expanded_category"]
+        self.assertTrue(category_rows, "expected an expanded_category row")
+        row = category_rows[0]
+        self.assertEqual(row["item"], "filesystem")
+        # Verify the promote branch actually fired (the branch that previously
+        # leaked the category string into the carry patch).
+        self.assertEqual(row["action"], "promote_to_carry")
+        scopes = row["proposed_learned_patch"]["scopes"]
+        for scope_patch in scopes.values():
+            self.assertNotIn("filesystem", scope_patch.get("carry", []))
+            self.assertNotIn("filesystem", scope_patch.get("expand_only", []))
 
 
 class ExpandToolsUsedAttributionTests(unittest.TestCase):
@@ -864,12 +763,11 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
             "scope": "assistant-a:telegram",
             "sticky_key": sticky_key,
             "session_id": REAL_KEY_TELEGRAM,
-            "initial_allowed_tools": initial_allowed,
-            "cut_tools": [],
+            "initial_active_tools": initial_allowed,
+            "expand_only_tools": [],
             "expansions": set(),
             "pending_expansion": None,
             "ceiling_tools": list(initial_allowed),
-            "unknown_kept_tools": [],
         })
 
     def _latest_row(self) -> dict:
@@ -890,21 +788,21 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
             session_id=REAL_KEY_TELEGRAM,
         )
         row = self._latest_row()
-        self.assertTrue(row.get("was_initially_available"))
-        self.assertNotEqual(row.get("expand_tools_used"), True,
+        self.assertTrue(row.get("was_initially_active"))
+        self.assertNotEqual(row.get("expansion_provided_access"), True,
             "tool already in initial allowed set must not be credited as expansion-driven")
 
-    def test_cut_tool_with_active_sticky_credits_expansion(self):
-        # The legitimate case: terminal was cut from the initial allowed
+    def test_expand_only_tool_with_active_sticky_credits_expansion(self):
+        # The legitimate case: terminal was expand-only in the initial active
         # set; sticky residency from a prior expansion is what made it
         # callable. The flag must fire.
         sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
         self._seed_sticky(sticky_key, "terminal", ["terminal"])
         self._set_prediction_state(initial_allowed=["memory"], sticky_key=sticky_key)
-        # Mark the tool as cut so was_cut reflects reality (the predictor
+        # Mark the tool expand-only so the canonical flag reflects reality (the predictor
         # would have set this when narrowing).
         state = plugin._PREDICTION_CV.get()
-        state["cut_tools"] = ["terminal"]
+        state["expand_only_tools"] = ["terminal"]
         plugin._PREDICTION_CV.set(state)
 
         plugin._on_post_tool_call(
@@ -912,15 +810,15 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
             session_id=REAL_KEY_TELEGRAM,
         )
         row = self._latest_row()
-        self.assertFalse(row.get("was_initially_available"))
-        self.assertTrue(row.get("expand_tools_used"),
-            "tool cut from initial allowed set but reachable via sticky must be credited")
+        self.assertFalse(row.get("was_initially_active"))
+        self.assertTrue(row.get("expansion_provided_access"),
+            "expand-only tool reachable via sticky must be credited")
         self.assertEqual(row.get("expand_category"), "terminal")
 
     def test_sticky_carried_tool_in_initial_allowed_still_credits_expansion(self):
         # Regression: in production, sticky_tools get merged into the
-        # narrowed allowed set BEFORE filtering, so a sticky-carried tool
-        # ends up in initial_allowed_tools. Without a pre-sticky baseline,
+        # narrowed active set BEFORE filtering, so a sticky-carried tool
+        # ends up in initial_active_tools. Without a pre-sticky baseline,
         # the credit decision saw was_initially_available=True and skipped
         # the sticky-expansion branch, zeroing out expand_tools_used.
         sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
@@ -929,7 +827,7 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
         self._set_prediction_state(initial_allowed=["terminal", "memory"], sticky_key=sticky_key)
         # …but the pre-sticky baseline does NOT include it.
         state = plugin._PREDICTION_CV.get()
-        state["baseline_allowed_tools"] = ["memory"]
+        state["baseline_active_tools"] = ["memory"]
         plugin._PREDICTION_CV.set(state)
 
         plugin._on_post_tool_call(
@@ -937,9 +835,9 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
             session_id=REAL_KEY_TELEGRAM,
         )
         row = self._latest_row()
-        self.assertFalse(row.get("was_initially_available"),
+        self.assertFalse(row.get("was_initially_active"),
             "baseline (pre-sticky) determines was_initially_available")
-        self.assertTrue(row.get("expand_tools_used"),
+        self.assertTrue(row.get("expansion_provided_access"),
             "sticky-carried tool must be credited as expansion-driven")
         self.assertEqual(row.get("expand_category"), "terminal")
 
@@ -963,15 +861,15 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
             session_id=REAL_KEY_TELEGRAM,
         )
         row = self._latest_row()
-        self.assertTrue(row.get("was_initially_available"))
+        self.assertTrue(row.get("was_initially_active"))
         self.assertTrue(row.get("after_expand_tools"),
             "round-trip happened — should still record after_expand_tools")
-        self.assertNotEqual(row.get("expand_tools_used"), True,
+        self.assertNotEqual(row.get("expansion_provided_access"), True,
             "round-trip provided nothing new — must not be credited as expansion-driven")
 
 
 class BuildApiKwargsSnapshotTests(unittest.TestCase):
-    """``initial_allowed_tools`` must be a *snapshot* captured on the first
+    """``initial_active_tools`` must be a *snapshot* captured on the first
     ``_build_api_kwargs`` call of a prediction, NOT a moving window that
     follows post-expansion state. If it moves, expansion-driven tool calls
     later in the same turn look like they were initially available, which
@@ -1011,9 +909,13 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         # Predictor narrowed to {memory, send_message}; terminal was cut.
         plugin._PREDICTION_CV.set({
             "prediction_id": "pred-1",
-            "allowed_tool_names": ["memory", "send_message"],
-            "baseline_allowed_tools": ["memory", "send_message"],
-            "known_tool_names": {"memory", "send_message", "terminal", "file_read"},
+            "active_tool_names": ["memory", "send_message"],
+            "baseline_active_tools": ["memory", "send_message"],
+            "resolved_always_carry": [],
+            "resolved_carry": ["memory", "send_message"],
+            # Full-start: terminal/file_read are cut via the demoted loadout.
+            "resolved_demoted": ["terminal", "file_read"],
+            "triggered_tools": [],
             "expansions": set(),
             "agent": "assistant-a", "platform": "telegram", "scope": "assistant-a:telegram",
             "sticky_key": "k", "session_id": REAL_KEY_TELEGRAM,
@@ -1023,7 +925,7 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         # First call: model sees the narrowed view.
         kwargs1 = self._run_wrapper_with_tools(["memory", "send_message", "terminal", "file_read"])
         state = plugin._PREDICTION_CV.get()
-        snapshot = list(state["initial_allowed_tools"])
+        snapshot = list(state["initial_active_tools"])
         self.assertEqual(sorted(snapshot), ["memory", "send_message"])
         self.assertEqual(sorted(_tool_names_in(kwargs1["tools"])), ["memory", "send_message"])
 
@@ -1039,8 +941,8 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         self.assertIn("terminal", _tool_names_in(kwargs2["tools"]))
         # …but the snapshot must NOT have moved.
         self.assertEqual(
-            sorted(state["initial_allowed_tools"]), sorted(snapshot),
-            "initial_allowed_tools must be a one-time snapshot per prediction",
+            sorted(state["initial_active_tools"]), sorted(snapshot),
+            "initial_active_tools must be a one-time snapshot per prediction",
         )
 
     def test_end_to_end_recovered_tool_credits_expand_tools_used(self):
@@ -1062,18 +964,22 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         plugin._CONFIG["log"] = True  # need writes to verify the row
         plugin._PREDICTION_CV.set({
             "prediction_id": "pred-current",
-            "allowed_tool_names": ["memory", "terminal"],  # post-sticky merge
-            "baseline_allowed_tools": ["memory"],           # pre-sticky
-            "known_tool_names": {"memory", "terminal"},
+            "active_tool_names": ["memory", "terminal"],  # post-sticky merge
+            "baseline_active_tools": ["memory"],           # pre-sticky
+            "resolved_always_carry": [],
+            "resolved_carry": ["memory"],
+            # terminal was demoted — that's why sticky recovery matters here.
+            "resolved_demoted": ["terminal"],
+            "triggered_tools": [],
             "expansions": set(),
             "agent": "assistant-a", "platform": "telegram", "scope": "assistant-a:telegram",
             "sticky_key": sticky_key, "session_id": REAL_KEY_TELEGRAM,
             "sticky_tools": ["terminal"], "sticky_categories": ["terminal"],
             "sticky_remaining_turns": {"terminal": 3},
-            "cut_tools": ["terminal"], "pending_expansion": None,
+            "expand_only_tools": ["terminal"], "pending_expansion": None,
         })
 
-        # First _build_api_kwargs call — establishes initial_allowed_tools.
+        # First _build_api_kwargs call — establishes initial_active_tools.
         self._run_wrapper_with_tools(["memory", "terminal"])
 
         # Model calls terminal.
@@ -1085,9 +991,9 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         tool_calls_path = Path(self.profile_home) / "state" / "tool-belt" / "tool_calls.jsonl"
         rows = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l]
         row = rows[-1]
-        self.assertFalse(row.get("was_initially_available"),
+        self.assertFalse(row.get("was_initially_active"),
             "baseline excluded terminal — it was only callable via sticky")
-        self.assertTrue(row.get("expand_tools_used"),
+        self.assertTrue(row.get("expansion_provided_access"),
             "sticky-recovered tool must be credited as expansion-driven")
 
     def test_already_available_tool_never_credits_expansion(self):
@@ -1108,15 +1014,17 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         plugin._CONFIG["log"] = True
         plugin._PREDICTION_CV.set({
             "prediction_id": "pred-current",
-            "allowed_tool_names": ["memory", "terminal"],
-            "baseline_allowed_tools": ["memory", "terminal"],  # terminal IS in baseline
-            "known_tool_names": {"memory", "terminal"},
+            "active_tool_names": ["memory", "terminal"],
+            "baseline_active_tools": ["memory", "terminal"],  # terminal IS in baseline
+            "resolved_always_carry": [],
+            "resolved_carry": ["memory", "terminal"],
+            "triggered_tools": [],
             "expansions": set(),
             "agent": "assistant-a", "platform": "telegram", "scope": "assistant-a:telegram",
             "sticky_key": sticky_key, "session_id": REAL_KEY_TELEGRAM,
             "sticky_tools": ["terminal"], "sticky_categories": ["terminal"],
             "sticky_remaining_turns": {"terminal": 3},
-            "cut_tools": [], "pending_expansion": None,
+            "expand_only_tools": [], "pending_expansion": None,
         })
 
         self._run_wrapper_with_tools(["memory", "terminal"])
@@ -1128,8 +1036,8 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         tool_calls_path = Path(self.profile_home) / "state" / "tool-belt" / "tool_calls.jsonl"
         rows = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l]
         row = rows[-1]
-        self.assertTrue(row.get("was_initially_available"))
-        self.assertNotEqual(row.get("expand_tools_used"), True,
+        self.assertTrue(row.get("was_initially_active"))
+        self.assertNotEqual(row.get("expansion_provided_access"), True,
             "tool in baseline must never be credited as expansion-driven")
 
 

@@ -1,8 +1,17 @@
 # Tool Belt — Surface Audit Summary
 
 **Date:** 2026-08-27
-**Commit audited:** `13c953e` (Task 6, read-only)
-**Sources:** Claude Code runtime-feature audit (`workspace/delegations/2026-08-27-084655-task-6-runtime-feature-audit/report.md`) and supported-surface audit (`workspace/delegations/2026-08-27-084655-task-6-supported-surface-audit/report.md`), reconciled against source by Bernard.
+**Commit audited:** `13c953e` (read-only pre-release audit)
+
+> **Historical document — superseded in part.** This audit predates the
+> carrying-model refactor AND the full-start default flip. Its factual
+> record stands, but statements about unknown tools staying available, the
+> protected always-on set, `learned_mode: off | auto`,
+> `check-tool-drift.py`, the learned overlay being "disabled by default",
+> the runtime "never rewriting learned policy by itself" (in-process
+> auto-shape now does, under the default `learned_mode: apply`), and any
+> since-removed script describe the pre-refactor model. Current behavior
+> is documented in `docs/ARCHITECTURE.md` and `docs/CONFIGURATION.md`.
 
 ---
 
@@ -70,7 +79,9 @@ Working and supported, but not the opening pitch:
 - `bootstrap.py` — optional warm start from existing sessions and telemetry
 - `analyze.py` — comprehensive effectiveness and recommendation report
 - `shape-ceiling.py` — writes reviewed per-scope learned adjustments
-- `savings-report.py` — concise, independently checkable savings view
+- `tool-belt savings` — canonical, read-only savings command (observed +
+  projected cohorts); backed by `savings.py`
+- `savings-report.py` — deprecated compatibility wrapper over `savings.py`
 
 **Advanced operations**
 

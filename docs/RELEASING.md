@@ -34,17 +34,17 @@ Full quality gate:
 .venv/bin/python tests/run_tests.py
 .venv/bin/python scripts/smoke-test.py
 .venv/bin/python -m compileall -q .
-bash -n scripts/daily-analysis.sh
+bash -n scripts/rotate-telemetry.sh
 ```
 
 Expected:
 
 | Command | Expected result |
 | --- | --- |
-| `tests/run_tests.py` | `OK` — 0 failures, 0 errors. The suite declares no conditional skips; a `skipped` line means something changed and needs explaining. |
+| `tests/run_tests.py` | `OK` — 0 failures, 0 errors. One skip is expected on a clean clone outside the Hermes venv: the real-bridge test (`skipUnless(_HAVE_HERMES)`). Any other `skipped` line means something changed and needs explaining. |
 | `scripts/smoke-test.py` | Two blocks: `8/8 checks passed` (cache-off / attribution) and `5/5 checks passed` (cache-on freeze). |
 | `compileall -q .` | No output, exit 0. |
-| `bash -n scripts/daily-analysis.sh` | No output, exit 0. |
+| `bash -n scripts/rotate-telemetry.sh` | No output, exit 0. |
 
 The smoke test prints `tool-belt: cannot import run_agent` and unknown-tool
 drift warnings from its synthetic fixtures. Those are expected fixture noise,
@@ -66,22 +66,6 @@ Expected — the manifest version, no warnings, and exactly the declared surface
 `1 tool` is `expand_tools`; the `5 hooks` are the five entries under
 `provides_hooks` in `plugin.yaml`. A count mismatch means a registration
 regressed against the manifest.
-
-### Drift check — run against a real profile
-
-```bash
-.venv/bin/python scripts/check-tool-drift.py
-```
-
-Expected: `check-tool-drift: no drift — every ceiling tool is named in the
-preset. ✓`
-
-This one is **not** a clean-clone check. It derives the live ceiling from
-`~/.hermes/state/tool-belt/predictions.jsonl`; with no telemetry it prints
-`could not determine live ceiling (no toolsets import, no telemetry)` **and
-still exits 0**. Run it from your normal working checkout against a profile
-that has real telemetry, or pass `--state-dir` explicitly. Treat the
-"could not determine" line as a skipped check, not a pass.
 
 ---
 
@@ -127,8 +111,8 @@ python3 "$HERMES_HOME/plugins/tool-belt/scripts/configure.py" --status
 ```
 
 Expected: `tool-belt` appears in the plugin list at the release version;
-`--status` reports every scope as fresh (no telemetry, sessions still needed)
-and writes nothing. Re-running `--status` must produce identical output — it is
+`--status` prints `Tool Belt: enabled`, names the discovered profiles, and
+reports that no telemetry has been recorded yet — and writes nothing. Re-running `--status` must produce identical output — it is
 read-only by contract.
 
 Optionally send one test message through the temp profile and confirm a row
@@ -172,7 +156,7 @@ tail -f "$HERMES_HOME/state/tool-belt/predictions.jsonl" | \
 
    ```
    expand_tools(category="browser")
-   expand_tools(tools=["browser_navigate"])
+   expand_tools(tool="browser_navigate")
    ```
 
 5. **`bypass_rate: 1.0` ships the full ceiling.** Set it on one scope, restart
@@ -254,7 +238,8 @@ unset HERMES_HOME
 - **Configuration defaults.** Defaults in
   [CONFIGURATION.md](CONFIGURATION.md) match [`policy.yaml`](../policy.yaml) and
   the constants in the code. `learned_mode` in particular defaults to
-  `recommend`, not `apply`.
+  `apply` (full-start): shaping is on unless a scope opts out to
+  `recommend`.
 - **Known issues are still true.** Re-read [KNOWN_ISSUES.md](KNOWN_ISSUES.md)
   against the models and providers you actually run. Remove observations that no
   longer reproduce — a stale entry blamed on a provider that has since fixed it

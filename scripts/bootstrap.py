@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Day-one warm start for the tool-belt plugin — mode-aware.
 
-The plugin runs in two modes per scope (cache-on default for Anthropic /
-OpenAI auto-cache; cache-off fallback for kimi / gpt-5.4-mini). This script
-runs the right warm-start for each:
+The plugin runs in two modes per scope (cache-on by default for providers
+with automatic prompt caching; cache-off fallback for providers without it).
+This script runs the right warm-start for each:
 
   · Cache-on scopes → ``shape-ceiling.py`` reports per-tool promote /
     demote candidates from real ``expand_tools`` evidence in live
@@ -83,58 +83,58 @@ def _discover_harvest_dirs(hermes_home: Path, profile_filter: str | None) -> lis
 
 
 def _shape_ceiling_actions(state_dirs: list[tuple[str, Path]], python: str) -> list[dict]:
-    """Run shape-ceiling.py --dry-run against each profile's live state.
-    Surfaces cache-on promote/demote candidates."""
+    """Run ``shape-ceiling.py --dry-run --json`` against each profile's live
+    state and collect its cache-on promote/demote candidates.
+
+    The shaper's porcelain document is the contract consumed here (schema
+    ``tool-belt/shape-ceiling``): a versioned JSON object with a ``scopes``
+    list, each carrying ``promote`` / ``demote`` entries and their evidence
+    counts. Its human prose is explicitly *not* a contract — this function
+    never reads stdout as text, so rewording the report cannot change what
+    bootstrap surfaces. ``--dry-run`` is passed because bootstrap only
+    reports; it never rewrites ``learned.json``.
+    """
     actions: list[dict] = []
     for label, sdir in state_dirs:
         try:
             result = subprocess.run(
                 [python, str(PLUGIN_DIR / "scripts" / "shape-ceiling.py"),
                  "--state-dir", str(sdir),
-                 "--dry-run"],
+                 "--dry-run",
+                 "--json"],
                 capture_output=True, text=True, check=False,
             )
-            # Re-parse: shape-ceiling.py emits human-readable text, but we
-            # can re-invoke its inner machinery via JSON-mode if available.
-            # For now: parse the stdout structure. Format we emit:
-            #   === scope:platform  (sessions_considered=N) ===
-            #     Promote: ...
-            #     Demote: ...
-            current_scope = ""
-            in_promote = False
-            in_demote = False
-            for line in result.stdout.splitlines():
-                line = line.rstrip()
-                if line.startswith("=== "):
-                    current_scope = line.lstrip("= ").split(" (")[0].strip()
-                    in_promote = in_demote = False
-                elif line.lstrip().startswith("Promote:"):
-                    in_promote = True
-                    in_demote = False
-                elif line.lstrip().startswith("Demote:"):
-                    in_demote = True
-                    in_promote = False
-                elif (in_promote or in_demote) and line.lstrip().startswith("+ "):
-                    # Promote row: "    + tool_name      sessions=N  calls=M  evidence=..."
-                    parts = line.lstrip("+ ").split()
-                    if parts:
-                        actions.append({
-                            "kind": "shape_promote" if in_promote else "shape_demote",
-                            "label": label,
-                            "scope": current_scope,
-                            "tool": parts[0],
-                            "raw": line.strip(),
-                        })
-                elif (in_promote or in_demote) and line.lstrip().startswith("- "):
-                    parts = line.lstrip("- ").split()
-                    if parts:
-                        actions.append({
-                            "kind": "shape_demote",
-                            "label": label,
-                            "scope": current_scope,
-                            "tool": parts[0],
-                            "raw": line.strip(),
-                        })
+            if not (result.stdout or "").strip():
+                # Empty state dir: the shaper reports on stderr and exits 1.
+                continue
+            payload = json.loads(result.stdout)
+            for scope_doc in payload.get("scopes") or []:
+                scope = str(scope_doc.get("scope") or "")
+                for row in scope_doc.get("promote") or []:
+                    actions.append({
+                        "kind": "shape_promote",
+                        "label": label,
+                        "scope": scope,
+                        "tool": str(row.get("tool") or ""),
+                        "detail": (
+                            f"sessions={row.get('sessions')}  calls={row.get('calls')}  "
+                            f"evidence={row.get('evidence')}"
+                        ),
+                    })
+                for row in scope_doc.get("demote") or []:
+                    actions.append({
+                        "kind": "shape_demote",
+                        "label": label,
+                        "scope": scope,
+                        "tool": str(row.get("tool") or ""),
+                        "detail": (
+                            f"sessions_without_use={row.get('sessions_without_use')}  "
+                            f"evidence={row.get('evidence')}"
+                        ),
+                    })
+        except json.JSONDecodeError as exc:
+            print(f"  warning: shape-ceiling output not parseable for {label}: {exc}",
+                  file=sys.stderr)
         except Exception as exc:
             print(f"  warning: shape-ceiling failed on {label}: {exc}", file=sys.stderr)
     return actions
@@ -160,7 +160,7 @@ def _harvest_actions(harvest_dirs: list[tuple[str, Path]], python: str) -> list[
             payload = json.loads(result.stdout)
             for rec in payload.get("recommendations", []):
                 if rec.get("kind") == "harvest_tool_promotion" and rec.get("action") in (
-                    "promote_always_on", "broaden_trigger_recall"
+                    "promote_to_carry", "keep_expand_only"
                 ):
                     actions.append({
                         "kind": "harvest_promotion",
@@ -169,7 +169,7 @@ def _harvest_actions(harvest_dirs: list[tuple[str, Path]], python: str) -> list[
                         "action": rec["action"],
                         "item": rec["item"],
                         "net": rec["metrics"]["net_savings_tokens"],
-                        "cuts": rec["metrics"]["harvest_was_cut"],
+                        "expand_only_calls": rec["metrics"]["harvest_was_expand_only"],
                     })
             for row in payload.get("trigger_keyword_candidates", []):
                 if not row.get("candidates"):
@@ -183,7 +183,7 @@ def _harvest_actions(harvest_dirs: list[tuple[str, Path]], python: str) -> list[
                     "target_trigger": row["target_trigger"],
                     "action": row["action"],
                     "pattern": top["pattern"],
-                    "cuts": row["cut_count"],
+                    "expand_only_calls": row["expand_only_count"],
                     "precision": top["precision"],
                 })
         except subprocess.CalledProcessError as exc:
@@ -243,8 +243,7 @@ def main() -> int:
             harvest_cmd += ["--profile", args.profile]
         if args.window_days is not None:
             harvest_cmd += ["--window-days", str(args.window_days)]
-        if args.hermes_home:
-            harvest_cmd += ["--hermes-home", str(args.hermes_home)]
+        harvest_cmd += ["--hermes-home", str(args.hermes_home)]
         try:
             subprocess.run(harvest_cmd, capture_output=args.quiet, text=True, check=True)
         except subprocess.CalledProcessError as exc:
@@ -275,35 +274,41 @@ def main() -> int:
     shape_promotes = [a for a in shape_actions if a["kind"] == "shape_promote"]
     shape_demotes = [a for a in shape_actions if a["kind"] == "shape_demote"]
     if shape_promotes:
-        print("\n  [cache-on] Promote into the frozen ceiling (from real expand_tools evidence):")
+        print("\n  [cache-on] Promote to carry (from real expand_tools evidence):")
         for i, a in enumerate(shape_promotes, 1):
-            print(f"    {i}. {a['scope']:<22} + {a['tool']}    ({a['raw'].split(a['tool'], 1)[-1].strip()})")
+            print(f"    {i}. {a['scope']:<22} + {a['tool']}    ({a['detail']})")
     if shape_demotes:
-        print("\n  [cache-on] Demote from always-on (unused across recent sessions):")
+        print("\n  [cache-on] Demote to expand_only (unused across recent sessions):")
         for i, a in enumerate(shape_demotes, 1):
-            print(f"    {i}. {a['scope']:<22} − {a['tool']}    ({a['raw'].split(a['tool'], 1)[-1].strip()})")
+            print(f"    {i}. {a['scope']:<22} − {a['tool']}    ({a['detail']})")
 
     # Harvest output (cache-off, historical) second
     harvest_promotions = sorted([a for a in harvest_actions if a["kind"] == "harvest_promotion"],
                                 key=lambda a: -a.get("net", 0))
     harvest_keywords = sorted([a for a in harvest_actions if a["kind"] == "harvest_keyword"],
-                              key=lambda a: -a["cuts"])
+                              key=lambda a: -a["expand_only_calls"])
     if harvest_promotions:
-        print("\n  [cache-off / harvest] Tool promotions (edit policy.yaml or channels.<scope>.always_on_extra):")
+        print("\n  [cache-off / harvest] Carry recommendations (review/apply with configure.py or shape-ceiling.py):")
         for i, p in enumerate(harvest_promotions, 1):
-            tag = "PROMOTE" if p["action"] == "promote_always_on" else "BROADEN"
+            tag = "PROMOTE-TO-CARRY" if p["action"] == "promote_to_carry" else "KEEP-EXPAND-ONLY"
             print(f"    {i}. [{tag}] {p['scope']:<22} {p['item']:<20} "
-                  f"cuts={p['cuts']:>4}  net={p['net']:+,} tok")
+                  f"expand_only_calls={p['expand_only_calls']:>4}  net={p['net']:+,} tok")
     if harvest_keywords:
         print("\n  [cache-off / harvest] Trigger keyword candidates (add to the named trigger's `keywords`):")
         for i, k in enumerate(harvest_keywords[:10], 1):
             print(f"    {i}. {k['scope']:<22} {k['target_trigger']:<14} ← \"{k['pattern']}\"")
-            print(f"       (cuts {k['cuts']}, precision {k['precision']:.2f} — "
+            print(f"       (expand_only_calls {k['expand_only_calls']}, precision {k['precision']:.2f} — "
                   f"would have fired for {k['tool']})")
 
+    # Activation goes through Hermes-owned config paths only: the guided
+    # command or `hermes config set`. Never tell an operator to hand-edit a
+    # config file — configure.py and scripts/README.md forbid it.
     print()
-    print("  To activate cache-on recommendations: set `learned_mode: apply` for the scope in config.yaml,")
-    print("  then re-run `shape-ceiling.py` (without --dry-run) to write learned.json.")
+    print("  To activate cache-on recommendations:")
+    print("    1. Guided:  python3 scripts/configure.py --agent <agent> --mode history")
+    print("       Direct:   hermes config set "
+          "plugins.tool-belt.channels.<scope>.learned_mode apply")
+    print("    2. Then write them: python3 scripts/shape-ceiling.py (without --dry-run)")
     print()
     return 0
 

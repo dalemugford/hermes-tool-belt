@@ -21,12 +21,12 @@ without (kimi, gpt-5.4-mini). The plugin runs in one of two modes:
     only at moments that already cost a cache break: session reset and
     context compaction.
 
-    Sticky residency, lookback, and per-turn predictor execution are all
-    skipped on the frozen path — they were per-turn-adjustment mechanisms
-    that the freeze makes redundant by design. ``expand_tools`` continues
-    to mutate the frozen set in-place; that mutation is model-driven and
-    pays one cache break for the value of getting the tool the model
-    actually wanted.
+    Sticky residency, lookback, and per-turn predictor execution do not
+    apply on the frozen path: the frozen set already carries forward
+    verbatim, so per-turn adjustment has nothing to add. ``expand_tools``
+    continues to mutate the frozen set in-place; that mutation is
+    model-driven and pays one cache break for the value of getting the
+    tool the model actually wanted.
 
   cache-off (``cache_mode: off`` or auto-detected for known-uncached models)
     Per-turn narrowing with sticky residency carrying expanded tools
@@ -83,8 +83,9 @@ LIFECYCLE
       - cross-session lock persistence to cache_mode_detection.json
 
   · on_session_end (fires per-turn — Hermes' hook semantics)
-      - sticky + lookback eviction only; freeze + cache-mode state stay
+      - sticky + lookback eviction; freeze + cache-mode state stay
         because this hook fires after every turn, not just at session end
+      - then the debounced in-process auto-shape pass (_maybe_auto_shape)
 
   · on_session_reset (true /reset or /new)
       - evict all per-session state
@@ -96,16 +97,19 @@ from __future__ import annotations
 
 import contextvars
 import hashlib
+import json
 import logging
 import os
+import threading
 import time
 from typing import Any
 
+from . import carrying as carrying_mod
 from . import expand_tools as expand_tools_mod
 from . import logger_io
 from . import predictor as predictor_mod
 from . import presets as presets_mod
-from .presets import WILDCARD_ALWAYS_ON
+from .presets import NO_NARROWING
 
 logger = logging.getLogger(__name__)
 
@@ -121,13 +125,26 @@ _PREDICTION_CV: contextvars.ContextVar[dict[str, Any] | None] = contextvars.Cont
 )
 
 _CONFIG: dict[str, Any] = {
-    "enabled": False,
+    # Zero-config default: hooks are live as soon as Hermes loads the plugin
+    # (the `plugins.enabled` list already gates whether the plugin loads at
+    # all). `plugins.tool-belt.enabled: false` is the explicit opt-out; an
+    # UNSET key must not silently disable every hook while register() still
+    # exposes expand_tools (seen live: a dangling expand_tools with no
+    # narrowing behind it).
+    "enabled": True,
     "log": True,
     "channels": {},
-    "always_on_extra": [],
-    "always_off": [],
     "agent": "",
-    "learned_mode": "recommend",
+    # Zero-config default (full-start contract): evidence-driven shaping
+    # applies automatically. `learned_mode: recommend` is the documented
+    # opt-in observe/trial mode; explicit configs win as always.
+    "learned_mode": "apply",
+    # In-process periodic auto-shaping (session-end trigger). True by
+    # default — automatic application for apply-mode scopes is the product
+    # promise; `auto_shape: false` is the global opt-out. Per-scope debounce
+    # interval (default 24h) overridable via `auto_shape_interval_hours`
+    # (top-level or channels.<scope>.).
+    "auto_shape": True,
     # Cache-off mode pipeline — sticky residency + per-turn predictor
     # lookback. Both are inert under cache-on (the default), where the
     # frozen tool set carries forward in-session expansions verbatim
@@ -156,7 +173,7 @@ _CONFIG: dict[str, Any] = {
     # Fraction of sessions (deterministic by session_id hash) to bypass
     # narrowing entirely, providing an A/B baseline cohort. Bypassed
     # predictions still run for telemetry (triggers_fired, etc.) but
-    # allowed_tool_names is set to WILDCARD and policy_source is "bypass".
+    # active_tool_names is set to NO_NARROWING and policy_source is "bypass".
     # 0.0 disables. Override per scope via channels.<scope>.bypass_rate.
     "bypass_rate": 0.0,
     # Determines whether tools may be mutated mid-session.
@@ -180,10 +197,9 @@ _CONFIG: dict[str, Any] = {
         "detect_min_input_tokens": 5000,
         # hit_rate ≥ on_threshold → lock "on"; else lock "off".
         "on_threshold": 0.40,
-        # Providers/models with known-bad provider-side caching skip the
-        # detection window and lock "off" immediately. From the state.db
-        # 14-day rollup: kimi at 2.5%, gpt-5.4-mini at 2.9%. Don't waste
-        # 5 calls of observation to re-derive what we already measured.
+        # Models empirically observed with negligible provider-side cache
+        # hit rates; skip the detection window and lock "off" immediately
+        # rather than spending 5 calls to re-derive a known answer.
         "providers_off_models": ["kimi-k2.6:cloud", "gpt-5.4-mini"],
     },
 }
@@ -206,6 +222,11 @@ _PRIOR_MESSAGES_BY_SESSION: dict[str, list[str]] = {}
 # Frozen tool-set decisions per canonical session key. Evicted on session
 # reset and context compaction; the per-turn on_session_end hook preserves it.
 _FROZEN_BY_SESSION: dict[str, dict[str, Any]] = {}
+#: Cache-mode decision pinned at a session's FIRST dispatch. Without the pin,
+#: a detection lock landing mid-session flips the current session's path —
+#: granted expansions vanish and the freeze entry leaks. Evicted with the
+#: freeze on session reset.
+_CACHE_DECISION_BY_SESSION: dict[str, str] = {}
 
 # Cross-session detection cache. Persisted JSON at
 # ``~/.hermes/state/tool-belt/cache_mode_detection.json``. Keyed by
@@ -250,6 +271,24 @@ _CACHE_MODE_BY_SESSION: dict[str, dict[str, Any]] = {}
 # session_key to the hook.
 _LAST_CANONICAL_BY_PLATFORM: dict[str, str] = {}
 
+# ─── Auto-shape engine state ──────────────────────────────────────────────
+# In-process throttle + lock for the session-end auto-shape trigger.
+#   "not_before" — earliest wall-clock time the next full engine pass may
+#     run. Comparing against it is the cheap guard: a single float compare
+#     before any file I/O or module import. The real per-scope debounce
+#     (default 24h, ``auto_shape_interval_hours``) is persisted in
+#     learned.json's ``shaping.last_auto_shape_at`` and enforced by
+#     ``shaping.auto_shape_run``.
+#   "lock" — two session-ends in this process must not run the engine
+#     concurrently. A second *gateway process* racing is already safe:
+#     learned.write_state is an atomic whole-document rename, so the last
+#     writer wins a consistent file; no cross-process locking is built.
+_AUTO_SHAPE = {"lock": threading.Lock(), "not_before": 0.0}
+# Re-run the (cheap) eligibility scan at most this often per process. The
+# scan itself reads telemetry files, so it is not free — but per-scope
+# debounce means a shorter recheck interval only costs reads, not writes.
+_AUTO_SHAPE_RECHECK_SECONDS = 900.0
+
 
 # ─── Config loading ────────────────────────────────────────────────────────
 
@@ -261,9 +300,15 @@ def _load_user_config() -> None:
         plugin_cfg = cfg_get(cfg, "plugins", "tool-belt", default={})
         if not isinstance(plugin_cfg, dict):
             return
-        for key in ("enabled", "log", "agent", "learned_mode", "bypass_rate", "cache_mode"):
+        for key in (
+            "enabled", "log", "agent", "learned_mode", "bypass_rate", "cache_mode",
+            "auto_shape", "auto_shape_interval_hours", "always_carry",
+        ):
             if key in plugin_cfg:
                 _CONFIG[key] = plugin_cfg[key]
+        # "always_on_extra"/"always_off" are REMOVED pre-1.0 knobs: copied
+        # only so presets._warn_legacy_disable_inputs can surface a stale
+        # value in user config. They are never applied.
         for key in ("channels", "always_on_extra", "always_off"):
             if key in plugin_cfg and plugin_cfg[key] is not None:
                 _CONFIG[key] = plugin_cfg[key]
@@ -290,9 +335,16 @@ def _load_user_config() -> None:
 # ─── The narrowing patch ───────────────────────────────────────────────────
 
 def _wrap_build_api_kwargs(original):
-    """Wrap AIAgent._build_api_kwargs to narrow tools per API call."""
-    def wrapped(self, api_messages):
-        kwargs = original(self, api_messages)
+    """Wrap AIAgent._build_api_kwargs to narrow tools per API call.
+
+    The wrapper must accept and forward every extra argument the host may
+    pass (the deployed gateway calls ``_build_api_kwargs(api_messages,
+    tools_for_api=...)`` on cache-plan branches): a fixed two-argument
+    signature raises TypeError at call BINDING — before the fail-open
+    try/except can engage — turning narrowing into an API-call crash.
+    """
+    def wrapped(self, api_messages, *args, **call_kwargs):
+        kwargs = original(self, api_messages, *args, **call_kwargs)
         if not _CONFIG["enabled"]:
             return kwargs
 
@@ -315,106 +367,166 @@ def _wrap_build_api_kwargs(original):
                 str(getattr(self, "provider", "") or kwargs.get("provider", "") or ""),
             )
 
-            allowed = state.get("allowed_tool_names")
+            active_names = state.get("active_tool_names")
             expansions = state.get("expansions") or set()
-            known = state.get("known_tool_names") or set()
 
-            # Wildcard: don't narrow, but still log on first call
-            if allowed == WILDCARD_ALWAYS_ON or allowed is None:
-                names = _tool_names(tools)
-                state["ceiling_tools"] = names
+            # Snapshot the live enabled ceiling once per turn. Split into the
+            # built-in ceiling ``E`` (the partition domain) and MCP/plugin
+            # passthrough names (outside the built-in partition). Captured here
+            # — the first _build_api_kwargs call — so expand_tools has the
+            # enabled ceiling recorded before it can report any activation.
+            ceiling_names = _tool_names(tools)
+            state["ceiling_tools"] = ceiling_names
+            builtin_ceiling: set[str] = set()
+            mcp_passthrough_names: list[str] = []
+            for name in ceiling_names:
+                base_name = _base_tool_name(name)
+                # Hermes prefixes tool names with "mcp_" on the Claude Code
+                # OAuth path (anthropic_adapter.py). Strip it before matching.
+                # Tool Search bridge tools are pass-through like MCP tools:
+                # they are the transport INTO the deferred catalog, not a
+                # shapeable built-in capability.
+                if (_is_mcp_tool(name) or _is_mcp_tool(base_name)
+                        or _is_bridge_tool(name) or _is_bridge_tool(base_name)):
+                    mcp_passthrough_names.append(name)
+                else:
+                    builtin_ceiling.add(base_name)
+            state.setdefault("enabled_ceiling", sorted(builtin_ceiling))
+            state.setdefault("mcp_passthrough_tools", mcp_passthrough_names)
+
+            # No-narrowing (no-narrowing preset or A/B bypass): don't
+            # narrow, but still log on the first call.
+            if active_names == NO_NARROWING or active_names is None:
                 # Snapshot once per prediction. Subsequent _build_api_kwargs
                 # calls within the same turn (after the model used a tool
                 # like expand_tools) must not overwrite the "what the model
-                # initially saw" record — otherwise expansion-driven calls
-                # look like they were available from the start.
-                state.setdefault("initial_allowed_tools", names)
-                state.setdefault("cut_tools", [])
-                state.setdefault("unknown_kept_tools", [])
+                # initially saw" record.
+                state.setdefault("initial_active_tools", ceiling_names)
+                state.setdefault("expand_only_tools", [])
                 state["last_tool_list_hash"] = _tool_list_hash(tools)
                 state["last_system_hash"] = _system_message_hash(api_messages)
                 state["api_call_idx"] = int(state.get("api_call_idx", 0)) + 1
                 _maybe_log_prediction(state, ceiling=tools, narrowed=tools)
                 return kwargs
 
-            allowed_set = set(allowed) if isinstance(allowed, list) else set()
-            allowed_set |= expansions  # user-expanded categories add tools
+            # Resolve explicit expansions (expand_tools) — a category name
+            # resolves through Hermes' toolset table to its member tool names.
+            # Sticky residency (cache-off) is an activation source too, never a
+            # residency change, so it joins the expanded set.
+            expanded_names: set[str] = set(expansions)
+            for item in expansions:
+                expanded_names |= _resolve_category_to_tools(item)
+            expanded_names |= set(state.get("sticky_tools") or [])
 
-            # When expansions name a CATEGORY (toolset name) rather than tool
-            # names directly, resolve them through Hermes' toolset table.
-            for cat in expansions:
-                allowed_set |= _resolve_category_to_tools(cat)
+            triggered_names = set(state.get("triggered_tools") or [])
 
-            # Apply safe-default for unknown tools: if a tool in the ceiling
-            # is not mentioned anywhere in the preset, keep it on
+            # Finalize the three strata (A/C/X) and the per-message active set
+            # against the LIVE enabled ceiling. No selection source can add a
+            # tool absent from ``E``. Full-start contract: unknown enabled
+            # built-ins are CARRIED; only the reconciled ``demoted`` loadout
+            # (learned.apply_to_preset) moves a tool to expand_only.
+            model = carrying_mod.resolve(
+                enabled=builtin_ceiling,
+                always_carry=set(state.get("resolved_always_carry") or []),
+                carry=set(state.get("resolved_carry") or []),
+                demoted=set(state.get("resolved_demoted") or []),
+                triggered=triggered_names,
+                expanded=expanded_names,
+                passthrough=set(),  # passthrough handled directly on the tool list
+                prior_active=set(state.get("prior_active_tools") or []),
+            )
+            active_set = model.active
+
+            # Full-start: the pre-ceiling baseline (predictor residents ∪
+            # trigger tools) understates what the model actually saw — most of
+            # class C is implicit (E − A − demoted). Widen the credit baseline
+            # with the resolved resident classes so expansion-credit
+            # attribution never credits expand_tools for a tool that was
+            # carried anyway.
+            baseline = state.get("baseline_active_tools")
+            if isinstance(baseline, list):
+                state["baseline_active_tools"] = sorted(
+                    set(baseline) | model.always_carry | model.carry
+                )
+
+            # Config always_carry pins absent from the enabled ceiling are
+            # inert — warn once per scope, naming them.
+            _warn_inert_pins(
+                str(state.get("scope") or ""),
+                state.get("config_always_carry") or [],
+                builtin_ceiling,
+            )
+
             filtered = []
-            ceiling_names = []
-            cut_names = []
-            unknown_kept_names = []
-            mcp_passthrough_names = []
+            expand_only_names = []
             for t in tools:
                 if not isinstance(t, dict):
                     continue
-                # Anthropic format: top-level "name". OpenAI format: function.name.
                 name = _tool_name(t)
                 if not name:
                     continue
-                ceiling_names.append(name)
-                # Hermes prefixes tool names with "mcp_" when sending to Anthropic
-                # via the Claude Code OAuth path (anthropic_adapter.py:1774-1778).
-                # Strip that prefix for matching against our preset, which uses
-                # the canonical (unprefixed) tool names.
                 base_name = _base_tool_name(name)
-                # MCP tools: pass through without narrowing. Tool Search
-                # manages MCP/plugin tool discovery — Tool Belt shapes
-                # built-in tools only. This keeps the two systems on
-                # separate layers and prevents Tool Belt from cutting an
-                # MCP tool that Tool Search's bridge would have served.
-                if _is_mcp_tool(name) or _is_mcp_tool(base_name):
+                # MCP/plugin tools pass through without narrowing — Tool Search
+                # owns their discovery; Tool Belt shapes built-in tools only.
+                # The Tool Search bridge tools pass through for the same
+                # reason: demoting the bridge would silently sever ALL access
+                # to the deferred MCP/plugin catalog (mirror image of
+                # _pin_expand_tools_visible, which protects the other layer's
+                # hatch in the other direction).
+                if (_is_mcp_tool(name) or _is_mcp_tool(base_name)
+                        or _is_bridge_tool(name) or _is_bridge_tool(base_name)):
                     filtered.append(t)
-                    mcp_passthrough_names.append(name)
                     continue
-                if base_name in allowed_set:
+                if base_name in active_set:
                     filtered.append(t)
-                elif base_name not in known:
-                    filtered.append(t)
-                    unknown_kept_names.append(name)
                 else:
-                    cut_names.append(name)
+                    expand_only_names.append(name)
 
             # Diagnostic: log what's happening on the FIRST call per turn.
             if not state.get("logged"):
                 logger.info(
-                    "tool-belt: filter input tools=%d allowed_set=%d known=%d "
-                    "→ kept=%d cut=%d (sample_names=%s, sample_cut=%s)",
-                    len(tools), len(allowed_set), len(known),
-                    len(filtered), len(cut_names),
-                    ceiling_names[:5], cut_names[:5],
+                    "tool-belt: filter input tools=%d active=%d → kept=%d "
+                    "expand_only=%d (sample_names=%s, sample_expand_only=%s)",
+                    len(tools), len(active_set),
+                    len(filtered), len(expand_only_names),
+                    ceiling_names[:5], expand_only_names[:5],
                 )
-                # Drift alarm: any ceiling tool not named in the preset is
-                # kept on as an unknown (safe default). That silently defeats
-                # narrowing when upstream adds tools, so surface it loudly —
-                # once per turn — instead of letting it hide in the counts.
-                if unknown_kept_names:
-                    logger.warning(
-                        "tool-belt: %d tools in ceiling not named in preset "
-                        "(kept on as unknown): %s. Run "
-                        "scripts/check-tool-drift.py to update policy.yaml.",
-                        len(unknown_kept_names),
-                        sorted(unknown_kept_names)[:10],
-                    )
+
+            # Append the expand-only discoverability manifest to a per-request
+            # CLONE of the expand_tools schema. Built from ``model.expand_only``
+            # (the residency stratum X), so it stays byte-identical across a
+            # cache-on session even when a trigger later activates one of these
+            # tools — residency never changes, only the active set grows. Fail
+            # OPEN: any error leaves ``filtered`` and the original schema intact.
+            try:
+                manifest_text = expand_tools_mod.build_expand_only_manifest(
+                    model.expand_only
+                )
+                if manifest_text:
+                    filtered = [
+                        expand_tools_mod.augment_schema_with_manifest(t, manifest_text)
+                        if _base_tool_name(_tool_name(t)) == "expand_tools"
+                        else t
+                        for t in filtered
+                    ]
+            except Exception as exc:
+                logger.debug(
+                    "tool-belt: expand-only manifest skipped (%s) — original "
+                    "expand_tools schema preserved", exc,
+                )
 
             kwargs = dict(kwargs)
             kwargs["tools"] = filtered
 
-            state["ceiling_tools"] = ceiling_names
-            # Snapshot once per prediction — see wildcard branch above. The
-            # filtered list on later calls reflects post-expansion state and
-            # would otherwise pollute "initial" with expansion-added tools.
-            state.setdefault("initial_allowed_tools", _tool_names(filtered))
-            state.setdefault("cut_tools", cut_names)
-            state.setdefault("mcp_passthrough_tools", mcp_passthrough_names)
-            state.setdefault("unknown_kept_tools", unknown_kept_names)
+            # Snapshot once per prediction — the filtered list on later calls
+            # reflects post-expansion state and would otherwise pollute
+            # "initial" with expansion-added tools.
+            state.setdefault("initial_active_tools", _tool_names(filtered))
+            state.setdefault("expand_only_tools", expand_only_names)
+            # Record the resolved partition for telemetry / attribution.
+            state["carry_always_carry"] = sorted(model.always_carry)
+            state["carry_carry"] = sorted(model.carry)
+            state["carry_expand_only"] = sorted(model.expand_only)
 
             # Per-call hash for response-side correlation with
             # cache_read_tokens. Updated every API call so intra-turn
@@ -479,6 +591,41 @@ def _base_tool_name(name: str) -> str:
     return name[4:] if name.startswith("mcp_") else name
 
 
+def _bridge_tool_names() -> frozenset[str]:
+    """Names of Hermes' Tool Search bridge tools (tiered-disclosure access
+    infrastructure): ``tool_search`` / ``tool_describe`` / ``tool_call``.
+
+    Sourced from ``tools.tool_search.BRIDGE_TOOL_NAMES`` so a upstream rename
+    tracks automatically; fail-OPEN to the hardcoded triple when hermes-agent
+    isn't importable (tests, offline analysis) so pass-through immunity never
+    silently vanishes.
+    """
+    try:
+        from tools.tool_search import BRIDGE_TOOL_NAMES  # type: ignore[import-not-found]
+        names = frozenset(str(n) for n in BRIDGE_TOOL_NAMES)
+        if names:
+            return names
+    except Exception:
+        pass
+    return frozenset({"tool_search", "tool_describe", "tool_call"})
+
+
+_BRIDGE_TOOL_NAMES: frozenset[str] = _bridge_tool_names()
+
+
+def _is_bridge_tool(name: str) -> bool:
+    """True for Hermes' Tool Search bridge tools.
+
+    The bridge is the transport for the deferred MCP/plugin catalog — tools
+    Tool Belt has explicitly disclaimed ownership of. Like MCP tools, the
+    bridge sits OUTSIDE the built-in partition: never demotable, never counted
+    as adaptive carry, never listed in the expand-only manifest. The
+    ``always_carry`` pin in policy.yaml is the pure-data backup for the case
+    where this structural check can't see ``tools.tool_search``.
+    """
+    return name in _BRIDGE_TOOL_NAMES
+
+
 def _is_mcp_tool(name: str) -> bool:
     """Return True if a tool name belongs to an MCP server.
 
@@ -502,12 +649,12 @@ def _is_mcp_tool(name: str) -> bool:
     return False
 
 
-def _tool_names(tools: list) -> list[str]:
+def _tool_names(tools: list[dict[str, Any]]) -> list[str]:
     """Return stable tool names from a tool-schema list."""
     return [name for name in (_tool_name(t) for t in tools) if name]
 
 
-def _tool_list_hash(tools: list) -> str:
+def _tool_list_hash(tools: list[dict[str, Any]]) -> str:
     """Truncated sha256 of the narrowed tool list in send-order.
 
     Captures membership, ordering, and schema-content drift — provider
@@ -517,8 +664,7 @@ def _tool_list_hash(tools: list) -> str:
     across consecutive turns in the same session.
     """
     try:
-        import json as _json
-        payload = _json.dumps(tools, sort_keys=False, ensure_ascii=False, separators=(",", ":"))
+        payload = json.dumps(tools, sort_keys=False, ensure_ascii=False, separators=(",", ":"))
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
     except Exception:
         return ""
@@ -551,8 +697,7 @@ def _system_message_hash(api_messages: Any) -> str:
         content = first.get("content")
         # Content can be str OR list-of-parts (Anthropic multimodal shape).
         if isinstance(content, list):
-            import json as _json
-            payload = _json.dumps(content, sort_keys=False, ensure_ascii=False, separators=(",", ":"))
+            payload = json.dumps(content, sort_keys=False, ensure_ascii=False, separators=(",", ":"))
         elif isinstance(content, str):
             payload = content
         else:
@@ -783,8 +928,7 @@ def _platform_from_session_key(session_key: Any) -> str:
     Hermes' :func:`gateway.session.build_session_key` produces:
         ``agent:main:{platform}:{chat_type}[:...]``
     Position 1 is the *literal* string ``"main"`` — NOT a per-profile
-    agent name (that lived in our imagination, not in the gateway).
-    Position 2 is the platform.
+    agent name. Position 2 is the platform.
 
     Returns ``""`` for anything that doesn't match the canonical shape
     (AIAgent's uuid/timestamp ``session_id``, blank inputs, anything
@@ -859,7 +1003,6 @@ def _looks_like_hermes_session_uuid(value: Any) -> bool:
 
 def _hermes_session_uuid(
     event: Any = None,
-    gateway: Any = None,
     session_store: Any = None,
     kwargs: dict[str, Any] | None = None,
     session_key: str = "",
@@ -928,9 +1071,9 @@ def _agent_platform_from_context(event: Any = None, kwargs: dict[str, Any] | Non
         we have no context, the first plausible answer wins.
 
     Scope is ``{agent}:{platform}``. Agent comes from profile context
-    (explicit config, HERMES_HOME profile dir, HERMES_PROFILE). Hermes'
-    ``HERMES_SESSION_KEY`` is shaped ``agent:main:{platform}:...`` —
-    position 1 is the literal ``"main"``, never a per-profile agent name.
+    (explicit config, HERMES_HOME profile dir, HERMES_PROFILE); the
+    platform comes from ``HERMES_SESSION_KEY`` — see
+    :func:`_platform_from_session_key` for that key's shape.
     Returns ``("", "", "")`` when either slot can't be filled with real
     data (analyzer buckets blank rows as "unknown").
     """
@@ -969,19 +1112,66 @@ def _agent_platform_from_context(event: Any = None, kwargs: dict[str, Any] | Non
     return agent, platform, f"{agent}:{platform}"
 
 
+#: Scopes already warned about inert config always_carry pins (per process).
+_WARNED_INERT_PINS: set[tuple[str, frozenset]] = set()
+
+
+def _warn_inert_pins(scope: str, pins: Any, enabled: set[str]) -> None:
+    """Warn once, naming config always_carry pins absent from ``E``.
+
+    A pinned name that is not an enabled tool is inert — the ceiling stays
+    authoritative and the pin cannot re-enable anything (``∩ E`` in
+    ``carrying.resolve``). Never fails; never raises.
+    """
+    try:
+        missing = frozenset(str(t) for t in (pins or []) if str(t) not in enabled)
+        if not missing:
+            return
+        key = (str(scope), missing)
+        if key in _WARNED_INERT_PINS:
+            return
+        _WARNED_INERT_PINS.add(key)
+        logger.warning(
+            "tool-belt: config always_carry pin(s) %s for scope %r are not in "
+            "the enabled tool ceiling — inert (a disabled/absent tool cannot "
+            "be re-enabled by pinning; check the name or enable the tool)",
+            ", ".join(sorted(missing)), scope,
+        )
+    except Exception:  # pragma: no cover — warning must never break dispatch
+        pass
+
+
 def _maybe_log_prediction(
     state: dict[str, Any],
     ceiling: list,
     narrowed: list,
 ) -> None:
-    """Write the prediction row to predictions.jsonl on the FIRST API call
-    per turn. Subsequent calls in the same turn don't re-log."""
+    """Write the prediction row to predictions.jsonl.
+
+    Runs on the FIRST API call per turn; subsequent calls in the same turn
+    don't re-log.
+    """
     if state.get("logged"):
         return
     state["logged"] = True
     if not _CONFIG.get("log", True):
         return
     try:
+        # Residency partition finalized against the live enabled ceiling in
+        # _build_api_kwargs (carrying.resolve). Empty on the no-narrowing/bypass
+        # path (no narrowing ran) — counts derive from the actual A/C/X sets so
+        # telemetry reflects the schema the model really saw, never the preset's
+        # pre-ceiling loadout.
+        always_carry_tools = list(state.get("carry_always_carry") or [])
+        carry_tools = list(state.get("carry_carry") or [])
+        expand_only_tools = list(
+            state.get("carry_expand_only") or state.get("expand_only_tools") or []
+        )
+        # T = trigger-activated expand_only tools (triggered ∩ X), flattened.
+        expand_only_set = set(expand_only_tools)
+        trigger_activated = sorted(
+            t for t in (state.get("triggered_tools") or []) if t in expand_only_set
+        )
         record = logger_io.PredictionRecord(
             ts=time.time(),
             prediction_id=state.get("prediction_id", ""),
@@ -996,26 +1186,28 @@ def _maybe_log_prediction(
             preset=str(state.get("preset", "")),
             triggers_fired=list(state.get("triggers_fired", [])),
             triggers_suppressed=list(state.get("triggers_suppressed") or []),
-            always_on_count=int(state.get("always_on_count", 0)),
+            always_carry_count=len(always_carry_tools),
+            carry_count=len(carry_tools),
             ceiling_count=len(ceiling),
             narrowed_count=len(narrowed),
             ceiling_tokens=logger_io.estimate_tokens(ceiling),
             narrowed_tokens=logger_io.estimate_tokens(narrowed),
             tokens_estimator=logger_io.token_estimator_name(),
             ceiling_tools=list(state.get("ceiling_tools") or _tool_names(ceiling)),
-            allowed_tools=list(state.get("initial_allowed_tools") or _tool_names(narrowed)),
-            cut_tools=list(state.get("cut_tools") or []),
-            unknown_kept_tools=list(state.get("unknown_kept_tools") or []),
+            active_tools=list(state.get("initial_active_tools") or _tool_names(narrowed)),
+            expand_only_tools=expand_only_tools,
             mcp_passthrough_tools=list(state.get("mcp_passthrough_tools") or []),
-            always_on_tools=list(state.get("always_on_tools") or []),
+            always_carry_tools=always_carry_tools,
+            carry_tools=carry_tools,
             trigger_tools_by_group=dict(state.get("trigger_tools_by_group") or {}),
+            trigger_activated_tools=trigger_activated,
             expanded_tools=sorted(str(t) for t in (state.get("expansions") or set())),
             sticky_tools=list(state.get("sticky_tools") or []),
             sticky_categories=list(state.get("sticky_categories") or []),
             sticky_remaining_turns=dict(state.get("sticky_remaining_turns") or {}),
             policy_source=str(state.get("policy_source", "preset")),
             policy_version=str(state.get("policy_version", "")),
-            learned_mode=str(state.get("learned_mode", "recommend")),
+            learned_mode=str(state.get("learned_mode", "apply")),
             learned_scope=str(state.get("learned_scope", "")),
             learned_changes=list(state.get("learned_changes") or []),
             lookback_used=int(state.get("lookback_used", 0)),
@@ -1027,6 +1219,10 @@ def _maybe_log_prediction(
             frozen_reuse_count=int(state.get("frozen_reuse_count", 0)),
         )
         logger_io.log_prediction(record)
+        # Per-tool schema size snapshot for the shaper's token-denominated
+        # demotion test. The ceiling defs only exist in-process; the sidecar
+        # write is debounced (1h) and never raises.
+        logger_io.update_schema_sizes(ceiling)
     except Exception as exc:
         logger.debug("tool-belt: log_prediction failed: %s", exc)
 
@@ -1054,6 +1250,7 @@ def _wrap_compress_context(original):
             if session_key and session_key in _FROZEN_BY_SESSION:
                 _FROZEN_BY_SESSION.pop(session_key, None)
                 _CACHE_MODE_BY_SESSION.pop(session_key, None)
+                _CACHE_DECISION_BY_SESSION.pop(session_key, None)
                 evicted_keys.append(session_key)
             # Defensive: also try the AIAgent's session_id (UUID) in case
             # the canonical environment key is unavailable.
@@ -1061,6 +1258,7 @@ def _wrap_compress_context(original):
             if aid and aid != session_key and aid in _FROZEN_BY_SESSION:
                 _FROZEN_BY_SESSION.pop(aid, None)
                 _CACHE_MODE_BY_SESSION.pop(aid, None)
+                _CACHE_DECISION_BY_SESSION.pop(aid, None)
                 evicted_keys.append(aid)
             if evicted_keys:
                 logger.info(
@@ -1076,19 +1274,69 @@ def _wrap_compress_context(original):
     return wrapped
 
 
+def _pin_expand_tools_visible() -> None:
+    """Keep ``expand_tools`` out of Hermes' native tiered-disclosure bridge.
+
+    Hermes' Tool Search bridge (``model_tools._compute_tool_definitions`` →
+    ``tools.tool_search.assemble_tool_defs``) runs at tool-definition time,
+    *upstream* of our ``_build_api_kwargs`` narrowing. Its classifier,
+    ``tool_search.is_deferrable_tool_name``, treats ``expand_tools`` as
+    deferrable (a non-core, non-MCP plugin tool) and replaces it with the
+    ``tool_search``/``describe``/``call`` bridge tools — hiding the one tool
+    whose whole job is expanding tools. Our narrowing only ever subtracts
+    from the on-the-wire list, so once the bridge has removed ``expand_tools``
+    we can never add it back, and ``always_carry`` (policy.yaml) never gets a
+    chance to protect it (``A = always_carry ∩ E`` is empty when the tool is
+    absent from the enabled ceiling ``E``).
+
+    Fix: wrap the classifier so ``expand_tools`` is never classified
+    deferrable. It then survives into ``E`` and our existing ``always_carry``
+    entry keeps it resident. Every caller of ``is_deferrable_tool_name`` lives
+    inside ``tool_search`` and resolves it via the module global at call time
+    (``classify_tools`` included), so rebinding the module attribute reaches
+    them all. Idempotent (guarded by a marker attribute) and fail-open: any
+    error leaves the bridge untouched and ``expand_tools`` merely deferred.
+    """
+    try:
+        import tools.tool_search as _ts  # type: ignore[import-not-found]
+    except Exception as exc:  # pragma: no cover — defensive
+        logger.debug("tool-belt: tool_search unavailable, expand_tools pin skipped (%s)", exc)
+        return
+
+    original = getattr(_ts, "is_deferrable_tool_name", None)
+    if original is None or getattr(original, "_tool_belt_expand_pin", False):
+        return
+
+    pinned_name = expand_tools_mod.SCHEMA["name"]
+
+    def _is_deferrable_keep_expand(name, *args, **kwargs):
+        # Only expand_tools is pinned — any other tool-belt tool keeps the
+        # native classifier's default treatment.
+        if name == pinned_name:
+            return False
+        return original(name, *args, **kwargs)
+
+    _is_deferrable_keep_expand._tool_belt_expand_pin = True  # type: ignore[attr-defined]
+    _is_deferrable_keep_expand.__wrapped__ = original  # type: ignore[attr-defined]
+    _ts.is_deferrable_tool_name = _is_deferrable_keep_expand
+    logger.info("tool-belt: expand_tools pinned visible against the Tool Search bridge")
+
+
 def _install_patches() -> bool:
     """Install the AIAgent monkey-patches.
 
-    NOTE on the from-import / class-method situation:
-      AIAgent is a class; ``_build_api_kwargs`` and ``_compress_context``
-      are methods on it. Replacing methods on the class affects ALL
-      instances (existing and new). No from-import binding problem
-      here — methods are looked up via the instance's class at call
-      time.
+    Patching the methods on the ``AIAgent`` class affects all existing and
+    future instances.
     """
     global _ORIGINAL_BUILD_API_KWARGS, _ORIGINAL_COMPRESS_CONTEXT, _PATCHED
     if _PATCHED:
         return True
+
+    # Pin expand_tools visible first — the Tool Search bridge runs at
+    # tool-definition time and is independent of run_agent, so install this
+    # even on builds where the run_agent patch below can't (yet) load.
+    _pin_expand_tools_visible()
+
     try:
         import run_agent  # type: ignore[import-not-found]
     except ImportError as exc:
@@ -1121,18 +1369,6 @@ def _install_patches() -> bool:
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────
-
-def _all_known_tool_names(preset) -> set[str]:
-    known: set[str] = set()
-    if isinstance(preset.always_on, list):
-        known.update(preset.always_on)
-    for group in preset.triggers:
-        known.update(group.tools)
-    # always_off tools are "known" too — naming them lets the safe-default
-    # cut them instead of keeping them on as unknowns.
-    known.update(getattr(preset, "always_off", []) or [])
-    return known
-
 
 def _attachments_from_event(event: Any) -> list[str]:
     out: list[str] = []
@@ -1280,31 +1516,31 @@ def _resolve_cache_mode_for_session(session_id: str, scope: str = "") -> str:
         prefix-cache stability.
 
     Mid-session switching is intentionally not supported — switching
-    itself busts the cache. The per-session detection telemetry from
-    ``_CACHE_MODE_BY_SESSION`` is for the analyzer and the NEXT session,
-    never for this one.
+    itself busts the cache. The decision is therefore PINNED at the
+    session's first dispatch (``_CACHE_DECISION_BY_SESSION``): a detection
+    lock landing mid-session applies to the NEXT session, never this one.
     """
+    sid = str(session_id or "")
+    if sid and sid in _CACHE_DECISION_BY_SESSION:
+        return _CACHE_DECISION_BY_SESSION[sid]
     mode = str(_CONFIG.get("cache_mode") or "auto").lower()
-    if mode == "off":
-        return "off"
-    if mode == "on":
-        return "on"
-    # auto: consult the cross-session cache; default "on" on a miss.
-    cached = _cached_detection_mode(scope)
-    if cached in ("on", "off"):
-        return cached
-    return "on"
+    if mode in ("on", "off"):
+        decision = mode
+    else:
+        # auto: consult the cross-session cache; default "on" on a miss.
+        cached = _cached_detection_mode(scope)
+        decision = cached if cached in ("on", "off") else "on"
+    if sid:
+        _CACHE_DECISION_BY_SESSION[sid] = decision
+    return decision
 
 
 def _freeze_session_snapshot(
     session_id: str,
     *,
-    allowed_tool_names: Any,
-    baseline_allowed_tools: Any,
-    known_tool_names: set[str],
+    active_tool_names: Any,
+    baseline_active_tools: Any,
     preset_name: str,
-    always_on_count: int,
-    always_on_tools: list[str],
     trigger_tools_by_group: dict[str, list[str]],
     triggers_fired: list[str],
     triggers_suppressed: list[str],
@@ -1313,26 +1549,38 @@ def _freeze_session_snapshot(
     learned_mode: str,
     learned_scope: str,
     learned_changes: list[str],
+    resolved_always_carry: list[str] | None = None,
+    resolved_carry: list[str] | None = None,
+    resolved_demoted: list[str] | None = None,
+    config_always_carry: list[str] | None = None,
+    triggered_tools: list[str] | None = None,
 ) -> None:
-    """Persist the first dispatch's tool-set decision for the session.
+    """Persist the first dispatch's carrying decision for the session.
 
-    Captured on the first dispatch under cache-on mode and reused on
-    every subsequent dispatch in the same session. Session reset and
+    Captured on the first dispatch under cache-on mode. The residency
+    assignment (``resolved_always_carry`` / ``resolved_carry``) freezes here;
+    trigger matching still runs on every later message and monotonically
+    unions newly triggered tools into ``triggered_tools`` (see
+    ``_on_pre_gateway_dispatch``'s frozen-reuse branch). Session reset and
     context compaction evict the snapshot.
 
-    ``triggers_fired`` / ``trigger_tools_by_group`` are stored on the
-    snapshot so subsequent turns' telemetry rows can describe the
-    decision honestly (this is what was triggered when we froze) rather
-    than blanking out as if the predictor never ran.
+    ``triggers_fired`` / ``trigger_tools_by_group`` are stored so subsequent
+    turns' telemetry rows can describe the decision honestly rather than
+    blanking out as if the predictor never ran.
     """
     _FROZEN_BY_SESSION[session_id] = {
-        "allowed_tool_names": allowed_tool_names,
-        "baseline_allowed_tools": baseline_allowed_tools,
-        "known_tool_names": known_tool_names,
+        "active_tool_names": active_tool_names,
+        "baseline_active_tools": baseline_active_tools,
+        # Frozen residency strata — the A/C loadout does not change in-session.
+        "resolved_always_carry": list(resolved_always_carry or []),
+        "resolved_carry": list(resolved_carry or []),
+        "resolved_demoted": list(resolved_demoted or []),
+        "config_always_carry": list(config_always_carry or []),
+        # Monotonic accumulator of trigger-activated (expand_only) tool names.
+        # Grows at most once per newly firing trigger group across the session.
+        "triggered_tools": list(triggered_tools or []),
         "expansions": set(),  # grown by expand_tools mid-session
         "preset_name": preset_name,
-        "always_on_count": always_on_count,
-        "always_on_tools": list(always_on_tools or []),
         "trigger_tools_by_group": dict(trigger_tools_by_group or {}),
         "triggers_fired_at_freeze": list(triggers_fired or []),
         "triggers_suppressed_at_freeze": list(triggers_suppressed or []),
@@ -1359,11 +1607,11 @@ def _build_state_from_frozen(
 ) -> dict[str, Any]:
     """Construct the contextvar state for a dispatch that reuses a frozen snapshot.
 
-    Sticky residency and lookback are *not populated* — both were
-    per-turn-adjustment mechanisms; the freeze makes them redundant by
-    design (see [[tool-belt-design-principle]]). The fields are
-    still present in the state dict with empty values so downstream
-    consumers (telemetry, post_tool_call) don't need conditional reads.
+    Sticky residency and lookback do not apply under the freeze: the frozen
+    set already carries forward verbatim, so neither is populated. The
+    fields are still present in the state dict with empty values so
+    downstream consumers (telemetry, post_tool_call) don't need conditional
+    reads.
 
     The frozen snapshot's ``expansions`` set carries forward — any
     expand_tools tools added in prior turns of this session stay
@@ -1372,9 +1620,20 @@ def _build_state_from_frozen(
     frozen["reuses"] = int(frozen.get("reuses", 0)) + 1
     return {
         "prediction_id": logger_io.new_prediction_id(),
-        "allowed_tool_names": frozen["allowed_tool_names"],
-        "baseline_allowed_tools": frozen["baseline_allowed_tools"],
-        "known_tool_names": frozen["known_tool_names"],
+        "active_tool_names": frozen["active_tool_names"],
+        "baseline_active_tools": frozen["baseline_active_tools"],
+        # Frozen residency strata — the A/C loadout is fixed per session.
+        "resolved_always_carry": list(frozen.get("resolved_always_carry") or []),
+        "resolved_carry": list(frozen.get("resolved_carry") or []),
+        "resolved_demoted": list(frozen.get("resolved_demoted") or []),
+        "config_always_carry": list(frozen.get("config_always_carry") or []),
+        # Trigger matching still runs each message under freeze; the caller
+        # merges newly fired trigger tools into ``frozen["triggered_tools"]``
+        # before this state is built, so the accumulated set is authoritative.
+        "triggered_tools": list(frozen.get("triggered_tools") or []),
+        # Accumulation lives in triggered_tools + expansions; no extra prior
+        # carry-forward is needed to keep the active set monotonic.
+        "prior_active_tools": [],
         # Carry expansions forward in-session — this is the core of the
         # "stay frozen, including prior expansions" behavior.
         "expansions": set(frozen.get("expansions") or set()),
@@ -1396,8 +1655,6 @@ def _build_state_from_frozen(
         # ("this is what we froze on").
         "triggers_fired": list(frozen.get("triggers_fired_at_freeze") or []),
         "triggers_suppressed": list(frozen.get("triggers_suppressed_at_freeze") or []),
-        "always_on_count": int(frozen.get("always_on_count", 0)),
-        "always_on_tools": list(frozen.get("always_on_tools") or []),
         "trigger_tools_by_group": dict(frozen.get("trigger_tools_by_group") or {}),
         "sticky_tools": [],
         "sticky_categories": [],
@@ -1408,7 +1665,7 @@ def _build_state_from_frozen(
         # multiple sources.
         "policy_source": frozen.get("policy_source", "preset"),
         "policy_version": frozen.get("policy_version", ""),
-        "learned_mode": frozen.get("learned_mode", "recommend"),
+        "learned_mode": frozen.get("learned_mode", "apply"),
         "learned_scope": frozen.get("learned_scope", ""),
         "learned_changes": list(frozen.get("learned_changes") or []),
         # Lookback disabled under freeze.
@@ -1445,7 +1702,6 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         # shaper's per-session grouping; touches nothing load-bearing.
         hermes_session_id = _hermes_session_uuid(
             event=event,
-            gateway=gateway,
             session_store=session_store,
             kwargs=kwargs,
             session_key=str(session_id),
@@ -1468,14 +1724,41 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         if isinstance(message, str) and message.strip().startswith("/"):
             return None
 
-        # Cache-on freeze: when this session already has a
-        # frozen tool-set decision, reuse it verbatim and skip the
-        # predictor entirely. The frozen path also disables sticky and
-        # lookback by construction.
+        # Cache-on freeze: when this session already has a frozen carrying
+        # decision, reuse the frozen residency. Residency stays fixed, but
+        # trigger matching still runs on every inbound message: a lightweight
+        # prediction on this message can activate a new expand_only tool. Newly
+        # fired trigger tools are monotonically unioned into the frozen active
+        # set (recorded distinctly from explicit expansion) and remain until
+        # session reset. Sticky/lookback stay disabled by construction.
         cache_decision = _resolve_cache_mode_for_session(str(session_id), scope=scope)
         if cache_decision == "on" and session_id and session_id in _FROZEN_BY_SESSION:
             frozen = _FROZEN_BY_SESSION[session_id]
-            _PREDICTION_CV.set(_build_state_from_frozen(
+            try:
+                preset = presets_mod.resolve_preset(_CONFIG, scope)
+                reprediction = predictor_mod.predict(message, attachments, preset)
+                new_trigger_tools = _trigger_tools_by_group(preset, reprediction.triggers_fired)
+                prior_triggered = set(frozen.get("triggered_tools") or [])
+                fresh_tools: set[str] = set()
+                for tools_list in new_trigger_tools.values():
+                    fresh_tools |= set(tools_list)
+                added = fresh_tools - prior_triggered
+                if added:
+                    # A new trigger group fired — grow the frozen active set
+                    # once. Record the trigger-driven mutation separately from
+                    # explicit expansion so attribution never confuses the two.
+                    frozen["triggered_tools"] = sorted(prior_triggered | fresh_tools)
+                    merged_groups = dict(frozen.get("trigger_tools_by_group") or {})
+                    merged_groups.update(new_trigger_tools)
+                    frozen["trigger_tools_by_group"] = merged_groups
+                    frozen["triggers_fired_at_freeze"] = sorted(
+                        set(frozen.get("triggers_fired_at_freeze") or [])
+                        | set(reprediction.triggers_fired)
+                    )
+            except Exception as exc:
+                logger.debug("tool-belt: cache-on re-trigger failed: %s", exc)
+                added = set()
+            built = _build_state_from_frozen(
                 frozen,
                 session_id=str(session_id),
                 hermes_session_id=hermes_session_id,
@@ -1484,7 +1767,10 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
                 agent=agent,
                 platform=platform,
                 message=message,
-            ))
+            )
+            if added:
+                built["trigger_driven_mutation"] = True
+            _PREDICTION_CV.set(built)
             return None
 
         # Under cache-on, the freeze about to happen makes sticky residency
@@ -1512,9 +1798,12 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
 
         preset = presets_mod.resolve_preset(_CONFIG, scope)
         prediction = predictor_mod.predict(predictor_input, attachments, preset)
-        known = _all_known_tool_names(preset)
-        always_on_tools = list(preset.always_on) if isinstance(preset.always_on, list) else []
+        resolved_always_carry = list(getattr(preset, "always_carry", []) or [])
+        resolved_carry = list(getattr(preset, "carry", []) or [])
+        resolved_demoted = list(getattr(preset, "demoted", []) or [])
+        config_pins = list(getattr(preset, "config_always_carry", []) or [])
         trigger_tools = _trigger_tools_by_group(preset, prediction.triggers_fired)
+        triggered_tool_names = sorted({t for tools in trigger_tools.values() for t in tools})
 
         if cache_on:
             sticky_tools: list[str] = []
@@ -1527,32 +1816,32 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             _decay_sticky(sticky_key)
             sticky_tools, sticky_categories, sticky_remaining = _live_sticky(sticky_key)
 
-        allowed_tool_names = prediction.allowed_tool_names
+        active_tool_names = prediction.active_tool_names
         # Capture the pre-sticky baseline. This is the set the model would
         # see *without* any prior expansion (sticky carries tools forward
         # only because a prior turn ran expand_tools). The credit decision
         # in _on_post_tool_call needs this to distinguish "model could have
         # called this anyway" from "this call is the payoff of an earlier
-        # expand". WILDCARD is preserved (bypass cohort / wildcard always_on
-        # already see every tool — nothing to attribute to expansion).
+        # expand". NO_NARROWING is preserved (bypass cohort / no-narrowing
+        # preset already see every tool — nothing to attribute to expansion).
         # Under cache-on, sticky_tools is empty so the merge is a no-op.
-        if allowed_tool_names == WILDCARD_ALWAYS_ON or allowed_tool_names is None:
-            baseline_allowed_tools: Any = WILDCARD_ALWAYS_ON
+        if active_tool_names == NO_NARROWING or active_tool_names is None:
+            baseline_active_tools: Any = NO_NARROWING
         else:
-            baseline_allowed_tools = sorted(set(allowed_tool_names))
+            baseline_active_tools = sorted(set(active_tool_names))
             if sticky_tools:
-                allowed_tool_names = sorted(set(allowed_tool_names) | set(sticky_tools))
+                active_tool_names = sorted(set(active_tool_names) | set(sticky_tools))
 
         # A/B baseline: deterministically bypass narrowing for a fraction of
         # sessions. The predictor still ran so we keep telemetry, but the
-        # allowed set widens to the full ceiling and the policy_source is
+        # active set widens to the full ceiling and the policy_source is
         # stamped so the analyzer can compare cohorts. Under cache-on this
         # is decided once and frozen for the session's life — no per-turn
         # flap risk.
         bypassed = _should_bypass(scope, str(session_id))
         if bypassed:
-            allowed_tool_names = WILDCARD_ALWAYS_ON
-            # Bypass means WILDCARD — sticky/lookback aren't narrowing
+            active_tool_names = NO_NARROWING
+            # Bypass means no narrowing — sticky/lookback aren't narrowing
             # anything, so their telemetry fields would falsely imply
             # narrowing signal in the bypass cohort. Zero them out for
             # cohort-comparison cleanliness.
@@ -1564,9 +1853,16 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
 
         _PREDICTION_CV.set({
             "prediction_id": logger_io.new_prediction_id(),
-            "allowed_tool_names": allowed_tool_names,
-            "baseline_allowed_tools": baseline_allowed_tools,
-            "known_tool_names": known,
+            "active_tool_names": active_tool_names,
+            "baseline_active_tools": baseline_active_tools,
+            # Residency strata carried separately so the partition can be
+            # finalized against the live enabled ceiling in _build_api_kwargs.
+            "resolved_always_carry": resolved_always_carry,
+            "resolved_carry": resolved_carry,
+            "resolved_demoted": resolved_demoted,
+            "config_always_carry": config_pins,
+            "triggered_tools": triggered_tool_names,
+            "prior_active_tools": [],
             "expansions": set(),
             "channel": channel,
             "agent": agent,
@@ -1580,15 +1876,13 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             "preset": prediction.preset_name,
             "triggers_fired": prediction.triggers_fired,
             "triggers_suppressed": prediction.triggers_suppressed,
-            "always_on_count": prediction.always_on_count,
-            "always_on_tools": always_on_tools,
             "trigger_tools_by_group": trigger_tools,
             "sticky_tools": sticky_tools,
             "sticky_categories": sticky_categories,
             "sticky_remaining_turns": sticky_remaining,
             "policy_source": policy_source,
             "policy_version": getattr(preset, "policy_version", ""),
-            "learned_mode": getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "recommend")),
+            "learned_mode": getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "apply")),
             "learned_scope": getattr(preset, "learned_scope", ""),
             "learned_changes": list(getattr(preset, "learned_changes", []) or []),
             "lookback_used": len(prior_messages),
@@ -1604,20 +1898,22 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         if cache_decision == "on" and session_id:
             _freeze_session_snapshot(
                 str(session_id),
-                allowed_tool_names=allowed_tool_names,
-                baseline_allowed_tools=baseline_allowed_tools,
-                known_tool_names=known,
+                active_tool_names=active_tool_names,
+                baseline_active_tools=baseline_active_tools,
                 preset_name=prediction.preset_name,
-                always_on_count=prediction.always_on_count,
-                always_on_tools=always_on_tools,
                 trigger_tools_by_group=trigger_tools,
                 triggers_fired=prediction.triggers_fired,
                 triggers_suppressed=prediction.triggers_suppressed,
                 policy_source=policy_source,
                 policy_version=getattr(preset, "policy_version", ""),
-                learned_mode=getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "recommend")),
+                learned_mode=getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "apply")),
                 learned_scope=getattr(preset, "learned_scope", ""),
                 learned_changes=list(getattr(preset, "learned_changes", []) or []),
+                resolved_always_carry=resolved_always_carry,
+                resolved_carry=resolved_carry,
+                resolved_demoted=resolved_demoted,
+                config_always_carry=config_pins,
+                triggered_tools=triggered_tool_names,
             )
     except Exception as exc:
         logger.warning("tool-belt: pre_gateway_dispatch failed: %s", exc)
@@ -1674,22 +1970,22 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
         session_id = kwargs.get("session_id") or task_id or ""
         if tool_name:
             tool = str(tool_name)
-            initial_allowed = set(state.get("initial_allowed_tools") or []) if state else set()
-            # Baseline = the allowed set *before* sticky carry-over merged in.
+            initial_allowed = set(state.get("initial_active_tools") or []) if state else set()
+            # Baseline = the active set *before* sticky carry-over merged in.
             # Used for credit attribution: a tool only sticky-carries because
             # a prior expand_tools ran — those calls should be credited to
             # expansion, not classified as "initially available."
-            # Falls back to initial_allowed for rows written before this
-            # field existed; WILDCARD means "no narrowing", every tool is
-            # initially available.
-            baseline_raw = state.get("baseline_allowed_tools") if state else None
-            if baseline_raw == WILDCARD_ALWAYS_ON:
+            # Falls back to initial_allowed when no prediction state is
+            # attached; NO_NARROWING means every tool is initially
+            # available.
+            baseline_raw = state.get("baseline_active_tools") if state else None
+            if baseline_raw == NO_NARROWING:
                 baseline_allowed: set[str] | None = None  # None means "everything"
             elif baseline_raw is None:
                 baseline_allowed = set(initial_allowed)
             else:
                 baseline_allowed = set(baseline_raw)
-            cut_tools = set(state.get("cut_tools") or []) if state else set()
+            expand_only = set(state.get("expand_only_tools") or []) if state else set()
             expanded = set(state.get("expansions") or set()) if state else set()
             pending_expansion = dict(state.get("pending_expansion") or {}) if state else {}
             if state:
@@ -1730,14 +2026,39 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                 source = "gateway"
             else:
                 source = "subagent"
+            # ``activation_source`` — the carrying class that made this tool
+            # active this turn (v2). Derived from the resolved A/C/X partition
+            # captured in state; refined to expansion/sticky_expansion below
+            # when the credit logic confirms an expand-driven call. MCP/plugin
+            # pass-through and out-of-band (cron/subagent) calls resolve to
+            # ``external`` — outside the built-in partition, never shaping
+            # evidence. A no-narrowing/bypass turn is ``full_ceiling``.
+            partition_ac = set(state.get("carry_always_carry") or []) if state else set()
+            partition_c = set(state.get("carry_carry") or []) if state else set()
+            triggered_set = set(state.get("triggered_tools") or []) if state else set()
+            if not state or source in ("cron", "subagent"):
+                activation_source = "external"
+            elif baseline_allowed is None:
+                activation_source = "full_ceiling"
+            elif base_name in partition_ac or tool in partition_ac:
+                activation_source = "always_carry"
+            elif base_name in partition_c or tool in partition_c:
+                activation_source = "carry"
+            elif base_name in triggered_set or tool in triggered_set:
+                activation_source = "trigger"
+            elif tool in expanded or base_name in expanded:
+                activation_source = "expansion"
+            else:
+                activation_source = "external"
             extra = {
                 "agent": attribution_agent,
                 "platform": attribution_platform,
                 "scope": attribution_scope,
                 "source": source,
-                "was_initially_available": was_initially_available,
-                "was_cut": tool in cut_tools,
-                "was_expanded": tool in expanded,
+                "was_initially_active": was_initially_available,
+                "was_expand_only": tool in expand_only,
+                "activated_by_expansion": tool in expanded,
+                "activation_source": activation_source,
             }
             if tool == "expand_tools":
                 extra["expand_event"] = pending_expansion
@@ -1767,24 +2088,23 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                         tool,
                     )
                 if expand_use:
-                    extra["expand_tools_used"] = True
+                    extra["expansion_provided_access"] = True
                     extra["expanded_tool"] = expand_use.get("expanded_tool", tool)
                     extra["turns_until_used"] = expand_use.get("turns_until_used", 0)
                     extra["expand_category"] = expand_use.get("category", extra.get("expand_category", ""))
                     extra["expansion_prediction_id"] = expand_use.get("expansion_prediction_id", "")
+                    # A prior-turn sticky recovery carries remaining_turns; a
+                    # same-turn expand_tools round-trip does not. Distinguish the
+                    # two activation sources for truthful attribution.
                     if "sticky_remaining_turns" in expand_use:
                         extra["sticky_remaining_turns"] = expand_use.get("sticky_remaining_turns")
-                    if state:
-                        state["expand_tools_used"] = True
-                        state.setdefault("expanded_tools_used", []).append({
-                            "tool": tool,
-                            "category": extra.get("expand_category", ""),
-                            "turns_until_used": extra.get("turns_until_used", 0),
-                        })
-                        if pending_expansion:
-                            state["pending_expansion"] = None
+                        extra["activation_source"] = "sticky_expansion"
+                    else:
+                        extra["activation_source"] = "expansion"
+                    if state and pending_expansion:
+                        state["pending_expansion"] = None
                 elif pending_expansion:
-                    extra["expand_tools_used"] = False
+                    extra["expansion_provided_access"] = False
             log_args = args if tool == "expand_tools" else None
             log_result = result if tool == "expand_tools" else None
             logger_io.log_tool_call(
@@ -1804,11 +2124,9 @@ def _cache_auto_cfg() -> dict[str, Any]:
 
 
 def _detection_cache_path():
-    """Resolve the persisted detection cache path. Lazy import of os to keep
-    the helper cheap; pathlib.Path import avoided to dodge a circular bind."""
-    import os as _os
-    home = _os.environ.get("HERMES_HOME") or _os.path.expanduser("~/.hermes")
-    return _os.path.join(home, "state", "tool-belt", "cache_mode_detection.json")
+    """Resolve the persisted detection cache path."""
+    home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    return os.path.join(home, "state", "tool-belt", "cache_mode_detection.json")
 
 
 def _load_detection_cache() -> None:
@@ -1822,10 +2140,9 @@ def _load_detection_cache() -> None:
     if _DETECTION_CACHE_LOADED:
         return
     _DETECTION_CACHE_LOADED = True
-    import json as _json
     try:
         with open(_detection_cache_path(), "r", encoding="utf-8") as f:
-            data = _json.load(f)
+            data = json.load(f)
         if isinstance(data, dict):
             for scope, entry in data.items():
                 if isinstance(scope, str) and isinstance(entry, dict):
@@ -1838,15 +2155,13 @@ def _load_detection_cache() -> None:
 
 def _save_detection_cache() -> None:
     """Persist the detection cache atomically."""
-    import json as _json
-    import os as _os
     path = _detection_cache_path()
     try:
-        _os.makedirs(_os.path.dirname(path), exist_ok=True)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            _json.dump(_DETECTION_CACHE, f, ensure_ascii=False, indent=2, sort_keys=True)
-        _os.replace(tmp, path)
+            json.dump(_DETECTION_CACHE, f, ensure_ascii=False, indent=2, sort_keys=True)
+        os.replace(tmp, path)
     except Exception as exc:
         logger.debug("tool-belt: detection cache save failed: %s", exc)
 
@@ -1924,9 +2239,8 @@ def _check_divergence(
 
     Threshold: 3 consecutive post-lock calls with hit rate below 30%
     when locked "on". 3 is short enough to fire on a real problem
-    without flapping on transient noise; 30% is well below the empirical
-    stable-hash floor on reference installations, so true cache breakage
-    sits well clear of it.
+    without flapping on transient noise; 30% is a deliberately low floor,
+    so true cache breakage sits well clear of it.
     """
     if state.get("mode") != "on" or state.get("locked_at_call") is None:
         return
@@ -2156,28 +2470,23 @@ def _on_session_end(session_id=None, **kwargs) -> None:
 
     ``on_session_end`` is a misleading hook name — Hermes fires it at the
     end of every ``run_conversation`` call, which means once per user
-    message in multi-turn sessions. The Hermes core comment at
-    conversation_loop.py:4680 calls this out explicitly.
+    message in multi-turn sessions. Hermes' own conversation loop calls
+    this out explicitly in a source comment.
 
-    DO NOT evict any state here that needs to survive across turns within
-    a session. In particular: ``_FROZEN_BY_SESSION``,
-    ``_CACHE_MODE_BY_SESSION``, and any other per-session memory must
-    remain. They're cleared by :func:`_on_session_reset` (true /reset or
-    /new) and by the compaction wrapper only.
+    NO per-session state is evicted here — deliberately. Sticky residency
+    and lookback history are SESSION-scoped features that must survive
+    across turns: sticky decays on its own per-dispatch turn budget
+    (``_decay_sticky``) and the lookback ring self-trims, so neither
+    grows unbounded. All per-session memory (freeze, cache-mode, sticky,
+    lookback) is cleared by :func:`_on_session_reset` (true /reset or
+    /new). An earlier revision evicted sticky/lookback here keyed on the
+    ``HERMES_SESSION_KEY`` env var; the deployed gateway migrated session
+    identity to ContextVars and never sets that var, so the eviction was
+    a live no-op — and anywhere the var DID exist it wiped sticky state
+    at the end of the turn that created it, defeating the feature.
 
-    What we DO clear here: the contextvar (task-scoped so it auto-cleans,
-    but explicit clear keeps state hygiene clean) and the per-turn
-    helpers (sticky residency, lookback history) which were designed
-    around the per-turn semantics this hook actually has.
-
-    Hermes invokes this hook with ``session_id`` set to the AIAgent's
-    uuid/timestamp identifier — NOT the canonical gateway session key
-    that pre_gateway_dispatch uses to index our per-session state. We
-    therefore prefer the canonical key, which is still discoverable
-    in-process via either a ``session_key`` kwarg (if Hermes ever passes
-    one) or the ``HERMES_SESSION_KEY`` env var the gateway sets for the
-    active dispatch. We evict under both supported key shapes so no
-    session-scoped state survives the per-turn cleanup.
+    What this hook does: clear the turn's prediction contextvar, then run
+    the debounced auto-shape pass.
     """
     if not _CONFIG["enabled"]:
         return None
@@ -2186,36 +2495,58 @@ def _on_session_end(session_id=None, **kwargs) -> None:
     except Exception:
         pass
 
-    eviction_ids: list[str] = []
-    canonical_key = ""
-    if isinstance(kwargs.get("session_key"), str) and kwargs["session_key"]:
-        canonical_key = str(kwargs["session_key"])
-    if not canonical_key:
-        env_key = os.environ.get("HERMES_SESSION_KEY") or ""
-        if env_key:
-            canonical_key = env_key
-    if canonical_key:
-        eviction_ids.append(canonical_key)
-    if session_id:
-        sid = str(session_id)
-        if sid and sid not in eviction_ids:
-            eviction_ids.append(sid)
-
-    for sid in eviction_ids:
-        sticky_key = _sticky_key_for_session(sid)
-        if sticky_key:
-            _STICKY_BY_KEY.pop(sticky_key, None)
-        _PRIOR_MESSAGES_BY_SESSION.pop(sid, None)
-        # NOTE: do NOT evict _FROZEN_BY_SESSION or _CACHE_MODE_BY_SESSION
-        # here. ``on_session_end`` is a misleading hook name — Hermes
-        # fires it at the end of every ``run_conversation`` call, which
-        # means once per user message in multi-turn sessions
-        # (conversation_loop.py:4680 warns about this explicitly).
-        # Evicting the freeze here would nuke it after the first turn,
-        # defeating the whole point of session-level freezing.
-        # Eviction lives in _on_session_reset (true /reset or /new) and
-        # the compaction wrapper.
+    # The sanctioned between-session moment
+    # for the in-process auto-shape engine. Fail-open by construction — see
+    # _maybe_auto_shape.
+    _maybe_auto_shape()
     return None
+
+
+def _maybe_auto_shape() -> None:
+    """Periodic in-process auto-shaping trigger (session-end path only).
+
+    Applies shaping automatically for scopes whose ``learned_mode`` resolves
+    to ``apply`` — the operator's standing consent — without any system-level
+    scheduler. Everything heavy lives in ``shaping.auto_shape_run``; this
+    wrapper only does the cheap gating:
+
+      · single timestamp compare (``_AUTO_SHAPE["not_before"]``) before any
+        file I/O or import;
+      · global opt-out ``auto_shape: false`` (default true — automatic is
+        the product promise);
+      · non-blocking in-process lock so two session-ends can't run the
+        engine twice (a second gateway process is covered by learned.py's
+        atomic whole-document write — no cross-process locking here);
+      · lazy import of the shaping module, paid at session-end time, never
+        at plugin load.
+
+    FAIL-OPEN ABSOLUTELY: any exception is logged as a warning and never
+    propagates into the gateway. The engine only writes learned.json — live
+    sessions keep their frozen carrying untouched (cache-on invariant); the
+    new assignment applies to future sessions when their preset resolves at
+    session start.
+    """
+    try:
+        if not _CONFIG["enabled"]:
+            return
+        if _CONFIG.get("auto_shape", True) is False or str(
+            _CONFIG.get("auto_shape", True)
+        ).strip().lower() in ("false", "0", "no", "off"):
+            return
+        now = time.time()
+        if now < float(_AUTO_SHAPE["not_before"]):
+            return  # cheap guard: one float compare, no I/O
+        if not _AUTO_SHAPE["lock"].acquire(blocking=False):
+            return  # another session-end is already running the engine
+        try:
+            _AUTO_SHAPE["not_before"] = now + _AUTO_SHAPE_RECHECK_SECONDS
+            from . import shaping as shaping_mod  # lazy: session-end time only
+
+            shaping_mod.auto_shape_run(_CONFIG)
+        finally:
+            _AUTO_SHAPE["lock"].release()
+    except Exception as exc:
+        logger.warning("tool-belt: auto-shape pass failed (fail-open): %s", exc)
 
 
 # ─── Hook: on_session_reset ────────────────────────────────────────────────
@@ -2268,6 +2599,7 @@ def _on_session_reset(session_id=None, **kwargs) -> None:
     for sid in eviction_ids:
         _FROZEN_BY_SESSION.pop(sid, None)
         _CACHE_MODE_BY_SESSION.pop(sid, None)
+        _CACHE_DECISION_BY_SESSION.pop(sid, None)
         sticky_key = _sticky_key_for_session(sid)
         if sticky_key:
             _STICKY_BY_KEY.pop(sticky_key, None)
@@ -2279,6 +2611,17 @@ def _on_session_reset(session_id=None, **kwargs) -> None:
 
 def register(ctx) -> None:
     _load_user_config()
+
+    # One-shot visibility for the config-disabled state: registration still
+    # happens (Plugin Doctor needs it), but every hook guards on
+    # ``_CONFIG["enabled"]`` — a config-disabled plugin exposes expand_tools
+    # while narrowing nothing. That state should never be silent.
+    if not _CONFIG.get("enabled", True):
+        logger.warning(
+            "tool-belt: registered but disabled by config "
+            "(plugins.tool-belt.enabled is false) — hooks inert, no narrowing, "
+            "no telemetry; expand_tools stays registered but idle"
+        )
 
     # NOTE: registration is unconditional. Hermes' plugin manager already
     # gates load/no-load via ``plugins.enabled`` in config.yaml, so an
@@ -2319,6 +2662,32 @@ def register(ctx) -> None:
     ctx.register_hook("post_api_request", _on_post_api_request)
     ctx.register_hook("on_session_end", _on_session_end)
     ctx.register_hook("on_session_reset", _on_session_reset)
+
+    # `hermes tool-belt ...` terminal subcommand. Optional and fail-open: a
+    # Hermes without register_cli_command (or a registration that raises) must
+    # never cost the tool/hooks above — the bare `tool-belt` launcher on PATH
+    # remains the guaranteed entry point either way. Imported lazily so plugin
+    # load doesn't pay for a module only the CLI path uses.
+    try:
+        if hasattr(ctx, "register_cli_command"):
+            from . import cli as cli_mod
+
+            ctx.register_cli_command(
+                name="tool-belt",
+                help="Tool Belt savings report and onboarding",
+                setup_fn=cli_mod.register_cli,
+                handler_fn=cli_mod.tool_belt_command,
+                description=(
+                    "Hermes Tool Belt operator CLI. `savings` prints the "
+                    "read-only token-savings report; `configure` runs "
+                    "onboarding. Flags are passed through unchanged to the "
+                    "same CLI the `tool-belt` launcher runs — see "
+                    "`hermes tool-belt savings --help` / "
+                    "`hermes tool-belt configure --help`."
+                ),
+            )
+    except Exception as exc:
+        logger.warning("tool-belt: CLI command registration failed: %s", exc)
 
     logger.info(
         "tool-belt: active (policy=policy.yaml, log=%s, learned_mode=%s, bypass_rate=%s)",

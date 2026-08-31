@@ -5,32 +5,28 @@ state lives under `$HERMES_HOME/state/tool-belt/`; generated reports and logs
 are not tracked by Git.
 
 Examples use `python3`; any Python 3 environment with PyYAML works. Set
-`HERMES_HOME` for a non-default Hermes home. `daily-analysis.sh` also accepts
-`HERMES_PYTHON` when a scheduler does not inherit the intended Python path.
-The root Hermes profile is labelled `default`; named profiles keep their
-directory names.
+`HERMES_HOME` for a non-default Hermes home. The root Hermes profile is
+labelled `default`; named profiles keep their directory names.
 
 ## Commands
 
 | Script | Purpose | Typical use |
 |---|---|---|
-| [`configure.py`](configure.py) | Guided onboarding. Detects the state of every agent scope, explains what shaping would change, and writes the configuration through `hermes config`. | The first command to run after installing. Re-run any time. |
+| [`configure.py`](configure.py) | Mode-setter. Detects every agent scope, sets the shaping mode (learning / history / off) and protected tools, and writes the configuration through `hermes config`. | The first command to run after installing. Re-run any time. |
 | [`bootstrap.py`](bootstrap.py) | Mode-aware first-install warm start. Uses live `expand_tools` evidence for cache-on scopes and session replay for cache-off scopes. | Optional, once after installation. |
 | [`shape-ceiling.py`](shape-ceiling.py) | Builds per-scope promote/demote recommendations from recent sessions and writes the learned overlay. | Run after enough organic sessions; inspect with `--dry-run` first. |
 | [`harvest-replay.py`](harvest-replay.py) | Replays existing Hermes sessions through the per-turn predictor and writes privacy-reduced synthetic telemetry. | Tune trigger coverage for cache-off scopes. |
 | [`cache-freeze-replay.py`](cache-freeze-replay.py) | Measures frozen-tool-list efficacy and estimates cache cost from matched API-call positions. **Also a hard library dependency of `analyze.py`**, which imports it via `importlib` for the cache-aware savings section; its CLI is an optional focused diagnostic. | Investigate cache behavior or verify analyzer savings. |
-| [`savings-report.py`](savings-report.py) | Produces the compact, independently checkable token-savings report documented in `docs/SAVINGS.md`. | Inspect all scopes or a selected date/scope window. |
-| [`check-tool-drift.py`](check-tool-drift.py) | Finds tool names present in the observed ceiling but absent from policy. | After Hermes/plugin upgrades or toolset changes. |
+| [`savings-report.py`](savings-report.py) | **Deprecated wrapper.** Kept for backward compatibility; delegates to the canonical engine in [`../savings.py`](../savings.py). Prefer `tool-belt savings`. | Legacy per-scope cache-on/off view. |
+| [`../tool-belt`](../tool-belt) `savings` | Canonical, read-only savings command. Reports every enabled agent (or one via `--agent`) with separately-labeled **observed** and **projected** cohorts; `--json` for a stable schema. Backed by [`../savings.py`](../savings.py). | The supported way to inspect savings. |
 | [`smoke-test.py`](smoke-test.py) | Exercises cache-on and cache-off behavior in isolated temporary state. | Before committing hook, freeze, expansion, or telemetry changes. |
 | [`rotate-telemetry.sh`](rotate-telemetry.sh) | Moves live JSONL telemetry into a timestamped archive without stopping the gateway. | Start a clean measurement window. |
-| [`daily-analysis.sh`](daily-analysis.sh) | Runs the analyzer and shaper for the root profile and named profiles with telemetry. | Run manually or from a scheduler. |
 | [`../tests/seed_sessions.py`](../tests/seed_sessions.py) | Populates a throwaway Hermes home with telemetry generated from the scripted conversations in `tests/scripts/`, using the real policy resolver and predictor. | Demo or debug onboarding without a live gateway: `.venv/bin/python tests/seed_sessions.py --home /tmp/demo-home`, then run `configure.py` against it with `HERMES_HOME` set. Requires the development environment from `CONTRIBUTING.md` (PyYAML). |
 
 Trigger-dampener regression coverage lives in
 [`tests/test_trigger_dampeners.py`](../tests/test_trigger_dampeners.py) and runs
 with the normal test suite. End-to-end onboarding coverage lives in
-[`tests/test_onboarding_e2e.py`](../tests/test_onboarding_e2e.py); the harness
-behind it is described in [`docs/TEST_HARNESS.md`](../docs/TEST_HARNESS.md).
+[`tests/test_onboarding_e2e.py`](../tests/test_onboarding_e2e.py).
 
 ## Common workflows
 
@@ -41,17 +37,24 @@ python3 scripts/configure.py            # interactive
 python3 scripts/configure.py --status   # read-only state report
 ```
 
-`configure.py` discovers every `agent:platform` scope from telemetry, reports
-which of four states it is in — `fresh`, `observing`, `ready`, `shaped` — and
-offers the step that fits. Two paths are available on a fresh scope:
+`configure.py` is a mode-setter. It discovers every `agent:platform` scope
+from telemetry; interactively you pick an agent, then either **Protected
+tools** (a picker over the agent's inventory — selections are written to
+`plugins.tool-belt.always_carry`, always carried and never shaped) or
+**Tool shaping options** (pick channels, then a mode):
 
-- **shape** — analyze the history already on disk, print a plain-language
-  summary of what would become always-on and what would move to on-demand,
-  and on confirmation write the learned overlay and set `learned_mode: apply`
-  for that scope.
-- **recommend** — leave tool loading untouched while telemetry accumulates,
-  then re-run later. The command prints how many more sessions each scope
-  needs; the minimum comes from `policy.yaml` `learning.shape_ceiling`.
+- **learning** — shaping on (`learned_mode: apply`); the plugin shapes
+  automatically from future usage. No history run.
+- **history** — shaping on, plus a shaping pass over the sessions already
+  recorded, shown as a plain-language diff and applied on confirmation.
+- **off** — observation mode (`learned_mode: recommend`): every enabled
+  tool is carried, telemetry keeps accumulating, and the learned overlay
+  is kept but not applied.
+
+`--status` classifies each scope from its settings: the row shows
+`shaping ON/OFF` with learned carry/expansion counts once a scope is
+shaped, `learning` while evidence accumulates, `observing` when shaping
+is off.
 
 Config is written only through `hermes config set` / `hermes config unset`;
 `config.yaml` is never edited directly. Every write is preceded by its
@@ -62,13 +65,17 @@ Non-interactive flags for scripting and tests:
 
 ```bash
 python3 scripts/configure.py --status
-python3 scripts/configure.py --agent default --path recommend --yes
-python3 scripts/configure.py --agent default --path shape --dry-run
-python3 scripts/configure.py --reset default
+python3 scripts/configure.py --agent default --mode learning --yes
+python3 scripts/configure.py --agent default --mode history --dry-run
+python3 scripts/configure.py --agent default --mode off --yes
 ```
 
 `--status` never writes. `--dry-run` prints every diff and writes nothing —
-neither files nor `hermes config` calls.
+neither files nor `hermes config` calls. The pre-1.0 spellings survive as
+hidden compatibility aliases: `--path shape` ≈ `--mode history`;
+`--path recommend` ≈ `--mode off` but additionally sets the scope's
+`bypass_rate` to `1.0` (full-ceiling observation baseline); `--reset AGENT`
+≈ `--mode off` but additionally clears the agent's learned overlay.
 
 ### Mine dampener and trigger-keyword candidates
 
@@ -108,10 +115,17 @@ to `$HERMES_HOME/state/tool-belt/learned.json`.
 ### Analyze cache behavior
 
 ```bash
+./tool-belt savings                       # canonical: all agents, both cohorts
+./tool-belt savings --agent=default --json # machine-readable, one agent
 python3 scripts/cache-freeze-replay.py
 python3 scripts/cache-freeze-replay.py --scope assistant-a:telegram
-python3 scripts/savings-report.py --json
+python3 scripts/savings-report.py --json   # deprecated wrapper
 ```
+
+`tool-belt savings` is the public entry point. Pricing (`PRICE_TABLE`), the
+token estimator, and the expand-round-trip overhead constant are single-sourced
+in `savings.py`; `cache-freeze-replay.py` imports the price table from there and
+`savings-report.py` re-exports the observed-cohort math — no duplicate tables.
 
 The standard `analyze.py` report already includes cache-aware matched-
 counterfactual figures. It computes them by importing `cache-freeze-replay.py`
@@ -136,7 +150,6 @@ writes only the learned overlay.
 ```bash
 python3 tests/run_tests.py
 python3 scripts/smoke-test.py
-python3 scripts/check-tool-drift.py
 ```
 
 The smoke test currently checks eight cache-off invariants and five cache-on
@@ -153,20 +166,10 @@ The script moves live `predictions.jsonl`, `tool_calls.jsonl`, and
 `$HERMES_HOME/state/tool-belt/archive/reset-<timestamp>[-<tag>]/`. The plugin
 recreates each file on the next append.
 
-### Run periodic analysis
+### Ongoing shaping and analysis
 
-```bash
-scripts/daily-analysis.sh
-```
-
-Generated output is written to:
-
-- `reports/<profile>/` inside the local plugin checkout (ignored by Git)
-- `<state-dir>/learned_recommendations.json`
-- `<state-dir>/learned.json` when shaping evidence changes
-- `$HERMES_HOME/state/tool-belt/cron-logs/`
-
-Scheduler setup is environment-specific. Invoke `daily-analysis.sh` from the
-scheduler appropriate to the host; no machine-specific scheduler configuration
-is shipped in the repository. Set `HERMES_PYTHON` explicitly in sparse
-scheduler environments when `python3` is not the interpreter with PyYAML.
+Scopes with `learned_mode: apply` are auto-shaped in-process by the plugin
+itself at session end (default once per 24h per scope; opt out with
+`auto_shape: false`, interval via `auto_shape_interval_hours`). No scheduled
+task is needed. For on-demand diagnostics, run the analyzer or shaper
+directly: `python3 analyze.py`, `python3 scripts/shape-ceiling.py --dry-run`.

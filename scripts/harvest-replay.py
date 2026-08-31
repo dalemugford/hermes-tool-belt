@@ -10,9 +10,9 @@ these alongside live telemetry and weights them differently.
 
 This unlocks two things:
 
-  1. Audit acceleration — open questions about trigger precision/recall and
-     dampener candidates can be answered now instead of after 7-14 days of
-     organic accumulation.
+  1. Trigger tuning without waiting — precision/recall and dampener-candidate
+     questions are answered from the session history already on disk, with no
+     organic accumulation period.
   2. Public-release warm start — on first install, the plugin runs harvest
      against the user's existing sessions so day-one recommendations are
      real, not "wait a week".
@@ -24,7 +24,7 @@ What harvest CAN validate:
 
 What harvest CANNOT validate (counterfactual):
   · Actual token savings (the model historically saw the full toolset)
-  · expand_tools_used round-trip frequency (no narrowing was active)
+  · expansion_provided_access round-trip frequency (no narrowing was active)
   · bypass cohort comparison (no bypass existed)
 
 Privacy invariants (enforced by code, not vibes):
@@ -43,10 +43,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import importlib
 import json
 import os
+import re as _re
 import sys
 import time
 from dataclasses import dataclass
@@ -57,13 +57,16 @@ HERE = Path(__file__).resolve().parent
 PLUGIN_DIR = HERE.parent
 sys.path.insert(0, str(PLUGIN_DIR.parent))
 sys.path.insert(0, str(PLUGIN_DIR))
-sys.path.insert(0, str(PLUGIN_DIR / "tests"))
-import conftest  # noqa: F401 — registers tool_belt_plugin
+sys.path.insert(0, str(HERE))
+from _plugin_loader import load_plugin_package  # noqa: E402
 
-plugin = sys.modules["tool_belt_plugin"]
+load_plugin_package()
+
 predictor = importlib.import_module("tool_belt_plugin.predictor")
 presets_mod = importlib.import_module("tool_belt_plugin.presets")
 logger_io = importlib.import_module("tool_belt_plugin.logger_io")
+savings_mod = importlib.import_module("tool_belt_plugin.savings")
+require_yaml = importlib.import_module("tool_belt_plugin.yaml_required").require_yaml
 
 
 # How far ahead in JSONL order to look for tool calls that "respond" to
@@ -79,6 +82,7 @@ class HarvestedSession:
     profile_agent: str           # "default" or a named profile, derived from path
     platform: str                # from session_meta
     ceiling_tools: list[str]     # tool names visible to the historical model
+    tool_defs: dict[str, Any]    # name -> the COMPLETE session_meta.tools entry
     turns: list[dict[str, Any]]  # ordered list of {role, content, tool_calls?, ts}
 
 
@@ -104,7 +108,11 @@ def parse_session(session_file: Path) -> HarvestedSession | None:
     messages, malformed JSON).
     """
     try:
-        lines = [json.loads(l) for l in session_file.read_text().splitlines() if l.strip()]
+        lines = [
+            json.loads(l)
+            for l in session_file.read_text(encoding="utf-8").splitlines()
+            if l.strip()
+        ]
     except Exception:
         return None
 
@@ -114,6 +122,7 @@ def parse_session(session_file: Path) -> HarvestedSession | None:
 
     raw_tools = meta.get("tools") or []
     ceiling_names: list[str] = []
+    tool_defs: dict[str, Any] = {}
     for entry in raw_tools:
         if not isinstance(entry, dict):
             continue
@@ -125,6 +134,11 @@ def parse_session(session_file: Path) -> HarvestedSession | None:
             name = entry.get("name")
         if isinstance(name, str) and name:
             ceiling_names.append(name)
+            # Preserve the COMPLETE definition — descriptions and JSON-Schema
+            # parameter blocks dominate real schema-token cost, so token counts
+            # must be taken over full defs, never `[{"name": ...}]` placeholders.
+            if name not in tool_defs:
+                tool_defs[name] = entry
 
     turns = [row for row in lines if row.get("role") in ("user", "assistant")]
     if not any(t.get("role") == "user" for t in turns):
@@ -135,11 +149,9 @@ def parse_session(session_file: Path) -> HarvestedSession | None:
         profile_agent=_profile_agent_from_path(session_file),
         platform=str(meta.get("platform") or "unknown"),
         ceiling_tools=ceiling_names,
+        tool_defs=tool_defs,
         turns=turns,
     )
-
-
-import re as _re
 
 
 # Hermes wraps user messages with system-injected framing — quote/reply
@@ -232,7 +244,16 @@ def replay_session(
     # harvest rows from one session linked together for windowed analysis.
     harvest_session_id = f"harvest:{session.session_file.stem}"
     ceiling_count = len(session.ceiling_tools)
-    ceiling_tokens = logger_io.estimate_tokens([{"name": n} for n in session.ceiling_tools])
+
+    def _defs_for(names: list[str]) -> list[Any]:
+        """Full definitions for the given names, in order. Falls back to a
+        name-only stub only for a name with no recorded definition (should not
+        happen for a well-formed session_meta)."""
+        return [session.tool_defs.get(n, {"name": n}) for n in names]
+
+    # Tokenize the COMPLETE tool definitions (name + description + parameter
+    # schema), via the canonical estimator — not `[{"name": ...}]` placeholders.
+    ceiling_tokens = savings_mod.schema_tokens(_defs_for(list(session.ceiling_tools)))
 
     for i, row in enumerate(session.turns):
         if row.get("role") != "user":
@@ -244,27 +265,53 @@ def replay_session(
         prediction = predictor.predict(message, attachments=[], preset=preset)
         prediction_id = logger_io.new_prediction_id()
 
-        # Compute the narrowed view: intersection of predicted-allowed
-        # with the session's ceiling. Unknown-to-policy tools default to
-        # always-on per the live writer's behavior.
-        if prediction.is_wildcard:
+        # Compute the narrowed view: intersection of the resolved active set
+        # with the session's ceiling. Under the 1.0 carrying model an enabled
+        # built-in outside the active set is derived expand_only.
+        if prediction.no_narrowing:
             allowed_names = list(session.ceiling_tools)
-            cut_names: list[str] = []
+            expand_only_names: list[str] = []
         else:
-            allowed_set = set(prediction.allowed_tool_names)  # type: ignore[arg-type]
-            known = _all_known_tool_names(preset)
+            # Full-start contract: an enabled built-in is resident unless the
+            # resolved preset demotes it; the predictor's candidate set adds
+            # trigger activations on top. Only demoted, un-triggered tools
+            # land in expand_only.
+            demoted = set(getattr(preset, "demoted", []) or [])
+            explicit = set(getattr(preset, "always_carry", []) or []) | set(
+                getattr(preset, "carry", []) or []
+            )
+            allowed_set = (
+                (set(session.ceiling_tools) - demoted)
+                | (explicit & set(session.ceiling_tools))
+                | set(prediction.active_tool_names)  # type: ignore[arg-type]
+            )
             allowed_names = []
-            cut_names = []
+            expand_only_names = []
             for name in session.ceiling_tools:
-                if name in allowed_set or name not in known:
+                if name in allowed_set:
                     allowed_names.append(name)
                 else:
-                    cut_names.append(name)
+                    expand_only_names.append(name)
 
-        narrowed_tokens = logger_io.estimate_tokens([{"name": n} for n in allowed_names])
+        narrowed_tokens = savings_mod.schema_tokens(_defs_for(allowed_names))
 
         # Ground truth: tool names the model actually called responding to this msg
         called_tools = _tool_calls_for_response(session.turns, i)
+
+        # v2 residency split over the active set: the preset's immutable
+        # always_carry baseline and adaptive carry loadout classify the
+        # resident tools; ``expand_only_names`` is the expand_only stratum X.
+        ac_base = set(getattr(preset, "always_carry", []) or [])
+        c_base = set(getattr(preset, "carry", []) or [])
+        demoted_base = set(getattr(preset, "demoted", []) or [])
+        always_carry_tools = [t for t in allowed_names if t in ac_base]
+        # Full-start: class C is everything resident that isn't always_carry
+        # and wasn't demoted (a demoted name in `allowed` is a trigger/expansion
+        # activation, not residency) — plus any explicit carry promotion.
+        carry_tools = [
+            t for t in allowed_names
+            if t not in ac_base and (t not in demoted_base or t in c_base)
+        ]
 
         record = logger_io.PredictionRecord(
             ts=harvest_run_ts,
@@ -279,16 +326,19 @@ def replay_session(
             preset=prediction.preset_name,
             triggers_fired=prediction.triggers_fired,
             triggers_suppressed=prediction.triggers_suppressed,
-            always_on_count=prediction.always_on_count,
+            always_carry_count=len(always_carry_tools),
+            carry_count=len(carry_tools),
+            always_carry_tools=always_carry_tools,
+            carry_tools=carry_tools,
             ceiling_count=ceiling_count,
             narrowed_count=len(allowed_names),
             ceiling_tokens=ceiling_tokens,
             narrowed_tokens=narrowed_tokens,
             ceiling_tools=list(session.ceiling_tools),
-            allowed_tools=list(allowed_names),
-            cut_tools=list(cut_names),
+            active_tools=list(allowed_names),
+            expand_only_tools=list(expand_only_names),
             policy_source="harvest",
-            policy_version="harvest-v1",
+            policy_version="harvest-emitter-1",
         )
         out_predictions.append(record.to_dict())
 
@@ -296,6 +346,7 @@ def replay_session(
         # stripped — privacy invariant.
         for tool_name in called_tools:
             out_tool_calls.append({
+                "schema_version": logger_io.SCHEMA_VERSION,
                 "ts": harvest_run_ts,
                 "prediction_id": prediction_id,
                 "session_id": harvest_session_id,
@@ -303,25 +354,13 @@ def replay_session(
                 "agent": session.profile_agent,
                 "platform": session.platform,
                 "scope": scope,
-                "was_initially_available": tool_name in allowed_names,
-                "was_cut": tool_name in cut_names,
+                "was_initially_active": tool_name in allowed_names,
+                "was_expand_only": tool_name in expand_only_names,
                 "policy_source": "harvest",
-                # No expand_tools_used field — counterfactual; analyzer must
-                # not treat absence as False (which the read-side filter
+                # No expansion_provided_access field — counterfactual; analyzer
+                # must not treat absence as False (which the read-side filter
                 # already handles via `is True`).
             })
-
-
-def _all_known_tool_names(preset: Any) -> set[str]:
-    """All tool names mentioned anywhere in the preset (always_on + every
-    trigger group). Mirrors the helper used inside the plugin's
-    _build_api_kwargs filter."""
-    known: set[str] = set()
-    if isinstance(preset.always_on, list):
-        known.update(preset.always_on)
-    for group in preset.triggers:
-        known.update(group.tools)
-    return known
 
 
 def iter_session_files(root_or_profile_dir: Path, window_days: int | None) -> Iterator[Path]:
@@ -340,24 +379,27 @@ def iter_session_files(root_or_profile_dir: Path, window_days: int | None) -> It
 def _load_plugin_config(profile_home: Path) -> dict[str, Any]:
     """Load the tool-belt section from the profile's config.yaml.
 
-    Matters because per-profile ``always_on_extra`` / ``always_off`` /
-    ``channels.*`` overrides change the predictor's narrowing behavior.
-    Running the harvest with the base policy alone over-cuts profiles
-    that have meaningful custom configuration (e.g. a profile's terminal +
-    execute_code + write_file + patch additions).
+    Matters because per-profile plugin settings and ``channels.*`` overrides
+    change the predictor's carrying behavior. Running the harvest with the base
+    policy alone can misclassify profiles with meaningful scope-specific
+    configuration.
 
     Returns a config dict shaped exactly like what the plugin's
     register() builds from ``cfg_get("plugins.tool-belt.*")``, with
     ``enabled: True`` so resolve_preset proceeds. Returns ``{"enabled":
-    True}`` (no overrides) if config.yaml is missing or unreadable —
+    True}`` (no overrides) if the config file is missing or unparseable —
     matches the live fail-safe behavior.
+
+    A missing PyYAML is *not* one of those cases: it would silently drop
+    every per-profile override and replay the wrong policy, so
+    :func:`require_yaml` exits instead.
     """
     config_path = profile_home / "config.yaml"
     if not config_path.is_file():
         return {"enabled": True}
+    yaml = require_yaml()
     try:
-        import yaml  # type: ignore[import-untyped]
-        data = yaml.safe_load(config_path.read_text()) or {}
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except Exception:
         return {"enabled": True}
     plugins = (data.get("plugins") or {}) if isinstance(data.get("plugins"), dict) else {}
@@ -402,10 +444,10 @@ def write_outputs(
     harvest_dir.mkdir(parents=True, exist_ok=True)
     pred_path = harvest_dir / "predictions.jsonl"
     call_path = harvest_dir / "tool_calls.jsonl"
-    with pred_path.open("w") as f:
+    with pred_path.open("w", encoding="utf-8") as f:
         for row in predictions:
             f.write(json.dumps(row) + "\n")
-    with call_path.open("w") as f:
+    with call_path.open("w", encoding="utf-8") as f:
         for row in tool_calls:
             f.write(json.dumps(row) + "\n")
     print(f"  wrote {pred_path} ({len(predictions)} rows)")

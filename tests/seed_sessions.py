@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """Scripted-session seeder — synthetic telemetry for onboarding simulation.
 
-Design: ``docs/TEST_HARNESS.md``.
-
 ``scripts/configure.py`` discovers ``agent:platform`` scopes from the
 telemetry the runtime hooks write during real gateway sessions. Producing
 that telemetry for real needs a live provider, a running gateway, *and* a
-messaging-platform account (``docs/TEST_HARNESS.md`` §1). This module
+messaging-platform account. This module
 replaces only the transport: it runs the **real** policy resolver and the
 **real** predictor over scripted messages — the same two calls
 ``_on_pre_gateway_dispatch`` makes (``__init__.py:1513-1514``) — and writes
@@ -43,8 +41,8 @@ would write, and each is a determinism trade made knowingly:
 * **``provider`` / ``model`` are left blank** — no API call happens, so
   there is nothing honest to record.
 
-Everything else — ``triggers_fired``, ``triggers_suppressed``,
-``always_on_tools``, the narrowed tool set — comes from real policy
+Everything else — ``triggers_fired``, ``triggers_suppressed``, the
+residency split, the narrowed tool set — comes from real policy
 evaluation against ``policy.yaml``, so a policy regression fails the seed
 instead of being papered over by hardcoded fixture values.
 
@@ -122,6 +120,7 @@ class SeedResult:
     sessions: int
     predictions: int
     tool_calls: int
+    sessions_written: int = 0
 
 
 # ────────────────────────────── script loading ───────────────────────────────
@@ -163,7 +162,7 @@ def _hermes_home(home: Path) -> Iterator[None]:
     Non-negotiable for isolation: ``learned.state_dir()``
     (``learned.py:66-67``) falls back to ``~/.hermes``, so a
     ``resolve_preset`` call without this reads the developer's real learned
-    overlay (``docs/TEST_HARNESS.md`` §F.3).
+    overlay.
     """
     previous = os.environ.get("HERMES_HOME")
     os.environ["HERMES_HOME"] = str(home)
@@ -184,18 +183,17 @@ def _hermes_home(home: Path) -> Iterator[None]:
 
 
 def _ceiling_tools(preset: Any) -> list[str]:
-    """A plausible user ceiling: always-on ∪ every trigger's tools ∪ always-off."""
+    """A plausible user ceiling: residents (A ∪ C) ∪ every trigger's tools."""
     out: list[str] = []
-    for tool in list(getattr(preset, "always_on", []) or []):
+    residents = [*(getattr(preset, "always_carry", []) or []),
+                 *(getattr(preset, "carry", []) or [])]
+    for tool in residents:
         if tool not in out:
             out.append(str(tool))
     for group in getattr(preset, "triggers", []) or []:
         for tool in getattr(group, "tools", []) or []:
             if tool not in out:
                 out.append(str(tool))
-    for tool in getattr(preset, "always_off", []) or []:
-        if tool not in out:
-            out.append(str(tool))
     return out
 
 
@@ -245,15 +243,39 @@ def build_prediction_row(
     what makes the harness inherit the production schema — see the module
     docstring.
     """
-    allowed = prediction.allowed_tool_names
-    narrowed = [] if allowed == presets.WILDCARD_ALWAYS_ON else [str(t) for t in allowed]
-    always_on = list(preset.always_on) if isinstance(preset.always_on, list) else []
+    active_names = prediction.active_tool_names
+    narrowed = ([] if active_names == presets.NO_NARROWING
+                else [str(t) for t in active_names])
+    # v2 residency split under the full-start contract: class A is the
+    # preset's always_carry; class C is EVERYTHING else enabled minus the
+    # preset's demotions (fresh scopes have none, so the whole ceiling rides
+    # resident — exactly what the runtime now does). ``unknown_kept``
+    # fixture tools join the ceiling and are therefore carried too.
+    always_carry_tools = list(getattr(preset, "always_carry", []) or [])
+    demoted_tools = set(getattr(preset, "demoted", []) or [])
+    ceiling_full = list(ceiling) + [t for t in unknown_kept if t not in ceiling]
+    carry_tools = [
+        t for t in ceiling_full
+        if t not in always_carry_tools and t not in demoted_tools
+    ]
+    for t in getattr(preset, "carry", []) or []:
+        if t not in carry_tools and t not in always_carry_tools:
+            carry_tools.append(str(t))
+    residents = always_carry_tools + carry_tools
+    # Residents are active every turn; the remainder of the ceiling is X.
+    active = sorted(set(narrowed) | set(residents))
+    active_set = set(active)
+    expand_only = [t for t in ceiling_full if t not in active_set]
     fired = set(prediction.triggers_fired)
     trigger_tools = {
         str(g.name): [str(t) for t in (g.tools or [])]
         for g in (getattr(preset, "triggers", []) or [])
         if str(g.name) in fired
     }
+    expand_only_set = set(expand_only)
+    trigger_activated = sorted(
+        t for tools in trigger_tools.values() for t in tools if t in expand_only_set
+    )
     session_uid = _session_uid(script_name, session_index)
 
     record = logger_io.PredictionRecord(
@@ -270,19 +292,21 @@ def build_prediction_row(
         preset=prediction.preset_name,
         triggers_fired=list(prediction.triggers_fired),
         triggers_suppressed=list(prediction.triggers_suppressed),
-        always_on_count=prediction.always_on_count,
-        always_on_tools=always_on,
-        ceiling_count=len(ceiling),
+        always_carry_count=len(always_carry_tools),
+        carry_count=len(carry_tools),
+        always_carry_tools=always_carry_tools,
+        carry_tools=carry_tools,
+        ceiling_count=len(ceiling_full),
         narrowed_count=len(narrowed),
         ceiling_tokens=SEEDED_CEILING_TOKENS,
         narrowed_tokens=SEEDED_NARROWED_TOKENS,
         tokens_estimator=SEEDED_TOKENS_ESTIMATOR,
-        ceiling_tools=list(ceiling),
-        allowed_tools=narrowed,
-        cut_tools=[t for t in ceiling if t not in set(narrowed)],
-        unknown_kept_tools=list(unknown_kept),
+        ceiling_tools=list(ceiling_full),
+        active_tools=active,
+        expand_only_tools=expand_only,
         mcp_passthrough_tools=[],
         trigger_tools_by_group=trigger_tools,
+        trigger_activated_tools=trigger_activated,
         expanded_tools=list(expanded_tools),
         policy_source=str(getattr(preset, "policy_source", "preset")),
         policy_version=str(getattr(preset, "policy_version", "")),
@@ -294,6 +318,98 @@ def build_prediction_row(
         ).hexdigest()[:16],
     )
     return record.to_dict()
+
+
+def _full_tool_def(name: str) -> dict[str, Any]:
+    """A COMPLETE OpenAI-shape tool definition (description + parameters).
+
+    The Phase 7B savings engine tokenizes the recorded definition verbatim;
+    names-only placeholders cannot back a release-quality projection.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": (
+                f"The {name} tool. It performs the {name} operation against the "
+                f"user's environment and returns a structured result describing "
+                f"what changed, including any diagnostics the caller may need."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": f"What {name} acts on."},
+                    "options": {
+                        "type": "object",
+                        "description": "Free-form options bag.",
+                        "properties": {
+                            "verbose": {"type": "boolean", "description": "Chatty output."},
+                            "dry_run": {"type": "boolean", "description": "Preview only."},
+                        },
+                    },
+                },
+                "required": ["target"],
+            },
+        },
+    }
+
+
+def write_session_jsonl(
+    hermes_home: str | Path,
+    *,
+    agent: str,
+    platform: str,
+    scope: str,
+    script_name: str,
+    sessions: int,
+    turns: Sequence[dict[str, Any]],
+    ceiling: Sequence[str],
+    session_uid_for,
+) -> int:
+    """Write one ``sessions/<uuid>.jsonl`` per seeded session, schemas complete.
+
+    The Phase 8 savings preview replays these files through the canonical
+    engine, so each file carries a ``session_meta`` row with the FULL tool
+    definitions for the scope's ceiling plus the user turns in order. Returns
+    the number of session files written.
+    """
+    home = Path(hermes_home)
+    sessions_dir = home / "sessions"
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    tool_defs = [_full_tool_def(t) for t in ceiling]
+    written = 0
+    for i in range(sessions):
+        uid = session_uid_for(script_name, i)
+        rows: list[dict[str, Any]] = [
+            {
+                "role": "session_meta",
+                "platform": platform,
+                "model": "seeded-model",
+                "provider": "seeded",
+                "api_mode": "seeded",
+                "hermes_session_id": uid,
+                "scope": scope,
+                "tools": tool_defs,
+            }
+        ]
+        for t, turn in enumerate(turns):
+            rows.append({"role": "user", "content": str(turn.get("user") or "")})
+            for call in _normalize_calls(turn.get("calls")):
+                for _ in range(call["count"]):
+                    rows.append({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {"function": {"name": call["tool"]}}
+                        ],
+                    })
+        path = sessions_dir / f"{uid}.jsonl"
+        path.write_text(
+            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows),
+            encoding="utf-8",
+        )
+        written += 1
+    return written
 
 
 def build_tool_call_row(
@@ -309,10 +425,11 @@ def build_tool_call_row(
 ) -> dict[str, Any]:
     """Build one ``tool_calls.jsonl`` row shaped like ``_on_post_tool_call``.
 
-    ``was_expanded`` / ``expand_tools_used`` are the two flags the shaper
-    accepts as promote evidence (``shape-ceiling.py:286-291``).
+    ``activated_by_expansion`` / ``expansion_provided_access`` are the two v2
+    flags the shaper accepts as promote evidence (``shape-ceiling.py:286-291``).
     """
     row: dict[str, Any] = {
+        "schema_version": logger_io.SCHEMA_VERSION,
         "ts": ts,
         "prediction_id": prediction_id,
         "session_id": session_id,
@@ -321,12 +438,13 @@ def build_tool_call_row(
         "platform": platform,
         "scope": scope,
         "source": "gateway",
-        "was_initially_available": not expanded,
-        "was_cut": expanded,
-        "was_expanded": expanded,
+        "was_initially_active": not expanded,
+        "was_expand_only": expanded,
+        "activated_by_expansion": expanded,
+        "activation_source": "expansion" if expanded else "carry",
     }
     if expanded:
-        row["expand_tools_used"] = True
+        row["expansion_provided_access"] = True
         row["expand_category"] = ""
         row["expanded_tool"] = tool_name
         row["turns_until_used"] = 0
@@ -382,11 +500,11 @@ def seed(
 
     with _hermes_home(hermes_home):
         # Load the base policy once so a broken policy.yaml surfaces here and
-        # not as a confusing per-turn wildcard fallback.
+        # not as a confusing per-turn no-narrowing fallback.
         base = presets.load_base_policy()
-        if base.is_wildcard:
+        if base.no_narrowing:
             raise ScriptMismatch(
-                "policy.yaml did not load — the predictor would fall back to wildcard"
+                "policy.yaml did not load — the predictor would fall back to no-narrowing"
             )
         # resolve_preset is constant for a (plugin_config, scope) pair; hoisting
         # it out of the turn loop removes most of the per-turn cost.
@@ -443,6 +561,17 @@ def seed(
 
     _append_jsonl(state_dir / "predictions.jsonl", pred_rows)
     _append_jsonl(state_dir / "tool_calls.jsonl", call_rows)
+    sessions_written = write_session_jsonl(
+        hermes_home,
+        agent=agent,
+        platform=platform,
+        scope=scope,
+        script_name=name,
+        sessions=sessions,
+        turns=turns,
+        ceiling=ceiling,
+        session_uid_for=_session_uid,
+    )
 
     return SeedResult(
         name=name,
@@ -452,6 +581,7 @@ def seed(
         sessions=sessions,
         predictions=len(pred_rows),
         tool_calls=len(call_rows),
+        sessions_written=sessions_written,
     )
 
 

@@ -10,15 +10,16 @@ What this validates (mechanical, not behavioral):
   Cache-off block:
     · session_id populated on every prediction row
     · bypass cohort distribution matches configured bypass_rate
-    · expand_tools_used NEVER credited when was_initially_available
+    · expansion_provided_access NEVER credited when was_initially_active
     · Sticky residency carries within session, evicts on session_end
     · Cross-session isolation: expansion doesn't leak across sessions
   Cache-on block:
     · First dispatch under cache-on freezes the tool set
     · Subsequent dispatches reuse the frozen snapshot (frozen_reuse=true)
     · expand_tools mid-session propagates to the frozen snapshot
-    · on_session_end does NOT evict the freeze (per-turn hook)
-    · on_session_reset DOES evict the freeze (true reset)
+    · on_session_end does NOT evict the freeze, sticky, or lookback
+      (per-turn hook — session-scoped state must survive it)
+    · on_session_reset DOES evict freeze + sticky + lookback (true reset)
     · Cache-mode detection captures per-call telemetry
 
 What this does NOT validate:
@@ -40,10 +41,10 @@ import json
 import os
 import sys
 import tempfile
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
 from unittest import mock
 
 HERE = Path(__file__).resolve().parent
@@ -51,22 +52,23 @@ PLUGIN_DIR = HERE.parent
 sys.path.insert(0, str(PLUGIN_DIR.parent))
 sys.path.insert(0, str(PLUGIN_DIR))
 
-# The conftest under tests/ registers the package alias the plugin uses
-# internally. Reuse it so this script and the unit tests load the
-# plugin the same way.
-sys.path.insert(0, str(PLUGIN_DIR / "tests"))
-import conftest  # noqa: F401 — side-effect: register tool_belt_plugin
+# The shared loader registers the package alias the plugin uses internally,
+# so this script, the other scripts, and the unit tests all load the plugin
+# the same way.
+sys.path.insert(0, str(HERE))
+from _plugin_loader import load_plugin_package  # noqa: E402
 
-plugin = sys.modules["tool_belt_plugin"]
+plugin = load_plugin_package()
 logger_io = importlib.import_module("tool_belt_plugin.logger_io")
 
 
 # Minimal but realistic-shaped Hermes tools payload. Each entry is the
 # Anthropic-format dict the plugin sees in kwargs["tools"]. Names cover
-# every category referenced by policy.yaml plus a few "unknown" tools
-# to exercise the unknown_kept path.
+# the trigger categories the scenarios exercise (file, shell, browser,
+# delegation, code execution) plus a few unlisted enabled tools to exercise
+# their derived expand-only path.
 SYNTHETIC_TOOLS = [
-    # Always-on per policy
+    # always_carry / carry per policy
     {"name": "session_search", "description": "x", "input_schema": {}},
     {"name": "mnemosyne_remember", "description": "x", "input_schema": {}},
     {"name": "mnemosyne_recall", "description": "x", "input_schema": {}},
@@ -87,7 +89,7 @@ SYNTHETIC_TOOLS = [
     {"name": "browser_click", "description": "x", "input_schema": {}},
     {"name": "delegate_task", "description": "x", "input_schema": {}},
     {"name": "execute_code", "description": "x", "input_schema": {}},
-    # Unknown to the policy — exercises the safe-default kept path
+    # Unknown to the policy — exercises the derived expand-only path
     {"name": "custom_unknown_tool", "description": "x", "input_schema": {}},
 ]
 
@@ -125,13 +127,13 @@ TARGETED_SCENARIOS: list[Scenario] = [
     ]),
 
     # 3. Already-available tool + sticky context — must NOT be credited
-    #    as expansion-driven. This is the item #1 bug guard.
+    #    as expansion-driven. This guards the expansion-attribution invariant.
     Scenario("already-available-001", turns=[
-        # terminal is in policy always_on? no — only via shell trigger.
-        # But we'll simulate the case where it ends up in initial_allowed.
+        # terminal is not carried by policy — it activates via the shell trigger.
+        # Simulate a case where it is already in the initial active set.
         # Use write_file: it's trigger-gated, fires on "save". Then we
         # call expand_tools(file) which re-adds the same tool. The
-        # post_tool_call for write_file must NOT show expand_tools_used.
+        # post_tool_call for write_file must NOT show expansion_provided_access.
         ("save these notes please", [
             "write_file",                # initially available via trigger
             "expand_tools(file)",        # redundant expansion
@@ -164,7 +166,7 @@ TARGETED_SCENARIOS: list[Scenario] = [
 ]
 
 # Bulk filler for bypass-cohort distribution. With bypass_rate=0.05 on
-# a 100-session sample, expect ~5 (Poisson 95% CI: 1-10).
+# a 100-session sample, expect ~5; the assertion accepts 1-15.
 FILLER_SCENARIOS: list[Scenario] = [
     Scenario(f"filler-{i:03d}", turns=[(f"message number {i}", [])])
     for i in range(100)
@@ -306,11 +308,12 @@ class Check:
         return 0 if passed == total else 1
 
 
-def run_assertions(state_dir: Path, check: Check) -> None:
+def run_cache_off_assertions(state_dir: Path, check: Check) -> None:
+    """Cache-off path assertions: sticky carries, expansion attribution, etc."""
     preds = [json.loads(l) for l in (state_dir / "predictions.jsonl").read_text().splitlines() if l]
     calls = [json.loads(l) for l in (state_dir / "tool_calls.jsonl").read_text().splitlines() if l]
 
-    # ─── #3: session_id populated on every prediction row ───
+    # ─── session_id populated on every prediction row ───
     blank_sids = [p for p in preds if not p.get("session_id")]
     check.assert_(not blank_sids,
         f"session_id populated on all prediction rows (blank: {len(blank_sids)}/{len(preds)})")
@@ -320,56 +323,65 @@ def run_assertions(state_dir: Path, check: Check) -> None:
     check.assert_(not blank_call_sids,
         f"session_id populated on all tool_call rows (blank: {len(blank_call_sids)}/{len(calls)})")
 
-    # ─── #4: bypass cohort distribution ───
+    # ─── bypass cohort distribution ───
     # We ran 100+ sessions with bypass_rate=0.05. Each session is in or out
-    # deterministically by hash; expect ~5 bypass sessions, range 1-12.
+    # deterministically by hash; expect ~5 bypass sessions, accepted range 1-15.
     sessions_in_bypass = {p["session_id"] for p in preds if p.get("policy_source") == "bypass"}
     total_sessions = {p["session_id"] for p in preds if p.get("session_id")}
     bypass_rate_observed = len(sessions_in_bypass) / max(1, len(total_sessions))
-    check.assert_(0.5 <= len(sessions_in_bypass) <= 15,
+    check.assert_(1 <= len(sessions_in_bypass) <= 15,
         f"bypass cohort within expected range "
         f"(observed: {len(sessions_in_bypass)} sessions / {len(total_sessions)} "
         f"= {bypass_rate_observed:.1%}, target ~5%)")
 
-    # ─── #1: expand_tools_used NEVER True when was_initially_available ───
+    # ─── expansion_provided_access NEVER True when was_initially_active ───
     spurious = [c for c in calls
-                if c.get("expand_tools_used") is True
-                and c.get("was_initially_available") is True]
+                if c.get("expansion_provided_access") is True
+                and c.get("was_initially_active") is True]
     check.assert_(not spurious,
-        f"expand_tools_used never credited when was_initially_available "
+        f"expansion_provided_access never credited when was_initially_active "
         f"(spurious: {len(spurious)})")
 
-    # ─── #1 sanity: legitimate expansion IS credited ───
+    # ─── attribution sanity: legitimate expansion IS credited ───
     legit = [c for c in calls
-             if c.get("expand_tools_used") is True
-             and c.get("was_initially_available") is False
+             if c.get("expansion_provided_access") is True
+             and c.get("was_initially_active") is False
              and c.get("tool_name") == "browser_navigate"]
     check.assert_(legit,
         f"legitimate post-expand calls ARE credited "
         f"(found {len(legit)} browser_navigate expansion-driven calls)")
 
     # ─── Cross-session isolation ───
-    # The "victim" session must have zero expand_tools_used flags despite
+    # The "victim" session must have zero expansion_provided_access flags despite
     # the prior session having expanded browser on the same scope.
     victim_calls = [c for c in calls if c.get("session_id", "").endswith("isolation-2-victim")]
-    victim_expanded = [c for c in victim_calls if c.get("expand_tools_used") is True]
+    victim_expanded = [c for c in victim_calls if c.get("expansion_provided_access") is True]
     check.assert_(not victim_expanded,
         f"sticky residency does not leak across sessions "
         f"(victim session expansion credits: {len(victim_expanded)})")
 
-    # ─── Session_end eviction ───
-    # After all scenarios completed, _STICKY_BY_KEY must be empty (every
-    # session called on_session_end).
-    remaining_sticky = list(plugin._STICKY_BY_KEY.keys())
-    check.assert_(not remaining_sticky,
-        f"on_session_end fully evicts sticky state "
-        f"(remaining sticky_keys: {len(remaining_sticky)})")
-
-    # ─── prior_messages also evicted ───
-    remaining_lookback = list(plugin._PRIOR_MESSAGES_BY_SESSION.keys())
-    check.assert_(not remaining_lookback,
-        f"on_session_end evicts lookback prior-message buffer "
-        f"(remaining session entries: {len(remaining_lookback)})")
+    # ─── Session lifecycle (M2 contract) ───
+    # on_session_end fires PER TURN, so session-scoped sticky residency and
+    # lookback history must SURVIVE it (evicting them per turn defeated both
+    # features); only on_session_reset clears them. Sticky additionally
+    # self-decays on its TTL. Prove both halves on a fresh probe session.
+    probe = _canonical_key("reset-probe", "telegram")
+    probe_sticky = plugin._sticky_key_for_session(probe)
+    plugin._STICKY_BY_KEY[probe_sticky] = {
+        "browser": {"tools": {"browser_navigate"}, "remaining_turns": 3}}
+    plugin._PRIOR_MESSAGES_BY_SESSION[probe] = ["remember me"]
+    with mock.patch.dict(os.environ, {"HERMES_SESSION_KEY": probe}, clear=False):
+        plugin._on_session_end(session_id=probe)
+    check.assert_(
+        probe_sticky in plugin._STICKY_BY_KEY
+        and probe in plugin._PRIOR_MESSAGES_BY_SESSION,
+        "on_session_end LEAVES session-scoped sticky/lookback (per-turn hook)")
+    plugin._on_session_reset(session_id="reset-probe-new-uuid",
+                             platform="telegram", session_key=probe)
+    check.assert_(probe_sticky not in plugin._STICKY_BY_KEY,
+        "on_session_reset evicts sticky residency")
+    check.assert_(probe not in plugin._PRIOR_MESSAGES_BY_SESSION,
+        "on_session_reset evicts lookback prior-message buffer")
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -400,19 +412,9 @@ CACHE_ON_SCENARIOS: list[Scenario] = [
 ]
 
 
-def run_cache_off_assertions(state_dir: Path, check: Check) -> None:
-    """Cache-off path assertions: sticky carries, expansion attribution, etc."""
-    run_assertions(state_dir, check)
-
-
 def run_cache_on_assertions(state_dir: Path, check: Check) -> None:
     """Cache-on path assertions: freeze, reuse, expansion propagation."""
     preds = [json.loads(l) for l in (state_dir / "predictions.jsonl").read_text().splitlines() if l]
-    api_calls_path = state_dir / "api_calls.jsonl"
-    api_calls = (
-        [json.loads(l) for l in api_calls_path.read_text().splitlines() if l]
-        if api_calls_path.exists() else []
-    )
 
     # ─── Freeze on first dispatch ───
     first_dispatches = [p for p in preds if p.get("frozen_reuse") is False]
@@ -442,10 +444,10 @@ def run_cache_on_assertions(state_dir: Path, check: Check) -> None:
     # ─── Tool list hash stable across turns in same session ───
     # Within a session, all reuse rows should share the same tool_list_hash
     # as the corresponding first dispatch (or its post-expansion variant).
-    for sid, plist in {
-        p["session_id"]: [pp for pp in preds if pp["session_id"] == p["session_id"]]
-        for p in preds
-    }.items():
+    preds_by_session: dict[str, list[dict]] = defaultdict(list)
+    for p in preds:
+        preds_by_session[p["session_id"]].append(p)
+    for sid, plist in preds_by_session.items():
         hashes = {pp.get("tool_list_hash", "") for pp in plist if pp.get("tool_list_hash")}
         # Multi-turn no-expand scenarios should have exactly 1 hash.
         # The expand scenario can grow to 2 (pre/post expansion).
@@ -484,15 +486,37 @@ def _reset_plugin_state() -> None:
     plugin._CACHE_MODE_BY_SESSION.clear()
 
 
+# Tools the smoke scenarios treat as expand_only. Under the full-start
+# contract a scope with no learned state carries EVERYTHING enabled, so the
+# expand_tools recovery path would never fire and the expansion-credit
+# assertions would have nothing to bite on. Seeding these demotions makes the
+# temp homes look like an evidence-shaped install — which is exactly the state
+# in which expansion crediting matters.
+SMOKE_DEMOTED = ["browser_navigate", "browser_click", "custom_unknown_tool"]
+
+
+def _seed_demoted(state_dir: Path) -> None:
+    """Write a learned.json demoting SMOKE_DEMOTED for the telegram platform
+    scope (matches assistant-a:telegram via the platform fallback)."""
+    (state_dir / "learned.json").write_text(json.dumps({
+        "version": 2,
+        "scopes": {"telegram": {
+            "carry": [], "expand_only": list(SMOKE_DEMOTED), "shaping": {},
+        }},
+    }, indent=2) + "\n", encoding="utf-8")
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         original_config = dict(plugin._CONFIG)
         off_home = Path(tmp) / "off" / "profiles" / "assistant-a"
         off_state = off_home / "state" / "tool-belt"
         off_state.mkdir(parents=True, exist_ok=True)
+        _seed_demoted(off_state)
         on_home = Path(tmp) / "on" / "profiles" / "assistant-a"
         on_state = on_home / "state" / "tool-belt"
         on_state.mkdir(parents=True, exist_ok=True)
+        _seed_demoted(on_state)
 
         try:
             # ──────── Block 1: cache-off (per-turn pipeline) ────────
@@ -503,7 +527,7 @@ def main() -> int:
                 "log": True,
                 "agent": "assistant-a",
                 "bypass_rate": 0.05,
-                "cache_mode": "off",  # exercise the legacy per-turn path
+                "cache_mode": "off",  # exercise the cache-off per-turn path
                 "channels": {},
                 "cache_off": {
                     "sticky": {"enabled": True, "ttl_turns": 3, "categories": ["*"]},
@@ -524,7 +548,7 @@ def main() -> int:
             # ──────── Block 2: cache-on (session-boundary freeze) ────────
             _reset_plugin_state()
             plugin._CONFIG["cache_mode"] = "on"
-            plugin._CONFIG["bypass_rate"] = 0.0  # bypass would freeze WILDCARD; not what we test here
+            plugin._CONFIG["bypass_rate"] = 0.0  # bypass would freeze the no-narrowing sentinel; not what we test here
 
             print(f"\n[cache-on] Running {len(CACHE_ON_SCENARIOS)} multi-turn scenarios in {on_state}...")
             for sc in CACHE_ON_SCENARIOS:

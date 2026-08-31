@@ -94,7 +94,7 @@ canonical session key (`agent:main:<platform>:...`) on every path — it
 passes the new post-rotation session UUID and the platform string. The
 freeze is keyed by the canonical key, so Tool Belt recovers it from a
 per-platform last-writer-wins back-reference (`_LAST_CANONICAL_BY_PLATFORM`,
-populated in `_on_pre_gateway_dispatch`; see `__init__.py:2255-2266`).
+populated in `_on_pre_gateway_dispatch` — see `_on_session_reset` in `__init__.py`).
 When several chats share one platform, that single back-reference points
 at whichever chat dispatched most recently, so a `/new` in a different
 chat evicts the wrong canonical key.

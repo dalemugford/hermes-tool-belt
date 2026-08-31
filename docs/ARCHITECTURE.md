@@ -205,9 +205,13 @@ call when it wants a tool group that wasn't loaded. The schema is:
       "category": {
         "type": "string",
         "description": "browser, image_gen, tts, vision, cronjob, delegation, code_execution, terminal, file, web, skills, homeassistant, ..."
+      },
+      "tool": {
+        "type": "string",
+        "description": "a specific tool name; the handler finds its category"
       }
     },
-    "required": ["category"]
+    "required": []
   }
 }
 ```
@@ -240,14 +244,40 @@ Promote evidence:
 - A tool call tagged `was_expanded: true` (the in-turn expansion path) or
   `expand_tools_used: true` (the sticky-carry path) is direct evidence
   the model reached for a tool that wasn't initially available.
-- A tool is promoted when it appears across `promote_min_sessions`
-  distinct sessions **and** receives `promote_min_calls` total calls
-  within the window.
+- A tool is promoted when it clears the anti-flap gates
+  (`promote_min_sessions` distinct sessions **and** `promote_min_calls`
+  total calls) **and** the economics favor carrying: the observed
+  expansion spend (`calls × 1500` tokens) exceeds what carrying the tool
+  would have cost over the same window.
 
-Demote evidence:
+Demote evidence — the economic test (token-denominated by design; the
+decision never consults a price table, because fewer tokens is always
+cheaper on every route):
 
-- A tool that appears in `always_on_tools` across the window but is
-  never actually called.
+`expand_tools` is sticky — expand once and the tool rides carried for the
+rest of the session — so a session *with* use costs about the same either
+way, plus one round-trip. Demotion only saves in sessions *without* use:
+
+```
+saving  = schema_size(tool) × billable exposures in sessions WITHOUT use
+penalty = 1500 × sessions WITH use        (one expand_tools round-trip each)
+demote when saving > demote_k × penalty
+promote when penalty > saving             (after the anti-flap gates)
+```
+
+- Per-tool schema sizes come from the `schema_sizes.json` sidecar
+  (snapshotted in-process, since only the live gateway sees real tool
+  definitions); unmeasured tools fall back to a 388-token average.
+- Billable exposures depend on the scope's locked prompt-cache mode:
+  cache **off** pays the manifest on every API call (counted per
+  prediction from `api_calls.jsonl`, min 1), cache **on** (or unknown)
+  roughly once per session — the conservative read.
+- Trigger-activated uses don't defend a carry slot: they stay free for a
+  demoted tool.
+- A tool with zero uses is the limit case (`demote_tokens = 0`) — it
+  always demotes, which is the old binary rule.
+- Between the demote and promote thresholds is a hysteresis band where a
+  tool holds its current class, so assignments don't flap.
 - Demotion fires only when the window contains at least
   `demote_min_sessions_no_use` sessions, so capability isn't pulled on
   thin evidence.
@@ -257,21 +287,22 @@ Defaults are inherited from `policy.yaml` under `learning.shape_ceiling`:
 ```yaml
 learning:
   shape_ceiling:
-    session_window: 20
+    session_window: 100
     promote_min_sessions: 2
     promote_min_calls: 3
     demote_min_sessions_no_use: 20
+    demote_k: 1.5
 ```
 
 CLI flags override per-run. Output is merged into
-`~/.hermes/state/tool-belt/learned.json` under
-`scopes[].cache_aware`, with `promote` mirrored to `scopes[].always_on`
-and `demote` to `scopes[].always_off` so the existing
-`apply_to_preset` reader picks them up.
+`~/.hermes/state/tool-belt/learned.json` as schema v2: promotions land in
+`scopes[].carry`, demotions in `scopes[].expand_only`, and the shaper's
+rationale (counts, economics, timestamps) in `scopes[].shaping`.
 
-The shaper writes recommendations to `learned.json`, but the runtime does
-not merge them under the default `learned_mode: recommend`. To activate
-them, set `learned_mode: apply` on the scope.
+The shaper writes assignments to `learned.json`, and under the default
+`learned_mode: apply` the runtime merges them into the preset on every
+dispatch. `learned_mode: recommend` is the opt-out observe mode: the
+overlay is kept on disk but not applied.
 
 ## Patch surface in the request lifecycle
 
@@ -356,12 +387,19 @@ never widen past it.
 ├── tool_calls.jsonl               # one row per tool call, linked by prediction_id
 ├── api_calls.jsonl                # one row per outbound API call, with cache + hash data
 ├── cache_mode_detection.json      # per-scope locked mode (cross-session)
-└── learned.json                   # promote / demote recommendations from the shaper
+├── schema_sizes.json              # measured per-tool schema token sizes
+├── auto_shape_stamp.json          # per-scope auto-shape debounce stamps
+├── inventory.json                 # tool-absence tracking (reconciliation grace)
+├── configure-state.json           # configure's pre-observation bypass memo
+├── learned_recommendations.json   # analyzer's reviewable recommendation report
+├── harvest/                       # session-history replay artifacts
+└── learned.json                   # the learned carrying assignment (v2)
 ```
 
 The plugin never writes `learned.json` from the prediction path. Writes
-come from the analyzer or the shaper script — an intentional boundary
-that keeps adaptive changes reviewable.
+come from the in-process auto-shape pass (session end, debounced), the
+shaper, and the configure flows — every one routed through
+`learned.write_state`.
 
 ## Failure modes
 

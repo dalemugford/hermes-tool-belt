@@ -3,9 +3,10 @@
 # code_execution trigger. Twenty sessions of `expand_tools` evidence puts it
 # well over promote_min_sessions (2) and promote_min_calls (3).
 #
-# Nothing here drives demotion: every tool in `always_on_tools` comes from
-# policy.yaml's always_on list, and `analyze.effective_protected_always_on`
-# shields all of those. See chat-heavy.yaml for the demote arm.
+# The promote arm's focus is `execute_code`; this fixture does not assert a
+# demote set. (Under the 1.0 model any `carry` resident left unused across the
+# window would also demote to expand_only — always_carry is never a candidate.)
+# See chat-heavy.yaml for the demote arm.
 name: terminal-heavy
 agent: testagent
 platform: telegram

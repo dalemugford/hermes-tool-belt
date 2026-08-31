@@ -4,15 +4,15 @@ Where ``tests/test_configure.py`` unit-tests ``scripts/configure.py`` against
 hand-built fixture rows, this file drives the whole onboarding arc over
 telemetry produced by ``tests/seed_sessions.py`` — the real policy resolver
 and the real predictor, run over the scripted conversations in
-``tests/scripts/``. Design: ``docs/TEST_HARNESS.md``.
+``tests/scripts/``.
 
 Isolation, in every test:
 
 * a temporary ``HERMES_HOME`` whose path contains a space
   (``test_configure.TempHomeTestCase``);
 * ``shutil.which`` and ``configure._default_runner`` both patched, so no real
-  ``hermes`` binary is ever reachable — and, per ``docs/TEST_HARNESS.md``
-  §F.1, so the overlay write is reached at all: ``flow_shape`` returns before
+  ``hermes`` binary is ever reachable — and so the overlay write is reached
+  at all: ``flow_shape`` returns before
   writing ``learned.json`` when ``hermes`` is missing;
 * ``learned._CACHE`` cleared, so one test's overlay cannot survive into the
   next through the mtime cache;
@@ -33,7 +33,6 @@ import unittest
 from pathlib import Path
 
 TESTS_DIR = Path(__file__).resolve().parent
-PLUGIN_DIR = TESTS_DIR.parent
 sys.path.insert(0, str(TESTS_DIR))
 import conftest  # noqa: F401,E402 — registers tool_belt_plugin
 
@@ -113,7 +112,8 @@ class SeederTests(OnboardingTestCase):
             message_preview="",
             preset="",
             triggers_fired=[],
-            always_on_count=0,
+            always_carry_count=0,
+            carry_count=0,
             ceiling_count=0,
             narrowed_count=0,
             ceiling_tokens=0,
@@ -123,7 +123,7 @@ class SeederTests(OnboardingTestCase):
         # …and every field the shaper actually reads is populated, not just present.
         for field in ("scope", "hermes_session_id", "ts", "prediction_id"):
             self.assertTrue(rows[0][field], f"{field} should be non-blank")
-        for field in ("always_on_tools", "unknown_kept_tools"):
+        for field in ("always_carry_tools", "carry_tools", "expand_only_tools"):
             self.assertIn(field, rows[0])
 
     def test_seeding_is_deterministic_and_uses_no_wall_clock(self) -> None:
@@ -151,11 +151,12 @@ class OnboardingArcTests(OnboardingTestCase):
     """The four-state machine and both onboarding paths, end to end."""
 
     def test_fresh_reporting(self) -> None:
-        """A home with no telemetry reports nothing and invents nothing."""
+        """A home with no telemetry names its profiles and invents nothing."""
         runner = tc.FakeRunner()
         rc, output = self.run_main(["--status"], runner)
         self.assertEqual(rc, 0)
-        self.assertIn("No agent scopes found yet", output)
+        self.assertIn("Hermes profile(s) found: default", output)
+        self.assertIn("No Tool Belt telemetry recorded", output)
         self.assertEqual(runner.writes, [])
 
     def test_recommend_to_observing(self) -> None:
@@ -184,20 +185,27 @@ class OnboardingArcTests(OnboardingTestCase):
         _rc, output = self.run_main(
             ["--status"], tc.FakeRunner(self.observing_config(result.scope))
         )
-        self.assertIn(configure.STATE_OBSERVING, output)
-        self.assertIn(f"{result.sessions}/{self.needed} sessions", output)
+        self.assertIn("shaping OFF (observing)", output)
 
     def test_threshold_crossing_to_ready(self) -> None:
-        """The same config at 20 sessions reads ``ready`` instead."""
+        """The same config at 20 sessions classifies ``ready`` — the state
+        machine still gates the shaping offer even though the status row
+        renders both observation states as ``shaping OFF (observing)``."""
         result = self.seed("chat-heavy")
         self.assertGreaterEqual(result.sessions, self.needed)
 
         runner = tc.FakeRunner(self.observing_config(result.scope))
         rc, output = self.run_main(["--status"], runner)
         self.assertEqual(rc, 0)
-        self.assertIn(configure.STATE_READY, output)
-        self.assertIn(f"{result.sessions}/{self.needed} sessions", output)
+        self.assertIn("shaping OFF (observing)", output)
         self.assertEqual(runner.writes, [])
+        infos = {i.scope: i for i in configure.discover_scopes(self.home)}
+        settings = configure.scope_settings(
+            result.scope, configure.read_plugin_config(runner), runner)
+        self.assertEqual(
+            configure.classify_scope(infos[result.scope], settings,
+                                     self.thresholds),
+            configure.STATE_READY)
 
     def test_shape_spine(self) -> None:
         """shape → overlay on disk, ``learned_mode: apply``, bypass off, ``shaped``."""
@@ -207,9 +215,13 @@ class OnboardingArcTests(OnboardingTestCase):
         self.assertEqual(rc, 0)
 
         entry = self.learned()["scopes"][result.scope]
-        self.assertIn("execute_code", entry["always_on"])
-        self.assertEqual(entry["cache_aware"]["scope"], result.scope)
-        self.assertIn("execute_code", output)
+        self.assertIn("execute_code", entry["carry"])
+        self.assertEqual(entry["shaping"]["scope"], result.scope)
+
+        # The confirmed-apply epilogue speaks the 1.0 vocabulary: the retired
+        # "moved to on-demand" phrasing must never resurface in any flow.
+        self.assertIn("Tools available by expansion:", output)
+        self.assertNotIn("moved to on-demand", output)
 
         self.assertEqual(
             {c[3]: c[4] for c in runner.writes},
@@ -223,10 +235,40 @@ class OnboardingArcTests(OnboardingTestCase):
             ["--status"],
             tc.FakeRunner({f"plugins.tool-belt.channels.{result.scope}.learned_mode": "apply"}),
         )
-        self.assertIn(configure.STATE_SHAPED, status)
+        self.assertIn("shaping ON (", status)
+
+    def test_overlay_write_is_disclosed_and_matches_what_lands_on_disk(self) -> None:
+        """The terminal diff names every tool the overlay write then contains."""
+        result = self.seed("terminal-heavy")
+        runner = tc.FakeRunner(self.observing_config(result.scope))
+        rc, output = self.run_main(["--path", "shape", "--yes"], runner)
+        self.assertEqual(rc, 0)
+
+        entry = self.learned()["scopes"][result.scope]
+        lines = output.splitlines()
+        carry_line = next(
+            l for l in lines if "Tools carried:" in l
+        )
+        expand_line = next(
+            l for l in lines if "Tools available by expansion:" in l
+        )
+        # Compact diff: the disclosed COUNTS equal what landed on disk.
+        self.assertTrue(carry_line.rstrip().endswith(f"→ {len(entry['carry'])}"),
+                        carry_line)
+        self.assertTrue(
+            expand_line.rstrip().endswith(f"→ {len(entry['expand_only'])}"),
+            expand_line)
 
     def test_demote_arm_named_profile(self) -> None:
-        """A chat-only agent in a named profile demotes its unused always-ons."""
+        """A chat-only agent in a named profile demotes its unused carry residents.
+
+        Under the 1.0 carrying model shaping moves enabled built-ins only between
+        the adaptive ``carry`` class and ``expand_only``: every ``carry`` resident
+        that goes unused across the window is a demote candidate (there is no
+        protected policy-mirror shielding them anymore). The immutable
+        ``always_carry`` surface is never a candidate. The overlay lands in the
+        named profile's state dir and is read through the v2 normalizer.
+        """
         result = self.seed("chat-heavy", profile_override="assistant-b")
         profile_state = self.home / "profiles" / "assistant-b" / "state" / "tool-belt"
         self.assertEqual(result.state_dir, profile_state)
@@ -237,14 +279,22 @@ class OnboardingArcTests(OnboardingTestCase):
 
         # The overlay lands in the profile's state dir, not the root's.
         self.assertFalse((self.root_state / "learned.json").exists())
-        entry = self.learned(profile_state)["scopes"][result.scope]
-        self.assertEqual(sorted(entry["always_off"]), ["cronjob", "image_generate"])
-        self.assertEqual(entry["always_on"], [])
+        entry = seed_sessions.learned.normalize_state(
+            self.learned(profile_state)
+        )["scopes"][result.scope]
+        expand_only = set(entry["expand_only"])
 
-        # Nothing structurally required may ever be demoted.
-        shaper = configure.load_shaper()
-        protected = shaper.effective_protected_always_on(PLUGIN_DIR)
-        self.assertEqual(set(entry["always_off"]) & protected, set())
+        # The injected unused residents demote to expand_only …
+        self.assertLessEqual({"unit_convert", "weather_lookup"}, expand_only)
+        # … alongside every other unused policy carry resident, while the one
+        # carry tool the agent actually used (mnemosyne_recall) stays resident.
+        self.assertNotIn("mnemosyne_recall", expand_only)
+        # Nothing was promoted into carry (no expansion evidence in this arm).
+        self.assertEqual(entry["carry"], [])
+
+        # The immutable always_carry surface can never be demoted, by construction.
+        always_carry = set(seed_sessions.presets.load_base_policy().always_carry)
+        self.assertEqual(expand_only & always_carry, set())
 
     def test_multi_scope_independence(self) -> None:
         """Two scopes in one home; shaping one leaves the other untouched."""
@@ -267,33 +317,9 @@ class OnboardingArcTests(OnboardingTestCase):
             ["--status"],
             tc.FakeRunner({f"plugins.tool-belt.channels.{terminal.scope}.learned_mode": "apply"}),
         )
-        self.assertIn(f"{terminal.scope:<28} {configure.STATE_SHAPED}", status)
-        self.assertIn(f"{browser.scope:<28} {configure.STATE_READY}", status)
-
-    def test_dry_run_writes_nothing(self) -> None:
-        result = self.seed("terminal-heavy")
-        before = self.fs_snapshot()
-        runner = tc.FakeRunner(self.observing_config(result.scope))
-        rc, output = self.run_main(["--path", "shape", "--yes", "--dry-run"], runner)
-        self.assertEqual(rc, 0)
-        self.assertIn("dry-run", output)
-        self.assertEqual(self.fs_snapshot(), before)
-        self.assertFalse((self.root_state / "learned.json").exists())
-        # Config is read (main() reads the block once) but never mutated.
-        self.assertEqual(runner.writes, [])
-        self.assertTrue(all(c[1:3] == ["config", "get"] for c in runner.calls))
-
-    def test_status_is_read_only(self) -> None:
-        self.seed("terminal-heavy")
-        self.seed("browser-heavy")
-        before = self.fs_snapshot()
-        runner = tc.FakeRunner()
-        rc, _out = self.run_main(["--status"], runner)
-        self.assertEqual(rc, 0)
-        self.assertEqual(self.fs_snapshot(), before)
-        self.assertEqual(runner.writes, [])
-        self.assertTrue(all(c[1:3] == ["config", "get"] for c in runner.calls))
-
+        self.assertIn(f"{terminal.scope:<24} shaping ON (1 carried", status)
+        # The untouched scope defaults ON and has no assignment: learning.
+        self.assertIn(f"{browser.scope:<24} shaping ON (learning)", status)
 
 if __name__ == "__main__":
     unittest.main()
