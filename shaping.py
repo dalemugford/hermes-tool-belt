@@ -462,6 +462,12 @@ def compute_scope_recommendations(
     # toward carrying). ``demand_uses`` keeps raw call counts for reporting.
     demand_use_sessions: dict[str, set[str]] = defaultdict(set)
     demand_uses: Counter[str] = Counter()
+    # Sessions where a trigger activated the tool AFTER the session's first
+    # prediction. Post-demotion, such a late fire mutates the frozen tool
+    # list under prompt caching — busting the provider prefix cache — so the
+    # demote arm must price it; a first-message fire is free (it lands in
+    # the freeze snapshot before anything is cached).
+    late_trigger_sessions: dict[str, set[str]] = defaultdict(set)
     api_counts = api_call_counts or {}
     session_exposures: dict[str, int] = {}
     for sid, plist in recent_sessions.items():
@@ -472,6 +478,11 @@ def compute_scope_recommendations(
             )
         else:
             session_exposures[sid] = 1
+        first_ts = min((p.get("ts", 0) for p in plist), default=0)
+        for p in plist:
+            if p.get("ts", 0) > first_ts:
+                for t in (p.get("trigger_activated_tools") or []):
+                    late_trigger_sessions[str(t)].add(sid)
         for p in plist:
             if p.get("residency_inferred"):
                 residency = p.get("residency") or {}
@@ -536,12 +547,24 @@ def compute_scope_recommendations(
         for tool_name in sorted(carry_observed - always_carry_observed):
             use_sessions = demand_use_sessions.get(tool_name, set())
             saving, penalty = _economics(tool_name, use_sessions)
+            # Under prompt caching, a demoted tool's LATE trigger fire is not
+            # free: it mutates the frozen tool list and busts the provider
+            # prefix cache. Charge one round-trip per such session (sessions
+            # already paying a demand-use round-trip aren't double-charged).
+            # Trigger evidence never promotes, so without this charge a
+            # trigger-only tool's demotion was a one-way door that could
+            # cost more than it saved.
+            late_trig = late_trigger_sessions.get(tool_name, set())
+            trigger_sessions = (late_trig - use_sessions
+                                if cache_mode != "off" else set())
+            if trigger_sessions:
+                penalty += EXPAND_ROUND_TRIP_TOKENS * len(trigger_sessions)
             if saving <= k * penalty:
                 continue  # carrying is (or may be) the cheaper side — hold
             if not _valid(tool_name, "demote"):
                 continue
             uses = int(demand_uses.get(tool_name, 0))
-            demote.append({
+            entry = {
                 "tool": tool_name,
                 "sessions_without_use": len(recent_sessions) - len(use_sessions),
                 "sessions_with_use": len(use_sessions),
@@ -550,7 +573,10 @@ def compute_scope_recommendations(
                 "demote_tokens": penalty,
                 "k": k,
                 "evidence": "carry_unused" if uses == 0 else "carry_uneconomic",
-            })
+            }
+            if trigger_sessions:
+                entry["late_trigger_sessions"] = len(trigger_sessions)
+            demote.append(entry)
 
     return {
         "scope": scope,

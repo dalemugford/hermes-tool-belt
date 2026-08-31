@@ -97,6 +97,46 @@ class EconomicDemotion(unittest.TestCase):
                         schema_sizes={"browser_exec": 2000}, cache_mode="off")
         self.assertNotIn("browser_exec", {d["tool"] for d in recs["demote"]})
 
+    def _late_trigger_sessions(self, n, trigger_sessions):
+        """n sessions of TWO predictions; in the named sessions the SECOND
+        prediction records a trigger activation of ``browser_exec``."""
+        preds, calls = [], []
+        for i in range(n):
+            for j in (0, 1):
+                pid = f"p{i}-{j}"
+                row = _pred_row(
+                    self.SCOPE, f"s{i}", pid,
+                    ceiling=self.E, always_carry=["clarify"],
+                    carry=["browser_exec", "terminal"],
+                    active=self.E, ts=float(i * 10 + j),
+                )
+                if j == 1 and i in trigger_sessions:
+                    row["trigger_activated_tools"] = ["browser_exec"]
+                preds.append(row)
+                calls.append(_use_call(pid, "terminal"))
+        return preds, calls
+
+    def test_late_trigger_fires_defend_carry_under_caching(self):
+        # 15 of 30 cache-on sessions have a mid-session trigger activation:
+        # post-demotion each would bust the prefix cache, so the demote arm
+        # charges a round-trip per such session — penalty 15×1500 = 22500,
+        # saving 1000×30 = 30000 ≤ 1.5×22500 → hold. Fails on the
+        # trigger-is-always-free math (penalty 0 → demote).
+        preds, calls = self._late_trigger_sessions(30, set(range(15)))
+        recs = _compute(self.SCOPE, preds, calls, window=100,
+                        schema_sizes={"browser_exec": 1000}, cache_mode="on")
+        self.assertNotIn("browser_exec", {d["tool"] for d in recs["demote"]})
+
+    def test_late_trigger_fires_are_free_without_caching(self):
+        # Same shape, cache OFF: no frozen list to mutate, no cache to bust —
+        # the trigger charge must not apply, and the unused carry demotes.
+        preds, calls = self._late_trigger_sessions(30, set(range(15)))
+        recs = _compute(self.SCOPE, preds, calls, window=100,
+                        schema_sizes={"browser_exec": 1000}, cache_mode="off")
+        entry = {d["tool"]: d for d in recs["demote"]}
+        self.assertIn("browser_exec", entry)
+        self.assertNotIn("late_trigger_sessions", entry["browser_exec"])
+
     def test_trigger_covered_uses_are_free(self):
         # Trigger activations stay free for a demoted tool, so they don't
         # defend a carry slot: 5 trigger-only sessions count as no-use.
