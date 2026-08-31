@@ -11,9 +11,9 @@ Configuration is assembled from three files with distinct ownership:
 
 | File | Owner | Purpose |
 |---|---|---|
-| `policy.yaml` (plugin dir) | Plugin | Shipped preset. Always-on baseline, trigger rules, shaper thresholds. |
+| `policy.yaml` (plugin dir) | Plugin | Shipped preset. Always-carry baseline, trigger rules, shaper thresholds. |
 | `config.yaml` (user) | User | Enable the plugin, set mode flags, add per-scope overrides. |
-| `learned.json` (state dir) | `shape-ceiling.py` | Auto-tuned promote/demote per scope. Generally not hand-edited. |
+| `learned.json` (state dir) | shaper / auto-shape / configure | The learned carrying assignment per scope (schema v2). Generally not hand-edited. |
 
 State files (`learned.json`, `cache_mode_detection.json`, JSONL
 telemetry) live under `~/.hermes/state/tool-belt/` by default. When
@@ -23,10 +23,12 @@ relative to it — so per-profile state lands under
 
 Resolution order at dispatch time (later layers override earlier):
 
-1. `policy.yaml` — base preset (`always_on`, `triggers`).
-2. `config.yaml` global overrides — `always_on_extra`, `always_off`.
-3. `config.yaml` per-scope overrides — `channels.<scope>.*`.
-4. `learned.json` — applied only when `learned_mode` is `apply`.
+1. `policy.yaml` — base preset (`always_carry`, `triggers`).
+2. `config.yaml` pins — `always_carry` (global and additive per-scope
+   `channels.<scope>.always_carry`).
+3. `config.yaml` per-scope settings — `channels.<scope>.*`.
+4. `learned.json` — applied under `learned_mode: apply` (the default);
+   kept but not applied under `recommend`.
 
 See [`presets.py:resolve_preset`](../presets.py) for the resolver.
 
@@ -40,16 +42,22 @@ for them, through `hermes config set` / `hermes config unset` — Hermes owns
 `config.yaml`, so the file is never edited directly. Every write is shown as
 a `before → after` line first and requires confirmation.
 
-The command writes exactly two per-scope keys, both of which are ordinary
-documented settings — it introduces no key of its own:
+`configure` is a mode-setter: pick the agent, then either its
+**Protected tools** (a picker whose selections are written to
+`plugins.tool-belt.always_carry`) or **Tool shaping options** — channels,
+then a mode. Non-interactively: `--agent <name> --mode learning|history|off`.
+
+It writes only ordinary documented settings — it introduces no key of
+its own:
 
 | Key | Written when | Value |
 |---|---|---|
-| `plugins.tool-belt.channels.<scope>.learned_mode` | shape path | `apply` |
-| `plugins.tool-belt.channels.<scope>.learned_mode` | recommend path, reset | `recommend` |
-| `plugins.tool-belt.channels.<scope>.bypass_rate` | recommend path | `1.0` (full observation) |
-| `plugins.tool-belt.channels.<scope>.bypass_rate` | shape path, on acceptance | `0.0` (narrow immediately) |
+| `plugins.tool-belt.channels.<scope>.learned_mode` | mode learning / history | `apply` |
+| `plugins.tool-belt.channels.<scope>.learned_mode` | mode off, reset | `recommend` |
+| `plugins.tool-belt.channels.<scope>.bypass_rate` | observation (legacy recommend path) | `1.0` (full observation) |
+| `plugins.tool-belt.channels.<scope>.bypass_rate` | mode history, on acceptance | `0.0` (narrow immediately) |
 | `plugins.tool-belt.channels.<scope>.bypass_rate` | reset | the value observation mode replaced, default `0.0` |
+| `plugins.tool-belt.always_carry` | Protected-tools picker, on confirmation | the selected tool list |
 
 Scope keys are the same `agent:platform` identifiers used by telemetry — see
 [`channels`](#channels).
@@ -100,10 +108,10 @@ plugins:
     enabled: true
     log: true
     cache_mode: auto
-    learned_mode: recommend
-    bypass_rate: 0.0
-    always_on_extra: []
-    always_off: []
+    learned_mode: apply
+    auto_shape: true
+    auto_shape_interval_hours: 24
+    always_carry: []
     cache_off:
       sticky:
         enabled: true
@@ -121,7 +129,10 @@ plugins:
 
 ### `enabled`
 
-Type: `bool`. Default: `false`.
+Type: `bool`. Default: `true`.
+
+Shipped ON: a fresh install narrows and records telemetry from first
+use (see [PRIVACY.md](PRIVACY.md)). Set `false` to opt out entirely.
 
 Master switch. When `false`, `register()` short-circuits and no
 monkey-patches are installed — the plugin is a no-op.
@@ -170,6 +181,23 @@ Legacy values normalize at load: `off` → `recommend`, and `auto` /
 `audit` → `apply`.
 
 May be overridden per scope via `channels.<scope>.learned_mode`.
+
+### `auto_shape`
+
+Type: `bool`. Default: `true`.
+
+Runs the in-process shaping pass from the session-end hook, for every
+scope whose `learned_mode` resolves to `apply` — the operator's standing
+consent. Debounced per scope (stamps live in the `auto_shape_stamp.json`
+sidecar); a pass that changes nothing writes nothing. Set `false` to
+shape only via `tool-belt configure` or the shaper script.
+
+### `auto_shape_interval_hours`
+
+Type: `number`. Default: `24`. Also accepted per scope under
+`channels.<scope>.auto_shape_interval_hours`.
+
+Minimum hours between auto-shape attempts for a scope.
 
 ### `always_carry`
 
@@ -380,7 +408,8 @@ the plugin; for new shapes either edit it in place or fork it.
 ```yaml
 name: aggressive
 description: >
-  Minimum always-on; everything else trigger-gated.
+  Full-start with a structural always-carry baseline; demotions are
+  evidence-driven; expand_only tools are trigger-gated.
 
 learning:
   shape_ceiling:
@@ -388,13 +417,16 @@ learning:
     promote_min_sessions: 2
     promote_min_calls: 3
     demote_min_sessions_no_use: 20
+    demote_k: 1.5
 
-always_on:
-  - mnemosyne_remember
+always_carry:
   - clarify
-  - read_file
-  - send_message
+  - skill_view
+  - skills_list
   - expand_tools
+  - tool_search
+  - tool_describe
+  - tool_call
 
 triggers:
   - name: shell
@@ -415,18 +447,18 @@ triggers:
 
 - `name` (`string`) — preset identifier; surfaces in `predictions.jsonl`.
 - `description` (`string`) — free text, ignored by the loader.
-- `always_on` (`list[str]` or `"*"`) — tools loaded on every message in
-  this scope, regardless of message content. The literal `"*"` means
-  "no narrowing — load everything in the user's `platform_toolsets`
-  ceiling".
+- `always_carry` (`list[str]`) — immutable residents: carried on every
+  message and never shaped by the learned layer. (A legacy policy file's
+  `always_on` list — or its `"*"` no-narrowing spelling — still loads,
+  folded in at read time.)
 - `triggers` (`list[dict]`) — trigger groups, evaluated against each
   inbound message. Multiple groups may fire on one message (additive).
 - `learning.shape_ceiling` (`dict`) — default thresholds for the
   between-session shaper. See below.
 
-Tools in the user's ceiling that are not listed in `always_on` and not
-named under any trigger are considered "unknown" and kept on (safe
-fallback for plugin-provided tools the policy author didn't list).
+Every enabled tool outside `always_carry` starts CARRIED (full-start);
+evidence-driven demotion is the only way a tool moves to expand-only,
+so tools the policy author didn't list are safe by construction.
 
 ### Trigger group shape
 
@@ -488,30 +520,34 @@ forking the preset.
 
 Path: `$HERMES_HOME/state/tool-belt/learned.json` (or
 `~/.hermes/state/tool-belt/learned.json` when `HERMES_HOME` is
-unset). Read-mostly: owned by `scripts/shape-ceiling.py`; consumed by
+unset). Written by the shaper (manual and session-end auto-shape),
+the configure flows, and inventory reconciliation — all through
+`learned.write_state`; consumed by
 [`learned.py:apply_to_preset`](../learned.py) when
-`learned_mode` is `apply`.
+`learned_mode` is `apply` (the default).
 
 ```json
 {
-  "version": 1,
-  "updated_at": "2026-06-01T00:00:00Z",
+  "version": 2,
+  "updated_at": "2026-08-01T00:00:00Z",
   "scopes": {
     "default:telegram": {
-      "cache_aware": {
+      "carry": ["browser_navigate"],
+      "expand_only": ["image_generate"],
+      "shaping": {
         "scope": "default:telegram",
-        "computed_at": "2026-06-01T00:00:00Z",
-        "sessions_considered": 20,
-        "window_requested": 20,
+        "computed_at": "2026-08-01T00:00:00Z",
+        "sessions_considered": 30,
+        "window_requested": 100,
+        "source": "auto",
+        "applied_at": "2026-08-01T00:00:00Z",
         "promote": [
-          {"tool": "browser_navigate", "sessions": 4, "calls": 7, "evidence": "expand_tools"}
+          {"tool": "browser_navigate", "sessions": 4, "calls": 7, "evidence": "expansion"}
         ],
         "demote": [
-          {"tool": "image_generate", "sessions_without_use": 20, "evidence": "always_on_unused"}
+          {"tool": "image_generate", "sessions_without_use": 29, "sessions_with_use": 1, "evidence": "carry_uneconomic", "k": 1.5}
         ]
-      },
-      "always_on": ["browser_navigate"],
-      "always_off": ["image_generate"]
+      }
     }
   }
 }
@@ -519,24 +555,25 @@ unset). Read-mostly: owned by `scripts/shape-ceiling.py`; consumed by
 
 ### Schema
 
-- `version` (`int`) — must equal `1` (`LEARNED_VERSION` in
-  [`learned.py`](../learned.py)). Mismatched versions are dropped.
+- `version` (`int`) — `2` (`LEARNED_VERSION` in
+  [`learned.py`](../learned.py)). Documents declaring a NEWER version are
+  refused on read and never rewritten. A v1 document (`always_on` /
+  `always_off` / `cache_aware` keys) is normalized to this shape in
+  memory on read — the file itself is only rewritten on the next real
+  write.
 - `updated_at` (`string`, ISO 8601 UTC) — last write timestamp.
 - `scopes` (`dict[str, dict]`) — per-scope overlays, keyed by
   `{agent}:{platform}` (with bare-platform fallback).
 
 Per scope:
 
-- `cache_aware` — full shaper output (`promote`, `demote`,
-  `sessions_considered`, `computed_at`). Owned by the shaper;
-  human-readable rationale for the lists below.
-- `always_on` — tools promoted into the always-on baseline. Mirrored
-  from `cache_aware.promote` by the shaper.
-- `always_off` — tools demoted from the always-on baseline and removed
-  from every trigger group. Mirrored from `cache_aware.demote`.
-- `trigger_adjustments` (optional) — `{<trigger_name>: {action:
-  demote|disable}}`. Disables a trigger group entirely. Currently
-  written only by manual edits.
+- `carry` — learned promotions into adaptive residency.
+- `expand_only` — evidence-driven demotions out of residency; the only
+  way an enabled tool leaves the full-start carry set.
+- `shaping` — the shaper's rationale block (`promote`, `demote`,
+  economics, `computed_at`, and the apply stamp: `source`
+  `auto|configure` + `applied_at`). Human-readable; nothing at runtime
+  branches on it.
 
 > **Learned trigger overlay (schema v2, supersedes the above for triggers).**
 > Under the 1.0 carrying model a scope's learned entry may carry a
@@ -558,26 +595,19 @@ Per scope:
 
 ### Global block
 
-```json
-{
-  "global": {
-    "always_off": ["some_tool"]
-  }
-}
-```
-
-A top-level `global.always_off` list applies across all scopes — useful
-for blocklisting a tool everywhere without touching `config.yaml`.
+A top-level `global` block is preserved through reads and writes for
+forward compatibility, but it is inert: no consumer reads it. Per-agent
+blocklisting belongs in `config.yaml` scope settings or `policy.yaml`.
 
 ### Hand-editing
 
-`learned.json` is rewritten atomically on every shaper run. Manual
-edits survive until the next `scripts/shape-ceiling.py` run that
-produces a different recommendation for the same scope, at which point
-the shaper-owned fields (`cache_aware`, `always_on`, `always_off`) are
-overwritten. Hand edits belong in `config.yaml` (`always_on_extra` /
-`always_off` / `channels.<scope>.*`); the learned file is for
-auto-tuned state.
+`learned.json` is rewritten atomically whenever a shaping pass actually
+changes an assignment (a quiet auto pass writes nothing — its debounce
+stamp lives in the `auto_shape_stamp.json` sidecar). Manual edits
+survive until the next changing pass overwrites the shaper-owned fields
+(`carry`, `expand_only`, `shaping`). Hand configuration belongs in
+`config.yaml` (`always_carry` pins, `channels.<scope>.*`); the learned
+file is for auto-tuned state.
 
 ---
 

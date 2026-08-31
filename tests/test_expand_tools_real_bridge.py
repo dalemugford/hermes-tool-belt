@@ -1,7 +1,7 @@
 """Real-bridge regression LOCK for the expand_tools pin.
 
-Why this exists as a separate test: the whole suite (and the sibling
-``test_expand_tools_pin.py``) feeds tool-belt a *synthetic* tool list that
+Why this exists as a separate test: the rest of the suite feeds tool-belt
+a *synthetic* tool list that
 already contains ``expand_tools`` -- so every test verified "given expand_tools
 is present, tool-belt keeps it", which was always true. The production bug was
 one layer up: Hermes' native tiered-disclosure bridge

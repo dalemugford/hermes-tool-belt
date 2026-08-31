@@ -47,8 +47,8 @@ The initial public capabilities of the plugin:
   against the enabled ceiling (a disabled/unknown name is inert, with one
   clear warning naming it), and are undemotable by construction — the
   runtime ignores learned demotions naming a pin and the shaper/auto-shape
-  engine filters such candidates before writing. `configure --status`
-  shows pins distinctly ("Always carried: N policy + M pinned (...)").
+  engine filters such candidates before writing. The Protected-tools picker
+  in `tool-belt configure` reads and writes these pins interactively.
 - **In-process periodic auto-shaping.** Scopes whose `learned_mode` resolves
   to `apply` are now shaped automatically by the plugin itself — triggered
   from the session-end path, debounced to once per 24h per scope
@@ -57,8 +57,8 @@ The initial public capabilities of the plugin:
   `auto_shape: false` is the global opt-out. Observe/recommend scopes are
   never auto-written. Each automatic apply is logged and recorded in the
   scope's learned `shaping` block (`source: "auto"`, `applied_at`,
-  `last_auto_shape_at`); `configure --status` shows
-  `shaping applied (auto, <date>)`. The shaper's compute/merge core moved
+  `last_auto_shape_at`); `configure --status` shows a shaped
+  scope's learned carry/expansion counts. The shaper's compute/merge core moved
   into the shared package module `shaping.py`, with
   `scripts/shape-ceiling.py` remaining as the CLI wrapper (flags, porcelain
   JSON, and human output unchanged).
@@ -108,18 +108,23 @@ The initial public capabilities of the plugin:
   block); sticky wording is reserved for cache-off, where the sticky block
   still reports residency.
 - **`hermes tool-belt ...` subcommand.** `register(ctx)` now calls Hermes' `ctx.register_cli_command()`, so `hermes tool-belt savings` and `hermes tool-belt configure` work alongside the bare `tool-belt` launcher. Flags are forwarded verbatim to the same `savings_cli` entry point the launcher execs, so the two invocation forms cannot drift. Registration is optional and fail-open: on a Hermes without `register_cli_command`, the tool and hooks register exactly as before.
-- **Canonical savings CLI (`tool-belt savings`).** Reports observed and counterfactual token savings across all enabled agents or one selected agent, with deterministic JSON, full-schema replay, confidence-aware percentages, and dollars only for provably metered routes. The launcher honors `HERMES_PYTHON` and the local Hermes environment without importing runtime hooks. The session-input percentage is shown only against provider-reported usage; when historical sessions predate telemetry, only the explicitly-labeled schema-only reduction is shown (reconstructed context omits tool results, system prompt, and per-API-call accumulation, so it never backs a percentage).
-- **Guided onboarding (`scripts/configure.py`).** One command from install to a
-  working configuration. Detects the state of every `agent:platform` scope —
-  fresh, observing, ready, or shaped — and offers the step that fits. Two
-  paths: shape now, which analyzes existing history and shows in plain
-  language what becomes always-on and what moves to on-demand before writing
-  anything; or recommend first, which leaves tool loading untouched while
-  telemetry accumulates and reports how many more sessions each scope needs.
-  Configuration is written only through `hermes config set`/`unset`, every
-  write is preceded by a `before → after` diff and an explicit confirmation,
-  and `--status`/`--dry-run` never write. Degrades cleanly to printing
-  hand-run commands when the `hermes` CLI is unavailable.
+- **Canonical savings CLI (`tool-belt savings`).** Reports observed and counterfactual token savings across all enabled agents or one selected agent, with deterministic JSON, full-schema replay, confidence-aware percentages, and dollars only for provably metered routes. Reports echo the honored `--since` window (`Window: since …` in text, a `since` key in JSON). The launcher honors `HERMES_PYTHON` and the local Hermes environment without importing runtime hooks. The session-input percentage is shown only against provider-reported usage; when historical sessions predate telemetry, only the explicitly-labeled schema-only reduction is shown (reconstructed context omits tool results, system prompt, and per-API-call accumulation, so it never backs a percentage).
+- **configure = mode-setter (`tool-belt configure`).** One command from
+  install to a working configuration: pick the agent, then Protected tools
+  (a spacebar picker over the agent's observed inventory, written to
+  `plugins.tool-belt.always_carry`) or Tool shaping — channels, then a mode:
+  On (learning: shape from future usage), On (use history: shape from
+  recorded sessions now, with a compact named-tools diff), or Off
+  (observation; the learned overlay is kept but not applied).
+  Non-interactive: `--mode learning|history|off` (the pre-1.0
+  `--path`/`--reset` spellings remain as hidden aliases). `--status` prints
+  `Tool Belt: enabled|disabled` plus one `shaping ON/OFF (…)` row per
+  agent scope. Configuration is written only through
+  `hermes config set`/`unset`, every write is preceded by a
+  `before → after` diff and an explicit confirmation, and
+  `--status`/`--dry-run` never write; guidance echoes the invocation form
+  actually used. Degrades cleanly to printing hand-run commands when the
+  `hermes` CLI is unavailable.
 - **Cache-aware session freezing.** Under prefix-cache-friendly providers,
   the selected tool set stays stable across normal turns. Model-requested
   expansion is the explicit cache-breaking exception.
@@ -136,12 +141,6 @@ The initial public capabilities of the plugin:
 - **Telemetry, analyzer, and savings reporting.** Append-only telemetry records
   every narrowing decision; the analyzer summarizes usage and reports token
   savings with an optional A/B baseline cohort.
-- **Interactive onboarding.** `scripts/configure.py` discovers every agent and
-  platform from telemetry, offers a shape-now path (analyze history, review a
-  plain-language summary, confirm) or an observe-first path (telemetry only,
-  no narrowing, until enough data exists), and reports per-agent state on
-  every re-run. Config writes go only through `hermes config set`/`unset`
-  with a shown diff before each write.
 - **Fail-open behavior.** Any internal failure leaves the original Hermes tool
   set fully available.
 - **Strict `platform_toolsets` ceiling.** The plugin only narrows within, and
@@ -184,12 +183,12 @@ The initial public capabilities of the plugin:
 ### Changed
 
 - **Simplified `learned_mode` to two values: `recommend` and `apply`.** The
-  default is `recommend`, which never merges `learned.json` into the live
-  preset (recommendations still flow through the analyzer and shaper for human
-  review). `apply` merges the learned overlay during preset resolution.
-  Existing configs keep working: legacy values migrate automatically at load —
-  `off` → `recommend`, and `auto` / `audit` → `apply`. No config edit is
-  required.
+  default is `apply` (full-start — see the Added entry above), which merges
+  the learned overlay during preset resolution. `recommend` is the opt-out
+  observe mode: the overlay is kept but never merged, and recommendations
+  flow through the analyzer and shaper for human review. Existing configs
+  keep working: legacy values migrate automatically at load — `off` →
+  `recommend`, and `auto` / `audit` → `apply`. No config edit is required.
 
 ### Fixed
 

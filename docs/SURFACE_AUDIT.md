@@ -3,11 +3,15 @@
 **Date:** 2026-08-27
 **Commit audited:** `13c953e` (read-only pre-release audit)
 
-> **Superseded in part.** This audit predates the carrying-model refactor.
-> Its factual record stands, but statements about unknown tools staying
-> available, the protected always-on set, `learned_mode: off | auto`, and
-> `check-tool-drift.py` describe the pre-refactor model. Current behavior is
-> documented in `docs/ARCHITECTURE.md` and `docs/CONFIGURATION.md`.
+> **Historical document — superseded in part.** This audit predates the
+> carrying-model refactor AND the full-start default flip. Its factual
+> record stands, but statements about unknown tools staying available, the
+> protected always-on set, `learned_mode: off | auto`,
+> `check-tool-drift.py`, the learned overlay being "disabled by default",
+> the runtime "never rewriting learned policy by itself" (in-process
+> auto-shape now does, under the default `learned_mode: apply`), and any
+> since-removed script describe the pre-refactor model. Current behavior
+> is documented in `docs/ARCHITECTURE.md` and `docs/CONFIGURATION.md`.
 
 ---
 

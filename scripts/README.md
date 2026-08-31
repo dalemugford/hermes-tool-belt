@@ -12,7 +12,7 @@ labelled `default`; named profiles keep their directory names.
 
 | Script | Purpose | Typical use |
 |---|---|---|
-| [`configure.py`](configure.py) | Guided onboarding. Detects the state of every agent scope, explains what shaping would change, and writes the configuration through `hermes config`. | The first command to run after installing. Re-run any time. |
+| [`configure.py`](configure.py) | Mode-setter. Detects every agent scope, sets the shaping mode (learning / history / off) and protected tools, and writes the configuration through `hermes config`. | The first command to run after installing. Re-run any time. |
 | [`bootstrap.py`](bootstrap.py) | Mode-aware first-install warm start. Uses live `expand_tools` evidence for cache-on scopes and session replay for cache-off scopes. | Optional, once after installation. |
 | [`shape-ceiling.py`](shape-ceiling.py) | Builds per-scope promote/demote recommendations from recent sessions and writes the learned overlay. | Run after enough organic sessions; inspect with `--dry-run` first. |
 | [`harvest-replay.py`](harvest-replay.py) | Replays existing Hermes sessions through the per-turn predictor and writes privacy-reduced synthetic telemetry. | Tune trigger coverage for cache-off scopes. |
@@ -37,17 +37,24 @@ python3 scripts/configure.py            # interactive
 python3 scripts/configure.py --status   # read-only state report
 ```
 
-`configure.py` discovers every `agent:platform` scope from telemetry, reports
-which of four states it is in — `fresh`, `observing`, `ready`, `shaped` — and
-offers the step that fits. Two paths are available on a fresh scope:
+`configure.py` is a mode-setter. It discovers every `agent:platform` scope
+from telemetry; interactively you pick an agent, then either **Protected
+tools** (a picker over the agent's inventory — selections are written to
+`plugins.tool-belt.always_carry`, always carried and never shaped) or
+**Tool shaping options** (pick channels, then a mode):
 
-- **shape** — analyze the history already on disk, print a plain-language
-  summary of what would become always-on and what would move to on-demand,
-  and on confirmation write the learned overlay and set `learned_mode: apply`
-  for that scope.
-- **recommend** — leave tool loading untouched while telemetry accumulates,
-  then re-run later. The command prints how many more sessions each scope
-  needs; the minimum comes from `policy.yaml` `learning.shape_ceiling`.
+- **learning** — shaping on (`learned_mode: apply`); the plugin shapes
+  automatically from future usage. No history run.
+- **history** — shaping on, plus a shaping pass over the sessions already
+  recorded, shown as a plain-language diff and applied on confirmation.
+- **off** — observation mode (`learned_mode: recommend`): every enabled
+  tool is carried, telemetry keeps accumulating, and the learned overlay
+  is kept but not applied.
+
+`--status` classifies each scope from its settings: the row shows
+`shaping ON/OFF` with learned carry/expansion counts once a scope is
+shaped, `learning` while evidence accumulates, `observing` when shaping
+is off.
 
 Config is written only through `hermes config set` / `hermes config unset`;
 `config.yaml` is never edited directly. Every write is preceded by its
@@ -58,13 +65,17 @@ Non-interactive flags for scripting and tests:
 
 ```bash
 python3 scripts/configure.py --status
-python3 scripts/configure.py --agent default --path recommend --yes
-python3 scripts/configure.py --agent default --path shape --dry-run
-python3 scripts/configure.py --reset default
+python3 scripts/configure.py --agent default --mode learning --yes
+python3 scripts/configure.py --agent default --mode history --dry-run
+python3 scripts/configure.py --agent default --mode off --yes
 ```
 
 `--status` never writes. `--dry-run` prints every diff and writes nothing —
-neither files nor `hermes config` calls.
+neither files nor `hermes config` calls. The pre-1.0 spellings survive as
+hidden compatibility aliases: `--path shape` ≈ `--mode history`;
+`--path recommend` ≈ `--mode off` but additionally sets the scope's
+`bypass_rate` to `1.0` (full-ceiling observation baseline); `--reset AGENT`
+≈ `--mode off` but additionally clears the agent's learned overlay.
 
 ### Mine dampener and trigger-keyword candidates
 

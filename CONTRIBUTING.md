@@ -61,7 +61,6 @@ diagnostics below exercise the plugin against the full Hermes runtime.
 Run targeted diagnostics when the mechanism they cover changes:
 
 ```bash
-.venv/bin/python scripts/check-tool-drift.py
 .venv/bin/python scripts/shape-ceiling.py --dry-run
 ```
 

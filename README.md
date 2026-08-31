@@ -85,54 +85,55 @@ methodology for measuring your own is in
 
 ## Install and configure
 
-Two commands. Install, then configure. The examples assume the launcher is
-installed (onboarding offers this after your first apply; or link it by hand:
-`mkdir -p ~/.local/bin && ln -s ~/.hermes/plugins/tool-belt/tool-belt ~/.local/bin/tool-belt`).
+Two commands. Install, then configure:
 
 ```bash
 hermes plugins install dalemugford/hermes-tool-belt
-tool-belt configure
+hermes tool-belt configure
 ```
 
-The plugin also registers itself as a Hermes subcommand, so the same two
-commands are available without the launcher on PATH — `hermes tool-belt
-configure` and `hermes tool-belt savings` take the identical flags and run
-the identical code (e.g. `hermes tool-belt savings --json`, `hermes tool-belt
-configure --status`).
+`hermes tool-belt configure` and `hermes tool-belt savings` are the
+canonical commands. Onboarding also offers to install a `tool-belt`
+launcher after your first apply (or link it by hand: `mkdir -p
+~/.local/bin && ln -s ~/.hermes/plugins/tool-belt/tool-belt
+~/.local/bin/tool-belt`); the launcher takes identical flags and runs
+identical code — pure convenience.
 
-`configure.py` is the front door. It finds every agent and platform you
-run, reads the telemetry already on disk, and asks how you want to
-start. It writes configuration only through `hermes config set` — never
-by editing `config.yaml` — shows you a `before → after` line for every
-change, and applies nothing without your explicit confirmation.
+`configure` is the front door: a mode-setter. It finds every agent and
+platform you run, reads the telemetry already on disk, and lets you set
+the shaping mode per agent and channel. It writes configuration only
+through `hermes config set` — never by editing `config.yaml` — shows
+you a `before → after` line for every change, and applies nothing
+without your explicit confirmation.
 
-You pick one of two paths, per agent:
+Interactively you pick an agent, then one of two areas:
 
-**Shape now** — for when you already have Hermes history. The command
-analyzes it, then shows you in plain language what would change: which
-tools stay loaded on every message, which move to on-demand, and which
-trigger groups still fire. Nothing is written until you say yes. On
-confirmation it writes the learned overlay and turns shaping on for the
-agents you chose.
+1. **Protected tools** — a picker over the agent's tool inventory.
+   Selected tools are written to `plugins.tool-belt.always_carry`:
+   always carried, never shaped.
+2. **Tool shaping options** — pick channels, then a mode:
+   - **learning** — shaping on (`learned_mode: apply`); the plugin
+     shapes automatically from future usage.
+   - **history** — shaping on, and a shaping pass runs over your
+     recorded sessions right away, with a review-and-confirm diff.
+   - **off** — observation mode (`learned_mode: recommend`): every
+     enabled tool is carried, telemetry keeps accumulating, and the
+     learned overlay is kept but not applied.
 
-**Recommend first** — for when you would rather watch before narrowing.
-The command puts the selected agents into observation mode: tool loading
-stays exactly as it is today while telemetry accumulates. It tells you
-how many more sessions each agent needs. Re-run the command later and it
-offers the same review-and-confirm step for whichever agents are ready.
-
-Either way, restart the gateway afterward so Hermes picks up the new
-configuration.
-
-Re-run `configure.py` any time. It always detects the current state and
-offers what fits — shape an agent that just became ready, add agents,
-review what shaping did, or reset an agent back to observation mode.
+Non-interactively: `--agent <name> --mode learning|history|off`.
+Restart the gateway afterward so Hermes picks up the new
+configuration. Re-run `configure` any time — it always detects the
+current state.
 
 ```bash
-tool-belt configure --status
+hermes tool-belt configure --status
 ```
 
-`--status` is read-only: per-agent state and how much data each has.
+`--status` is read-only. It prints `Tool Belt: enabled|disabled`, then
+an `Agents` list with one row per scope:
+`N. scope  shaping ON/OFF (…)` — the parenthetical shows the learned
+carry/expansion counts once a scope is shaped, `learning` while
+evidence is still accumulating, or `observing` when shaping is off.
 
 ### Optional: real-tokenizer counts
 
@@ -172,9 +173,10 @@ want real precision/recall numbers.
 ## Daily use
 
 Nothing to do. The plugin runs on every message; `expand_tools` is the
-model's recovery valve; between sessions the shaper folds real usage
-back into the policy. Re-run `configure.py` whenever you want to review
-what shaping did, promote a scope from observation, or reset an agent.
+model's recovery valve; at session end the in-process auto-shape pass
+folds real usage back into `learned.json`. Re-run `hermes tool-belt
+configure` whenever you want to review what shaping did, protect a
+tool, or switch an agent's mode.
 
 ## If something feels off
 
@@ -182,12 +184,14 @@ what shaping did, promote a scope from observation, or reset an agent.
 `expand_tools(category=...)` to recover it — that's the designed path,
 and repeated use gets the category promoted in future sessions. For an
 immediate, permanent fix, pin it with `plugins.tool-belt.always_carry:
-[tool_name]` (global, or additively under `channels.<scope>.`). Check
-`configure.py --status` to see what shaping is active for that agent.
+[tool_name]` (global, or additively under `channels.<scope>.`) — the
+Protected tools picker in `hermes tool-belt configure` writes the same
+key. Check `hermes tool-belt configure --status` to see what shaping is
+active for that agent.
 
 **"Tools load that I never use."** That's carry cost the shaper will
 eventually demote — or help it along: run
-`python3 analyze.py` for demotion candidates, or
+`python3 ~/.hermes/plugins/tool-belt/analyze.py` for demotion candidates, or
 `tool-belt configure --mode off --agent <agent>` to switch an agent to
 observation mode.
 
@@ -225,10 +229,6 @@ plugins:
     enabled: true
     log: true
 
-    # Global tweaks layered on top of policy.yaml
-    always_on_extra: []
-    always_off: []
-
     # A/B baseline cohort — deterministically ship the full toolset for
     # a fraction of sessions so savings have a control to compare
     # against. 1.0 on a scope fully disables narrowing there.
@@ -249,7 +249,6 @@ plugins:
         learned_mode: recommend
         always_carry: []       # adds to the global pins (union, never removes)
         bypass_rate: 0.05      # 5% baseline cohort on this scope only
-        always_on_extra: [terminal]
       slack:                    # platform-wide fallback
         bypass_rate: 1.0       # disable narrowing on Slack entirely
 ```
@@ -263,7 +262,7 @@ Every knob — cache-off sticky residency, predictor lookback, dampener
 tuning, learned.json shape, full telemetry field reference — is
 documented in [docs/CONFIGURATION.md](docs/CONFIGURATION.md). The full
 operator command set (bootstrap, shaper, analyzer, savings report,
-drift check) is in [scripts/README.md](scripts/README.md).
+telemetry rotation) is in [scripts/README.md](scripts/README.md).
 
 ```bash
 python3 ~/.hermes/plugins/tool-belt/scripts/bootstrap.py   # inspect recommendations, writes nothing
@@ -367,9 +366,16 @@ latest changes. See [CHANGELOG.md](CHANGELOG.md) for what has changed.
 ├── predictor.py      # deterministic intent matching
 ├── presets.py        # policy loading and per-scope resolution
 ├── learned.py        # learned overlay loading and merging
+├── carrying.py       # resident-partition carrying model
+├── shaping.py        # evidence-driven shaping + in-process auto-shape pass
 ├── expand_tools.py   # dynamic recovery meta-tool
 ├── logger_io.py      # telemetry writers
 ├── analyze.py        # telemetry analyzer
+├── savings.py        # savings-report computation
+├── savings_cli.py    # savings-report rendering and CLI
+├── cli.py            # `hermes tool-belt` subcommand registration
+├── yaml_required.py  # PyYAML availability guard for the operator scripts
+├── tool-belt         # public command launcher (configure, savings, …)
 ├── policy.yaml       # shipped policy and shaping thresholds
 ├── AGENTS.md         # repository engineering rules
 ├── CHANGELOG.md      # unreleased and tagged user-facing changes

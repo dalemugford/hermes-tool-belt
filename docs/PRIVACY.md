@@ -111,13 +111,17 @@ Two caveats:
 
 - Rotation **archives, it does not delete**. Rotated data stays on disk
   under `archive/` until removed by hand.
-- The script rotates `predictions.jsonl` and `tool_calls.jsonl` only.
-  `api_calls.jsonl` is left in place and continues to grow.
+- The script rotates all three files — `predictions.jsonl`,
+  `tool_calls.jsonl`, and `api_calls.jsonl`.
 
 ## Turning collection off
 
-Two independent switches in the `plugins.tool-belt` block of Hermes'
-`config.yaml` (see [CONFIGURATION.md](CONFIGURATION.md#log)):
+The shipped defaults are `enabled: true` and `log: true`
+([`__init__.py:_CONFIG`](../__init__.py)): telemetry — including the
+`message_preview` excerpt (up to 80 characters) and `message_hash`
+described above — is recorded from first use. Two independent opt-out
+switches in the `plugins.tool-belt` block of Hermes' `config.yaml`
+(see [CONFIGURATION.md](CONFIGURATION.md#log)):
 
 - `log: false` — stops every JSONL writer. All three logging hooks
   check it before doing any work
@@ -126,9 +130,9 @@ Two independent switches in the `plugins.tool-belt` block of Hermes'
   work; you simply stop observing it. Note that the analyzer and the
   learned overlay have nothing to learn from after this, so the shaping
   workflow effectively stops too.
-- `enabled: false` — the master switch (this is the shipped default).
-  `register()` short-circuits, no patches are installed, and the plugin
-  is a no-op. Nothing is narrowed and nothing is logged.
+- `enabled: false` — the master switch. `register()` short-circuits, no
+  patches are installed, and the plugin is a no-op. Nothing is narrowed
+  and nothing is logged.
 
 ## Erasing everything
 
@@ -169,9 +173,9 @@ longer read.
 Neither derived state file contains message content.
 
 `learned.json` holds per-scope promote/demote decisions computed from
-telemetry: tool-name lists (`always_on`, `always_off`), the shaper's
-rationale block (`cache_aware`, with counts and a timestamp), and
-optional trigger adjustments — see
+telemetry: tool-name lists (`carry`, `expand_only`), the shaper's
+rationale block (`shaping`, with counts and a timestamp), and
+optional trigger adjustments (`triggers`) — see
 [CONFIGURATION.md § `learned.json` reference](CONFIGURATION.md#learnedjson-reference).
 Tool names and counts, nothing more.
 

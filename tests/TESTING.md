@@ -62,8 +62,9 @@ functions with explicit fixtures.* The rebuild answers that shape directly.
 `tests/run_tests.py`. Bare `pytest tests/` does NOT work (the hyphenated
 plugin dir breaks its import of the package `__init__`); use unittest.
 The real-bridge tests require the Hermes venv interpreter — under a bare
-python they self-skip and the file becomes a silent no-op, so CI must use
-`~/.hermes/hermes-agent/venv/bin/python3`.
+python they self-skip (one expected skip on a clean clone, and in the
+shipped GitHub CI, which builds a bare venv). For the full-fidelity run,
+use `~/.hermes/hermes-agent/venv/bin/python3`.
 
 ## Known hygiene debt
 
