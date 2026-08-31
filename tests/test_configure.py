@@ -227,6 +227,51 @@ class AgentNameFilterTests(TempHomeTestCase):
         self.assertIsNone(configure.split_platform_args([" , "]))
 
 
+class HubMenuTests(TempHomeTestCase):
+    """The hub v0: a numbered scope table with honest verbs, row-number
+    selection, and a loop that returns to a re-rendered table. No other test
+    drives the menu loop; these lock the row-number contract (no typed
+    labels), the read-only guarantee of 'preview', and clean exit."""
+
+    def _seed_three_ready(self):
+        seed_telemetry(self.root_state, "default:telegram", self.needed)
+        seed_telemetry(self.root_state, "default:slack", self.needed)
+
+    def _run_hub(self, keys: str):
+        infos = configure.discover_scopes(self.home)
+        lines: list[str] = []
+        it = iter(keys.splitlines())
+        ctx = make_ctx(self.home, FakeRunner(),
+                       reader=lambda _p: next(it),
+                       out=lines.append,
+                       plugin_config={})
+        rc = configure._menu(ctx, infos)
+        return rc, "\n".join(lines), ctx
+
+    def test_table_is_numbered_and_preview_is_read_only(self):
+        self._seed_three_ready()
+        rc, out, ctx = self._run_hub("preview\n1\nquit\n")
+        self.assertEqual(rc, 0)
+        self.assertIn("#  scope", out, "a numbered table header is shown")
+        self.assertRegex(out, r"\n  1 ", "rows are numbered")
+        self.assertIn("preview only — nothing was written", out)
+        self.assertEqual(ctx.applied, [], "preview writes NOTHING")
+
+    def test_blank_cancels_selection_and_loop_returns(self):
+        self._seed_three_ready()
+        # preview -> blank (cancel) -> the table renders again -> quit
+        rc, out, _ = self._run_hub("preview\n\nquit\n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.count("#  scope"), 2,
+                         "cancelling an action returns to a re-rendered table")
+
+    def test_reset_verb_absent_when_nothing_is_shaped(self):
+        self._seed_three_ready()
+        rc, out, _ = self._run_hub("quit\n")
+        self.assertNotIn("reset   —", out,
+                         "reset is offered only when a shaped scope exists")
+
+
 class StateMachineTests(TempHomeTestCase):
     def _info(self, sessions: int) -> "configure.ScopeInfo":
         return configure.ScopeInfo(

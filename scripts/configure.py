@@ -1481,52 +1481,134 @@ def flow_status(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
     return 0
 
 
-def _menu(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
-    """The re-entry state machine: show what's true, offer what fits."""
-    states = {info.scope: classify_scope(info, ctx.settings(info.scope), ctx.thresholds) for info in infos}
-    ready = [i for i in infos if states[i.scope] == STATE_READY]
-    observing = [i for i in infos if states[i.scope] == STATE_OBSERVING]
-    shaped = [i for i in infos if states[i.scope] == STATE_SHAPED]
-    fresh = [i for i in infos if states[i.scope] == STATE_FRESH]
+def _hub_savings_headline(ctx: RunContext) -> str | None:
+    """The measured net-tokens-saved line for the hub's top — proof of life.
 
+    Read-only, best-effort: the savings engine over the real home. Returns
+    None (header omitted) when the engine or its data is unavailable, never
+    an approximation.
+    """
+    engine = load_savings_engine()
+    if engine is None:
+        return None
+    try:
+        report = engine.compute(hermes_home=ctx.hermes_home, cache_mode="on")
+    except Exception:
+        return None
+    net = sum(a.observed.net_token_reduction for a in report.agents
+              if a.observed.n_sessions > 0)
+    sessions = sum(a.observed.n_sessions for a in report.agents
+                   if a.observed.n_sessions > 0)
+    if net <= 0:
+        return None
+    return (f"  Net tokens saved so far: {net:,}  "
+            f"(measured across {sessions} session(s))")
+
+
+def _hub_table(ctx: RunContext, infos, states) -> None:
+    """Render the numbered scope table — the hub's home view."""
+    ctx.out("\n  #  scope                        state       detail")
+    for idx, info in enumerate(infos, 1):
+        row = render_status_row(info, states[info.scope], ctx.thresholds)
+        ctx.out(f"  {idx:<2}{row}")
+
+
+def _hub_pick_scope(ctx: RunContext, infos, verb: str):
+    """Ask for ONE scope by row number (kills the label-vs-profile trap)."""
+    if len(infos) == 1:
+        return infos[0]
+    while True:
+        answer = prompt(f"  {verb} which? (row number, or blank to cancel): ",
+                        ctx.reader)
+        if not answer:
+            return None
+        try:
+            idx = int(answer)
+        except ValueError:
+            ctx.out("  Enter a row number from the table.")
+            continue
+        if 1 <= idx <= len(infos):
+            return infos[idx - 1]
+        ctx.out(f"  Row number must be 1–{len(infos)}.")
+
+
+def _hub_preview(ctx: RunContext, info: ScopeInfo) -> None:
+    """Read-only picture for ONE scope: what shaping WOULD do + projection.
+
+    'preview' never writes — the verb means the same thing it says. The
+    projection runs on demand (a few seconds) with a progress line.
+    """
+    preset = load_base_preset()
+    recs = compute_recommendations(info, ctx.thresholds)
     ctx.out("")
-    for info in infos:
-        ctx.out(render_status_row(info, states[info.scope], ctx.thresholds))
+    for line in render_shaping_summary(info, recs, preset, ctx.thresholds):
+        ctx.out(line)
+    ctx.out("\n  Estimating savings for this scope… (a few seconds)")
+    try:
+        proposal = proposed_assignment(info, recs)
+    except Exception:
+        proposal = None
+    agent = _project_scope(info, proposal) if proposal else None
+    if agent is not None and agent.projected.net_token_reduction:
+        proj = agent.projected
+        ctx.out(f"  Projected: ≈{proj.net_token_reduction:,} fewer tokens over "
+                f"{proj.sessions_analyzed} analyzed session(s)"
+                + (f"  ({proj.net_input_reduction_pct:.0f}% of input)"
+                   if proj.net_input_reduction_pct is not None else ""))
+    else:
+        ctx.out("  Projection unavailable for this scope yet "
+                "(needs more recorded sessions).")
+    ctx.out("  (preview only — nothing was written)")
 
-    if shaped and not ready and not fresh and not observing:
-        ctx.out("\n  Every agent is shaped.")
-        choice = prompt_choice("  Review shaping, reset an agent, or quit?", ("review", "reset", "quit"), ctx.reader)
+
+def _menu(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
+    """The hub: a menu loop over a numbered scope table.
+
+    Verbs are honest — 'preview' is always read-only, 'shape' always leads to
+    a disclosed write. Actions pick a scope by ROW NUMBER, never a typed
+    label. The loop always returns to a re-rendered table; blank/q/EOF exit.
+    """
+    while True:
+        states = {i.scope: classify_scope(i, ctx.settings(i.scope),
+                                          ctx.thresholds) for i in infos}
+        headline = _hub_savings_headline(ctx)
+        if headline:
+            ctx.out("\n" + headline)
+        _hub_table(ctx, infos, states)
+
+        shapeable = [i for i in infos
+                     if states[i.scope] in (STATE_READY, STATE_FRESH,
+                                            STATE_OBSERVING)]
+        shaped = [i for i in infos if states[i.scope] == STATE_SHAPED]
+        verbs = ["preview"]
+        if shapeable:
+            verbs.append("shape")
+        if shaped:
+            verbs.append("reset")
+        verbs.append("quit")
+
+        ctx.out("\n  preview — see what shaping would do (read-only)")
+        if "shape" in verbs:
+            ctx.out("  shape   — analyze history and apply (asks first)")
+        if "reset" in verbs:
+            ctx.out("  reset   — return a shaped scope to observation")
+        ctx.out("  quit")
+        choice = prompt_choice("  Action?", tuple(verbs), ctx.reader)
+
         if choice == "quit":
             return 0
-        if choice == "review":
-            preset = load_base_preset()
-            for info in prompt_multi_select(shaped, ctx.reader):
-                recs = compute_recommendations(info, ctx.thresholds)
-                ctx.out("")
-                for line in render_shaping_summary(info, recs, preset, ctx.thresholds):
-                    ctx.out(line)
-            return 0
-        return flow_reset(ctx, prompt_multi_select(shaped, ctx.reader))
-
-    if ready:
-        ctx.out(f"\n  {len(ready)} agent(s) have enough data to shape now.")
-        if confirm("  Review the shaping for them?", ctx.reader):
-            return flow_shape(ctx, prompt_multi_select(ready, ctx.reader))
-
-    if observing:
-        ctx.out("\n  Still collecting for: " + ", ".join(i.scope for i in observing))
-
-    candidates = fresh or infos
-    ctx.out("\n  Two ways to start:")
-    ctx.out("    shape      Use the history you already have and narrow now.")
-    ctx.out("    recommend  Watch first, narrow once there's enough data.")
-    choice = prompt_choice("  Which?", ("shape", "recommend", "quit"), ctx.reader)
-    if choice == "quit":
-        return 0
-    selected = prompt_multi_select(candidates, ctx.reader)
-    if choice == "shape":
-        return flow_shape(ctx, selected)
-    return flow_recommend(ctx, selected)
+        if choice == "preview":
+            info = _hub_pick_scope(ctx, infos, "Preview")
+            if info is not None:
+                _hub_preview(ctx, info)
+        elif choice == "shape":
+            info = _hub_pick_scope(ctx, shapeable, "Shape")
+            if info is not None:
+                flow_shape(ctx, [info])
+        elif choice == "reset":
+            info = _hub_pick_scope(ctx, shaped, "Reset")
+            if info is not None:
+                flow_reset(ctx, [info])
 
 
 def _ask_platforms(ctx: RunContext) -> list[str]:
