@@ -385,17 +385,17 @@ class SessionHookSemanticsTests(unittest.TestCase):
         self.assertIn("sid", plugin._FROZEN_BY_SESSION)
         self.assertIn("sid", plugin._CACHE_MODE_BY_SESSION)
 
-    def test_on_session_end_evicts_sticky_and_lookback(self):
-        # Sticky is keyed by a hash derived from session_id, not by sid
-        # directly. Populate the canonical sticky key the handler will look up.
+    def test_on_session_end_keeps_sticky_and_lookback(self):
+        # The hook fires per turn; sticky (3-turn TTL) and lookback are
+        # session-scoped and must survive it, or the features are inert.
         sticky_key = plugin._sticky_key_for_session("sid")
         self.assertTrue(sticky_key, "sanity: derivation produces non-empty key")
         plugin._STICKY_BY_KEY[sticky_key] = {"terminal": {"remaining_turns": 2}}
         plugin._PRIOR_MESSAGES_BY_SESSION["sid"] = ["msg1"]
         with mock.patch.dict(os.environ, {"HERMES_SESSION_KEY": "sid"}, clear=False):
             plugin._on_session_end(session_id="sid", session_key="sid")
-        self.assertNotIn("sid", plugin._PRIOR_MESSAGES_BY_SESSION)
-        self.assertNotIn(sticky_key, plugin._STICKY_BY_KEY)
+        self.assertIn("sid", plugin._PRIOR_MESSAGES_BY_SESSION)
+        self.assertIn(sticky_key, plugin._STICKY_BY_KEY)
 
     def test_on_session_reset_evicts_freeze(self):
         plugin._on_session_reset(session_id="sid", session_key="sid")

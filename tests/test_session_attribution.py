@@ -320,11 +320,11 @@ class PostToolCallAttributionRecoveryTests(unittest.TestCase):
         self.assertEqual(row["scope"], "assistant-a:telegram")
 
 
-class SessionEndCleanupTests(unittest.TestCase):
-    """The pre-dispatch path keys sticky/lookback state by the canonical
-    session key. Hermes' ``on_session_end`` hands us the AIAgent's
-    uuid-style ``session_id`` — without the env-var fallback the plugin
-    would leave stale per-session entries behind."""
+class SessionEndKeepsSessionStateTests(unittest.TestCase):
+    """``on_session_end`` fires PER TURN, so sticky residency and lookback
+    history — session-scoped features with their own decay/trim bounds —
+    must SURVIVE it; evicting them per turn defeated both features. True
+    cleanup belongs to ``_on_session_reset`` only."""
 
     AGENT_SESSION_ID = "20260516_123456_deadbeef"
 
@@ -348,33 +348,22 @@ class SessionEndCleanupTests(unittest.TestCase):
         plugin._PRIOR_MESSAGES_BY_SESSION[canonical_key] = ["hello"]
         return sticky_key
 
-    def test_evicts_canonical_state_when_env_key_present(self):
+    def test_sticky_and_lookback_survive_the_per_turn_hook(self):
         sticky_key = self._seed_state(REAL_KEY_TELEGRAM)
         with mock.patch.dict(
             os.environ, {"HERMES_SESSION_KEY": REAL_KEY_TELEGRAM}, clear=False
         ):
-            plugin._on_session_end(session_id=self.AGENT_SESSION_ID)
-        self.assertNotIn(sticky_key, plugin._STICKY_BY_KEY)
-        self.assertNotIn(REAL_KEY_TELEGRAM, plugin._PRIOR_MESSAGES_BY_SESSION)
+            plugin._on_session_end(session_id=self.AGENT_SESSION_ID,
+                                   session_key=REAL_KEY_TELEGRAM)
+        self.assertIn(sticky_key, plugin._STICKY_BY_KEY)
+        self.assertIn(REAL_KEY_TELEGRAM, plugin._PRIOR_MESSAGES_BY_SESSION)
 
-    def test_evicts_canonical_state_via_explicit_kwarg(self):
+    def test_session_reset_still_evicts_them(self):
         sticky_key = self._seed_state(REAL_KEY_TELEGRAM)
-        with mock.patch.dict(os.environ, {"HERMES_SESSION_KEY": ""}, clear=False):
-            plugin._on_session_end(
-                session_id=self.AGENT_SESSION_ID,
-                session_key=REAL_KEY_TELEGRAM,
-            )
+        plugin._on_session_reset(session_id="new-uuid",
+                                 session_key=REAL_KEY_TELEGRAM)
         self.assertNotIn(sticky_key, plugin._STICKY_BY_KEY)
         self.assertNotIn(REAL_KEY_TELEGRAM, plugin._PRIOR_MESSAGES_BY_SESSION)
-
-    def test_also_evicts_uuid_keyed_state(self):
-        # UUID-keyed state is a supported defensive fallback and must be
-        # cleaned up alongside canonical-key state.
-        uuid_sticky = self._seed_state(self.AGENT_SESSION_ID)
-        with mock.patch.dict(os.environ, {"HERMES_SESSION_KEY": ""}, clear=False):
-            plugin._on_session_end(session_id=self.AGENT_SESSION_ID)
-        self.assertNotIn(uuid_sticky, plugin._STICKY_BY_KEY)
-        self.assertNotIn(self.AGENT_SESSION_ID, plugin._PRIOR_MESSAGES_BY_SESSION)
 
 
 class AnalyzerExcludesDegradedModeTests(unittest.TestCase):

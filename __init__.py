@@ -2473,25 +2473,20 @@ def _on_session_end(session_id=None, **kwargs) -> None:
     message in multi-turn sessions. Hermes' own conversation loop calls
     this out explicitly in a source comment.
 
-    DO NOT evict any state here that needs to survive across turns within
-    a session. In particular: ``_FROZEN_BY_SESSION``,
-    ``_CACHE_MODE_BY_SESSION``, and any other per-session memory must
-    remain. They're cleared by :func:`_on_session_reset` (true /reset or
-    /new) and by the compaction wrapper only.
+    NO per-session state is evicted here — deliberately. Sticky residency
+    and lookback history are SESSION-scoped features that must survive
+    across turns: sticky decays on its own per-dispatch turn budget
+    (``_decay_sticky``) and the lookback ring self-trims, so neither
+    grows unbounded. All per-session memory (freeze, cache-mode, sticky,
+    lookback) is cleared by :func:`_on_session_reset` (true /reset or
+    /new). An earlier revision evicted sticky/lookback here keyed on the
+    ``HERMES_SESSION_KEY`` env var; the deployed gateway migrated session
+    identity to ContextVars and never sets that var, so the eviction was
+    a live no-op — and anywhere the var DID exist it wiped sticky state
+    at the end of the turn that created it, defeating the feature.
 
-    What we DO clear here: the contextvar (task-scoped so it auto-cleans,
-    but explicit clear keeps state hygiene clean) and the per-turn
-    helpers (sticky residency, lookback history) which were designed
-    around the per-turn semantics this hook actually has.
-
-    Hermes invokes this hook with ``session_id`` set to the AIAgent's
-    uuid/timestamp identifier — NOT the canonical gateway session key
-    that pre_gateway_dispatch uses to index our per-session state. We
-    therefore prefer the canonical key, which is still discoverable
-    in-process via either a ``session_key`` kwarg (if Hermes ever passes
-    one) or the ``HERMES_SESSION_KEY`` env var the gateway sets for the
-    active dispatch. We evict under both supported key shapes so no
-    session-scoped state survives the per-turn cleanup.
+    What this hook does: clear the turn's prediction contextvar, then run
+    the debounced auto-shape pass.
     """
     if not _CONFIG["enabled"]:
         return None
@@ -2500,30 +2495,7 @@ def _on_session_end(session_id=None, **kwargs) -> None:
     except Exception:
         pass
 
-    eviction_ids: list[str] = []
-    canonical_key = ""
-    if isinstance(kwargs.get("session_key"), str) and kwargs["session_key"]:
-        canonical_key = str(kwargs["session_key"])
-    if not canonical_key:
-        env_key = os.environ.get("HERMES_SESSION_KEY") or ""
-        if env_key:
-            canonical_key = env_key
-    if canonical_key:
-        eviction_ids.append(canonical_key)
-    if session_id:
-        sid = str(session_id)
-        if sid and sid not in eviction_ids:
-            eviction_ids.append(sid)
-
-    for sid in eviction_ids:
-        sticky_key = _sticky_key_for_session(sid)
-        if sticky_key:
-            _STICKY_BY_KEY.pop(sticky_key, None)
-        _PRIOR_MESSAGES_BY_SESSION.pop(sid, None)
-        # NOTE: do NOT evict _FROZEN_BY_SESSION or _CACHE_MODE_BY_SESSION
-        # here — see this function's docstring for why.
-
-    # After the per-turn bookkeeping: the sanctioned between-session moment
+    # The sanctioned between-session moment
     # for the in-process auto-shape engine. Fail-open by construction — see
     # _maybe_auto_shape.
     _maybe_auto_shape()
