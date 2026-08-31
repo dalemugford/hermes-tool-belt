@@ -1047,6 +1047,76 @@ class PromptTests(unittest.TestCase):
         self.assertEqual(configure.prompt_multi_select(infos, reader), infos)
 
 
+class ModeFlagTests(TempHomeTestCase):
+    """``--mode learning|history|off`` is the public scripting surface and
+    must mirror the interactive menu; ``--path``/``--reset`` survive only as
+    hidden aliases (absent from --help)."""
+
+    def _run(self, argv: list[str]):
+        runner = FakeRunner()
+        lines: list[str] = []
+        with contextlib.ExitStack() as stack:
+            for patch in isolate(runner, "/usr/bin/hermes", lines):
+                stack.enter_context(patch)
+            rc = configure.main(argv + ["--yes", "--hermes-home",
+                                        str(self.home)])
+        return rc, "\n".join(lines), runner
+
+    def _seed(self) -> None:
+        seed_telemetry(self.root_state, "default:telegram",
+                       sessions=self.needed, always_on=["web_search"],
+                       expanded_tool="terminal", expanded_sessions=12,
+                       expanded_calls_each=2)
+
+    def test_mode_learning_writes_apply_without_history_run(self) -> None:
+        self._seed()
+        rc, output, runner = self._run(["--mode", "learning"])
+        self.assertEqual(rc, 0)
+        modes = {c[3]: c[4] for c in runner.writes}
+        self.assertEqual(
+            modes,
+            {"plugins.tool-belt.channels.default:telegram.learned_mode":
+             "apply"})
+        self.assertFalse((self.root_state / "learned.json").exists(),
+                         "learning mode must not run a history shape")
+
+    def test_mode_history_shapes_now(self) -> None:
+        self._seed()
+        rc, _output, runner = self._run(["--mode", "history"])
+        self.assertEqual(rc, 0)
+        self.assertTrue((self.root_state / "learned.json").exists())
+        modes = {c[3]: c[4] for c in runner.writes
+                 if c[3].endswith("learned_mode")}
+        self.assertEqual(
+            modes,
+            {"plugins.tool-belt.channels.default:telegram.learned_mode":
+             "apply"})
+
+    def test_mode_off_writes_recommend_and_keeps_overlay(self) -> None:
+        self._seed()
+        self._run(["--mode", "history"])
+        rc, _output, runner = self._run(["--mode", "off"])
+        self.assertEqual(rc, 0)
+        modes = {c[3]: c[4] for c in runner.writes}
+        self.assertEqual(
+            modes,
+            {"plugins.tool-belt.channels.default:telegram.learned_mode":
+             "recommend"})
+        doc = json.loads((self.root_state / "learned.json").read_text())
+        self.assertIn("default:telegram", doc["scopes"],
+                      "off pauses shaping but keeps the overlay (resumable)")
+
+    def test_old_flags_are_hidden_but_still_parse(self) -> None:
+        help_text = configure.build_parser().format_help()
+        self.assertIn("--mode", help_text)
+        self.assertNotIn("--path", help_text)
+        self.assertNotIn("--reset", help_text)
+        args = configure.build_parser().parse_args(["--path", "shape"])
+        self.assertEqual(args.path, "shape")
+        args = configure.build_parser().parse_args(["--reset", "default"])
+        self.assertEqual(args.reset, "default")
+
+
 class HermesHomeContainmentTests(TempHomeTestCase):
     """Live-sweep catch: the `hermes` CLI resolves ITS home from
     $HERMES_HOME, so a run pointed at --hermes-home must pin that env for

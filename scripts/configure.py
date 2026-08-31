@@ -34,11 +34,16 @@ is written without explicit confirmation (or ``--yes``).
 Usage
 =====
 
-  python3 scripts/configure.py                     # interactive
-  python3 scripts/configure.py --status            # read-only state report
-  python3 scripts/configure.py --agent default --path recommend --yes
-  python3 scripts/configure.py --agent default --path shape --dry-run
-  python3 scripts/configure.py --reset default     # back to recommend mode
+  python3 scripts/configure.py                       # interactive
+  python3 scripts/configure.py --status              # read-only state report
+  python3 scripts/configure.py --agent default --mode history --dry-run
+  python3 scripts/configure.py --agent default --mode learning --yes
+  python3 scripts/configure.py --agent default --mode off --yes
+
+``--mode`` mirrors the interactive menu: learning (shape from future usage),
+history (shape from recorded sessions now), off (observe only; the learned
+overlay is kept but not applied). ``--path shape|recommend`` and ``--reset``
+remain as hidden compatibility aliases (--reset also clears the overlay).
 """
 
 from __future__ import annotations
@@ -1951,8 +1956,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--status", action="store_true", help="print per-scope state and telemetry counts, write nothing")
     parser.add_argument("--agent", default=None, help="restrict to one agent/profile (skips selection)")
-    parser.add_argument("--path", choices=("shape", "recommend"), default=None, help="skip the path question")
-    parser.add_argument("--reset", metavar="AGENT", default=None, help="return an agent to recommend mode")
+    parser.add_argument(
+        "--mode", choices=("learning", "history", "off"), default=None,
+        help="set the shaping mode non-interactively: learning (shape from "
+             "future usage), history (shape from recorded sessions now), "
+             "off (observe only)")
+    # Hidden compatibility aliases from the pre-mode-setter vocabulary:
+    # --path shape ≈ --mode history, --path recommend = observation mode with
+    # a full-ceiling baseline, --reset additionally clears the overlay.
+    parser.add_argument("--path", choices=("shape", "recommend"), default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--reset", metavar="AGENT", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--yes", action="store_true", help="apply without the interactive confirmation")
     parser.add_argument("--dry-run", action="store_true", help="show every diff, write nothing")
     parser.add_argument("--platform", action="append", default=None, help="platform to assume when a profile has no telemetry (repeatable)")
@@ -2041,8 +2054,10 @@ def _main_with_home(args: argparse.Namespace, hermes_home: Path) -> int:
 
         if args.reset:
             rc = flow_reset(ctx, infos)
-        elif args.path == "shape":
+        elif args.mode == "history" or args.path == "shape":
             rc = flow_shape(ctx, infos)
+        elif args.mode in ("learning", "off"):
+            rc = _apply_mode(ctx, infos, args.mode)
         elif args.path == "recommend":
             rc = flow_recommend(ctx, infos)
         else:

@@ -188,7 +188,8 @@ immediate, permanent fix, pin it with `plugins.tool-belt.always_carry:
 **"Tools load that I never use."** That's carry cost the shaper will
 eventually demote — or help it along: run
 `python3 analyze.py` for demotion candidates, or
-`configure.py --reset <agent>` to return an agent to observation mode.
+`tool-belt configure --mode off --agent <agent>` to switch an agent to
+observation mode.
 
 **"I want it off right now."** Two switches, per scope or global:
 

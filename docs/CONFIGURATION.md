@@ -66,8 +66,10 @@ derived from [`learning.shape_ceiling`](#learningshape_ceiling) in
 
 ### Reset behavior
 
-`configure.py --reset <agent>` returns a shaped scope to its pre-shaping
-state:
+`tool-belt configure --mode off --agent <agent>` pauses shaping for an agent
+(the learned overlay is kept but not applied — turning shaping back on
+resumes where it left off). The deeper `configure.py --reset <agent>` returns
+a shaped scope all the way to its pre-shaping state:
 
 1. The scope's entry is removed from [`learned.json`](#learnedjson-reference).
    Other scopes and the global block are left untouched, and the file itself
