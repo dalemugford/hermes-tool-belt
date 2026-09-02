@@ -22,18 +22,11 @@ SCHEMA = {
     "name": "expand_tools",
     "description": (
         "Load a category of tools that wasn't included in this turn's tool list. "
-        "Use this when you need a tool that isn't available — for example: "
-        "'browser' for web automation, 'image_gen' for drawing, 'cronjob' for "
-        "scheduling, 'tts' for text-to-speech, 'delegation' for spawning subagents, "
-        "'code_execution' for batch processing scripts. After calling, the new "
-        "tools are available on the very next tool call and usually stay "
-        "available — often for the rest of the session, at minimum for the "
-        "next few turns. If a tool you need is ever absent, simply call this "
-        "again. Cheap and safe to call "
-        "preemptively if you're unsure whether a tool is loaded. "
-        "Accepts a 'category' (toolset name) or a 'tool' (specific tool name). "
-        "If you know the tool name but not its category, pass it as 'tool' and "
-        "the handler will find the right category for you."
+        "Use this when you need a tool that isn't available (e.g. 'browser' for "
+        "web automation; the manifest below lists what's gated). After calling, "
+        "the new tools are available on the very next tool call and stay loaded — "
+        "usually for the rest of the session. If a tool you need is ever absent, "
+        "call this again."
     ),
     "parameters": {
         "type": "object",
@@ -41,18 +34,15 @@ SCHEMA = {
             "category": {
                 "type": "string",
                 "description": (
-                    "The toolset name to load. Common values: browser, image_gen, "
-                    "tts, vision, cronjob, delegation, code_execution, terminal, "
-                    "file, web, skills, homeassistant. Any toolset name from "
-                    "Hermes' toolset table is accepted."
+                    "The toolset name to load (e.g. 'browser'). Any name from the "
+                    "manifest above or Hermes' toolset table is accepted."
                 ),
             },
             "tool": {
                 "type": "string",
                 "description": (
-                    "A specific tool name to load (e.g. 'mnemosyne_diagnose', 'browser_exec'). "
-                    "If you know the tool name but not its category, use this instead of 'category'. "
-                    "The handler will resolve it to the correct toolset automatically."
+                    "A specific tool name (e.g. 'browser_exec') when you know the "
+                    "tool but not its category; the handler resolves it."
                 ),
             },
         },
@@ -82,10 +72,9 @@ def _available_toolset_names() -> list[str]:
 _UNGROUPED_LABEL = "(ungrouped)"
 
 _MANIFEST_HEADER = (
-    "Enabled expand-only tools (full schemas omitted this turn to save "
-    "context). A trigger may auto-activate one when your message needs it; "
-    "otherwise call expand_tools(tool=NAME) — or expand_tools(category=NAME) — "
-    "to load it explicitly. Grouped by toolset:"
+    "Expand-only tools (schemas omitted to save context); a trigger may "
+    "auto-load one, or call expand_tools(tool=NAME) yourself. "
+    "Grouped by toolset:"
 )
 
 

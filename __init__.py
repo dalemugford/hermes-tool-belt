@@ -3,35 +3,43 @@
 The plugin reduces per-API-call tool overhead by sending the model only the
 tools likely to be useful, while respecting the user's ``platform_toolsets``
 ceiling and keeping ``expand_tools`` as a safety valve for the cases the
-plugin guessed wrong.
+plugin guessed wrong — on the providers where narrowing pays.
 
-ARCHITECTURE — two modes, one mechanism
-=======================================
+ARCHITECTURE — two postures, keyed by provider
+==============================================
 
-The cost calculus differs sharply between providers with active prefix
-caching (Anthropic, OpenAI auto-cache — ~80% of typical traffic) and those
-without (kimi, gpt-5.4-mini). The plugin runs in one of two modes:
+Whether narrowing helps or hurts is a property of the PROVIDER, per call:
+some prompt-cache the prefix (OpenRouter, openai-codex — ~90%+ hit rates
+measured) and some never do (ollama-cloud — 0% over thousands of calls).
+A scope mixes both through primary/fallback/delegation, so the posture
+is resolved against the provider a session is talking to, not the scope.
+Detection state is keyed ``scope|provider``. The plugin runs one of two
+postures per session:
 
-  cache-on (default under ``cache_mode: auto | on``)
-    Freeze the tool set at session start. Subsequent dispatches in the
-    same session reuse the frozen set verbatim. Tool-list mutation between
-    turns would otherwise bust the provider prefix cache and re-bill the
-    conversation history at the full input rate — a cost that dwarfs the
-    schema-token savings from per-turn narrowing. The freeze is evicted
-    only at moments that already cost a cache break: session reset and
-    context compaction.
+  cache-on / carry-all (caching providers; ``cache_mode: on`` forces it)
+    Ship the full enabled ceiling on every call, minus ``expand_tools``,
+    and never touch the list again for the session's life. Any tool-list
+    mutation on a caching provider busts the prefix cache and re-bills
+    the whole conversation history at the full input rate (26K–54K
+    tokens per event, measured) — far more than per-turn narrowing ever
+    saves. Nothing to narrow means nothing to expand, so ``expand_tools``
+    is stripped from the wire too: shipping it would only invite the one
+    mutation the posture exists to prevent. The predictor, sticky
+    residency, and lookback do not run; the prediction row is still
+    written (ceiling == shipped, reduction 0) so the cohort stays
+    visible in telemetry.
 
-    Sticky residency, lookback, and per-turn predictor execution do not
-    apply on the frozen path: the frozen set already carries forward
-    verbatim, so per-turn adjustment has nothing to add. ``expand_tools``
-    continues to mutate the frozen set in-place; that mutation is
-    model-driven and pays one cache break for the value of getting the
-    tool the model actually wanted.
+  cache-off (non-caching providers; ``cache_mode: off`` forces it)
+    Per-turn narrowing with ``expand_tools`` shipped (carrying the
+    expand-only manifest) and sticky residency carrying expanded tools
+    forward a few turns. With no prefix cache to protect, every schema
+    token not sent is a token saved. This is the value engine.
 
-  cache-off (``cache_mode: off`` or auto-detected for known-uncached models)
-    Per-turn narrowing with sticky residency carrying expanded tools
-    forward a few turns. This mode serves providers where prefix caching
-    doesn't apply.
+The posture is pinned at a session's first dispatch against the provider
+it resolves to (observed, else the configured primary). A mid-session
+provider change that would flip the posture evicts the pin so the next
+dispatch re-resolves — the model switch already broke the cache, so the
+re-resolution costs nothing extra.
 
 See docs/ARCHITECTURE.md for the full design and docs/CONFIGURATION.md
 for every config knob.
@@ -40,10 +48,11 @@ PATCH SURFACE — minimal, runtime-applied
 ========================================
 
   · ``AIAgent._build_api_kwargs`` — filters ``kwargs["tools"]`` per call.
-    Source of the filter is either the session's frozen set (cache-on) or
-    the per-turn predictor's allowed set (cache-off).
-  · ``AIAgent._compress_context`` — evicts the freeze on compaction so the
-    next dispatch re-freezes against the post-compaction state.
+    Under carry-all the filter only removes ``expand_tools``; under
+    cache-off it applies the per-turn predictor's allowed set.
+  · ``AIAgent._compress_context`` — evicts the session's posture pin on
+    compaction so the next dispatch re-resolves against the
+    post-compaction state (compaction already costs a cache break).
 
 ``self.tools`` on the AIAgent is left untouched — we narrow the on-the-wire
 payload only.
@@ -59,32 +68,35 @@ LIFECYCLE
         post_api_request, on_session_end, on_session_reset
 
   · pre_gateway_dispatch(event, ...)
-      - resolve cache_mode for the session (config + cross-session cache)
-      - cache-on with frozen state: reuse the frozen set, skip predictor
-      - cache-on first dispatch: run predictor, freeze the result
+      - resolve the posture for the session (config + scope|provider
+        detection cache), pinned at first dispatch
+      - cache-on: carry-all state, no predictor
       - cache-off: run predictor (sticky + lookback enabled)
       - stash state in a contextvar (expand_tools mutates this same dict)
 
   · patched _build_api_kwargs(self, api_messages)
       - call original to get the full kwargs
       - read state from the contextvar
-      - filter kwargs["tools"] down to the allowed set
+      - carry-all: strip expand_tools, ship everything else verbatim
+      - cache-off: filter kwargs["tools"] down to the allowed set
       - on first call per turn: write the prediction row
       - on every call: write the api_calls row (cache tokens, system_hash, …)
-      - propagate any new expansions back to the session's frozen snapshot
 
   · post_tool_call(tool_name, …)
       - append row to tool_calls.jsonl with prediction_id linkage
 
   · post_api_request(usage, …)
       - per-call cache_read / cache_write capture
-      - cache-mode detection state machine (locks "on"/"off" per session)
+      - cache-mode detection state machine, per scope|provider bucket of
+        the CALL's provider (locks "on"/"off")
+      - provider-change eviction of the session's pin when the new
+        provider's posture differs
       - cache-TTL expiry detection (stable hash + cold cache after >5min)
       - cross-session lock persistence to cache_mode_detection.json
 
   · on_session_end (fires per-turn — Hermes' hook semantics)
-      - sticky + lookback eviction; freeze + cache-mode state stay
-        because this hook fires after every turn, not just at session end
+      - clears the turn contextvar only; sticky/lookback/pin/cache-mode
+        state stay because this hook fires after every turn
       - then the debounced in-process auto-shape pass (_maybe_auto_shape)
 
   · on_session_reset (true /reset or /new)
@@ -147,11 +159,11 @@ _CONFIG: dict[str, Any] = {
     # (top-level or channels.<scope>.).
     "auto_shape": True,
     # Cache-off mode pipeline — sticky residency + per-turn predictor
-    # lookback. Both are inert under cache-on (the default), where the
-    # frozen tool set carries forward in-session expansions verbatim
-    # via _FROZEN_BY_SESSION. The cache_off sub-section makes the
-    # dual-mode structure explicit instead of layering MODE-ONLY notes
-    # on top-level keys.
+    # lookback. Both are inert under cache-on (carry-all), where the
+    # full ceiling ships on every call and there is nothing to carry
+    # forward. The cache_off sub-section makes the dual-posture
+    # structure explicit instead of layering MODE-ONLY notes on
+    # top-level keys.
     "cache_off": {
         "sticky": {
             "enabled": True,
@@ -177,13 +189,14 @@ _CONFIG: dict[str, Any] = {
     # active_tool_names is set to NO_NARROWING and policy_source is "bypass".
     # 0.0 disables. Override per scope via channels.<scope>.bypass_rate.
     "bypass_rate": 0.0,
-    # Determines whether tools may be mutated mid-session.
-    #   auto — observe cache_read_tokens for the first few turns and
-    #          self-select on|off. Bias the default to "on" once the
-    #          empirical window concludes.
-    #   on   — assume provider prefix-caching is active; freeze tools at
-    #          session start.
-    #   off  — assume caching is inactive; narrow tools per turn.
+    # Determines whether tools may be narrowed at all.
+    #   auto — observe cache_read_tokens for the first few calls on each
+    #          scope|provider bucket and self-select on|off; "on" until
+    #          the empirical window concludes.
+    #   on   — assume provider prefix-caching is active; carry the full
+    #          ceiling (minus expand_tools) and never mutate the list.
+    #   off  — assume caching is inactive; narrow tools per turn with
+    #          expand_tools shipped.
     "cache_mode": "auto",
     "cache_auto": {
         # Observe at least this many API calls before locking the mode.
@@ -198,12 +211,23 @@ _CONFIG: dict[str, Any] = {
         "detect_min_input_tokens": 5000,
         # hit_rate ≥ on_threshold → lock "on"; else lock "off".
         "on_threshold": 0.40,
-        # Models empirically observed with negligible provider-side cache
-        # hit rates; skip the detection window and lock "off" immediately
-        # rather than spending 5 calls to re-derive a known answer.
+        # Models (or provider names) empirically observed with negligible
+        # provider-side cache hit rates; skip the detection window and
+        # lock "off" immediately rather than spending 5 calls to
+        # re-derive a known answer.
         "providers_off_models": ["kimi-k2.6:cloud", "gpt-5.4-mini"],
     },
 }
+
+# Host facts, NOT plugin settings: the configured primary provider/model
+# from Hermes' top-level ``model`` block. Kept outside ``_CONFIG`` on
+# purpose — ``_CONFIG`` is exactly the operator surface declared in
+# plugin.yaml (locked by tests/test_config_path.py), and these are read
+# from the host, never set by the operator through us. The provider is
+# the posture-resolution fallback before a session has been observed on
+# any provider; the model is telemetry only. Best-effort — "" when the
+# host config is unreadable.
+_HOST_MODEL: dict[str, str] = {"provider": "", "model": ""}
 
 _ORIGINAL_BUILD_API_KWARGS: Any = None
 _ORIGINAL_COMPRESS_CONTEXT: Any = None
@@ -220,52 +244,62 @@ _POLICY_TURN_BY_SCOPE: dict[str, int] = {}
 _PRIOR_MESSAGES_BY_SESSION: dict[str, list[str]] = {}
 
 # ─── Cache-aware state ────────────────────────────────────────────────────
-# Frozen tool-set decisions per canonical session key. Evicted on session
-# reset and context compaction; the per-turn on_session_end hook preserves it.
-_FROZEN_BY_SESSION: dict[str, dict[str, Any]] = {}
-#: Cache-mode decision pinned at a session's FIRST dispatch. Without the pin,
-#: a detection lock landing mid-session flips the current session's path —
-#: granted expansions vanish and the freeze entry leaks. Evicted with the
-#: freeze on session reset.
-_CACHE_DECISION_BY_SESSION: dict[str, str] = {}
+#: Posture pinned at a session's FIRST dispatch, with the provider it was
+#: resolved against: ``{"mode": "on"|"off", "provider": str}``. Without the
+#: pin, a detection lock landing mid-session flips the current session's
+#: path turn-to-turn. Evicted on session reset, context compaction, and a
+#: mid-session provider change whose posture differs (see
+#: _on_post_api_request) — all three already cost a cache break.
+_CACHE_DECISION_BY_SESSION: dict[str, dict[str, str]] = {}
 
 # Cross-session detection cache. Persisted JSON at
 # ``~/.hermes/state/tool-belt/cache_mode_detection.json``. Keyed by
-# scope (``agent:platform``) — model identity isn't reliable at
-# pre_gateway_dispatch (set later by the AIAgent) and scope is the
-# right granularity for "does this profile's provider cache?". Values:
-#   {scope: {"mode": "on"|"off", "locked_at": ts, "lock_reason": str,
-#            "hit_rate_at_lock": float, "sessions_locked": int,
-#            "last_model": str}}
-# Loaded once on register(); written on every per-session lock event.
+# ``scope|provider`` (``agent:platform|provider``) — whether the prefix
+# cache hits is a property of the provider a call went to, and a scope
+# mixes providers via primary/fallback/delegation. Values:
+#   {"scope|provider": {"mode": "on"|"off", "locked_at": ts,
+#                       "lock_reason": str, "hit_rate_at_lock": float,
+#                       "sessions_locked": int, "last_model": str}}
+# Pre-1.0 files were keyed by bare scope; _load_detection_cache re-keys
+# them under the configured primary provider. Loaded once on register();
+# written on every lock event.
 _DETECTION_CACHE: dict[str, dict[str, Any]] = {}
 _DETECTION_CACHE_LOADED = False
 
 # Cache-mode detection state per canonical session_key. Each entry:
 #   {
-#     "mode": "pending" | "on" | "off",
-#     "calls_observed": int,
-#     "cache_read": int, "cache_write": int, "input": int,
-#     "locked_at_call": int | None,
-#     "lock_reason": str,  # "provider_blocklist" | "threshold_met" |
-#                          # "threshold_failed" | "forced_on" | "forced_off"
+#     "observed_provider": str,   # provider of the most recent API call
+#     "last_call_ts": float, "last_call_hash": str,   # TTL-expiry probe
+#     "buckets": {
+#       provider: {
+#         "mode": "pending" | "on" | "off",
+#         "calls_observed": int,
+#         "cache_read": int, "cache_write": int, "input": int,
+#         "locked_at_call": int | None,
+#         "lock_reason": str,  # "provider_blocklist" | "threshold_met" |
+#                              # "threshold_failed" | "forced_on" | "forced_off"
+#       }
+#     }
 #   }
-# Populated by _on_post_api_request and consulted by freeze decisions.
+# One bucket per provider the session has been observed on, so a failover
+# call to a non-caching provider never drags a caching primary's numbers.
+# Populated by _on_post_api_request; consulted by posture resolution.
 _CACHE_MODE_BY_SESSION: dict[str, dict[str, Any]] = {}
 
 
 # Most-recently-seen canonical session key per platform. Populated in
 # _on_pre_gateway_dispatch (which sees the real session_store-derived key)
-# and consumed by _on_session_reset to recover the freeze's canonical key.
+# and consumed by _on_session_reset to recover the canonical key the
+# session's pin and detection state are stored under.
 #
 # Why this exists: Hermes' gateway fires on_session_reset with only the
 # NEW session UUID and the platform string — not the canonical session_key
-# the freeze is stored under. The new UUID is meaningless to us; without
+# the state is stored under. The new UUID is meaningless to us; without
 # this back-reference, the eviction path is a silent no-op.
 #
 # Multi-chat tradeoff: under several active chats on the same platform,
 # this map only tracks the latest. /new in one chat will evict that
-# chat's freeze (correct) but not other chats' (also correct, because
+# chat's state (correct) but not other chats' (also correct, because
 # /new is per-chat and we only just touched this one). If chats fire
 # back-to-back, the last-touched wins eviction; the others continue
 # normally. Per-chat granularity would require Hermes core passing
@@ -309,6 +343,19 @@ def _load_user_config() -> None:
                 "as channels.<agent>.<platform>); move them and remove the "
                 "old block"
             )
+        # Configured primary provider/model (Hermes' top-level ``model``
+        # block) — the posture-resolution fallback before a session has
+        # been observed on any provider. Read before the plugin-settings
+        # gate so it lands even when the operator has no tool-belt block.
+        try:
+            _HOST_MODEL["provider"] = str(
+                cfg_get(cfg, "model", "provider", default="") or ""
+            ).strip().lower()
+            _HOST_MODEL["model"] = str(
+                cfg_get(cfg, "model", "default", default="") or ""
+            ).strip()
+        except Exception:
+            pass
         plugin_cfg = cfg_get(cfg, "plugins", "entries", "tool-belt", "settings",
                              default={})
         if not isinstance(plugin_cfg, dict):
@@ -410,19 +457,38 @@ def _wrap_build_api_kwargs(original):
             state.setdefault("enabled_ceiling", sorted(builtin_ceiling))
             state.setdefault("mcp_passthrough_tools", mcp_passthrough_names)
 
-            # No-narrowing (no-narrowing preset or A/B bypass): don't
-            # narrow, but still log on the first call.
+            # No-narrowing (carry-all posture, no-narrowing preset, or A/B
+            # bypass): don't narrow, but still log on the first call.
             if active_names == NO_NARROWING or active_names is None:
+                shipped = tools
+                if state.get("policy_source") == "cache_on_carry_all":
+                    # Carry-all: everything ships EXCEPT expand_tools. It is
+                    # a registered real tool, so Hermes always includes it;
+                    # with nothing narrowed there is nothing to expand, and
+                    # shipping it would invite the one mid-session mutation
+                    # this posture exists to prevent. The list is otherwise
+                    # untouched, so its hash is byte-stable across the
+                    # session — the whole point on a caching provider.
+                    shipped = [
+                        t for t in tools
+                        if not (isinstance(t, dict)
+                                and _base_tool_name(_tool_name(t)) == "expand_tools")
+                    ]
+                    if len(shipped) != len(tools):
+                        kwargs = dict(kwargs)
+                        kwargs["tools"] = shipped
                 # Snapshot once per prediction. Subsequent _build_api_kwargs
                 # calls within the same turn (after the model used a tool
                 # like expand_tools) must not overwrite the "what the model
                 # initially saw" record.
-                state.setdefault("initial_active_tools", ceiling_names)
+                state.setdefault("initial_active_tools", _tool_names(shipped))
                 state.setdefault("expand_only_tools", [])
-                state["last_tool_list_hash"] = _tool_list_hash(tools)
+                state["last_tool_list_hash"] = _tool_list_hash(shipped)
                 state["last_system_hash"] = _system_message_hash(api_messages)
                 state["api_call_idx"] = int(state.get("api_call_idx", 0)) + 1
-                _maybe_log_prediction(state, ceiling=tools, narrowed=tools)
+                # ceiling == narrowed: reduction 0 by construction, and the
+                # cohort stays visible in telemetry.
+                _maybe_log_prediction(state, ceiling=shipped, narrowed=shipped)
                 return kwargs
 
             # Resolve explicit expansions (expand_tools) — a category name
@@ -510,10 +576,10 @@ def _wrap_build_api_kwargs(original):
 
             # Append the expand-only discoverability manifest to a per-request
             # CLONE of the expand_tools schema. Built from ``model.expand_only``
-            # (the residency stratum X), so it stays byte-identical across a
-            # cache-on session even when a trigger later activates one of these
-            # tools — residency never changes, only the active set grows. Fail
-            # OPEN: any error leaves ``filtered`` and the original schema intact.
+            # (the residency stratum X), so it stays byte-identical across the
+            # session even when a trigger later activates one of these tools —
+            # residency never changes, only the active set grows. Fail OPEN:
+            # any error leaves ``filtered`` and the original schema intact.
             try:
                 manifest_text = expand_tools_mod.build_expand_only_manifest(
                     model.expand_only
@@ -551,20 +617,6 @@ def _wrap_build_api_kwargs(original):
             state["last_tool_list_hash"] = _tool_list_hash(filtered)
             state["last_system_hash"] = _system_message_hash(api_messages)
             state["api_call_idx"] = int(state.get("api_call_idx", 0)) + 1
-
-            # Propagate any expansions back to the session's
-            # frozen snapshot so the next dispatch reuses them. Without
-            # this, expand_tools events would only live for one turn and
-            # the model would have to re-expand on every subsequent
-            # turn — defeating the freeze's whole point.
-            sid = state.get("session_id", "")
-            if sid and sid in _FROZEN_BY_SESSION:
-                current_expansions = set(state.get("expansions") or set())
-                if current_expansions:
-                    frozen = _FROZEN_BY_SESSION[sid]
-                    prior = set(frozen.get("expansions") or set())
-                    if not current_expansions.issubset(prior):
-                        frozen["expansions"] = prior | current_expansions
 
             _maybe_log_prediction(state, ceiling=tools, narrowed=filtered)
             return kwargs
@@ -694,7 +746,7 @@ def _system_message_hash(api_messages: Any) -> str:
     the system prompt, prompt-caching strategy adjustments, etc.) busts
     the entire downstream cache regardless of how stable the tool list
     is. If this hash varies turn-over-turn within a session while
-    tool_list_hash stays stable, the freeze is doing its job and
+    tool_list_hash stays stable, carry-all is doing its job and
     something else upstream is the cache breaker.
 
     Returns truncated sha256 of the first message's content when its
@@ -1026,7 +1078,7 @@ def _hermes_session_uuid(
     """Resolve the Hermes internal session UUID for telemetry grouping.
 
     Telemetry-only. Unlike :func:`_canonical_session_key` (the load-bearing
-    session *key* used for freeze/bypass/sticky/lookback keying), this is the
+    session *key* used for pin/bypass/sticky/lookback keying), this is the
     per-session UUID that changes on ``/new``. The shaper groups by it so a
     single long-lived chat still yields the distinct-session count its demote
     threshold needs.
@@ -1243,14 +1295,49 @@ def _maybe_log_prediction(
         logger.debug("tool-belt: log_prediction failed: %s", exc)
 
 
+def _evict_session_cache_state(session_id: str, keep_provider: str = "") -> bool:
+    """Drop a session's posture pin and detection state.
+
+    The single eviction path shared by context compaction, ``/reset`` /
+    ``/new``, and a mid-session provider change (see
+    ``_on_post_api_request``) — every one of them is a moment the
+    provider's cached prefix is already gone, so re-resolving the posture
+    on the next dispatch costs nothing extra. Returns True when anything
+    was actually evicted.
+
+    ``keep_provider`` is the provider-change form: the pin and every OTHER
+    provider's bucket go, but the session stays marked as observed on
+    ``keep_provider`` with that bucket intact — so the re-resolution lands
+    on the provider the session is actually talking to, not the
+    configured primary, and this call's observation isn't thrown away.
+    """
+    sid = str(session_id or "")
+    if not sid:
+        return False
+    had_pin = _CACHE_DECISION_BY_SESSION.pop(sid, None) is not None
+    if not keep_provider:
+        had_mode = _CACHE_MODE_BY_SESSION.pop(sid, None) is not None
+        return had_pin or had_mode
+    mode_state = _CACHE_MODE_BY_SESSION.get(sid) or {}
+    buckets = mode_state.get("buckets") or {}
+    kept = buckets.get(keep_provider)
+    _CACHE_MODE_BY_SESSION[sid] = {
+        "observed_provider": keep_provider,
+        "buckets": {keep_provider: kept} if kept is not None else {},
+    }
+    return True
+
+
 def _wrap_compress_context(original):
-    """Evict the session's frozen snapshot after compaction.
+    """Evict the session's posture pin after compaction.
 
     Compaction rewrites the conversation history — the provider's
     cached prefix becomes worthless because the bytes after the system
-    block differ. We treat that moment as a free reshape opportunity:
-    drop the frozen tool set so the next ``pre_gateway_dispatch``
-    runs the predictor fresh against the post-compaction state.
+    block differ. We treat that moment as a free re-resolution
+    opportunity: drop the pin and detection state so the next
+    ``pre_gateway_dispatch`` resolves the posture fresh (a detection
+    lock that landed mid-session can take effect here rather than
+    waiting for the next session).
 
     The wrapper runs around the original to keep the AIAgent's
     compaction semantics intact even on failure paths — we evict only
@@ -1263,23 +1350,22 @@ def _wrap_compress_context(original):
         try:
             session_key = os.environ.get("HERMES_SESSION_KEY") or ""
             evicted_keys: list[str] = []
-            if session_key and session_key in _FROZEN_BY_SESSION:
-                _FROZEN_BY_SESSION.pop(session_key, None)
-                _CACHE_MODE_BY_SESSION.pop(session_key, None)
-                _CACHE_DECISION_BY_SESSION.pop(session_key, None)
-                evicted_keys.append(session_key)
+            # Only carry-all sessions re-resolve here. Cache-off sessions
+            # are narrowing per turn already and their detection counters
+            # must survive compaction unchanged.
+            if session_key and _pinned_posture(session_key) == "on":
+                if _evict_session_cache_state(session_key):
+                    evicted_keys.append(session_key)
             # Defensive: also try the AIAgent's session_id (UUID) in case
             # the canonical environment key is unavailable.
             aid = getattr(self, "session_id", "") or ""
-            if aid and aid != session_key and aid in _FROZEN_BY_SESSION:
-                _FROZEN_BY_SESSION.pop(aid, None)
-                _CACHE_MODE_BY_SESSION.pop(aid, None)
-                _CACHE_DECISION_BY_SESSION.pop(aid, None)
-                evicted_keys.append(aid)
+            if aid and aid != session_key and _pinned_posture(aid) == "on":
+                if _evict_session_cache_state(aid):
+                    evicted_keys.append(aid)
             if evicted_keys:
                 logger.info(
-                    "tool-belt: compaction evicted freeze for session(s) %s — "
-                    "next dispatch will re-freeze",
+                    "tool-belt: compaction evicted posture pin for session(s) "
+                    "%s — next dispatch will re-resolve",
                     evicted_keys,
                 )
         except Exception as exc:
@@ -1367,12 +1453,12 @@ def _install_patches() -> bool:
     _ORIGINAL_BUILD_API_KWARGS = AIAgent._build_api_kwargs
     AIAgent._build_api_kwargs = _wrap_build_api_kwargs(_ORIGINAL_BUILD_API_KWARGS)
 
-    # Compaction-driven freeze eviction. No `post_compaction`
+    # Compaction-driven posture-pin eviction. No `post_compaction`
     # hook exists in Hermes, so we wrap the forwarder method directly.
     # Best-effort — when _compress_context is missing (older Hermes
-    # versions, custom builds) the freeze persists across compaction,
-    # which costs a single cache break on the next dispatch but doesn't
-    # corrupt anything.
+    # versions, custom builds) the pin persists across compaction, which
+    # only delays a mid-session detection lock to the next session and
+    # doesn't corrupt anything.
     if hasattr(AIAgent, "_compress_context"):
         _ORIGINAL_COMPRESS_CONTEXT = AIAgent._compress_context
         AIAgent._compress_context = _wrap_compress_context(_ORIGINAL_COMPRESS_CONTEXT)
@@ -1517,101 +1603,99 @@ def _should_bypass(scope: str, session_id: str) -> bool:
     return bucket < rate
 
 
-# ─── Cache-aware freeze ────────────────────────────────────────────────────
+# ─── Cache-aware posture ───────────────────────────────────────────────────
 
-def _resolve_cache_mode_for_session(session_id: str, scope: str = "") -> str:
-    """Decide whether this dispatch should freeze tools at the session level.
+def _pinned_posture(session_id: str) -> str:
+    """The session's pinned posture ("on"/"off"), or "" when unpinned."""
+    pin = _CACHE_DECISION_BY_SESSION.get(str(session_id or ""))
+    if not isinstance(pin, dict):
+        return ""
+    mode = pin.get("mode")
+    return mode if mode in ("on", "off") else ""
 
-    Returns "on" or "off":
 
-      · Explicit ``cache_mode: off`` → "off" — keep per-turn narrowing.
-      · Explicit ``cache_mode: on`` → "on" — freeze.
-      · ``cache_mode: auto`` (default) → consult the cross-session
-        detection cache. If a prior session of this scope locked to a
-        definite mode, honor it. Otherwise default to "on" to protect
-        prefix-cache stability.
+def _session_provider(session_id: str) -> str:
+    """Provider this session was most recently observed on ("" if none yet).
 
-    Mid-session switching is intentionally not supported — switching
-    itself busts the cache. The decision is therefore PINNED at the
-    session's first dispatch (``_CACHE_DECISION_BY_SESSION``): a detection
-    lock landing mid-session applies to the NEXT session, never this one.
+    Set by ``_on_post_api_request`` from the per-call ``provider`` Hermes
+    reports, so it reflects failover and ``/model`` switches — not just the
+    configured primary.
     """
-    sid = str(session_id or "")
-    if sid and sid in _CACHE_DECISION_BY_SESSION:
-        return _CACHE_DECISION_BY_SESSION[sid]
+    mode_state = _CACHE_MODE_BY_SESSION.get(str(session_id or "")) or {}
+    return str(mode_state.get("observed_provider") or "")
+
+
+def _bucket_mode(scope: str, provider: str, session_key: str = "") -> str:
+    """Locked mode ("on"/"off") for a scope|provider bucket, or "" if pending.
+
+    The session's in-process bucket wins when it has locked — forced
+    modes and provider-blocklist locks live only there, never in the
+    persisted cache — then the cross-session cache.
+    """
+    provider = str(provider or "").strip().lower()
+    buckets = (_CACHE_MODE_BY_SESSION.get(str(session_key or "")) or {}).get("buckets") or {}
+    mode = (buckets.get(provider) or {}).get("mode")
+    if mode in ("on", "off"):
+        return mode
+    return _cached_detection_mode(scope, provider)
+
+
+def _resolve_posture_for_provider(scope: str, provider: str, session_key: str = "") -> str:
+    """Posture ("on"/"off") for a scope|provider bucket, unpinned.
+
+      · Explicit ``cache_mode: off`` → "off" — per-turn narrowing.
+      · Explicit ``cache_mode: on`` → "on" — carry-all.
+      · ``cache_mode: auto`` (default) → consult the bucket (this
+        session's in-process lock, then the cross-session detection
+        cache). If it locked to a definite mode, honor it. Otherwise
+        default to "on": until proven uncached, protect prefix-cache
+        stability.
+    """
     mode = str(_CONFIG.get("cache_mode") or "auto").lower()
     if mode in ("on", "off"):
-        decision = mode
-    else:
-        # auto: consult the cross-session cache; default "on" on a miss.
-        cached = _cached_detection_mode(scope)
-        decision = cached if cached in ("on", "off") else "on"
+        return mode
+    locked = _bucket_mode(scope, provider, session_key)
+    return locked if locked in ("on", "off") else "on"
+
+
+def _resolve_cache_mode_for_session(
+    session_id: str, scope: str = "", provider: str = "",
+) -> str:
+    """Decide this session's posture: carry-all ("on") or narrow ("off").
+
+    The posture is a property of the PROVIDER the session talks to, so it
+    resolves against one, in order: (a) the provider this session has
+    already been observed on (failover / ``/model`` aware), (b) the
+    explicit ``provider`` argument, (c) the configured primary provider,
+    (d) "" — the bare-scope entry ``_cached_detection_mode`` falls back
+    to for pre-1.0 detection files.
+
+    The decision is PINNED at the session's first dispatch
+    (``_CACHE_DECISION_BY_SESSION``) together with the provider it was
+    resolved against: a detection lock landing mid-session applies to
+    the NEXT session, never this one. The one mid-session re-resolution
+    is a provider change whose posture differs — ``_on_post_api_request``
+    evicts the pin then, because the switch already broke the cache.
+    """
+    sid = str(session_id or "")
+    pinned = _pinned_posture(sid)
+    if pinned:
+        return pinned
+    resolved_provider = (
+        _session_provider(sid)
+        or str(provider or "").strip().lower()
+        or str(_HOST_MODEL.get("provider") or "")
+    )
+    decision = _resolve_posture_for_provider(scope, resolved_provider, session_key=sid)
     if sid:
-        _CACHE_DECISION_BY_SESSION[sid] = decision
+        _CACHE_DECISION_BY_SESSION[sid] = {
+            "mode": decision, "provider": resolved_provider,
+        }
     return decision
 
 
-def _freeze_session_snapshot(
-    session_id: str,
-    *,
-    active_tool_names: Any,
-    baseline_active_tools: Any,
-    preset_name: str,
-    trigger_tools_by_group: dict[str, list[str]],
-    triggers_fired: list[str],
-    triggers_suppressed: list[str],
-    policy_source: str,
-    policy_version: str,
-    learned_mode: str,
-    learned_scope: str,
-    learned_changes: list[str],
-    resolved_always_carry: list[str] | None = None,
-    resolved_carry: list[str] | None = None,
-    resolved_demoted: list[str] | None = None,
-    config_always_carry: list[str] | None = None,
-    triggered_tools: list[str] | None = None,
-) -> None:
-    """Persist the first dispatch's carrying decision for the session.
-
-    Captured on the first dispatch under cache-on mode. The residency
-    assignment (``resolved_always_carry`` / ``resolved_carry``) freezes here;
-    trigger matching still runs on every later message and monotonically
-    unions newly triggered tools into ``triggered_tools`` (see
-    ``_on_pre_gateway_dispatch``'s frozen-reuse branch). Session reset and
-    context compaction evict the snapshot.
-
-    ``triggers_fired`` / ``trigger_tools_by_group`` are stored so subsequent
-    turns' telemetry rows can describe the decision honestly rather than
-    blanking out as if the predictor never ran.
-    """
-    _FROZEN_BY_SESSION[session_id] = {
-        "active_tool_names": active_tool_names,
-        "baseline_active_tools": baseline_active_tools,
-        # Frozen residency strata — the A/C loadout does not change in-session.
-        "resolved_always_carry": list(resolved_always_carry or []),
-        "resolved_carry": list(resolved_carry or []),
-        "resolved_demoted": list(resolved_demoted or []),
-        "config_always_carry": list(config_always_carry or []),
-        # Monotonic accumulator of trigger-activated (expand_only) tool names.
-        # Grows at most once per newly firing trigger group across the session.
-        "triggered_tools": list(triggered_tools or []),
-        "expansions": set(),  # grown by expand_tools mid-session
-        "preset_name": preset_name,
-        "trigger_tools_by_group": dict(trigger_tools_by_group or {}),
-        "triggers_fired_at_freeze": list(triggers_fired or []),
-        "triggers_suppressed_at_freeze": list(triggers_suppressed or []),
-        "policy_source": policy_source,
-        "policy_version": policy_version,
-        "learned_mode": learned_mode,
-        "learned_scope": learned_scope,
-        "learned_changes": list(learned_changes or []),
-        "frozen_at": time.time(),
-        "reuses": 0,
-    }
-
-
-def _build_state_from_frozen(
-    frozen: dict[str, Any],
+def _build_carry_all_state(
+    preset: Any,
     *,
     session_id: str,
     hermes_session_id: str = "",
@@ -1621,77 +1705,52 @@ def _build_state_from_frozen(
     platform: str,
     message: str,
 ) -> dict[str, Any]:
-    """Construct the contextvar state for a dispatch that reuses a frozen snapshot.
+    """Construct the contextvar state for a carry-all (cache-on) dispatch.
 
-    Sticky residency and lookback do not apply under the freeze: the frozen
-    set already carries forward verbatim, so neither is populated. The
-    fields are still present in the state dict with empty values so
-    downstream consumers (telemetry, post_tool_call) don't need conditional
-    reads.
-
-    The frozen snapshot's ``expansions`` set carries forward — any
-    expand_tools tools added in prior turns of this session stay
-    available without a fresh expand_tools round-trip.
+    Nothing is narrowed, so the predictor, sticky residency, and lookback
+    do not run and there is no residency partition to record. The fields
+    are still present with empty values so downstream consumers
+    (telemetry, post_tool_call) don't need conditional reads, and
+    ``policy_source`` is stamped ``"cache_on_carry_all"`` — distinct from
+    ``"bypass"``, the internal A/B control cohort — so the analyzer can
+    tell the two unnarrowed cohorts apart.
     """
-    frozen["reuses"] = int(frozen.get("reuses", 0)) + 1
     return {
         "prediction_id": logger_io.new_prediction_id(),
-        "active_tool_names": frozen["active_tool_names"],
-        "baseline_active_tools": frozen["baseline_active_tools"],
-        # Frozen residency strata — the A/C loadout is fixed per session.
-        "resolved_always_carry": list(frozen.get("resolved_always_carry") or []),
-        "resolved_carry": list(frozen.get("resolved_carry") or []),
-        "resolved_demoted": list(frozen.get("resolved_demoted") or []),
-        "config_always_carry": list(frozen.get("config_always_carry") or []),
-        # Trigger matching still runs each message under freeze; the caller
-        # merges newly fired trigger tools into ``frozen["triggered_tools"]``
-        # before this state is built, so the accumulated set is authoritative.
-        "triggered_tools": list(frozen.get("triggered_tools") or []),
-        # Accumulation lives in triggered_tools + expansions; no extra prior
-        # carry-forward is needed to keep the active set monotonic.
+        "active_tool_names": NO_NARROWING,
+        "baseline_active_tools": NO_NARROWING,
+        "resolved_always_carry": list(getattr(preset, "always_carry", []) or []),
+        "resolved_carry": list(getattr(preset, "carry", []) or []),
+        "resolved_demoted": list(getattr(preset, "demoted", []) or []),
+        "config_always_carry": list(getattr(preset, "config_always_carry", []) or []),
+        "triggered_tools": [],
         "prior_active_tools": [],
-        # Carry expansions forward in-session — this is the core of the
-        # "stay frozen, including prior expansions" behavior.
-        "expansions": set(frozen.get("expansions") or set()),
+        "expansions": set(),
         "channel": channel,
         "agent": agent,
         "platform": platform,
         "scope": scope,
-        # Sticky disabled under freeze — empty key short-circuits all
-        # sticky helpers and the post_tool_call credit logic falls back
-        # to the in-turn ``pending_expansion`` check, which is correct.
+        # Sticky disabled — empty key short-circuits all sticky helpers.
         "sticky_key": "",
         "session_id": session_id,
         "hermes_session_id": hermes_session_id,
         "message_hash": logger_io.hash_message(message),
         "message_preview": logger_io.message_preview(message),
-        "preset": frozen["preset_name"],
-        # Triggers aren't recomputed per turn under freeze. We surface the
-        # at-freeze values so the prediction row tells an honest story
-        # ("this is what we froze on").
-        "triggers_fired": list(frozen.get("triggers_fired_at_freeze") or []),
-        "triggers_suppressed": list(frozen.get("triggers_suppressed_at_freeze") or []),
-        "trigger_tools_by_group": dict(frozen.get("trigger_tools_by_group") or {}),
+        "preset": str(getattr(preset, "name", "") or ""),
+        "triggers_fired": [],
+        "triggers_suppressed": [],
+        "trigger_tools_by_group": {},
         "sticky_tools": [],
         "sticky_categories": [],
         "sticky_remaining_turns": {},
-        # ``frozen`` policy_source is set on first-dispatch (could be
-        # "preset", "learned", or "bypass") — preserved on reuse so the
-        # cohort analyzer doesn't see the same session split across
-        # multiple sources.
-        "policy_source": frozen.get("policy_source", "preset"),
-        "policy_version": frozen.get("policy_version", ""),
-        "learned_mode": frozen.get("learned_mode", "apply"),
-        "learned_scope": frozen.get("learned_scope", ""),
-        "learned_changes": list(frozen.get("learned_changes") or []),
-        # Lookback disabled under freeze.
+        "policy_source": "cache_on_carry_all",
+        "policy_version": getattr(preset, "policy_version", ""),
+        "learned_mode": getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "apply")),
+        "learned_scope": getattr(preset, "learned_scope", ""),
+        "learned_changes": list(getattr(preset, "learned_changes", []) or []),
         "lookback_used": 0,
         "lookback_turns_config": 0,
         "logged": False,
-        # Marker for downstream telemetry — useful in the analyzer to
-        # tell first-dispatch from reuse without joining on session.
-        "frozen_reuse": True,
-        "frozen_reuse_count": frozen["reuses"],
     }
 
 
@@ -1731,51 +1790,25 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
 
         # Slash-command messages (/new, /reset, /resume, /model, ...) are
         # intercepted by the gateway's command router AFTER this hook
-        # fires but BEFORE any LLM call. A freeze built here would
-        # snapshot the predictor's read of the command text itself and
-        # never reach an API call to be logged. Skip the whole pipeline
-        # for these — we've already tracked the canonical key above so
-        # the subsequent on_session_reset can evict any pre-existing
-        # freeze cleanly.
+        # fires but BEFORE any LLM call. A pin resolved here would never
+        # reach an API call to be logged. Skip the whole pipeline for
+        # these — we've already tracked the canonical key above so the
+        # subsequent on_session_reset can evict any pre-existing pin
+        # cleanly.
         if isinstance(message, str) and message.strip().startswith("/"):
             return None
 
-        # Cache-on freeze: when this session already has a frozen carrying
-        # decision, reuse the frozen residency. Residency stays fixed, but
-        # trigger matching still runs on every inbound message: a lightweight
-        # prediction on this message can activate a new expand_only tool. Newly
-        # fired trigger tools are monotonically unioned into the frozen active
-        # set (recorded distinctly from explicit expansion) and remain until
-        # session reset. Sticky/lookback stay disabled by construction.
+        # Carry-all (cache-on): the provider prompt-caches, so the full
+        # ceiling ships on every call and the list is never mutated
+        # mid-session. There is nothing to predict or narrow — the
+        # predictor, sticky residency, and lookback all stay off. The
+        # preset still resolves so the prediction row can name the policy
+        # the cohort ran under.
         cache_decision = _resolve_cache_mode_for_session(str(session_id), scope=scope)
-        if cache_decision == "on" and session_id and session_id in _FROZEN_BY_SESSION:
-            frozen = _FROZEN_BY_SESSION[session_id]
-            try:
-                preset = presets_mod.resolve_preset(_CONFIG, scope)
-                reprediction = predictor_mod.predict(message, attachments, preset)
-                new_trigger_tools = _trigger_tools_by_group(preset, reprediction.triggers_fired)
-                prior_triggered = set(frozen.get("triggered_tools") or [])
-                fresh_tools: set[str] = set()
-                for tools_list in new_trigger_tools.values():
-                    fresh_tools |= set(tools_list)
-                added = fresh_tools - prior_triggered
-                if added:
-                    # A new trigger group fired — grow the frozen active set
-                    # once. Record the trigger-driven mutation separately from
-                    # explicit expansion so attribution never confuses the two.
-                    frozen["triggered_tools"] = sorted(prior_triggered | fresh_tools)
-                    merged_groups = dict(frozen.get("trigger_tools_by_group") or {})
-                    merged_groups.update(new_trigger_tools)
-                    frozen["trigger_tools_by_group"] = merged_groups
-                    frozen["triggers_fired_at_freeze"] = sorted(
-                        set(frozen.get("triggers_fired_at_freeze") or [])
-                        | set(reprediction.triggers_fired)
-                    )
-            except Exception as exc:
-                logger.debug("tool-belt: cache-on re-trigger failed: %s", exc)
-                added = set()
-            built = _build_state_from_frozen(
-                frozen,
+        if cache_decision == "on":
+            preset = presets_mod.resolve_preset(_CONFIG, scope)
+            _PREDICTION_CV.set(_build_carry_all_state(
+                preset,
                 session_id=str(session_id),
                 hermes_session_id=hermes_session_id,
                 scope=scope,
@@ -1783,34 +1816,16 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
                 agent=agent,
                 platform=platform,
                 message=message,
-            )
-            if added:
-                built["trigger_driven_mutation"] = True
-            _PREDICTION_CV.set(built)
+            ))
             return None
 
-        # Under cache-on, the freeze about to happen makes sticky residency
-        # and lookback redundant — the frozen set carries forward verbatim
-        # via _build_state_from_frozen, including any in-session
-        # expand_tools additions, and the per-turn predictor doesn't run
-        # on subsequent dispatches. Skipping these helpers on the cache-on
-        # first dispatch avoids polluting the freeze baseline with stale
-        # carry-over state and keeps the design-principle invariant clean:
-        # cache-on changes the cadence of adjustment, not the granularity.
-        cache_on = (cache_decision == "on")
-
-        if cache_on:
-            sticky_key = ""
-            lookback_turns = 0
-            prior_messages: list[str] = []
-            predictor_input = message
-        else:
-            # Narrow sticky-residency key: session-scoped, opaque. Distinct
-            # from the coarse policy scope (agent:platform).
-            sticky_key = _sticky_key_for_session(str(session_id))
-            lookback_turns = _predictor_lookback_turns()
-            prior_messages = _lookback_prior_messages(str(session_id), lookback_turns)
-            predictor_input = _compose_predictor_input(prior_messages, message)
+        # Cache-off: per-turn narrowing. Narrow sticky-residency key:
+        # session-scoped, opaque. Distinct from the coarse policy scope
+        # (agent:platform).
+        sticky_key = _sticky_key_for_session(str(session_id))
+        lookback_turns = _predictor_lookback_turns()
+        prior_messages = _lookback_prior_messages(str(session_id), lookback_turns)
+        predictor_input = _compose_predictor_input(prior_messages, message)
 
         preset = presets_mod.resolve_preset(_CONFIG, scope)
         prediction = predictor_mod.predict(predictor_input, attachments, preset)
@@ -1821,16 +1836,11 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         trigger_tools = _trigger_tools_by_group(preset, prediction.triggers_fired)
         triggered_tool_names = sorted({t for tools in trigger_tools.values() for t in tools})
 
-        if cache_on:
-            sticky_tools: list[str] = []
-            sticky_categories: list[str] = []
-            sticky_remaining: dict[str, int] = {}
-        else:
-            # Push the current message onto the session's lookback ring AFTER
-            # prediction so we don't include the current message as its own prior.
-            _record_lookback_message(str(session_id), message, lookback_turns)
-            _decay_sticky(sticky_key)
-            sticky_tools, sticky_categories, sticky_remaining = _live_sticky(sticky_key)
+        # Push the current message onto the session's lookback ring AFTER
+        # prediction so we don't include the current message as its own prior.
+        _record_lookback_message(str(session_id), message, lookback_turns)
+        _decay_sticky(sticky_key)
+        sticky_tools, sticky_categories, sticky_remaining = _live_sticky(sticky_key)
 
         active_tool_names = prediction.active_tool_names
         # Capture the pre-sticky baseline. This is the set the model would
@@ -1840,7 +1850,6 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         # called this anyway" from "this call is the payoff of an earlier
         # expand". NO_NARROWING is preserved (bypass cohort / no-narrowing
         # preset already see every tool — nothing to attribute to expansion).
-        # Under cache-on, sticky_tools is empty so the merge is a no-op.
         if active_tool_names == NO_NARROWING or active_tool_names is None:
             baseline_active_tools: Any = NO_NARROWING
         else:
@@ -1851,9 +1860,7 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
         # A/B baseline: deterministically bypass narrowing for a fraction of
         # sessions. The predictor still ran so we keep telemetry, but the
         # active set widens to the full ceiling and the policy_source is
-        # stamped so the analyzer can compare cohorts. Under cache-on this
-        # is decided once and frozen for the session's life — no per-turn
-        # flap risk.
+        # stamped so the analyzer can compare cohorts.
         bypassed = _should_bypass(scope, str(session_id))
         if bypassed:
             active_tool_names = NO_NARROWING
@@ -1905,32 +1912,6 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             "lookback_turns_config": lookback_turns,
             "logged": False,
         })
-
-        # On the first dispatch under cache-on mode, freeze the
-        # decision we just made. Every subsequent dispatch in this
-        # session will reuse it via the frozen-path branch above. Skip
-        # when there's no usable session_id (out-of-band dispatch can't
-        # be re-identified, so caching the decision would only collide).
-        if cache_decision == "on" and session_id:
-            _freeze_session_snapshot(
-                str(session_id),
-                active_tool_names=active_tool_names,
-                baseline_active_tools=baseline_active_tools,
-                preset_name=prediction.preset_name,
-                trigger_tools_by_group=trigger_tools,
-                triggers_fired=prediction.triggers_fired,
-                triggers_suppressed=prediction.triggers_suppressed,
-                policy_source=policy_source,
-                policy_version=getattr(preset, "policy_version", ""),
-                learned_mode=getattr(preset, "learned_mode", _CONFIG.get("learned_mode", "apply")),
-                learned_scope=getattr(preset, "learned_scope", ""),
-                learned_changes=list(getattr(preset, "learned_changes", []) or []),
-                resolved_always_carry=resolved_always_carry,
-                resolved_carry=resolved_carry,
-                resolved_demoted=resolved_demoted,
-                config_always_carry=config_pins,
-                triggered_tools=triggered_tool_names,
-            )
     except Exception as exc:
         logger.warning("tool-belt: pre_gateway_dispatch failed: %s", exc)
     return None
@@ -2145,11 +2126,24 @@ def _detection_cache_path():
     return os.path.join(home, "state", "tool-belt", "cache_mode_detection.json")
 
 
+def _detection_key(scope: str, provider: str = "") -> str:
+    """Detection-cache key: ``scope|provider`` (bare ``scope`` when unknown)."""
+    scope = str(scope or "")
+    provider = str(provider or "").strip().lower()
+    return f"{scope}|{provider}" if provider else scope
+
+
 def _load_detection_cache() -> None:
     """Read the persisted detection cache into memory exactly once.
 
+    Pre-1.0 files were keyed by bare scope (no ``|``). Those entries are
+    re-keyed under the configured primary provider — the only provider a
+    scope-level lock could have been observing — and persisted in the new
+    format on the next save. When the primary is unknown the bare key is
+    kept as-is; ``_cached_detection_mode`` falls back to it.
+
     Failures are silent — a missing or corrupt file means we fall through
-    to the safe-default "on" for every scope until the first lock writes
+    to the safe-default "on" for every bucket until the first lock writes
     a new entry. No telemetry is lost in either direction.
     """
     global _DETECTION_CACHE_LOADED
@@ -2159,10 +2153,27 @@ def _load_detection_cache() -> None:
     try:
         with open(_detection_cache_path(), "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict):
-            for scope, entry in data.items():
-                if isinstance(scope, str) and isinstance(entry, dict):
-                    _DETECTION_CACHE[scope] = entry
+        if not isinstance(data, dict):
+            return
+        primary = str(_HOST_MODEL.get("provider") or "")
+        migrated = 0
+        for key, entry in data.items():
+            if not (isinstance(key, str) and isinstance(entry, dict)):
+                continue
+            if "|" not in key and primary:
+                new_key = _detection_key(key, primary)
+                # A new-format entry for the same bucket is newer evidence.
+                if new_key not in data and new_key not in _DETECTION_CACHE:
+                    _DETECTION_CACHE[new_key] = entry
+                    migrated += 1
+                continue
+            _DETECTION_CACHE[key] = entry
+        if migrated:
+            logger.info(
+                "tool-belt: re-keyed %d scope-only detection entr%s under "
+                "primary provider %r", migrated, "y" if migrated == 1 else "ies",
+                primary,
+            )
     except FileNotFoundError:
         pass
     except Exception as exc:
@@ -2186,14 +2197,15 @@ def _persist_detection_lock(
     scope: str,
     state: dict[str, Any],
     model: str,
+    provider: str = "",
 ) -> None:
-    """Record a session's lock result to the cross-session cache.
+    """Record a bucket's lock result to the cross-session cache.
 
-    The cache is keyed by scope. Same-scope sessions that lock the same
-    way bump ``sessions_locked``; a disagreeing lock overwrites with
-    ``sessions_locked = 1`` — the most recent reality wins. We don't
-    average or smooth because cache behavior is a property of the
-    provider+model setup, not a noisy signal that benefits from
+    The cache is keyed by ``scope|provider``. Same-bucket sessions that
+    lock the same way bump ``sessions_locked``; a disagreeing lock
+    overwrites with ``sessions_locked = 1`` — the most recent reality
+    wins. We don't average or smooth because cache behavior is a property
+    of the provider+model setup, not a noisy signal that benefits from
     averaging — when it changes, it changes hard (provider migration,
     model swap).
 
@@ -2204,7 +2216,8 @@ def _persist_detection_lock(
         return
     if state.get("lock_reason") == "provider_blocklist":
         return
-    cached = _DETECTION_CACHE.get(scope)
+    key = _detection_key(scope, provider)
+    cached = _DETECTION_CACHE.get(key)
     new_entry = {
         "mode": state["mode"],
         "locked_at": time.time(),
@@ -2216,20 +2229,23 @@ def _persist_detection_lock(
         new_entry["sessions_locked"] = int(cached.get("sessions_locked", 0)) + 1
     else:
         new_entry["sessions_locked"] = 1
-    _DETECTION_CACHE[scope] = new_entry
+    _DETECTION_CACHE[key] = new_entry
     _save_detection_cache()
 
 
-def _cached_detection_mode(scope: str) -> str:
-    """Consult the cross-session cache for a scope's prior locked mode.
+def _cached_detection_mode(scope: str, provider: str = "") -> str:
+    """Consult the cross-session cache for a scope|provider's locked mode.
 
     Returns "on", "off", or "" (no cache entry). Auto mode at dispatch
-    time uses this to set the initial freeze decision intelligently —
-    skipping the freeze entirely for known cache-off scopes.
+    time uses this to resolve the posture without repeating the
+    observation window. A bare-scope entry (pre-1.0 file whose primary
+    provider was unknown at load) is the fallback lookup.
     """
     if not scope:
         return ""
-    entry = _DETECTION_CACHE.get(scope)
+    entry = _DETECTION_CACHE.get(_detection_key(scope, provider))
+    if not entry and provider:
+        entry = _DETECTION_CACHE.get(scope)
     if not entry:
         return ""
     mode = entry.get("mode")
@@ -2243,15 +2259,23 @@ def _check_divergence(
     cache_write: int,
     scope: str,
     session_key: str,
+    provider: str = "",
+    provider_changed: bool = False,
 ) -> None:
     """Post-lock observation: does the locked mode still match reality?
 
-    A session locked "on" with consistently low hit rate post-lock is
-    evidence that the freeze is the wrong call for this session —
-    a changing prompt prefix, a tools mismatch we didn't anticipate, or
-    simply a cold-cache window. We don't switch modes mid-session
+    A bucket locked "on" with consistently low hit rate post-lock is
+    evidence that carry-all is the wrong call for this session — a
+    changing prompt prefix, a tools mismatch we didn't anticipate, or
+    simply a cold-cache window. We don't switch postures mid-session
     (the switch itself busts cache), but we surface the divergence so
     the analyzer can flag the session for forensic review.
+
+    Operates per scope|provider bucket. ``provider_changed`` marks a call
+    that landed on a different provider than the session's previous call
+    (failover, ``/model``, or a switch back): it is EXPECTED to miss —
+    that provider has no prefix for this history — so the streak resets
+    and the call never counts toward a warning.
 
     Threshold: 3 consecutive post-lock calls with hit rate below 30%
     when locked "on". 3 is short enough to fire on a real problem
@@ -2261,7 +2285,10 @@ def _check_divergence(
     if state.get("mode") != "on" or state.get("locked_at_call") is None:
         return
     if state.get("divergence_warned"):
-        return  # one warning per session is enough
+        return  # one warning per bucket is enough
+    if provider_changed:
+        state["divergence_streak"] = 0
+        return
 
     denom = cache_read + input_tokens + cache_write
     hit_rate = (cache_read / denom) if denom else 0.0
@@ -2274,12 +2301,13 @@ def _check_divergence(
     if state["divergence_streak"] >= 3:
         state["divergence_warned"] = True
         logger.warning(
-            "tool-belt: freeze divergence — scope=%s session=%s "
+            "tool-belt: cache divergence — scope=%s provider=%s session=%s "
             "locked_mode=on but %d consecutive post-lock calls hit <30%% "
             "(last hit_rate=%.1f%%). Possible Mnemosyne prefix-break, "
             "provider cache regression, or unmodeled tool mutation. "
-            "Session continues frozen; analyzer flags for review.",
-            scope, session_key, state["divergence_streak"], hit_rate * 100,
+            "Session continues carry-all; analyzer flags for review.",
+            scope, provider, session_key, state["divergence_streak"],
+            hit_rate * 100,
         )
 
 
@@ -2290,23 +2318,37 @@ def _update_cache_mode_detection(
     cache_write: int,
     input_tokens: int,
     scope: str = "",
+    provider: str = "",
 ) -> str:
-    """Update detection state for a session and return the current mode.
+    """Update detection state for a session|provider and return its mode.
+
+    Accumulation and the lock happen in the bucket of the CALL's
+    provider (``_CACHE_MODE_BY_SESSION[session_key]["buckets"][provider]``),
+    so a failover call to a non-caching provider never drags a caching
+    primary's numbers. The session-level ``observed_provider`` is updated
+    on every call.
 
     Decision rules:
       · Forced mode (cache_mode != "auto") locks immediately.
-      · Models in cache_auto.providers_off_models lock "off" immediately.
+      · Models — or provider names — in cache_auto.providers_off_models
+        lock "off" immediately.
       · "pending" until BOTH `calls_observed >= detect_calls` AND
         `input_observed >= detect_min_input_tokens` are met. Then:
           hit_rate = read / (read + write + input)
           ≥ on_threshold → "on", else → "off".
-      · Once locked, never switch mid-session.
+      · Once locked, a bucket never switches mid-session.
     """
     if not session_key:
         return "off"
 
     forced = str(_CONFIG.get("cache_mode") or "auto").lower()
-    state = _CACHE_MODE_BY_SESSION.get(session_key)
+    provider = str(provider or "").strip().lower()
+    session_state = _CACHE_MODE_BY_SESSION.setdefault(session_key, {})
+    prev_provider = session_state.get("observed_provider")
+    provider_changed = prev_provider is not None and prev_provider != provider
+    session_state["observed_provider"] = provider
+    buckets = session_state.setdefault("buckets", {})
+    state = buckets.get(provider)
     if state is None:
         state = {
             "mode": "pending",
@@ -2317,7 +2359,7 @@ def _update_cache_mode_detection(
             "locked_at_call": None,
             "lock_reason": "",
         }
-        _CACHE_MODE_BY_SESSION[session_key] = state
+        buckets[provider] = state
 
         # Forced modes resolve before the first observation lands.
         if forced == "on":
@@ -2336,16 +2378,22 @@ def _update_cache_mode_detection(
 
     if state["mode"] != "pending":
         # Post-lock observation — divergence detection has teeth here.
-        _check_divergence(state, cache_read, input_tokens, cache_write, scope, session_key)
+        _check_divergence(
+            state, cache_read, input_tokens, cache_write, scope, session_key,
+            provider=provider, provider_changed=provider_changed,
+        )
         return state["mode"]
 
-    # Provider blocklist: lock "off" the moment we see a known-bad model.
+    # Provider blocklist: lock "off" the moment we see a known-bad model
+    # or provider.
     blocklist = _cache_auto_cfg().get("providers_off_models") or []
-    if model and isinstance(blocklist, list) and model in blocklist:
-        state["mode"] = "off"
-        state["locked_at_call"] = state["calls_observed"]
-        state["lock_reason"] = "provider_blocklist"
-        return state["mode"]  # not persisted — provider blocklist is config, not observation
+    if isinstance(blocklist, list):
+        listed = {str(x).strip().lower() for x in blocklist if x}
+        if (model and str(model).strip().lower() in listed) or (provider and provider in listed):
+            state["mode"] = "off"
+            state["locked_at_call"] = state["calls_observed"]
+            state["lock_reason"] = "provider_blocklist"
+            return state["mode"]  # not persisted — provider blocklist is config, not observation
 
     cfg = _cache_auto_cfg()
     try:
@@ -2377,9 +2425,63 @@ def _update_cache_mode_detection(
         # Persist the lock so the next session can choose correctly without
         # repeating the observation window.
         if scope:
-            _persist_detection_lock(scope, state, model)
+            _persist_detection_lock(scope, state, model, provider=provider)
 
     return state["mode"]
+
+
+def _provider_caches(scope: str, provider: str, session_key: str = "") -> bool | None:
+    """Locked verdict for a scope|provider bucket: True ("on"), False ("off"),
+    None while pending.
+
+    This is the ``provider_caches`` contract on every ``api_calls`` row —
+    the savings code reads it, so its meaning is exactly "does this
+    provider prefix-cache" (per ``_bucket_mode``), never the session
+    posture.
+    """
+    mode = _bucket_mode(scope, provider, session_key)
+    if mode == "on":
+        return True
+    if mode == "off":
+        return False
+    return None
+
+
+def _maybe_evict_on_provider_change(
+    session_key: str, scope: str, provider: str,
+) -> None:
+    """Re-resolve the session's posture when its provider changes.
+
+    Dale's edge case: ``/model`` in Telegram, or a failover, moves a
+    session from a caching provider to a non-caching one (or back). The
+    pin was resolved against the OLD provider; if the NEW provider's
+    posture differs, keep-pinning would narrow on a caching provider or
+    carry-all on a non-caching one for the rest of the session. The
+    switch already busted the provider's prefix cache, so evicting the
+    pin — through the same path compaction and ``/reset`` use — and
+    letting the next dispatch re-resolve costs nothing. Detection
+    counters for the old provider go with it; the new provider's bucket
+    starts fresh.
+    """
+    pin = _CACHE_DECISION_BY_SESSION.get(session_key)
+    if not isinstance(pin, dict):
+        return
+    provider = str(provider or "").strip().lower()
+    pinned_provider = str(pin.get("provider") or "")
+    if not provider or provider == pinned_provider:
+        return
+    new_posture = _resolve_posture_for_provider(scope, provider, session_key=session_key)
+    if new_posture == pin.get("mode"):
+        # Same posture on the new provider — the pin stays, but record
+        # the provider so a later switch compares against reality.
+        pin["provider"] = provider
+        return
+    _evict_session_cache_state(session_key, keep_provider=provider)
+    logger.info(
+        "tool-belt: session %s moved from provider %r to %r — posture %s → %s; "
+        "pin evicted, next dispatch re-resolves",
+        session_key, pinned_provider, provider, pin.get("mode"), new_posture,
+    )
 
 
 # ─── Hook: post_api_request ────────────────────────────────────────────────
@@ -2407,28 +2509,38 @@ def _on_post_api_request(**kwargs) -> None:
         if not isinstance(usage, dict):
             usage = {}
         session_key = str(state.get("session_id", ""))
+        scope = str(state.get("scope", ""))
         model = str(kwargs.get("model") or state.get("model", "") or "")
+        provider = str(kwargs.get("provider") or state.get("provider", "") or "")
         cache_read = int(usage.get("cache_read_tokens") or 0)
         cache_write = int(usage.get("cache_write_tokens") or 0)
         input_tokens = int(usage.get("input_tokens") or 0)
 
-        # Detection returns pending/on/off, persists settled scope-level
-        # decisions, and checks post-lock divergence.
+        # Detection returns pending/on/off for the CALL's provider bucket,
+        # persists settled scope|provider decisions, and checks post-lock
+        # divergence.
         cache_mode = _update_cache_mode_detection(
             session_key=session_key,
             model=model,
             cache_read=cache_read,
             cache_write=cache_write,
             input_tokens=input_tokens,
-            scope=str(state.get("scope", "")),
+            scope=scope,
+            provider=provider,
         )
+        provider_caches = _provider_caches(scope, provider, session_key)
+        # Mid-session provider change (failover, /model): re-resolve the
+        # posture if the new provider's differs. Runs AFTER detection so
+        # the new provider's bucket keeps this call's observation.
+        if session_key:
+            _maybe_evict_on_provider_change(session_key, scope, provider)
 
         # Cache-TTL expiry detection. A stable-hash call with
         # zero cache_read after a long idle gap is the signature of
         # provider-side cache eviction (Anthropic's default 5m TTL).
-        # The freeze logic did everything right — the TTL just lapsed
-        # in between turns. Flagging this distinctly stops the analyzer
-        # from misattributing it as freeze-quality regression.
+        # Carry-all did everything right — the TTL just lapsed in
+        # between turns. Flagging this distinctly stops the analyzer
+        # from misattributing it as a tool-list mutation.
         ttl_expired = False
         now = time.time()
         current_hash = str(state.get("last_tool_list_hash", ""))
@@ -2456,7 +2568,7 @@ def _on_post_api_request(**kwargs) -> None:
             "api_call_idx": int(state.get("api_call_idx", 0)),
             "api_call_count": int(kwargs.get("api_call_count") or 0),
             "model": model,
-            "provider": str(kwargs.get("provider") or state.get("provider", "") or ""),
+            "provider": provider,
             "api_mode": str(kwargs.get("api_mode") or ""),
             "tool_list_hash": current_hash,
             "system_hash": str(state.get("last_system_hash", "")),
@@ -2470,7 +2582,12 @@ def _on_post_api_request(**kwargs) -> None:
             "api_duration": float(kwargs.get("api_duration") or 0.0),
             "finish_reason": str(kwargs.get("finish_reason") or ""),
             "message_count": int(kwargs.get("message_count") or 0),
+            # Session posture as detected for this call's bucket (pending/on/
+            # off) — unchanged semantics; the savings code classifies on it.
             "cache_mode": cache_mode,
+            # Provider verdict: True/False once the scope|provider bucket has
+            # locked "on"/"off", None while pending. Additive contract.
+            "provider_caches": provider_caches,
             "cache_ttl_expired": ttl_expired,
         }
         logger_io.log_api_call(row)
@@ -2493,9 +2610,9 @@ def _on_session_end(session_id=None, **kwargs) -> None:
     and lookback history are SESSION-scoped features that must survive
     across turns: sticky decays on its own per-dispatch turn budget
     (``_decay_sticky``) and the lookback ring self-trims, so neither
-    grows unbounded. All per-session memory (freeze, cache-mode, sticky,
-    lookback) is cleared by :func:`_on_session_reset` (true /reset or
-    /new). An earlier revision evicted sticky/lookback here keyed on the
+    grows unbounded. All per-session memory (posture pin, cache-mode,
+    sticky, lookback) is cleared by :func:`_on_session_reset` (true /reset
+    or /new). An earlier revision evicted sticky/lookback here keyed on the
     ``HERMES_SESSION_KEY`` env var; the deployed gateway migrated session
     identity to ContextVars and never sets that var, so the eviction was
     a live no-op — and anywhere the var DID exist it wiped sticky state
@@ -2538,9 +2655,9 @@ def _maybe_auto_shape() -> None:
 
     FAIL-OPEN ABSOLUTELY: any exception is logged as a warning and never
     propagates into the gateway. The engine only writes learned.json — live
-    sessions keep their frozen carrying untouched (cache-on invariant); the
-    new assignment applies to future sessions when their preset resolves at
-    session start.
+    sessions keep their in-flight carrying untouched; the new assignment
+    applies to future cache-off sessions when their preset resolves at
+    dispatch (carry-all sessions ship the whole ceiling regardless).
     """
     try:
         if not _CONFIG["enabled"]:
@@ -2572,10 +2689,9 @@ def _on_session_reset(session_id=None, **kwargs) -> None:
 
     `/reset` keeps the same canonical session_key but wipes the agent's
     message history — which, from the provider's cache perspective, is
-    identical to a fresh session. The frozen tool set and the mode
-    detection state from the prior conversation must be discarded so the
-    next ``pre_gateway_dispatch`` re-freezes against the new (empty)
-    history.
+    identical to a fresh session. The posture pin and the mode detection
+    state from the prior conversation must be discarded so the next
+    ``pre_gateway_dispatch`` re-resolves against the new (empty) history.
 
     Sticky/lookback state is also evicted by `on_session_end` semantics
     and intentionally cleared here too — `/reset` is a stronger signal
@@ -2600,7 +2716,7 @@ def _on_session_reset(session_id=None, **kwargs) -> None:
             eviction_ids.append(sid)
 
     # Hermes' on_session_reset hook passes only the NEW session UUID
-    # (post-rotation) and the platform string. The freeze is keyed by
+    # (post-rotation) and the platform string. The pin is keyed by
     # the canonical session_key (agent:main:<platform>:...) which the
     # hook does NOT pass. Recover it from the platform back-reference
     # we populate in _on_pre_gateway_dispatch — that hook fires for
@@ -2613,9 +2729,7 @@ def _on_session_reset(session_id=None, **kwargs) -> None:
             eviction_ids.append(last_canonical)
 
     for sid in eviction_ids:
-        _FROZEN_BY_SESSION.pop(sid, None)
-        _CACHE_MODE_BY_SESSION.pop(sid, None)
-        _CACHE_DECISION_BY_SESSION.pop(sid, None)
+        _evict_session_cache_state(sid)
         sticky_key = _sticky_key_for_session(sid)
         if sticky_key:
             _STICKY_BY_KEY.pop(sticky_key, None)

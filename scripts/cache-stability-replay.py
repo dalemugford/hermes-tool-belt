@@ -1,15 +1,45 @@
 #!/usr/bin/env python3
-"""Replay API-call telemetry through the session-freeze policy and estimate
-the cache cost of tool-list mutations.
+"""Measure tool-list stability per session from API-call telemetry and
+estimate the cache cost of every tool-list mutation.
+
+What it measures
+================
+
+For each session, the first call's ``tool_list_hash`` is the baseline; every
+later call is classified as matching it or as a mutation (further split into
+expand-driven / trigger-driven / avoidable). This is a pure read of what
+went over the wire.
+
+How to read it per posture:
+
+  · Caching provider → carry-all. The baseline IS the enabled ceiling
+    (minus ``expand_tools``, which is not shipped) and the list is never
+    touched again for the session's life. Every mutation counter should be
+    zero by construction, and ``matches_stable`` should equal
+    ``comparable_calls``. A non-zero mutation on a caching scope is a
+    REGRESSION of the carry-all contract — this script is the cheapest way
+    to catch one (``--scope`` a caching scope and expect zeros).
+
+  · Non-caching provider → per-turn narrowing. Mutations are expected and
+    cheap: there is no prefix cache to bust, so the counters describe the
+    narrowing activity (explicit expansions, trigger activations) rather
+    than a cost. The cache-cost figures below are meaningless there and
+    will read ~0 because ``cache_read_tokens`` is 0 on those calls.
+
+"First-call hash" is the tool-list hash of a session's first call; a
+session is *stable* when every later call carries that same hash. (This
+diagnostic and its keys were once named for a per-session *freeze* policy
+that has since been replaced by the carry-all posture; the mechanism it
+measures — tool-list stability against the first-call hash — is unchanged.)
 
 Why the matched counterfactual matters
 ======================================
 
 The ``tokens_saved`` ledger (predictions.jsonl) reports schema-token savings
-without netting out the cache-miss penalty that mutation-driven narrowing
-imposes on the conversation history prefix. Under cache-on providers
-(Anthropic + OpenAI auto-cache) that penalty can dominate the savings on
-any session past a handful of turns.
+without netting out the cache-miss penalty that a tool-list mutation imposes
+on the conversation history prefix. On caching providers that penalty can
+dominate the savings on any session past a handful of turns — which is why
+those scopes carry everything and never mutate.
 
 The corrected counterfactual:
 
@@ -25,9 +55,9 @@ The corrected counterfactual:
     of forcing every mutation to look costly.
 
 Usage:
-  python3 scripts/cache-freeze-replay.py
-  python3 scripts/cache-freeze-replay.py --scope assistant-a:telegram
-  python3 scripts/cache-freeze-replay.py --markdown        # markdown for the report dir
+  python3 scripts/cache-stability-replay.py
+  python3 scripts/cache-stability-replay.py --scope assistant-a:telegram
+  python3 scripts/cache-stability-replay.py --markdown        # markdown for the report dir
 """
 
 from __future__ import annotations
@@ -58,7 +88,7 @@ def _session_key(row: dict[str, Any]) -> str:
     """Distinct-session key matching the shaper/analyzer semantics.
 
     Prefer ``hermes_session_id`` (rotates on ``/new``, so pre- and post-reset
-    turns land in *different* freeze cohorts and a stale frozen hash can never
+    turns land in *different* cohorts and a stale baseline hash can never
     pollute a fresh session). Fall back to ``session_id`` — the stable chat key
     — for normalized historical rows written before the UUID was captured.
     """
@@ -92,38 +122,39 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
     return out
 
 
-def freeze_simulation(
+def stability_simulation(
     preds: list[dict[str, Any]],
     calls: list[dict[str, Any]],
     tool_calls: list[dict[str, Any]] | None = None,
     scope_filter: str = "",
 ) -> dict[str, Any]:
-    """For each session, fix the frozen tool-list hash as the first call's
-    hash and replay every subsequent call: would it have mutated against
-    that frozen baseline?
+    """For each session, take the first call's ``tool_list_hash`` as the
+    baseline and classify every subsequent call: did the wire-level tool
+    list stay identical to that baseline, or mutate?
 
     Sessions are grouped by :func:`_session_key` (``hermes_session_id`` with a
-    ``session_id`` fallback) so a ``/new`` reset starts a fresh freeze cohort
-    instead of polluting the frozen hash across the reset boundary.
+    ``session_id`` fallback) so a ``/new`` reset starts a fresh cohort
+    instead of polluting the baseline hash across the reset boundary.
 
     Distinguishes four call types:
-      · matches_freeze    — would have hit the cached prefix
+      · matches_stable    — identical to the baseline: hit the cached prefix
       · expand_driven     — hash differs and the turn shows an ``expand_tools``
                             call, so the mutation is an explicit expansion
-                            (model-driven, accepted — the freeze grows to admit
-                            the expanded tools)
+                            (model-driven; only possible under narrowing,
+                            where ``expand_tools`` is shipped)
       · trigger_driven    — hash differs with no expansion, but the turn newly
                             fired a trigger that activated a previously
-                            expand_only tool. Under cache-on the frozen active
-                            set legitimately grows once for that trigger; it is
-                            policy-driven and accepted, never a "would_break"
+                            expand_only tool (policy-driven; narrowing only)
       · would_break       — hash differs with neither an expansion nor a new
-                            trigger activation — the freeze policy would have
-                            prevented this break by holding the tool set steady
+                            trigger activation — an unexplained mutation
 
-    This is a conservative upper bound: expanded/triggered tools persist for the
-    session, so repeated use after the initial mutation does not require
-    repeated mutations.
+    On a caching (carry-all) scope all three mutation counters must be zero:
+    the baseline is the full ceiling, ``expand_tools`` is not shipped, and
+    the plugin never touches the list mid-session. Any non-zero count there
+    is a regression, not an accepted cost. On a narrowing scope the counters
+    are descriptive: a "mutation" costs nothing where there is no prefix
+    cache, and expanded/triggered tools persist for the session, so repeated
+    use after the initial mutation does not require repeated mutations.
     """
     # Canonicalize rows through the central adapter (v1/v2 + hermes_session_id
     # + trigger_activated_tools).
@@ -213,7 +244,7 @@ def freeze_simulation(
                 cached_on_match.append(cached)
                 continue
             # Hash differs. Classify the mutation: explicit expansion first,
-            # then trigger activation, else an avoidable freeze break.
+            # then trigger activation, else an avoidable cache break.
             pid = c.get("prediction_id", "")
             meta = pred_meta.get(pid, {})
             if meta.get("expand_called_this_turn"):
@@ -236,17 +267,18 @@ def freeze_simulation(
         "api_calls": len(calls),
         "first_calls_per_session": first_calls,
         "comparable_calls": comparable,
-        "matches_freeze": matches,
+        "matches_stable": matches,
         "expand_driven_mutations": expand_driven,
         "trigger_driven_mutations": trigger_driven,
         "would_break_mutations": would_break,
         "mutation_rate_today": (
             total_mutations / comparable if comparable else 0.0
         ),
-        # The freeze only eliminates avoidable breaks; explicit expansions and
-        # trigger activations are accepted growth the freeze intentionally
-        # admits, so they are excluded from the eliminable share.
-        "freeze_eliminates_pct_of_mutations": (
+        # Share of mutations that are unexplained (neither an explicit
+        # expansion nor a trigger activation). Historical key name — kept
+        # because analyze.py reads it — but on a carry-all scope the whole
+        # numerator AND denominator should be zero.
+        "unexplained_mutation_share": (
             would_break / total_mutations if total_mutations else 0.0
         ),
         "avg_cache_read_when_matches": round(avg(cached_on_match), 1),
@@ -315,7 +347,7 @@ def matched_counterfactual(
         "cache_read_lost_upper_bound": 0,
         "cache_read_actual": 0,
         "input_actual": 0,
-        "freeze_eligible": 0,
+        "stable_eligible": 0,
         "expand_caused_mutations": 0,
     })
 
@@ -363,15 +395,16 @@ def render_markdown(result: dict[str, Any], cf: dict[str, Any]) -> str:
     out: list[str] = []
     out.append("# Cache-Aware Replay Report\n")
     out.append(f"_scope: {result['scope_filter']}_\n")
-    out.append("## Freeze coverage\n")
+    out.append("## Tool-list stability (vs. each session's first-call hash)\n")
     out.append(f"- sessions: {result['sessions']}, predictions: {result['predictions']}, api_calls: {result['api_calls']}")
     out.append(f"- first-call-per-session excluded: {result['first_calls_per_session']}")
     out.append(f"- comparable calls: {result['comparable_calls']}")
-    out.append(f"- **matches frozen hash: {result['matches_freeze']}** (avg cache_read: {result['avg_cache_read_when_matches']:,.0f})")
-    out.append(f"- expand-driven mutations: {result['expand_driven_mutations']} (accepted — explicit expansion, model-paid)")
-    out.append(f"- trigger-driven mutations: {result['trigger_driven_mutations']} (accepted — trigger activation, policy-paid)")
-    out.append(f"- **would_break mutations: {result['would_break_mutations']}** (avg cache_read: {result['avg_cache_read_when_would_break']:,.0f})")
-    out.append(f"- freeze eliminates **{result['freeze_eliminates_pct_of_mutations'] * 100:.1f}%** of currently-observed mutations\n")
+    out.append(f"- **matches first-call hash: {result['matches_stable']}** (avg cache_read: {result['avg_cache_read_when_matches']:,.0f})")
+    out.append(f"- expand-driven mutations: {result['expand_driven_mutations']} (explicit expansion — narrowing scopes only)")
+    out.append(f"- trigger-driven mutations: {result['trigger_driven_mutations']} (trigger activation — narrowing scopes only)")
+    out.append(f"- **would_break mutations: {result['would_break_mutations']}** (unexplained; avg cache_read: {result['avg_cache_read_when_would_break']:,.0f})")
+    out.append(f"- unexplained share of mutations: **{result['unexplained_mutation_share'] * 100:.1f}%**")
+    out.append("- on a caching (carry-all) scope every mutation counter must be 0 — anything else is a regression\n")
     out.append("## Cache-adjusted savings (matched counterfactual)\n")
     out.append("Per-model cache_read_tokens lost to mutation, computed against the stable cohort at the same api_call_idx position within session.\n")
     out.append("| model | calls | mut | stable | cache_read_lost_upper_bound | est_usd_lost |")
@@ -398,14 +431,14 @@ def main() -> int:
         print(f"No api_calls.jsonl rows under {state_dir}. Run more sessions first.", file=sys.stderr)
         return 1
 
-    result = freeze_simulation(preds, calls, tool_calls=tool_calls, scope_filter=args.scope)
+    result = stability_simulation(preds, calls, tool_calls=tool_calls, scope_filter=args.scope)
     cf = matched_counterfactual(calls, scope_filter=args.scope)
 
     if args.markdown:
         print(render_markdown(result, cf))
         return 0
 
-    print(f"cache-freeze replay  (scope: {result['scope_filter']})")
+    print(f"cache-stability replay — tool-list stability  (scope: {result['scope_filter']})")
     print(f"  sessions={result['sessions']}  predictions={result['predictions']}  api_calls={result['api_calls']}")
     print(f"  first-call-per-session (excluded): {result['first_calls_per_session']}")
     print(f"  comparable calls: {result['comparable_calls']}")
@@ -413,14 +446,15 @@ def main() -> int:
     print("  Observed behavior:")
     print(f"    mutation rate (any cause): {result['mutation_rate_today'] * 100:.1f}%")
     print()
-    print("  Under session-start freeze:")
-    print(f"    matches frozen hash:        {result['matches_freeze']:>4} calls  (cached avg: {result['avg_cache_read_when_matches']:,.0f})")
-    print(f"    expand-driven mutations:    {result['expand_driven_mutations']:>4} calls  (accepted — model paid)")
-    print(f"    trigger-driven mutations:   {result['trigger_driven_mutations']:>4} calls  (accepted — trigger fired)")
-    print(f"    would_break mutations:      {result['would_break_mutations']:>4} calls  (cached avg: {result['avg_cache_read_when_would_break']:,.0f})")
+    print("  Against each session's first-call hash:")
+    print(f"    matches first-call hash:    {result['matches_stable']:>4} calls  (cached avg: {result['avg_cache_read_when_matches']:,.0f})")
+    print(f"    expand-driven mutations:    {result['expand_driven_mutations']:>4} calls  (explicit expansion — narrowing only)")
+    print(f"    trigger-driven mutations:   {result['trigger_driven_mutations']:>4} calls  (trigger activation — narrowing only)")
+    print(f"    would_break mutations:      {result['would_break_mutations']:>4} calls  (unexplained; cached avg: {result['avg_cache_read_when_would_break']:,.0f})")
     print()
-    print(f"  Freeze eliminates {result['freeze_eliminates_pct_of_mutations'] * 100:.1f}% of currently-observed mutations.")
-    print("  The remainder is expansion- and trigger-driven — the accepted cost of the safety valves.")
+    print(f"  Unexplained share of mutations: {result['unexplained_mutation_share'] * 100:.1f}%.")
+    print("  Caching (carry-all) scope: every mutation counter above must be 0 — a non-zero count is a regression.")
+    print("  Narrowing scope: mutations are expected and cost nothing (no prefix cache to bust).")
 
     if cf.get("per_model"):
         print()

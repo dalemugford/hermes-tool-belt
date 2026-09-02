@@ -6,7 +6,7 @@ code:
   1. ``matched_counterfactual`` crashed with ``TypeError`` on an explicit
      JSON ``null`` in ``cache_read_tokens`` / ``input_tokens`` /
      ``api_call_idx``.
-  2. ``freeze_simulation`` raised ``KeyError`` on prediction rows lacking
+  2. ``stability_simulation`` raised ``KeyError`` on prediction rows lacking
      ``prediction_id`` — rows the module documents as tolerated.
   3. ``summary_payload`` double-counted sessions observed in more than one
      scope.
@@ -55,10 +55,10 @@ def _args(*extra: str):
 
 
 def _load_replay_module():
-    """Load ``scripts/cache-freeze-replay.py`` (hyphenated, not importable)."""
+    """Load ``scripts/cache-stability-replay.py`` (hyphenated, not importable)."""
     spec = importlib.util.spec_from_file_location(
-        "cache_freeze_replay_test",
-        PLUGIN_DIR / "scripts" / "cache-freeze-replay.py",
+        "cache_stability_replay_test",
+        PLUGIN_DIR / "scripts" / "cache-stability-replay.py",
     )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -67,7 +67,7 @@ def _load_replay_module():
 
 
 class ReplayNullToleranceTests(unittest.TestCase):
-    """Fix 1 + 2 — crash bugs in scripts/cache-freeze-replay.py."""
+    """Fix 1 + 2 — crash bugs in scripts/cache-stability-replay.py."""
 
     def setUp(self):
         self.replay = _load_replay_module()
@@ -89,7 +89,7 @@ class ReplayNullToleranceTests(unittest.TestCase):
         result = self.replay.matched_counterfactual(calls, scope_filter="a:telegram")
         self.assertEqual(result["total_calls"], 3)
 
-    def test_freeze_simulation_tolerates_rows_without_prediction_id(self):
+    def test_stability_simulation_tolerates_rows_without_prediction_id(self):
         preds = [
             {"scope": "a:telegram", "hermes_session_id": "s1", "ts": 1,
              "prediction_id": "p1"},
@@ -104,9 +104,9 @@ class ReplayNullToleranceTests(unittest.TestCase):
             {"scope": "a:telegram", "hermes_session_id": "s1", "ts": 2,
              "api_call_idx": 1, "tool_list_hash": "h1", "prediction_id": "p1"},
         ]
-        result = self.replay.freeze_simulation(preds, calls, tool_calls=[],
+        result = self.replay.stability_simulation(preds, calls, tool_calls=[],
                                                scope_filter="a:telegram")
-        self.assertEqual(result["matches_freeze"], 1)
+        self.assertEqual(result["matches_stable"], 1)
 
 
 class SessionUnionTests(unittest.TestCase):

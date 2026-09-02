@@ -35,11 +35,12 @@ observed:
    against changes even when the tool block and system block don't.
 
 **Impact.** Higher input-token billing on reasoning turns and the turn
-that follows them. Savings figures for `gpt-5.4`-family scopes will be
+that follows them. Cache hit rates for `gpt-5.4`-family scopes will be
 noisier than for Anthropic models, where cache behavior is more
-deterministic. The freeze mechanism itself is unaffected: the tool list
-stays stable across the session, which is everything `tool-belt`
-can do here.
+deterministic. The carry-all posture itself is unaffected: the tool
+list stays byte-stable across the session, which is everything
+`tool-belt` can do here. (Savings figures are not affected either —
+on a caching route the plugin narrows nothing and claims nothing.)
 
 **Workaround.** None owed by this plugin. The issue is upstream of
 where tool curation lives, and no in-plugin change can prevent the
@@ -49,64 +50,16 @@ model instead.
 
 ---
 
-### Gateway restarts drop in-memory freeze state
+### Removed: in-memory freeze state (gateway restarts, concurrent `/new`)
 
-**Symptom.** After a `hermes gateway restart` (or any other process
-restart), the first message in a previously-active session comes back
-with a cache miss — `cache_read_tokens=0` despite the session having
-been mid-conversation. Subsequent turns in the same session cache
-normally again.
-
-**Cause.** The per-session frozen tool snapshot lives in
-`_FROZEN_BY_SESSION`, an in-process dictionary in `__init__.py`. It is
-not persisted to disk. A restart wipes it, so the next dispatch for
-that session runs the predictor fresh and writes a new freeze. The
-freshly computed tool block is functionally equivalent in most cases,
-but the provider's cached prefix was keyed on the prior block's bytes,
-so the first post-restart turn is a cold-cache turn.
-
-Cache-mode detection state (`cache_mode_detection.json` at
-`~/.hermes/state/tool-belt/`) IS persisted, so the re-freeze uses
-the same cache mode as before without paying for another detection
-window. Cache-off sticky residency is also in-memory and is cleared on
-restart in the same way.
-
-**Impact.** One cache-miss turn per active session, per restart. On
-short sessions the cost is negligible; on long sessions with large
-histories it's a one-time hit on whichever turn happens to arrive first
-after the restart.
-
-**Workaround.** Don't restart the gateway mid-session unless you need
-to. Restarts to apply config or code changes are unavoidable; expect to
-pay one cache-miss turn per session that resumes afterward.
-
----
-
-### Concurrent chats on one platform can leave a freeze un-evicted on `/new`
-
-**Symptom.** With two or more active chats on the same platform, issuing
-`/new` in one chat sometimes fails to evict a sibling chat's frozen tool
-snapshot. The reset clears the intended session but a sibling freeze can
-linger in memory until it ages out or that chat resets.
-
-**Cause.** Hermes core's `on_session_reset` hook does not pass the
-canonical session key (`agent:main:<platform>:...`) on every path — it
-passes the new post-rotation session UUID and the platform string. The
-freeze is keyed by the canonical key, so Tool Belt recovers it from a
-per-platform last-writer-wins back-reference (`_LAST_CANONICAL_BY_PLATFORM`,
-populated in `_on_pre_gateway_dispatch` — see `_on_session_reset` in `__init__.py`).
-When several chats share one platform, that single back-reference points
-at whichever chat dispatched most recently, so a `/new` in a different
-chat evicts the wrong canonical key.
-
-**Impact.** A sibling chat's freeze may survive a `/new` it should have
-been cleared by. The tradeoff is deliberate: the fallback recovers the
-common single-chat case cleanly rather than skipping eviction entirely.
-Fail-open and the strict ceiling are unaffected — a stale freeze only
-narrows to a previously-valid tool set, never widens it, and it ages out
-or is replaced on the next reset of the owning chat.
-
-**Workaround.** None owed by this plugin. A durable fix requires a
-Hermes-core hook-contract change so `on_session_reset` passes the
-canonical session key directly; a per-platform heuristic inside the
-plugin cannot disambiguate concurrent chats on the same platform.
+Earlier releases kept a per-session frozen tool snapshot in process
+memory, which produced two documented sharp edges: a gateway restart
+re-froze every active session (one cold-cache turn each), and `/new` in
+one chat could evict a sibling chat's snapshot on the same platform. The
+snapshot no longer exists — on a caching provider the plugin ships the
+full ceiling minus `expand_tools` on every call, and the list is stable
+by construction rather than by bookkeeping. A restart or a mis-targeted
+reset now only drops the posture pin, which re-resolves on the next
+dispatch from the on-disk detection cache with no change to the tool
+list. Cache-off sticky residency is still in-memory and is cleared by a
+restart, as before.

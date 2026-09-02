@@ -476,6 +476,63 @@ class BypassExpansionOverheadTests(_HomeCase):
                          baseline)
 
 
+class ForwardVsHistoricalNetTests(_HomeCase):
+    """The headline is the ONGOING (non-caching) net. A caching-provider
+    expand break is a one-time cost carry-all eliminated (D1), so it drags
+    the blended history but must NOT reduce the forward figure the report
+    quotes and projects (2026-09-02)."""
+
+    def _seed(self, state):
+        state.mkdir(parents=True, exist_ok=True)
+        preds = [
+            # Caching cohort: narrowed, and its expand broke the prefix cache.
+            {"schema_version": 2, "ts": 1.0, "prediction_id": "cach",
+             "session_id": "default:telegram:S1", "scope": "default:telegram",
+             "policy_source": "preset", "ceiling_count": 40, "narrowed_count": 20,
+             "ceiling_tokens": 10000, "narrowed_tokens": 4000},
+            # Non-caching cohort: narrowed, no expand — the ongoing engine.
+            {"schema_version": 2, "ts": 2.0, "prediction_id": "ncach",
+             "session_id": "default:telegram:S2", "scope": "default:telegram",
+             "policy_source": "preset", "ceiling_count": 40, "narrowed_count": 22,
+             "ceiling_tokens": 10000, "narrowed_tokens": 5000},
+        ]
+        apis = [
+            # A miss (cache_read 0, prompt > 2000) so the expand reads as a break.
+            {"ts": 1.0, "prediction_id": "cach", "scope": "default:telegram",
+             "api_call_idx": 0, "cache_mode": "on", "provider": "openai-codex",
+             "input_tokens": 6000, "prompt_tokens": 60000, "cache_read_tokens": 0},
+            {"ts": 2.0, "prediction_id": "ncach", "scope": "default:telegram",
+             "api_call_idx": 0, "cache_mode": "off", "provider": "ollama-cloud",
+             "input_tokens": 5000, "prompt_tokens": 5000, "cache_read_tokens": 0},
+        ]
+        tcs = [{"schema_version": 2, "ts": 1.5, "prediction_id": "cach",
+                "scope": "default:telegram", "tool_name": "expand_tools",
+                "source": "gateway"}]
+        (state / "predictions.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in preds), encoding="utf-8")
+        (state / "api_calls.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in apis), encoding="utf-8")
+        (state / "tool_calls.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in tcs), encoding="utf-8")
+
+    def test_forward_net_excludes_eliminated_caching_break(self):
+        state = self.home / "state" / "tool-belt"
+        self._seed(state)
+        obs = savings.compute_observed(state)
+        # The caching cohort's history is net-negative (tiny cache-read-priced
+        # savings minus the break), and carry-all eliminates it going forward.
+        self.assertLess(obs.net_caching_historical, 0)
+        # The forward net is the non-caching cohort only, and is strictly
+        # higher than the blended history that still carries the break.
+        self.assertEqual(
+            obs.net_forward,
+            obs.saved_input_equiv_noncaching - obs.overhead_noncaching)
+        self.assertGreater(obs.net_forward, obs.net_token_reduction)
+        # The non-caching engine is genuinely positive (full-price schema
+        # saved, no expand overhead on it).
+        self.assertGreater(obs.net_forward, 0)
+
+
 class ExpansionVsTriggerTests(_HomeCase):
     """(7) Trigger activation adds no expansion charge; explicit expansion
     does."""
@@ -965,6 +1022,9 @@ class AnnualizedPaceTests(_HomeCase):
             n_predictions=10, n_sessions=5,
             realized_schema_token_reduction=100_000,
             net_token_reduction=100_000,
+            # The headline and pace project the ONGOING (non-caching) net.
+            net_forward=100_000,
+            saved_input_equiv_noncaching=100_000,
             first_ts=1_780_000_000.0,
             last_ts=1_780_000_000.0 + span_days * 86400.0)
         return savings.SavingsReport(
@@ -978,7 +1038,7 @@ class AnnualizedPaceTests(_HomeCase):
         text = savings_cli.render_text(self._report(30))
         self.assertIn("At this pace (30 days measured)", text)
         self.assertIn("12 months", text)
-        # 100k tokens over 30 days → ≈1,216,666/yr
+        # 100k tokens saved over 30 days → ≈1,216,666/yr
         self.assertIn("1,216,66", text)
 
     def test_pace_line_absent_below_a_week(self):

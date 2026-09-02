@@ -4,10 +4,11 @@
 
 A plugin for [Hermes Agent](https://hermes-agent.nousresearch.com).
 
-> On the install it was built against, Tool Belt has saved **9.5 million
-> tokens** of measured overhead — about 60k tokens and three cents of API
-> cost per conversation, with every tool still one ask away. Run
-> `hermes tool-belt savings` to see yours.
+> Tool shaping for uncached APIs. On the install it was built against, Tool
+> Belt has saved **5.7 million tokens** of tool-definition overhead — every
+> tool still one ask away. (On providers that prompt-cache, it carries the
+> full set instead, automatically — nothing to save there, nothing to
+> configure.) Run `hermes tool-belt savings` to see yours.
 
 ## What it does
 
@@ -28,16 +29,20 @@ more. Five capabilities:
    mis-route — every decision is auditable in telemetry, and the
    shipped [policy.yaml](policy.yaml) is the truth.
 
-3. **Cache-aware session loadouts.** For prefix-caching providers, the
-   tool set freezes at session start and stays stable, so the provider
-   prefix cache keeps hitting. Cache behavior is auto-detected per
-   model and scope; non-caching providers get per-turn narrowing
-   instead. You set nothing.
+3. **Provider-aware loadouts.** Narrowing only pays where the provider
+   doesn't prefix-cache. On a **non-caching** provider it narrows every
+   turn — real full-price savings. On a **caching** provider it does the
+   opposite: it carries the whole set, byte-stable, so the prefix cache
+   never breaks (schema there is cache-read cheap, and a mid-session change
+   re-bills the entire history). Cache behavior is auto-detected per
+   provider; you set nothing.
 
-4. **`expand_tools` recovery.** The model's escape hatch: one call
-   loads a missing category or tool mid-session, and repeated use of a
-   category gets it promoted into future sessions. **The model's reach
-   IS the promotion vote.**
+4. **`expand_tools` recovery (non-caching providers).** The model's escape
+   hatch when narrowing gated a tool it needs: one call loads a missing
+   category mid-session, and repeated use gets it promoted into future
+   sessions. **The model's reach IS the promotion vote.** On caching
+   providers there is nothing to recover — everything is already carried —
+   so `expand_tools` is not shipped.
 
 5. **Safety guarantees.** Fails open — any internal error leaves your
    full tool set untouched. Never widens the ceiling. Demotes only on
@@ -61,18 +66,22 @@ web, terminal, file, browser, MCP servers, custom skills — that's
 The naive fix — re-narrow every turn — fights provider
 prefix-caching: changing the tool block between turns busts the cache
 and re-bills the conversation history at full input rate. On a
-multi-turn session, lost cache costs more than schema savings.
+multi-turn session with a caching provider, that break costs far more
+than the schema you saved — and the saved schema was cache-read cheap
+to carry anyway. So narrowing there is a bad trade in both directions.
 
-Tool Belt resolves the tension by cadence:
+Tool Belt resolves the tension by **provider**, not cadence:
 
-- **Cache-on** (Anthropic, OpenAI auto-cache): the tool set freezes at
-  session start and is reused verbatim every turn, so the provider
-  prefix cache stays hot. Illustrative shape: 37-tool ceiling →
-  ~14-tool frozen loadout → ~95% cache hit on subsequent turns.
-- **Cache-off** (providers without prefix caching): per-turn narrowing
-  with short sticky residency for expanded tools. Illustrative: a
-  37-tool ceiling narrowed to 14 on a shell-intent message saves
-  roughly a third of the tool-schema overhead per message.
+- **Caching providers** (Anthropic, OpenAI/Codex auto-cache, OpenRouter):
+  carry the whole ceiling, byte-stable every turn, so the prefix cache
+  never breaks. Narrowing is deliberately *not* done here — it would save
+  cache-read pennies and risk a full-history re-bill. `expand_tools` is not
+  shipped (nothing to recover), so there is no mid-session mutation at all.
+- **Non-caching providers** (Ollama, and any provider without prefix
+  caching): per-turn narrowing with short sticky residency for expanded
+  tools. This is where the real, full-price savings are. Illustrative: a
+  37-tool ceiling narrowed to 14 on a shell-intent message saves roughly a
+  third of the tool-schema overhead per message.
 
 The numbers above are illustrative, not measured guarantees — the
 methodology for measuring your own is in
@@ -289,19 +298,17 @@ python3 ~/.hermes/plugins/tool-belt/scripts/bootstrap.py   # inspect recommendat
 
 ## How it works
 
-One mechanism, two cadences, chosen per scope:
+One mechanism, two postures, chosen per `scope|provider`:
 
-- **Cache-on** (prefix-caching providers): the first dispatch of a
-  session runs the predictor and *freezes* the resulting tool set.
-  Every later dispatch reuses it verbatim, so the prefix cache stays
-  hot. `expand_tools` additions are folded into the frozen set for the
-  rest of the session — one deliberate cache break, then stability.
-  The freeze is evicted only at moments that already cost one:
-  `/reset`, `/new`, session end, or compaction.
-- **Cache-off** (no provider caching): per-turn narrowing — always-on
-  tools, plus every trigger group whose regexes match the message,
-  plus expanded/sticky tools, intersected with your configured
-  ceiling.
+- **Caching providers** (prefix-caching): carry-all. Every dispatch ships
+  the whole ceiling (minus `expand_tools`), byte-stable, so the prefix
+  cache never breaks and no predictor runs. There is no per-session
+  snapshot and no mid-session mutation — the posture pin is evicted only at
+  moments that already cost a cache break (`/reset`, `/new`, a provider
+  switch, compaction).
+- **Non-caching providers**: per-turn narrowing — always-on tools, plus
+  every trigger group whose regexes match the message, plus
+  expanded/sticky tools, intersected with your configured ceiling.
 - **Between sessions**, the in-process auto-shape pass (session end,
   debounced per scope) reads accumulated use and `expand_tools`
   evidence and writes per-tool promote/demote assignments into
@@ -309,13 +316,14 @@ One mechanism, two cadences, chosen per scope:
   run the same engine on demand. Applied at runtime only when
   `learned_mode: apply` (the default).
 
-The full lifecycle — hooks, freeze mechanics, compaction handling,
+The full lifecycle — hooks, the carry-all posture, compaction handling,
 telemetry joins — is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Limitations and known sharp edges
 
 - **CLI sessions don't fire `pre_gateway_dispatch`.** CLI messages bypass
-  the gateway, so neither narrowing nor freeze applies. No telemetry written.
+  the gateway, so neither narrowing nor the carry-all posture applies. No
+  telemetry written.
 - **Subagents are not narrowed.** When `delegate_task` spawns a subagent,
   the parent's tool curation is inherited; the predictor doesn't run again.
 - **Cron jobs are not narrowed.** Cron sessions get explicit per-job
@@ -323,14 +331,11 @@ telemetry joins — is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **New tools start carried.** A tool Hermes enables that no policy or
   learned entry names is carried on every call until evidence demotes it
   (full-start) — safe for shipping new plugins, at some carry cost first.
-- **In-memory session state doesn't survive gateway restarts.** Both the
-  cache-on frozen snapshot and cache-off sticky residency live in process
-  memory. A restart between turns will re-freeze (cache-on) or clear
-  sticky carry-over (cache-off). The cross-session detection cache and
-  `learned.json` are on disk; only the per-session memory is volatile.
-- **Concurrent chats on one platform** can leave a sibling chat's freeze
-  un-evicted on `/new`. Deliberate tradeoff; see
-  [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
+- **In-memory session state doesn't survive gateway restarts.** The
+  cache-mode posture pin (caching providers) and sticky residency
+  (non-caching) live in process memory. A restart between turns re-resolves
+  the posture or clears sticky carry-over. The cross-session detection cache
+  and `learned.json` are on disk; only the per-session memory is volatile.
 - **Codex (gpt-5.4) reasoning trace breaks cache mid-session.** When the
   model produces reasoning tokens, the resulting message-history mutation
   busts cache on the next call regardless of what the plugin does.
@@ -387,7 +392,7 @@ latest changes. See [CHANGELOG.md](CHANGELOG.md) for what has changed.
 ```
 ~/.hermes/plugins/tool-belt/
 ├── plugin.yaml       # Hermes plugin manifest
-├── __init__.py       # runtime hooks, cache-mode detection, frozen loadouts
+├── __init__.py       # runtime hooks, cache-mode detection, carry-all + narrowing
 ├── predictor.py      # deterministic intent matching
 ├── presets.py        # policy loading and per-scope resolution
 ├── learned.py        # learned overlay loading and merging
@@ -415,10 +420,10 @@ latest changes. See [CHANGELOG.md](CHANGELOG.md) for what has changed.
 
 The code is the source of truth. The active doc set is intentionally small:
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the plugin works: the two modes, the freeze mechanism, `expand_tools`, between-session shaping, where in the request lifecycle the patches sit.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the plugin works: the two postures, carry-all vs narrowing, `expand_tools`, between-session shaping, where in the request lifecycle the patches sit.
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — every knob in `config.yaml`, `policy.yaml`, and `learned.json`, with defaults; full telemetry field reference.
 - [docs/SAVINGS.md](docs/SAVINGS.md) — how the token-savings numbers are computed and how to verify them on your own data.
-- [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) — behaviors that look like bugs but aren't (Codex reasoning cache, gateway-restart freeze loss, concurrent-chat resets).
+- [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) — behaviors that look like bugs but aren't (Codex reasoning cache, gateway-restart posture loss).
 - [docs/PRIVACY.md](docs/PRIVACY.md) — what telemetry records and what it never records, where state lives, and how to disable collection or erase it.
 - [docs/RELEASING.md](docs/RELEASING.md) — the maintainer release checklist: pre-release verification, clean-profile install test, behavioral spot-checks, version and tag steps.
 

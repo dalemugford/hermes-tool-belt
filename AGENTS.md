@@ -27,14 +27,15 @@ the same change.
 
 ## Repository map
 
-- Runtime hooks and cache behavior: `__init__.py`
+- Runtime hooks and cache posture (carry-all on caching providers, per-turn
+  narrowing on non-caching ones): `__init__.py`
 - Carrying-strata partition helpers: `carrying.py`
 - Prediction and policy: `predictor.py`, `presets.py`, `policy.yaml`
 - Dynamic recovery: `expand_tools.py`
 - Learned overlay: `learned.py`
 - Telemetry writes: `logger_io.py`
 - Telemetry analysis: `analyze.py`
-- Analyzer cache-cost library: `scripts/cache-freeze-replay.py` (imported by
+- Analyzer cache-cost library: `scripts/cache-stability-replay.py` (imported by
   `analyze.py`; also a standalone CLI)
 - Savings engine and CLI: `savings.py`, `savings_cli.py`, `tool-belt` launcher
 - Supported operator commands: `scripts/`

@@ -1,4 +1,4 @@
-"""Regression coverage for cache-freeze-replay session grouping across `/new`.
+"""Regression coverage for cache-stability-replay session grouping across `/new`.
 
 The freeze simulation must group calls by the Hermes session id
 (``hermes_session_id``), which rotates on ``/new``, and fall back to the legacy
@@ -10,7 +10,7 @@ set") and its accumulated trigger-mutation history, so a fresh `/new` session
 would spuriously "break" the stale frozen prefix.
 
 These tests import the real script functions (``_session_key``,
-``freeze_simulation``) rather than re-deriving their logic.
+``stability_simulation``) rather than re-deriving their logic.
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def _load_script(module_name: str, filename: str):
     return module
 
 
-cache_replay = _load_script("tool_belt_cache_replay_session", "cache-freeze-replay.py")
+cache_replay = _load_script("tool_belt_cache_replay_session", "cache-stability-replay.py")
 
 
 def _pred(prediction_id, session_id, ts, *, hermes_session_id=None,
@@ -92,11 +92,11 @@ class FreezeSimulationNewBoundaryTests(unittest.TestCase):
             _call("P2", shared_transport, ts=11, api_call_idx=1,
                   tool_list_hash="B", hermes_session_id="H2"),
         ]
-        result = cache_replay.freeze_simulation(preds, calls, tool_calls=[])
+        result = cache_replay.stability_simulation(preds, calls, tool_calls=[])
         # One freeze cohort per Hermes session, each with its own first call.
         self.assertEqual(result["sessions"], 2)
         self.assertEqual(result["first_calls_per_session"], 2)
-        self.assertEqual(result["matches_freeze"], 2)
+        self.assertEqual(result["matches_stable"], 2)
         # The post-/new hash change must NOT read as an avoidable freeze break;
         # grouping by transport session_id alone would produce would_break==2.
         self.assertEqual(result["would_break_mutations"], 0)
@@ -125,7 +125,7 @@ class FreezeSimulationNewBoundaryTests(unittest.TestCase):
             _call("P2", shared_transport, ts=11, api_call_idx=1,
                   tool_list_hash="D", hermes_session_id="H2"),
         ]
-        result = cache_replay.freeze_simulation(preds, calls, tool_calls=[])
+        result = cache_replay.stability_simulation(preds, calls, tool_calls=[])
         self.assertEqual(result["sessions"], 2)
         self.assertEqual(result["first_calls_per_session"], 2)
         # Both mutations are trigger-driven; none is an avoidable break. Grouping
@@ -144,10 +144,10 @@ class FreezeSimulationNewBoundaryTests(unittest.TestCase):
             _call("P1", sid, ts=2, api_call_idx=1, tool_list_hash="A"),
             _call("P1", sid, ts=3, api_call_idx=2, tool_list_hash="A"),
         ]
-        result = cache_replay.freeze_simulation(preds, calls, tool_calls=[])
+        result = cache_replay.stability_simulation(preds, calls, tool_calls=[])
         self.assertEqual(result["sessions"], 1)
         self.assertEqual(result["first_calls_per_session"], 1)
-        self.assertEqual(result["matches_freeze"], 2)
+        self.assertEqual(result["matches_stable"], 2)
         self.assertEqual(result["would_break_mutations"], 0)
 
 

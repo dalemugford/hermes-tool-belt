@@ -59,12 +59,14 @@ def _reset_plugin_state() -> None:
     plugin._STICKY_BY_KEY.clear()
     plugin._POLICY_TURN_BY_SCOPE.clear()
     plugin._PRIOR_MESSAGES_BY_SESSION.clear()
-    plugin._FROZEN_BY_SESSION.clear()
     plugin._CACHE_MODE_BY_SESSION.clear()
     plugin._CACHE_DECISION_BY_SESSION.clear()
     plugin._LAST_CANONICAL_BY_PLATFORM.clear()
     plugin._DETECTION_CACHE.clear()
     plugin._DETECTION_CACHE_LOADED = False
+    # Host facts (configured primary provider/model) live outside _CONFIG;
+    # clear so a test that sets a primary can't leak into the next.
+    plugin._HOST_MODEL.update(provider="", model="")
 
 
 class ResolveCacheModeTests(unittest.TestCase):
@@ -115,113 +117,57 @@ class ResolveCacheModeTests(unittest.TestCase):
             "the NEXT session honors the lock")
 
 
-class FreezeSnapshotTests(unittest.TestCase):
-    """_freeze_session_snapshot + _build_state_from_frozen: snapshot shape."""
+class CarryAllStateTests(unittest.TestCase):
+    """_build_carry_all_state: the cache-on (caching-provider) dispatch state.
+
+    Replaces the removed freeze model (D1, 2026-09-02): caching providers
+    carry the whole ceiling, ship no ``expand_tools``, and never mutate the
+    tool list mid-session, so there is no per-session snapshot to reuse.
+    """
+
+    class _Preset:
+        name = "aggressive"
+        policy_version = "v1"
+        always_carry = ["clarify"]
+        carry = ["read_file", "write_file"]
+        demoted: list = []
+        config_always_carry: list = []
+        learned_mode = "apply"
+        learned_scope = ""
+        learned_changes: list = []
 
     def setUp(self):
         _seed_plugin_config()
         _reset_plugin_state()
 
-    def test_snapshot_starts_with_zero_reuses(self):
-        plugin._freeze_session_snapshot(
-            "sid",
-            active_tool_names=["read_file"],
-            baseline_active_tools=["read_file"],
-            preset_name="aggressive",
-            trigger_tools_by_group={},
-            triggers_fired=[],
-            triggers_suppressed=[],
-            policy_source="preset",
-            policy_version="v1",
-            learned_mode="recommend",
-            learned_scope="",
-            learned_changes=[],
-        )
-        self.assertEqual(plugin._FROZEN_BY_SESSION["sid"]["reuses"], 0)
-        self.assertEqual(plugin._FROZEN_BY_SESSION["sid"]["expansions"], set())
-
-    def test_build_from_frozen_increments_reuses(self):
-        plugin._freeze_session_snapshot(
-            "sid",
-            active_tool_names=["read_file"],
-            baseline_active_tools=["read_file"],
-            preset_name="aggressive",
-            trigger_tools_by_group={},
-            triggers_fired=[],
-            triggers_suppressed=[],
-            policy_source="preset",
-            policy_version="v1",
-            learned_mode="recommend",
-            learned_scope="",
-            learned_changes=[],
-        )
-        frozen = plugin._FROZEN_BY_SESSION["sid"]
-
-        state1 = plugin._build_state_from_frozen(
-            frozen, session_id="sid", scope="assistant-a:telegram",
-            channel="assistant-a:telegram", agent="assistant-a", platform="telegram",
-            message="first reuse",
-        )
-        self.assertTrue(state1["frozen_reuse"])
-        self.assertEqual(state1["frozen_reuse_count"], 1)
-
-        state2 = plugin._build_state_from_frozen(
-            frozen, session_id="sid", scope="assistant-a:telegram",
-            channel="assistant-a:telegram", agent="assistant-a", platform="telegram",
-            message="second reuse",
-        )
-        self.assertEqual(state2["frozen_reuse_count"], 2)
-
-    def test_build_from_frozen_carries_expansions(self):
-        plugin._freeze_session_snapshot(
-            "sid",
-            active_tool_names=["read_file"],
-            baseline_active_tools=["read_file"],
-            preset_name="aggressive",
-            trigger_tools_by_group={},
-            triggers_fired=[],
-            triggers_suppressed=[],
-            policy_source="preset",
-            policy_version="v1",
-            learned_mode="recommend",
-            learned_scope="",
-            learned_changes=[],
-        )
-        plugin._FROZEN_BY_SESSION["sid"]["expansions"] = {"browser_navigate", "browser_click"}
-
-        state = plugin._build_state_from_frozen(
-            plugin._FROZEN_BY_SESSION["sid"],
+    def _build(self, message="hi"):
+        return plugin._build_carry_all_state(
+            self._Preset(),
             session_id="sid", scope="assistant-a:telegram",
-            channel="assistant-a:telegram", agent="assistant-a", platform="telegram",
-            message="hi",
+            channel="assistant-a:telegram", agent="assistant-a",
+            platform="telegram", message=message,
         )
-        self.assertEqual(state["expansions"], {"browser_navigate", "browser_click"})
 
-    def test_build_from_frozen_disables_sticky_and_lookback(self):
-        plugin._freeze_session_snapshot(
-            "sid",
-            active_tool_names=["read_file"],
-            baseline_active_tools=["read_file"],
-            preset_name="aggressive",
-            trigger_tools_by_group={},
-            triggers_fired=[],
-            triggers_suppressed=[],
-            policy_source="preset",
-            policy_version="v1",
-            learned_mode="recommend",
-            learned_scope="",
-            learned_changes=[],
-        )
-        state = plugin._build_state_from_frozen(
-            plugin._FROZEN_BY_SESSION["sid"],
-            session_id="sid", scope="assistant-a:telegram",
-            channel="assistant-a:telegram", agent="assistant-a", platform="telegram",
-            message="hi",
-        )
+    def test_carry_all_state_is_no_narrowing(self):
+        state = self._build()
+        self.assertIs(state["active_tool_names"], plugin.NO_NARROWING)
+        self.assertIs(state["baseline_active_tools"], plugin.NO_NARROWING)
+
+    def test_carry_all_stamps_distinct_policy_source(self):
+        # Must NOT be "bypass" — that is the internal A/B control cohort;
+        # the analyzer has to tell the two unnarrowed cohorts apart.
+        self.assertEqual(self._build()["policy_source"], "cache_on_carry_all")
+
+    def test_carry_all_disables_sticky_and_lookback(self):
+        state = self._build()
         self.assertEqual(state["sticky_key"], "")
         self.assertEqual(state["sticky_tools"], [])
         self.assertEqual(state["lookback_used"], 0)
         self.assertEqual(state["lookback_turns_config"], 0)
+
+    def test_carry_all_starts_with_no_expansions(self):
+        # Nothing is admitted mid-session; expand_tools is not even shipped.
+        self.assertEqual(self._build()["expansions"], set())
 
 
 class DetectionStateMachineTests(unittest.TestCase):
@@ -248,7 +194,7 @@ class DetectionStateMachineTests(unittest.TestCase):
         )
         self.assertEqual(mode, "off")
         self.assertEqual(
-            plugin._CACHE_MODE_BY_SESSION["sid"]["lock_reason"],
+            plugin._CACHE_MODE_BY_SESSION["sid"]["buckets"][""]["lock_reason"],
             "provider_blocklist",
         )
 
@@ -272,7 +218,7 @@ class DetectionStateMachineTests(unittest.TestCase):
             )
         self.assertEqual(mode, "on")
         self.assertEqual(
-            plugin._CACHE_MODE_BY_SESSION["sid"]["lock_reason"],
+            plugin._CACHE_MODE_BY_SESSION["sid"]["buckets"][""]["lock_reason"],
             "threshold_met",
         )
 
@@ -286,7 +232,7 @@ class DetectionStateMachineTests(unittest.TestCase):
             )
         self.assertEqual(mode, "off")
         self.assertEqual(
-            plugin._CACHE_MODE_BY_SESSION["sid"]["lock_reason"],
+            plugin._CACHE_MODE_BY_SESSION["sid"]["buckets"][""]["lock_reason"],
             "threshold_failed",
         )
 
@@ -355,34 +301,30 @@ class DetectionCachePersistenceTests(unittest.TestCase):
 class SessionHookSemanticsTests(unittest.TestCase):
     """Verify Tool Belt follows Hermes' session-hook contracts.
 
-    Hermes fires on_session_end once per user message. Frozen state therefore
-    survives that hook and is evicted by on_session_reset instead.
+    Hermes fires on_session_end once per user message, so the session's
+    posture pin (_CACHE_DECISION_BY_SESSION) and detection state
+    (_CACHE_MODE_BY_SESSION) must survive it; on_session_reset — /new,
+    /reset — evicts them through _evict_session_cache_state (D3, 2026-09-02;
+    the old freeze snapshot was removed with the carry-all posture).
     """
 
     def setUp(self):
         _seed_plugin_config()
         _reset_plugin_state()
-        # Seed a frozen snapshot.
-        plugin._freeze_session_snapshot(
-            "sid",
-            active_tool_names=["read_file"],
-            baseline_active_tools=["read_file"],
-            preset_name="aggressive",
-            trigger_tools_by_group={},
-            triggers_fired=[],
-            triggers_suppressed=[],
-            policy_source="preset",
-            policy_version="v1",
-            learned_mode="recommend",
-            learned_scope="",
-            learned_changes=[],
-        )
-        plugin._CACHE_MODE_BY_SESSION["sid"] = {"mode": "on", "calls_observed": 3}
+        # Seed a posture pin + its detection bucket, as a live cache-on
+        # session would carry after its first dispatch.
+        plugin._CACHE_DECISION_BY_SESSION["sid"] = {
+            "mode": "on", "provider": "openai-codex",
+        }
+        plugin._CACHE_MODE_BY_SESSION["sid"] = {
+            "observed_provider": "openai-codex",
+            "buckets": {"openai-codex": {"mode": "on", "calls_observed": 3}},
+        }
 
-    def test_on_session_end_does_not_evict_freeze(self):
+    def test_on_session_end_does_not_evict_posture(self):
         with mock.patch.dict(os.environ, {"HERMES_SESSION_KEY": "sid"}, clear=False):
             plugin._on_session_end(session_id="sid", session_key="sid")
-        self.assertIn("sid", plugin._FROZEN_BY_SESSION)
+        self.assertIn("sid", plugin._CACHE_DECISION_BY_SESSION)
         self.assertIn("sid", plugin._CACHE_MODE_BY_SESSION)
 
     def test_on_session_end_keeps_sticky_and_lookback(self):
@@ -397,9 +339,9 @@ class SessionHookSemanticsTests(unittest.TestCase):
         self.assertIn("sid", plugin._PRIOR_MESSAGES_BY_SESSION)
         self.assertIn(sticky_key, plugin._STICKY_BY_KEY)
 
-    def test_on_session_reset_evicts_freeze(self):
+    def test_on_session_reset_evicts_posture(self):
         plugin._on_session_reset(session_id="sid", session_key="sid")
-        self.assertNotIn("sid", plugin._FROZEN_BY_SESSION)
+        self.assertNotIn("sid", plugin._CACHE_DECISION_BY_SESSION)
         self.assertNotIn("sid", plugin._CACHE_MODE_BY_SESSION)
 
 
@@ -442,12 +384,12 @@ class SlashCommandBypassTests(unittest.TestCase):
         return store
 
     def test_pre_gateway_dispatch_skips_slash_command(self):
-        """A /new message must not build a freeze."""
+        """A /new message must not pin a posture for the session."""
         event = self._make_event("/new")
         store = self._make_session_store()
         plugin._on_pre_gateway_dispatch(event=event, session_store=store)
-        self.assertNotIn(self.CANONICAL, plugin._FROZEN_BY_SESSION,
-                         "freeze should not be created for slash-command messages")
+        self.assertNotIn(self.CANONICAL, plugin._CACHE_DECISION_BY_SESSION,
+                         "no posture pin should be created for slash-command messages")
 
     def test_pre_gateway_dispatch_records_canonical_for_slash_command(self):
         """Even though /new is bypassed, the canonical key must be tracked
@@ -465,21 +407,10 @@ class SlashCommandBypassTests(unittest.TestCase):
         """Hermes fires on_session_reset with only session_id (new UUID)
         and platform — never the canonical key. Eviction must succeed by
         falling back to _LAST_CANONICAL_BY_PLATFORM."""
-        # Seed: a freeze under the canonical key, with the platform back-ref
-        plugin._freeze_session_snapshot(
-            self.CANONICAL,
-            active_tool_names=["read_file"],
-            baseline_active_tools=["read_file"],
-            preset_name="aggressive",
-            trigger_tools_by_group={},
-            triggers_fired=[],
-            triggers_suppressed=[],
-            policy_source="preset",
-            policy_version="v1",
-            learned_mode="recommend",
-            learned_scope="",
-            learned_changes=[],
-        )
+        # Seed: a posture pin under the canonical key, with the platform back-ref.
+        plugin._CACHE_DECISION_BY_SESSION[self.CANONICAL] = {
+            "mode": "on", "provider": "openai-codex",
+        }
         plugin._LAST_CANONICAL_BY_PLATFORM[self.PLATFORM] = self.CANONICAL
 
         # Call _on_session_reset with the new session UUID Hermes hands
@@ -490,35 +421,36 @@ class SlashCommandBypassTests(unittest.TestCase):
             platform=self.PLATFORM,
         )
 
-        self.assertNotIn(self.CANONICAL, plugin._FROZEN_BY_SESSION,
-                         "freeze under canonical key should be evicted via platform fallback")
+        self.assertNotIn(self.CANONICAL, plugin._CACHE_DECISION_BY_SESSION,
+                         "posture pin under canonical key should be evicted via platform fallback")
 
-    def test_new_then_message_does_not_reuse_freeze(self):
-        """End-to-end: /new arrives, then a real message. The real message
-        must produce frozen_reuse=False because /new should have skipped
-        building any freeze, and any pre-existing freeze must have been
-        evicted by on_session_reset's platform fallback."""
+    def test_new_then_message_builds_fresh_carry_all(self):
+        """End-to-end: /new arrives, then a real message. /new must not pin
+        a posture; on_session_reset evicts any stale pin via the platform
+        fallback; the real message then builds a fresh carry-all state under
+        cache_mode=on (policy_source cache_on_carry_all), not a stale reuse."""
         store = self._make_session_store()
 
         # Step 1: /new arrives. pre_gateway_dispatch fires.
         plugin._on_pre_gateway_dispatch(event=self._make_event("/new"), session_store=store)
-        self.assertNotIn(self.CANONICAL, plugin._FROZEN_BY_SESSION)
+        self.assertNotIn(self.CANONICAL, plugin._CACHE_DECISION_BY_SESSION)
 
         # Step 2: Gateway routes /new → on_session_reset with new UUID.
         plugin._on_session_reset(
             session_id="20260601_162555_d16739f9",
             platform=self.PLATFORM,
         )
-        self.assertNotIn(self.CANONICAL, plugin._FROZEN_BY_SESSION)
+        self.assertNotIn(self.CANONICAL, plugin._CACHE_DECISION_BY_SESSION)
 
-        # Step 3: Real user message arrives. With cache_mode=on, this
-        # should build a fresh freeze (reuses=0), not reuse one.
+        # Step 3: Real user message arrives. With cache_mode=on, this builds
+        # a carry-all dispatch state stamped cache_on_carry_all.
         plugin._CONFIG["cache_mode"] = "on"
-        plugin._on_pre_gateway_dispatch(event=self._make_event("Run the communication test"), session_store=store)
-        frozen = plugin._FROZEN_BY_SESSION.get(self.CANONICAL)
-        self.assertIsNotNone(frozen, "real message should build a fresh freeze")
-        self.assertEqual(frozen["reuses"], 0,
-                         "fresh freeze should have reuses=0 (not a reuse of a stale snapshot)")
+        plugin._on_pre_gateway_dispatch(
+            event=self._make_event("Run the communication test"), session_store=store)
+        state = plugin._PREDICTION_CV.get()
+        self.assertIsNotNone(state, "real message should build a dispatch state")
+        self.assertEqual(state.get("policy_source"), "cache_on_carry_all")
+        self.assertIs(state.get("active_tool_names"), plugin.NO_NARROWING)
 
 
 class BypassCohortTests(unittest.TestCase):
@@ -650,105 +582,6 @@ class EnabledCeilingCaptureTests(unittest.TestCase):
                          "untriggered expand_only tool is cut")
         self.assertIn("mcp__github__create_issue", kept,
                       "MCP tool passes through untouched")
-
-
-class CacheOnRetriggerAttributionTests(unittest.TestCase):
-    """Under cache-on, a later trigger grows the frozen active set exactly once
-    and is attributed distinctly from an explicit expand_tools expansion."""
-
-    PLATFORM = "telegram"
-    CANONICAL = "agent:main:telegram:dm:200000002"
-
-    def setUp(self):
-        _seed_plugin_config()
-        _reset_plugin_state()
-        plugin._CONFIG["cache_mode"] = "on"
-
-    def _event(self, text: str):
-        from types import SimpleNamespace
-        platform_obj = SimpleNamespace(value=self.PLATFORM)
-        source = SimpleNamespace(platform=platform_obj, chat_id="200000002", user_id="user-b")
-        return SimpleNamespace(text=text, message=text, source=source, platform=None)
-
-    def _store(self):
-        store = mock.MagicMock()
-        store._generate_session_key.return_value = self.CANONICAL
-        return store
-
-    def _preset(self):
-        import re
-        presets = importlib.import_module("tool_belt_plugin.presets")
-        return presets.Preset(
-            name="t",
-            always_carry=["clarify"],
-            carry=[],
-            triggers=[presets.TriggerGroup(
-                name="web",
-                tools=["web_extract"],
-                keyword_patterns=[re.compile(r"https?://", re.IGNORECASE)],
-                exclude_patterns=[],
-                has_attachment=None,
-            )],
-        )
-
-    def _seed_freeze(self):
-        plugin._freeze_session_snapshot(
-            self.CANONICAL,
-            active_tool_names=["clarify"],
-            baseline_active_tools=["clarify"],
-            preset_name="t",
-            trigger_tools_by_group={},
-            triggers_fired=[],
-            triggers_suppressed=[],
-            policy_source="preset",
-            policy_version="",
-            learned_mode="recommend",
-            learned_scope="",
-            learned_changes=[],
-            resolved_always_carry=["clarify"],
-            resolved_carry=[],
-            triggered_tools=[],
-        )
-
-    def test_later_trigger_mutation_is_distinct_from_explicit_expansion(self):
-        self._seed_freeze()
-
-        # A later message triggers web_extract for the first time.
-        with mock.patch.object(plugin.presets_mod, "resolve_preset",
-                               return_value=self._preset()):
-            plugin._on_pre_gateway_dispatch(
-                event=self._event("please read https://example.com"),
-                session_store=self._store(),
-            )
-        state = plugin._PREDICTION_CV.get()
-        self.assertTrue(state.get("trigger_driven_mutation"),
-                        "a newly fired trigger records a trigger-driven mutation")
-        self.assertIn("web_extract", set(state.get("triggered_tools") or []))
-        # The mutation is a trigger activation, NOT an explicit expansion.
-        self.assertEqual(state.get("expansions"), set(),
-                         "trigger activation is never recorded as an explicit expansion")
-        self.assertIn("web_extract",
-                      set(plugin._FROZEN_BY_SESSION[self.CANONICAL]["triggered_tools"]),
-                      "frozen accumulator grows with the new trigger tool")
-
-    def test_same_trigger_next_turn_does_not_remutate(self):
-        self._seed_freeze()
-        with mock.patch.object(plugin.presets_mod, "resolve_preset",
-                               return_value=self._preset()):
-            plugin._on_pre_gateway_dispatch(
-                event=self._event("read https://example.com"),
-                session_store=self._store(),
-            )
-            # Second turn, same trigger — the enlarged set is reused, no new mutation.
-            plugin._on_pre_gateway_dispatch(
-                event=self._event("also https://example.org"),
-                session_store=self._store(),
-            )
-        state2 = plugin._PREDICTION_CV.get()
-        self.assertFalse(state2.get("trigger_driven_mutation"),
-                         "re-firing the same trigger does not grow the set again")
-        self.assertIn("web_extract", set(state2.get("triggered_tools") or []),
-                      "the previously triggered tool remains active")
 
 
 class ExpandOnlyManifestInjectionTests(unittest.TestCase):

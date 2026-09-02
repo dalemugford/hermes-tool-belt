@@ -43,14 +43,16 @@ DEFAULT_PROMOTE_EXPAND_RATE = 0.50
 DEFAULT_PROMOTE_USE_RATE = 0.80
 DEFAULT_UNUSED_CARRY_TURNS = 10
 DEFAULT_TRIGGER_MIN_FIRES = 3
-# Estimated total token cost of one expand_tools round-trip: the model emits a
-# tool-call (~150 output tokens), the gateway hands the result back (~250),
-# and the next API call resends system + messages + widened tool list. The
-# largest term is "extra full API request body," dominated by message history
-# and the widened tool schemas. 1500 is a conservative single-call estimate;
-# tune via --expand-round-trip-tokens to a measured baseline. The
-# value is single-sourced in the canonical savings engine so the analyzer, the
-# savings report, and the projection all charge the same per-event overhead.
+# Per-event cost of one expand_tools round-trip. The analyzer no longer
+# charges a flat estimate: ``main`` MEASURES the cost per scope from the same
+# telemetry (``savings.measure_expand_overhead``) — on a caching provider an
+# expansion breaks the prefix cache and re-bills the whole history (tens of
+# thousands of tokens per event); on a non-caching provider it costs one extra
+# full-price API call (the expand meta-call's input_tokens). This constant is
+# the FALLBACK charged when a scope's telemetry is too thin to measure;
+# --expand-round-trip-tokens overrides only that fallback. Single-sourced in
+# the canonical savings engine so the analyzer, the savings report, the
+# projection, and the shaper all fall back to the same figure.
 DEFAULT_EXPAND_ROUND_TRIP_TOKENS = _savings.EXPAND_ROUND_TRIP_TOKENS
 # Dampener suggestion defaults. These are conservative — tuning down min
 # support or precision quickly produces noise; tuning up shrinks the
@@ -870,7 +872,7 @@ def _stability_payload(stat: "ScopeStats") -> dict[str, Any]:
     schema savings are partially or fully eaten by re-billing the
     history at full input rate. This payload reports the raw frequency;
     the cache-cost analysis uses per-call ``cache_read_tokens`` captured
-    in ``api_calls.jsonl`` and computed by ``scripts/cache-freeze-replay.py``,
+    in ``api_calls.jsonl`` and computed by ``scripts/cache-stability-replay.py``,
     surfaced in the Cache-Aware Savings section of this report.
 
     Counts exclude turn 1 (always a cold cache by definition) and rows
@@ -924,6 +926,38 @@ def _cohort_payload(stat: "ScopeStats") -> dict[str, Any]:
     return out
 
 
+def expand_overhead_for_scope(
+    args: argparse.Namespace, scope: str
+) -> "_savings.MeasuredExpandOverhead | None":
+    """The scope's measured expansion overhead, if ``main`` computed one.
+
+    ``main`` stores ``{scope: MeasuredExpandOverhead}`` on
+    ``args.expand_overhead_by_scope``; callers that build ``args`` directly
+    (tests, ad-hoc scripts) have none and fall back to the flag.
+    """
+    table = getattr(args, "expand_overhead_by_scope", None)
+    if isinstance(table, dict):
+        measured = table.get(scope)
+        if measured is not None:
+            return measured
+    return None
+
+
+def expand_round_trip_tokens_for(args: argparse.Namespace, scope: str) -> int:
+    """Per-event expand_tools cost for ``scope``: the MEASURED event-weighted
+    figure across its cache cohorts, else ``--expand-round-trip-tokens``."""
+    measured = expand_overhead_for_scope(args, scope)
+    if measured is not None:
+        return int(measured.blended_per_event)
+    return int(args.expand_round_trip_tokens)
+
+
+def expand_round_trip_basis_for(args: argparse.Namespace, scope: str) -> str:
+    """``measured`` | ``fallback`` | ``mixed`` for the figure above."""
+    measured = expand_overhead_for_scope(args, scope)
+    return measured.blended_basis if measured is not None else "fallback"
+
+
 def category_net_value(
     expansions: int,
     predictions: int,
@@ -934,11 +968,12 @@ def category_net_value(
     """Estimate the net token value of promoting a category into the carry class.
 
     Saved by promotion: each expansion event avoids one round-trip
-    (``expansions × expand_round_trip_tokens``). Costs of promotion: every
-    prediction now carries the category's tools in the request schema
-    (``predictions × tools_in_category × per_tool_tokens``). Net value is
-    saved minus cost; positive means promotion is likely beneficial under
-    these defaults, negative means keep gated.
+    (``expansions × expand_round_trip_tokens`` — the caller passes the scope's
+    measured per-event cost via :func:`expand_round_trip_tokens_for`). Costs
+    of promotion: every prediction now carries the category's tools in the
+    request schema (``predictions × tools_in_category × per_tool_tokens``).
+    Net value is saved minus cost; positive means promotion is likely
+    beneficial under these defaults, negative means keep gated.
     """
     saved = max(0, expansions) * max(0, expand_round_trip_tokens)
     cost = max(0, predictions) * max(0, tools_in_category) * max(0, per_tool_tokens)
@@ -1231,6 +1266,8 @@ def harvest_recommendation_rows(
         net_savings = expand_only_calls × expand_round_trip_tokens
                     − predictions × per_tool_tokens
 
+    where ``expand_round_trip_tokens`` is the scope's measured per-event cost
+    (:func:`expand_round_trip_tokens_for`; the flag is only the fallback).
     Positive net favors promote-to-carry; negative favors keeping the tool
     expand_only (relying on trigger activation / explicit expansion to cover its
     use cases). Auto-detected — emits nothing when no harvest rows are present,
@@ -1251,12 +1288,14 @@ def harvest_recommendation_rows(
         if stat.harvest_predictions == 0:
             continue
         denom = max(stat.harvest_predictions, 1)
+        per_event = expand_round_trip_tokens_for(args, scope)
+        per_event_basis = expand_round_trip_basis_for(args, scope)
         for tool, expand_only_calls in stat.harvest_was_expand_only.most_common():
             if tool in immutable:
                 continue
             if expand_only_calls < min_calls:
                 continue
-            round_trip_cost = expand_only_calls * args.expand_round_trip_tokens
+            round_trip_cost = expand_only_calls * per_event
             carry_cost = denom * args.per_tool_tokens
             net = round_trip_cost - carry_cost
             # A true rate: the share of harvest *predictions* in which this
@@ -1306,7 +1345,8 @@ def harvest_recommendation_rows(
                     "net_savings_tokens": net,
                 },
                 "defaults": {
-                    "expand_round_trip_tokens": args.expand_round_trip_tokens,
+                    "expand_round_trip_tokens": per_event,
+                    "expand_round_trip_basis": per_event_basis,
                     "per_tool_tokens": args.per_tool_tokens,
                     "harvest_min_expand_only_calls": min_calls,
                 },
@@ -1339,6 +1379,8 @@ def recommendation_rows(
                     else preset_always_carry())
     for scope, stat in stats.items():
         denominator = max(stat.predictions, 1)
+        per_event = expand_round_trip_tokens_for(args, scope)
+        per_event_basis = expand_round_trip_basis_for(args, scope)
         for category, count in stat.expansions_by_category.most_common():
             used_rows = stat.expanded_uses_by_category.get(category, 0)
             used_events = len(stat.used_expansion_event_ids_by_category.get(category, set()))
@@ -1349,7 +1391,7 @@ def recommendation_rows(
                 expansions=count,
                 predictions=stat.predictions,
                 tools_in_category=tools_in_category,
-                expand_round_trip_tokens=args.expand_round_trip_tokens,
+                expand_round_trip_tokens=per_event,
                 per_tool_tokens=args.per_tool_tokens,
             )
             if count < args.min_expansions:
@@ -1399,7 +1441,8 @@ def recommendation_rows(
                     "min_expansions": args.min_expansions,
                     "promote_expand_rate": args.promote_expand_rate,
                     "promote_use_rate": args.promote_use_rate,
-                    "expand_round_trip_tokens": args.expand_round_trip_tokens,
+                    "expand_round_trip_tokens": per_event,
+                    "expand_round_trip_basis": per_event_basis,
                     "per_tool_tokens": args.per_tool_tokens,
                 },
                 # Category rows are advisory: ``item`` is a toolset name, not a
@@ -1415,7 +1458,7 @@ def recommendation_rows(
                     f"est. round-trip savings={cost_value['saved_round_trip_tokens']:,} tok, "
                     f"est. carry cost={cost_value['added_carry_tokens']:,} tok, "
                     f"net={cost_value['net_value_tokens']:+,} tok under "
-                    f"per_tool={args.per_tool_tokens}, round_trip={args.expand_round_trip_tokens}"
+                    f"per_tool={args.per_tool_tokens}, round_trip={per_event} ({per_event_basis})"
                 ),
             })
 
@@ -1512,7 +1555,11 @@ def summary_payload(
         for stat in stats.values()
     )
     total_saved = sum(stat.total_tokens_saved for stat in stats.values())
-    total_expand_cost = total_expansions * args.expand_round_trip_tokens
+    # Each scope's events at that scope's measured per-event cost.
+    total_expand_cost = sum(
+        stat.expansion_events * expand_round_trip_tokens_for(args, scope)
+        for scope, stat in stats.items()
+    )
     total_first_turns = sum(stat.first_turns for stat in stats.values())
     total_mutation_turns = sum(stat.mutation_turns for stat in stats.values())
     total_stable_turns = sum(stat.stable_turns for stat in stats.values())
@@ -1592,12 +1639,17 @@ def threshold_payload(args: argparse.Namespace) -> dict[str, Any]:
 def scope_payload(stat: ScopeStats, args: argparse.Namespace) -> dict[str, Any]:
     immutable = preset_always_carry(Path(__file__).resolve().parent)
     used_events = sum(len(event_ids) for event_ids in stat.used_expansion_event_ids_by_category.values())
-    expand_round_trip_total = stat.expansion_events * args.expand_round_trip_tokens
+    per_event = expand_round_trip_tokens_for(args, stat.scope)
+    measured = expand_overhead_for_scope(args, stat.scope)
+    expand_round_trip_total = stat.expansion_events * per_event
     net_savings = stat.total_tokens_saved - expand_round_trip_total
     return {
         "predictions": stat.predictions,
         "sessions": len(stat.sessions),
         "logged_first_call_tokens_saved": stat.total_tokens_saved,
+        "expand_round_trip_tokens": per_event,
+        "expand_round_trip_basis": expand_round_trip_basis_for(args, stat.scope),
+        "expand_overhead": measured.to_json() if measured is not None else None,
         "estimated_expand_round_trip_cost_tokens": expand_round_trip_total,
         "estimated_net_savings_tokens": net_savings,
         "ceiling_tokens": stat.total_ceiling_tokens,
@@ -1641,23 +1693,23 @@ def scope_payload(stat: ScopeStats, args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-_CACHE_FREEZE_MOD = None
+_CACHE_STABILITY_MOD = None
 
 
-def _load_cache_freeze_module():
-    """Load scripts/cache-freeze-replay.py via importlib (hyphenated filename)."""
-    global _CACHE_FREEZE_MOD
-    if _CACHE_FREEZE_MOD is not None:
-        return _CACHE_FREEZE_MOD
-    script = Path(__file__).resolve().parent / "scripts" / "cache-freeze-replay.py"
+def _load_cache_stability_module():
+    """Load scripts/cache-stability-replay.py via importlib (hyphenated filename)."""
+    global _CACHE_STABILITY_MOD
+    if _CACHE_STABILITY_MOD is not None:
+        return _CACHE_STABILITY_MOD
+    script = Path(__file__).resolve().parent / "scripts" / "cache-stability-replay.py"
     if not script.exists():
         return None
-    spec = importlib.util.spec_from_file_location("cache_freeze_replay", script)
+    spec = importlib.util.spec_from_file_location("cache_stability_replay", script)
     if spec is None or spec.loader is None:
         return None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    _CACHE_FREEZE_MOD = mod
+    _CACHE_STABILITY_MOD = mod
     return mod
 
 
@@ -1667,21 +1719,21 @@ def compute_cache_cost(
     tool_calls: list[dict[str, Any]],
     scopes: list[str],
 ) -> dict[str, dict[str, Any]]:
-    """Run the cache-freeze replay per scope and return a scope→result map.
+    """Run the cache-stability replay per scope and return a scope→result map.
 
     Each value has:
-      - freeze: freeze_simulation() output
+      - stability: stability_simulation() output
       - counterfactual: matched_counterfactual() output
     Returns an empty dict if the module or api_calls are unavailable.
     """
-    mod = _load_cache_freeze_module()
+    mod = _load_cache_stability_module()
     if mod is None or not api_calls:
         return {}
     result: dict[str, dict[str, Any]] = {}
     for scope in scopes:
-        freeze = mod.freeze_simulation(predictions, api_calls, tool_calls=tool_calls, scope_filter=scope)
+        stability = mod.stability_simulation(predictions, api_calls, tool_calls=tool_calls, scope_filter=scope)
         cf = mod.matched_counterfactual(api_calls, scope_filter=scope)
-        result[scope] = {"freeze": freeze, "counterfactual": cf}
+        result[scope] = {"stability": stability, "counterfactual": cf}
     return result
 
 
@@ -1692,6 +1744,19 @@ def _cache_cost_total(cache_cost: dict[str, dict[str, Any]], key: str, default: 
         for model_data in scope_data.get("counterfactual", {}).get("per_model", {}).values():
             total += model_data.get(key, default)
     return total
+
+
+def _per_event_label(stats: dict[str, ScopeStats], args: argparse.Namespace) -> str:
+    """Human label for the per-event cost basis across the reported scopes."""
+    parts = []
+    for scope in stats:
+        parts.append(
+            f"{scope} @ {expand_round_trip_tokens_for(args, scope):,}/event"
+            f" {expand_round_trip_basis_for(args, scope)}"
+        )
+    if not parts:
+        return f"@ {args.expand_round_trip_tokens:,}/event fallback"
+    return "; ".join(parts)
 
 
 def format_summary(
@@ -1713,7 +1778,7 @@ def format_summary(
         f"expanded-tool use rows: {totals['expanded_tool_use_rows']} ({totals['expanded_tool_use_rows_per_expansion']:.2f} rows per expansion)",
         f"logged first-call tokens saved: {totals['logged_first_call_tokens_saved']:,}",
         f"est. expand_tools round-trip cost: {totals['estimated_expand_round_trip_cost_tokens']:,} tok "
-        f"(@ {args.expand_round_trip_tokens}/event)",
+        f"({_per_event_label(stats, args)})",
         f"est. net savings (saved − round-trip cost): {totals['estimated_net_savings_tokens']:+,} tok",
         f"recommendation candidates: {totals['recommendation_candidates']}",
         (
@@ -1802,7 +1867,7 @@ def markdown_report(
             "## Cache-Aware Savings (matched counterfactual)",
             "",
             "Per-call `cache_read_tokens` are captured in `api_calls.jsonl` on every API response. "
-            "The cache-freeze replay matches each mutated call against the stable cohort at the same "
+            "The cache-stability replay matches each mutated call against the stable cohort at the same "
             "`api_call_idx` position within the session, computing the counterfactual cache reads "
             "that were lost to tool-list mutations. Dollar estimates use per-model list prices.",
             "",
@@ -1814,19 +1879,19 @@ def markdown_report(
             "",
         ])
         for scope, scope_data in cache_cost.items():
-            freeze = scope_data["freeze"]
+            stability = scope_data["stability"]
             cf = scope_data["counterfactual"]
             lines.extend([
                 f"### {scope}",
                 "",
-                f"- Comparable calls: **{freeze['comparable_calls']:,}**",
-                f"- Matches frozen hash: **{freeze['matches_freeze']}** (avg cache_read: {freeze['avg_cache_read_when_matches']:,.0f})",
-                f"- Expand-driven mutations: **{freeze['expand_driven_mutations']}** (accepted — model requested new tools)",
+                f"- Comparable calls: **{stability['comparable_calls']:,}**",
+                f"- Matches first-call hash: **{stability['matches_stable']}** (avg cache_read: {stability['avg_cache_read_when_matches']:,.0f})",
+                f"- Expand-driven mutations: **{stability['expand_driven_mutations']}** (accepted — model requested new tools)",
                 # Printed so matches + the three mutation classes reconcile to
                 # comparable_calls, as the standalone replay report does.
-                f"- Trigger-driven mutations: **{freeze.get('trigger_driven_mutations', 0)}** (accepted — trigger activation)",
-                f"- Would-break mutations: **{freeze['would_break_mutations']}** (avg cache_read: {freeze['avg_cache_read_when_would_break']:,.0f})",
-                f"- Freeze eliminates **{freeze['freeze_eliminates_pct_of_mutations'] * 100:.1f}%** of observed mutations",
+                f"- Trigger-driven mutations: **{stability.get('trigger_driven_mutations', 0)}** (accepted — trigger activation)",
+                f"- Would-break mutations: **{stability['would_break_mutations']}** (avg cache_read: {stability['avg_cache_read_when_would_break']:,.0f})",
+                f"- Unexplained share of mutations: **{stability['unexplained_mutation_share'] * 100:.1f}%**",
                 "",
             ])
             per_model = cf.get("per_model", {})
@@ -1854,7 +1919,7 @@ def markdown_report(
             "## Cache-Aware Savings (matched counterfactual)",
             "",
             "> ⚠ No `api_calls.jsonl` data available — cache cost not computed. "
-            "The freeze-replay script (`scripts/cache-freeze-replay.py`) can be run manually.",
+            "The cache-stability replay script (`scripts/cache-stability-replay.py`) can be run manually.",
             "",
         ])
 
@@ -1863,7 +1928,9 @@ def markdown_report(
         "## Adjustable Defaults Used",
         "",
         f"- Per-tool token estimate: `{args.per_tool_tokens}` tokens/API call",
-        f"- Expand round-trip token estimate: `{args.expand_round_trip_tokens}` tokens/event",
+        f"- Expand round-trip fallback: `{args.expand_round_trip_tokens}` tokens/event "
+        f"(charged only where a scope's telemetry is too thin to measure; "
+        f"per scope: {_per_event_label(stats, args)})",
         f"- Minimum expansions before promotion review: `{args.min_expansions}`",
         f"- Promotion expand-rate default: `{args.promote_expand_rate:.2f}`",
         f"- Promotion use-rate default: `{args.promote_use_rate:.2f}`",
@@ -2151,9 +2218,10 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=DEFAULT_EXPAND_ROUND_TRIP_TOKENS,
         help=(
-            "Estimated total token cost of one expand_tools round-trip "
-            "(model output + result + extra API request). Used by net-value "
-            "promotion math. Tune to your measured baseline."
+            "FALLBACK per-event cost of one expand_tools round-trip, charged "
+            "only for scopes whose telemetry is too thin to measure the real "
+            "cost (a prefix-cache break on caching providers; one extra "
+            "full-price call otherwise). Measured figures always win."
         ),
     )
     parser.add_argument(
@@ -2198,14 +2266,25 @@ def main() -> int:
     predictions = [logger_io.normalize_prediction_row(r) for r in load_rows(predictions_paths)]
     tool_calls = [logger_io.normalize_tool_call_row(r) for r in load_rows(tool_calls_paths)]
     stats = collect_stats(predictions, tool_calls)
+
+    # Load api_calls.jsonl for cache-cost analysis (cache_read_tokens per call)
+    # and for the per-scope MEASURED expand_tools cost every net-value figure
+    # below charges (the --expand-round-trip-tokens flag is only its fallback).
+    api_calls_paths = telemetry_paths(args.state_dir, "api_calls.jsonl", args.include_archives)
+    api_calls = load_rows(api_calls_paths)
+    args.expand_overhead_by_scope = {
+        scope: _savings.measure_expand_overhead(
+            predictions, api_calls, tool_calls, scope=scope,
+            fallback_per_event=args.expand_round_trip_tokens,
+        )
+        for scope in stats
+    }
+
     immutable_always_carry = preset_always_carry(Path(__file__).resolve().parent)
     recs = recommendation_rows(stats, args, immutable_always_carry) + harvest_recommendation_rows(stats, args, immutable_always_carry)
     dampeners = dampener_candidates(stats, args)
     trigger_keywords = trigger_keyword_candidates(stats, args)
 
-    # Load api_calls.jsonl for cache-cost analysis (cache_read_tokens per call)
-    api_calls_paths = telemetry_paths(args.state_dir, "api_calls.jsonl", args.include_archives)
-    api_calls = load_rows(api_calls_paths)
     cache_cost = compute_cache_cost(predictions, api_calls, tool_calls, list(stats.keys())) if api_calls else None
 
     # Break down tool_calls by source so the headline counts don't conflate

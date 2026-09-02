@@ -175,16 +175,19 @@ class SessionEndAutoApplyTests(AutoShapeBase):
         second = (self.state_dir / "learned.json").read_text(encoding="utf-8")
         self.assertEqual(first, second)
 
-    def test_frozen_session_state_is_never_mutated(self):
+    def test_live_session_posture_is_never_mutated(self):
+        # The session-end auto-shape pass rewrites learned.json; it must not
+        # touch a live session's posture pin (D3, 2026-09-02 — replaces the
+        # removed frozen-snapshot state this guarded).
         seed_state_dir(self.state_dir)
-        frozen = {"tools": ["read_file"], "frozen": True}
-        plugin._FROZEN_BY_SESSION["live-key"] = frozen
-        self.addCleanup(plugin._FROZEN_BY_SESSION.pop, "live-key", None)
-        snapshot = copy.deepcopy(plugin._FROZEN_BY_SESSION["live-key"])
+        pin = {"mode": "on", "provider": "openai-codex"}
+        plugin._CACHE_DECISION_BY_SESSION["live-key"] = pin
+        self.addCleanup(plugin._CACHE_DECISION_BY_SESSION.pop, "live-key", None)
+        snapshot = copy.deepcopy(pin)
         plugin._on_session_end(session_id="sess-x")
         self.assertIsNotNone(self.learned_doc())  # the apply really happened
-        self.assertIs(plugin._FROZEN_BY_SESSION["live-key"], frozen)
-        self.assertEqual(plugin._FROZEN_BY_SESSION["live-key"], snapshot)
+        self.assertIs(plugin._CACHE_DECISION_BY_SESSION["live-key"], pin)
+        self.assertEqual(plugin._CACHE_DECISION_BY_SESSION["live-key"], snapshot)
 
 
 class FutureSchemaGuardTests(AutoShapeBase):

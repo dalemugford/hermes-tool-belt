@@ -85,12 +85,29 @@ def _rate_basis_label(proj: _savings.ProjectedCohort) -> str:
     return "n/a"
 
 
+def _basis_tag(basis: str, fallback_per_event: int = _savings.EXPAND_ROUND_TRIP_TOKENS) -> str:
+    """How the expansion overhead behind a net figure was costed."""
+    if basis == "measured":
+        return "measured overhead"
+    if basis == "mixed":
+        return f"overhead partly measured, partly fallback {_fmt_int(fallback_per_event)} tok/event"
+    return f"fallback: {_fmt_int(fallback_per_event)} tok/event"
+
+
+def _combined_basis(bases: list[str]) -> str:
+    seen = {b for b in bases if b}
+    if not seen:
+        return "measured"
+    return seen.pop() if len(seen) == 1 else "mixed"
+
+
 def _render_projection(out: list[str], proj: _savings.ProjectedCohort, indent: str) -> None:
     """The projection lines for one agent — shown only while measured data
     is insufficient (an estimate from replayed session history)."""
     out.append(
         f"{indent}estimated net savings: {_fmt_int(proj.net_token_reduction)} tok"
-        f"  (from {proj.sessions_analyzed} past session(s), confidence: {proj.confidence})"
+        f"  (input-equiv, {_basis_tag(proj.overhead_basis, proj.overhead_per_event)};"
+        f" from {proj.sessions_analyzed} past session(s), confidence: {proj.confidence})"
     )
     if proj.net_input_reduction_pct is not None:
         out.append(
@@ -132,16 +149,40 @@ def render_text(report: _savings.SavingsReport) -> str:
     measured = [a for a in report.agents if a.observed.n_sessions > 0]
     unmeasured = [a for a in report.agents if a.observed.n_sessions == 0]
 
-    total_net = sum(a.observed.net_token_reduction for a in measured)
-    total_sessions = sum(a.observed.n_sessions for a in measured)
-    if measured:
+    # Tool Belt shapes tools for UNCACHED APIs. An agent whose provider
+    # prompt-caches is carried whole (no shaping) and is simply out of scope:
+    # it neither saves nor costs, so it is not counted in the savings — noted
+    # separately instead. ``net_forward`` is that in-scope net (schema tokens
+    # unsent minus the expand overhead the shaped traffic paid).
+    def _carried_whole(obs: Any) -> bool:
+        cach = (obs.cache_on.get("n_predictions_caching", 0)
+                + obs.cache_off.get("n_predictions_caching", 0))
+        ncach = (obs.cache_on.get("n_predictions_noncaching", 0)
+                 + obs.cache_off.get("n_predictions_noncaching", 0))
+        return cach > ncach
+    shaped = [a for a in measured if not _carried_whole(a.observed)]
+    carried = [a for a in measured if _carried_whole(a.observed)]
+
+    total_saved = sum(a.observed.net_forward for a in shaped)
+    total_sessions = sum(a.observed.n_sessions for a in shaped)
+    if shaped:
+        basis = _combined_basis([a.observed.overhead_basis for a in shaped])
+        gross = sum(a.observed.saved_input_equiv_noncaching for a in shaped)
+        overhead = sum(a.observed.overhead_noncaching for a in shaped)
         out.append("")
         out.append(
             "  " + _b("NET TOKENS SAVED:") + " "
-            + _color(_fmt_int(total_net), _Colors.BOLD, _Colors.GREEN)
-            + f"  measured across {total_sessions} session(s) of real traffic."
+            + _color(_fmt_int(total_saved), _Colors.BOLD, _Colors.GREEN)
+            + f"  ({_basis_tag(basis)})"
         )
-        per_session = total_net // total_sessions if total_sessions else 0
+        out.append(
+            f"  measured across {total_sessions} session(s) of real traffic."
+        )
+        out.append(_dim(
+            f"    tool-definition tokens unsent: {_fmt_int(gross)}"
+            f"  —  minus expand_tools overhead: {_fmt_int(overhead)}"
+        ))
+        per_session = total_saved // total_sessions if total_sessions else 0
         if per_session > 0:
             out.append(
                 "  Agent conversations use "
@@ -160,24 +201,24 @@ def render_text(report: _savings.SavingsReport) -> str:
             for label, model in examples
             if model in _savings.PRICE_TABLE
         ]
-        if total_net > 0 and priced:
+        if total_saved > 0 and priced:
             out.append("")
             out.append(
                 f"  Estimated value at API list prices"
                 f" ({_savings.PRICE_TABLE_RATE_BASIS}, input rate):"
             )
             for label, model, rate in priced:
-                usd = total_net / 1_000_000 * rate
+                usd = total_saved / 1_000_000 * rate
                 out.append(f"    {label:<16} " + _green(f"≈ ${usd:,.2f}")
                            + _dim(f"  ({model})"))
         # Annualized pace: net saved / measured wall-clock span, projected to
         # 12 months. Needs a week of history to say anything defensible.
-        first = min((a.observed.first_ts for a in measured
+        first = min((a.observed.first_ts for a in shaped
                      if a.observed.first_ts > 0), default=0.0)
-        last = max((a.observed.last_ts for a in measured), default=0.0)
+        last = max((a.observed.last_ts for a in shaped), default=0.0)
         span_days = (last - first) / 86400.0
-        if total_net > 0 and span_days >= 7.0:
-            yearly = int(total_net * 365.0 / span_days)
+        if total_saved > 0 and span_days >= 7.0:
+            yearly = int(total_saved * 365.0 / span_days)
             usd_txt = ""
             if priced:
                 lo = min(yearly / 1_000_000 * rate for _, _, rate in priced)
@@ -189,20 +230,28 @@ def render_text(report: _savings.SavingsReport) -> str:
                 f" Tool Belt saves"
             )
             out.append("  " + _green(f"≈{_fmt_int(yearly)} tokens") + f"{usd_txt}.")
+        if carried:
+            names = ", ".join(a.display_name or a.agent for a in carried)
+            out.append("")
+            out.append(_dim(
+                f"  {len(carried)} agent(s) on prompt-caching providers carry the"
+                f" full tool set (no shaping needed): {names}."
+            ))
         out.append("")
         out.append("  " + _b("PER AGENT"))
-        for a in measured:
+        for a in shaped:
             obs = a.observed
             name = a.display_name or a.agent
             out.append(
                 "    " + _b(f"{name:<12}") + " "
-                + _green(f"{_fmt_int(obs.net_token_reduction):>12} tok")
+                + _green(f"{_fmt_int(obs.net_forward):>12} tok")
                 + _dim(f"   {obs.n_sessions} session(s)")
             )
         out.append("")
         out.append(_dim(
-            "  Calculation: Unsent tool-definition tokens (vs carrying all), "
-            "minus expand_tools fetch overhead."
+            "  Calculation: tool-definition tokens Tool Belt kept off the wire "
+            "(vs carrying the full set), minus the measured cost of each "
+            "expand_tools round-trip that recovered a tool narrowing had gated."
         ))
 
     for a in unmeasured:

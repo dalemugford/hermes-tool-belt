@@ -77,6 +77,16 @@ class _WireHome(unittest.TestCase):
         plugin._PREDICTION_CV.set(None)
         plugin._STICKY_BY_KEY.clear()
         plugin._PRIOR_MESSAGES_BY_SESSION.clear()
+        # A fresh install has no detection evidence and no host-config
+        # primary: clear the cross-session/cache-mode/pin state a sibling
+        # test may have left, or posture resolution would inherit it and a
+        # caching-provider "off" lock would flip this install off carry-all.
+        plugin._DETECTION_CACHE.clear()
+        plugin._DETECTION_CACHE_LOADED = False
+        plugin._CACHE_MODE_BY_SESSION.clear()
+        plugin._CACHE_DECISION_BY_SESSION.clear()
+        plugin._LAST_CANONICAL_BY_PLATFORM.clear()
+        plugin._HOST_MODEL.update(provider="", model="")
 
         # Hermes toolsets seam — the one allowed fake.
         ts = types.ModuleType("toolsets")
@@ -121,27 +131,21 @@ class ZeroConfigFullStart(_WireHome):
                       "zero-config install must be ON by default (the "
                       "90-minute registered-but-inert incident)")
 
+        # Zero-config default is cache_mode: auto with no detection evidence,
+        # which resolves to the caching-provider carry-all posture (D1): ship
+        # the whole ceiling EXCEPT expand_tools (nothing to expand when
+        # everything is already carried), and never narrow.
         state = self._dispatch()
         kept = self._run_wire()
 
-        # Full start: NOTHING is missing from the wire on a fresh install.
-        self.assertEqual(kept, set(self.NAMES),
-                         "fresh install ships the entire ceiling — pins, "
-                         "unknowns, bridge, and MCP included")
-
-        # Partition honesty in the same breath: nothing demoted, unknowns in
-        # adaptive carry, pins in the immutable class.
-        self.assertEqual(list(state.get("carry_expand_only") or
-                              state.get("expand_only_tools") or []), [],
-                         "nothing is expand-only before any evidence exists")
-        carry = set(state.get("carry_carry") or [])
-        self.assertIn("read_file", carry, "unknown tools start as adaptive carry")
-        always = set(state.get("carry_always_carry") or [])
-        self.assertIn("clarify", always)
-        self.assertIn("expand_tools", always)
-        for name in BRIDGE:
-            self.assertIn(name, state.get("mcp_passthrough_tools") or [],
-                          "bridge rides outside the partition")
+        self.assertEqual(kept, set(self.NAMES) - {"expand_tools"},
+                         "fresh install carries the entire ceiling — pins, "
+                         "unknowns, bridge, and MCP — minus expand_tools")
+        self.assertEqual(state.get("policy_source"), "cache_on_carry_all",
+                         "the carry-all cohort is stamped distinctly from bypass")
+        self.assertIs(state.get("active_tool_names"), plugin.NO_NARROWING)
+        self.assertEqual(list(state.get("expand_only_tools") or []), [],
+                         "nothing is expand-only under carry-all")
 
         # Honest telemetry, from the REAL writers into the fresh home.
         pred_file = self.home / "state" / "tool-belt" / "predictions.jsonl"
@@ -157,9 +161,37 @@ class ZeroConfigFullStart(_WireHome):
         self.assertIn("read_file",
                       json.loads(sizes_file.read_text())["tools"])
 
+    def test_fresh_install_on_noncaching_provider_partitions_honestly(self):
+        # On a non-caching ("off") provider the full-start partition still
+        # applies: nothing demoted before evidence, unknowns in adaptive
+        # carry, pins immutable, bridge outside the partition, expand_tools
+        # SHIPPED as the recovery valve.
+        plugin._CONFIG["cache_mode"] = "off"
+        state = self._dispatch()
+        kept = self._run_wire()
+
+        self.assertEqual(kept, set(self.NAMES),
+                         "non-caching full start ships the entire ceiling, "
+                         "expand_tools included")
+        self.assertEqual(list(state.get("carry_expand_only") or
+                              state.get("expand_only_tools") or []), [],
+                         "nothing is expand-only before any evidence exists")
+        carry = set(state.get("carry_carry") or [])
+        self.assertIn("read_file", carry, "unknown tools start as adaptive carry")
+        always = set(state.get("carry_always_carry") or [])
+        self.assertIn("clarify", always)
+        self.assertIn("expand_tools", always)
+        for name in BRIDGE:
+            self.assertIn(name, state.get("mcp_passthrough_tools") or [],
+                          "bridge rides outside the partition")
+
 
 class DemotionRecoveryOnTheWire(_WireHome):
     def test_demoted_tool_absent_then_recovered_via_real_handler(self):
+        # Demotion and expand_tools recovery are the non-caching ("off")
+        # engine (D1: caching providers carry everything and ship no
+        # expand_tools), so this exercises the off posture explicitly.
+        plugin._CONFIG["cache_mode"] = "off"
         # Learn the real scope string from a first dispatch, then demote
         # read_file through the production writer.
         scope = self._dispatch()["scope"]
@@ -169,8 +201,7 @@ class DemotionRecoveryOnTheWire(_WireHome):
              "scopes": {scope: {"carry": [], "expand_only": ["read_file"]}}},
             self.home / "state" / "tool-belt" / "learned.json")
 
-        # A NEW session: the first dispatch's frozen snapshot must not leak
-        # (session freeze is per-session by design).
+        # A NEW session: per-session state must not leak between sessions.
         state = self._dispatch("plain message, no triggers",
                                session_key="telegram_555000222")
         kept = self._run_wire()

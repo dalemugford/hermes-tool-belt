@@ -88,7 +88,7 @@ Working and supported, but not the opening pitch:
 - `harvest-replay.py` — privacy-reduced synthetic telemetry from session history
 - `daily-analysis.sh` — scheduled multi-profile analyzer/shaper wrapper
 - `rotate-telemetry.sh` — starts a clean measurement window
-- `cache-freeze-replay.py` — cache-cost engine used internally by `analyze.py`,
+- `cache-stability-replay.py` — cache-cost engine used internally by `analyze.py`,
   with an optional diagnostic CLI
 
 **Maintainer tooling**
@@ -110,7 +110,7 @@ Recommendations agreed for discussion:
 - Remove `memory` from the protected-always-on set in `analyze.py` — the shipped
   policy deliberately forces the legacy `memory` tool off, making its protected
   status contradictory.
-- Keep `cache-freeze-replay.py` where it is; document the analyzer dependency
+- Keep `cache-stability-replay.py` where it is; document the analyzer dependency
   rather than extracting shared math before release.
 - Change "twice-daily" to "periodic" in `daily-analysis.sh` — cadence belongs to
   the operator.

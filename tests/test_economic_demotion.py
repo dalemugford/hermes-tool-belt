@@ -100,7 +100,9 @@ class EconomicDemotion(unittest.TestCase):
     def test_saving_counted_only_where_the_tool_was_carried(self):
         # browser_exec carried in 10 of 30 sessions (zero use): demotion can
         # only save schema where the schema was actually shipped — 2000×10,
-        # not 2000×30. Fails on the union-of-carries math.
+        # not 2000×30. Fails on the union-of-carries math. Non-caching
+        # ("off") scope — the only posture that shapes (D1: caching carries
+        # everything and never demotes).
         preds, calls = [], []
         for i in range(30):
             pid = f"p{i}"
@@ -112,7 +114,7 @@ class EconomicDemotion(unittest.TestCase):
             ))
             calls.append(_use_call(pid, "terminal"))
         recs = _compute(self.SCOPE, preds, calls, window=100,
-                        schema_sizes={"browser_exec": 2000}, cache_mode="on")
+                        schema_sizes={"browser_exec": 2000}, cache_mode="off")
         entry = {d["tool"]: d for d in recs["demote"]}
         self.assertIn("browser_exec", entry)
         self.assertEqual(entry["browser_exec"]["carry_tokens"], 2000 * 10)
@@ -229,11 +231,12 @@ class EconomicPromotion(unittest.TestCase):
         self.assertNotIn("web_extract", {p["tool"] for p in recs["promote"]})
 
     def test_promotion_granted_when_expansion_spend_exceeds_carry(self):
-        # Expanded in every one of 3 cache-on sessions: no unused sessions,
-        # marginal carry cost 0 vs penalty 3×1500 → promote, economics
-        # stamped on the entry.
+        # Expanded in every one of 3 non-caching sessions: no unused
+        # sessions, marginal carry cost 0 vs penalty 3×1500 → promote,
+        # economics stamped on the entry. 3 expand events is below the
+        # measure threshold, so the per-event cost is the 1500 fallback.
         preds, calls = self._expansion_history(3, use_sessions={0, 1, 2})
-        recs = _compute(self.SCOPE, preds, calls, cache_mode="on")
+        recs = _compute(self.SCOPE, preds, calls, cache_mode="off")
         entry = {p["tool"]: p for p in recs["promote"]}
         self.assertIn("web_extract", entry)
         self.assertEqual(entry["web_extract"]["expansion_tokens"],

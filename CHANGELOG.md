@@ -19,6 +19,43 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ### Changed
 
+- **The cache-mode axis is now per provider, not per scope, and the caching
+  posture is carry-all (behavior change; expect the savings headline to drop
+  ~3×).** Whether narrowing helps or hurts is a property of the *provider*,
+  per call — a caching provider re-bills the whole conversation history when
+  the tool set changes mid-session, so on it Tool Belt saves cache-read
+  pennies of schema and risks a large break. Measured across two live
+  profiles, the old scope-keyed model over-sold by ~3.3× (a scope that fails
+  over between a caching primary and a non-caching fallback was mis-locked in
+  both directions), and on caching providers Tool Belt was net-negative
+  because `expand_tools` mutations were 57–87% of all cache-miss cost. So:
+  - **Caching providers → carry-all.** The whole tool ceiling ships every
+    turn (minus `expand_tools`, which has nothing to recover when everything
+    is already carried), the tool list is byte-stable for the session, and no
+    predictor runs. This removes the per-session **frozen snapshot** and the
+    "one cache break per `expand_tools` call" model entirely.
+  - **Non-caching providers → unchanged.** Per-turn narrowing, sticky
+    residency, lookback, and `expand_tools` — this is where the honest
+    savings are, and it is untouched.
+  - **Detection is keyed `scope|provider`.** Legacy `cache_mode_detection.json`
+    keys migrate to `scope|<configured primary>` on load; a failover call to
+    a non-caching provider no longer drags a caching primary's bucket. A
+    mid-session provider change (e.g. `/model`) that flips the posture
+    re-resolves it (the switch already busted the cache, so it's free).
+    `cache_auto.providers_off_models` now also matches provider *names*.
+  - **`api_calls.jsonl` rows gain `provider_caches`** (`true`/`false`/`null`);
+    `frozen_reuse`/`frozen_reuse_count` remain but are vestigial (always
+    `false`/`0`).
+- **Savings accounting is cache-aware.** Gross schema savings are priced at
+  the cache-read rate on caching providers (they live in the cached prefix)
+  and full input rate otherwise; the flat `EXPAND_ROUND_TRIP_TOKENS = 1500`
+  per-event overhead is replaced by a per-cohort *measured* cost (caching:
+  the causal prefix-break re-bill; non-caching: the extra full-price call),
+  with 1500 kept only as the thin-data fallback. The `tool-belt savings`
+  headline is now a single honest input-token-equivalent net, tagged with
+  its basis (`measured` / `fallback`). Under a caching posture the shaper is
+  a no-op (nothing to demote when everything is carried).
+
 - **Config moved to Hermes' plugin-settings subtree.** Tool Belt's settings
   now live at `plugins.entries.tool-belt.settings.*` — the path Hermes
   reserves for every plugin, which `ctx.get_config`, `config_schema`

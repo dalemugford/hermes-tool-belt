@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
-"""End-to-end smoke test for the tool-belt plugin (both modes).
+"""End-to-end smoke test for the tool-belt plugin (both postures).
 
 Runs hand-curated session scenarios through the plugin in an isolated
 tempdir, then asserts on the resulting telemetry that the plugin's
-invariants hold in both cache-off (per-turn) and cache-on (freeze)
-modes.
+invariants hold in both cache-off (per-turn narrowing) and cache-on
+(carry-all) postures.
 
 What this validates (mechanical, not behavioral):
-  Cache-off block:
+  Cache-off block (narrowing — the value engine):
     · session_id populated on every prediction row
     · bypass cohort distribution matches configured bypass_rate
     · expansion_provided_access NEVER credited when was_initially_active
-    · Sticky residency carries within session, evicts on session_end
+    · Sticky residency carries within session, survives on_session_end
+      (per-turn hook), evicts on on_session_reset
     · Cross-session isolation: expansion doesn't leak across sessions
-  Cache-on block:
-    · First dispatch under cache-on freezes the tool set
-    · Subsequent dispatches reuse the frozen snapshot (frozen_reuse=true)
-    · expand_tools mid-session propagates to the frozen snapshot
-    · on_session_end does NOT evict the freeze, sticky, or lookback
-      (per-turn hook — session-scoped state must survive it)
-    · on_session_reset DOES evict freeze + sticky + lookback (true reset)
-    · Cache-mode detection captures per-call telemetry
+  Cache-on block (carry-all):
+    · every prediction row is policy_source == "cache_on_carry_all" with
+      ceiling_count == narrowed_count (nothing narrowed, reduction 0)
+    · expand_tools is ABSENT from the wire (kwargs["tools"]) and from the
+      row's active_tools — nothing to expand, so it is not shipped
+    · EXACTLY ONE tool_list_hash per session — the list is never mutated
+    · no expand_tools rows in tool_calls.jsonl for cache-on sessions
+    · a tool the narrowing posture would have gated (browser_navigate) is
+      already on the wire and its call is was_initially_active, never
+      credited to expansion
+    · api_calls.jsonl rows carry the provider_caches key
+    · on_session_end does NOT evict the posture pin (per-turn hook);
+      on_session_reset DOES (true reset)
 
 What this does NOT validate:
   · Whether the predictor's regex triggers classify real user intent
@@ -192,19 +198,26 @@ def _build_session_store(canonical_key: str):
     return store
 
 
-def _run_wrapped_build_api_kwargs(tools: list[dict]) -> None:
-    """Invoke the plugin's narrowing path with a synthetic tools list.
+# Wire-level record of what each dispatch actually shipped:
+# (canonical_session_key, turn_idx, [tool names in kwargs["tools"]]).
+# Cleared between blocks. Lets the cache-on assertions check the wire
+# itself rather than only the telemetry row that describes it.
+WIRE_LOG: list[tuple[str, int, list[str]]] = []
+
+
+def _run_wrapped_build_api_kwargs(tools: list[dict]) -> dict:
+    """Invoke the plugin's per-call path with a synthetic tools list.
 
     Constructs a temporary wrapped function over a fake "original" that
     returns kwargs unchanged. This exercises the same code path the
     AIAgent monkey-patch runs in production, including writing the
-    prediction row.
+    prediction row. Returns the kwargs the plugin would hand to the API.
     """
     def fake_original(self, api_messages):
         return {"tools": list(tools)}
 
     wrapped = plugin._wrap_build_api_kwargs(fake_original)
-    wrapped(self=SimpleNamespace(), api_messages=[])
+    return wrapped(self=SimpleNamespace(), api_messages=[]) or {}
 
 
 def _canonical_key(chat_id: str, platform: str) -> str:
@@ -212,7 +225,13 @@ def _canonical_key(chat_id: str, platform: str) -> str:
     return f"agent:main:{platform}:dm:{chat_id}"
 
 
-def run_scenario(scenario: Scenario, profile_home: Path) -> None:
+def run_scenario(scenario: Scenario, profile_home: Path,
+                 api_usage: dict | None = None) -> None:
+    """Drive one scenario. ``api_usage``, when given, is fed to the
+    post_api_request hook after every dispatch (as Hermes would with the
+    provider's usage block) so api_calls.jsonl rows get written; the
+    cache-off block leaves it None — that path is asserted on
+    predictions/tool_calls only and is unchanged."""
     canonical = _canonical_key(scenario.chat_id, scenario.platform)
     sticky_key_expected = plugin._sticky_key_for_session(canonical)
 
@@ -225,7 +244,18 @@ def run_scenario(scenario: Scenario, profile_home: Path) -> None:
                               "HERMES_HOME": str(profile_home)},
                              clear=False):
             plugin._on_pre_gateway_dispatch(event=event, gateway=None, session_store=store)
-            _run_wrapped_build_api_kwargs(SYNTHETIC_TOOLS)
+            kwargs = _run_wrapped_build_api_kwargs(SYNTHETIC_TOOLS)
+            WIRE_LOG.append((canonical, turn_idx, [
+                str(t.get("name") or "") for t in (kwargs.get("tools") or [])
+                if isinstance(t, dict)
+            ]))
+            if api_usage is not None:
+                plugin._on_post_api_request(
+                    usage=dict(api_usage),
+                    model=str(api_usage.get("_model") or "smoke-model"),
+                    provider=str(api_usage.get("_provider") or "smoke-provider"),
+                    api_call_count=turn_idx + 1,
+                )
 
             for call in tool_calls:
                 if call.startswith("expand_tools("):
@@ -389,101 +419,151 @@ def run_cache_off_assertions(state_dir: Path, check: Check) -> None:
 # ────────────────────────────────────────────────────────────────────────
 
 CACHE_ON_SCENARIOS: list[Scenario] = [
-    # Multi-turn session: freeze on turn 1, reuse on turns 2-3.
+    # Multi-turn chit-chat: carry-all on every turn, one hash for the session.
     Scenario("cache-on-multi-001", turns=[
         ("hi how's it going", []),
         ("any updates today", []),
         ("thanks", []),
     ]),
-    # Mid-session expand_tools: expansion must propagate to frozen snapshot
-    # so the next turn reuses the expanded set without re-expanding.
-    Scenario("cache-on-expand-001", turns=[
+    # A tool the narrowing posture gates behind expand_tools (browser_* is
+    # demoted by _seed_demoted). Under carry-all it is on the wire from the
+    # first call, so the model calls it directly — there is no expand_tools
+    # to call (it isn't shipped) and the list never changes. The scenario is
+    # deliberately mixed-intent across turns to give the (non-running)
+    # predictor every chance to change its mind; the hash must not move.
+    Scenario("cache-on-direct-001", turns=[
         ("morning", []),
-        ("open google.com", [
-            "expand_tools(browser)",
-            "browser_navigate",
-        ]),
-        ("now navigate to ycombinator.com", [
-            # Should be available without re-expanding — frozen snapshot
-            # carried the prior expansion forward.
-            "browser_navigate",
-        ]),
+        ("open google.com", ["browser_navigate"]),
+        ("now write that to a file", ["write_file"]),
+        ("and run ls", ["terminal"]),
     ]),
 ]
 
+# Provider usage block fed to post_api_request for the cache-on block —
+# a warm caching provider (cache_read > 0). The _model/_provider keys are
+# driver metadata, not part of the usage dict the hook sees.
+CACHE_ON_USAGE = {
+    "input_tokens": 1200, "output_tokens": 80,
+    "cache_read_tokens": 9000, "cache_write_tokens": 0,
+    "_model": "smoke-model", "_provider": "openrouter",
+}
+
 
 def run_cache_on_assertions(state_dir: Path, check: Check) -> None:
-    """Cache-on path assertions: freeze, reuse, expansion propagation."""
+    """Cache-on (carry-all) contract: everything ships, nothing mutates."""
     preds = [json.loads(l) for l in (state_dir / "predictions.jsonl").read_text().splitlines() if l]
+    calls = [json.loads(l) for l in (state_dir / "tool_calls.jsonl").read_text().splitlines() if l]
+    api_path = state_dir / "api_calls.jsonl"
+    api_rows = ([json.loads(l) for l in api_path.read_text().splitlines() if l]
+                if api_path.exists() else [])
+    expected_turns = sum(len(sc.turns) for sc in CACHE_ON_SCENARIOS)
 
-    # ─── Freeze on first dispatch ───
-    first_dispatches = [p for p in preds if p.get("frozen_reuse") is False]
-    check.assert_(len(first_dispatches) >= 2,
-        f"first dispatch under cache-on produces frozen_reuse=False rows "
-        f"(found {len(first_dispatches)}, expected ≥2 from 2 scenarios)")
+    check.assert_(len(preds) == expected_turns,
+        f"one prediction row per dispatch under cache-on "
+        f"(found {len(preds)}, expected {expected_turns})")
 
-    # ─── Reuse on subsequent dispatches ───
-    reuses = [p for p in preds if p.get("frozen_reuse") is True]
-    check.assert_(len(reuses) >= 3,
-        f"subsequent dispatches reuse the frozen snapshot "
-        f"(found {len(reuses)} reuse rows, expected ≥3 from multi-turn scenarios)")
+    # ─── Every row is the carry-all cohort with nothing narrowed ───
+    not_carry_all = [p for p in preds if p.get("policy_source") != "cache_on_carry_all"]
+    check.assert_(not not_carry_all,
+        f"every cache-on prediction row has policy_source == cache_on_carry_all "
+        f"(other: {sorted({str(p.get('policy_source')) for p in not_carry_all})})")
+    narrowed = [p for p in preds if p.get("ceiling_count") != p.get("narrowed_count")]
+    check.assert_(not narrowed and all(int(p.get("tokens_saved") or 0) == 0 for p in preds),
+        f"ceiling_count == narrowed_count and tokens_saved == 0 on every row "
+        f"(narrowed rows: {len(narrowed)})")
 
-    # ─── Reuse counts increment correctly ───
-    by_session: dict[str, list[int]] = {}
-    for p in preds:
-        if p.get("frozen_reuse") is True:
-            by_session.setdefault(p.get("session_id", ""), []).append(p.get("frozen_reuse_count", 0))
-    sequential = all(
-        counts == sorted(counts) and counts[0] == 1
-        for counts in by_session.values() if counts
-    )
-    check.assert_(sequential,
-        f"frozen_reuse_count starts at 1 and increments per dispatch "
-        f"(by-session counts: {by_session})")
+    # ─── expand_tools is NOT shipped: on the wire, and on the row ───
+    wire_with_expand = [(sid, t) for sid, t, names in WIRE_LOG if "expand_tools" in names]
+    check.assert_(WIRE_LOG and not wire_with_expand,
+        f"expand_tools absent from kwargs['tools'] on every cache-on dispatch "
+        f"({len(WIRE_LOG)} dispatches captured, {len(wire_with_expand)} shipped it)")
+    row_with_expand = [p for p in preds if "expand_tools" in (p.get("active_tools") or [])]
+    check.assert_(not row_with_expand,
+        f"expand_tools absent from active_tools on every prediction row "
+        f"(rows carrying it: {len(row_with_expand)})")
+    # Everything ELSE in the synthetic ceiling is on the wire — including the
+    # tools _seed_demoted marks expand_only, which carry-all ignores.
+    expected_wire = sorted(t["name"] for t in SYNTHETIC_TOOLS if t["name"] != "expand_tools")
+    short_wire = [(sid, t) for sid, t, names in WIRE_LOG if sorted(names) != expected_wire]
+    check.assert_(not short_wire,
+        f"full ceiling (minus expand_tools) on the wire for every dispatch, "
+        f"demotions ignored (short dispatches: {len(short_wire)})")
 
-    # ─── Tool list hash stable across turns in same session ───
-    # Within a session, all reuse rows should share the same tool_list_hash
-    # as the corresponding first dispatch (or its post-expansion variant).
+    # ─── EXACTLY ONE tool_list_hash per session ───
     preds_by_session: dict[str, list[dict]] = defaultdict(list)
     for p in preds:
         preds_by_session[p["session_id"]].append(p)
-    for sid, plist in preds_by_session.items():
-        hashes = {pp.get("tool_list_hash", "") for pp in plist if pp.get("tool_list_hash")}
-        # Multi-turn no-expand scenarios should have exactly 1 hash.
-        # The expand scenario can grow to 2 (pre/post expansion).
-        if "multi-001" in sid:
-            check.assert_(len(hashes) == 1,
-                f"chitchat-only session has stable tool_list_hash "
-                f"(session {sid[-40:]}: {len(hashes)} distinct hashes)")
+    unstable = {
+        sid[-40:]: len({pp.get("tool_list_hash", "") for pp in plist})
+        for sid, plist in preds_by_session.items()
+        if len({pp.get("tool_list_hash", "") for pp in plist}) != 1
+    }
+    check.assert_(len(preds_by_session) == len(CACHE_ON_SCENARIOS) and not unstable,
+        f"exactly one tool_list_hash per cache-on session, including the mixed-intent one "
+        f"(sessions: {len(preds_by_session)}, unstable: {unstable})")
+    wire_hashes_by_session: dict[str, set[tuple[str, ...]]] = defaultdict(set)
+    for sid, _t, names in WIRE_LOG:
+        wire_hashes_by_session[sid].add(tuple(names))
+    check.assert_(all(len(v) == 1 for v in wire_hashes_by_session.values()),
+        "the wire-level tool list is byte-identical across every turn of a session")
 
-    # ─── Expansion propagates to frozen snapshot ───
-    # In the expand scenario, turn 3 has a browser_navigate call but no
-    # expand_tools — confirming the prior expansion stuck.
-    expand_session_calls_path = state_dir / "tool_calls.jsonl"
-    calls = [json.loads(l) for l in expand_session_calls_path.read_text().splitlines() if l]
-    expand_sid_calls = [c for c in calls if "expand-001" in c.get("session_id", "")]
-    turn3_browser_calls = [
-        c for c in expand_sid_calls
-        if c.get("tool_name") == "browser_navigate"
-    ]
-    check.assert_(len(turn3_browser_calls) >= 2,
-        f"browser_navigate called more than once across the expand scenario "
-        f"(found {len(turn3_browser_calls)} — expansion persists)")
+    # ─── No expand_tools calls, and gated tools were already available ───
+    expand_calls = [c for c in calls if c.get("tool_name") == "expand_tools"]
+    check.assert_(not expand_calls,
+        f"no expand_tools rows in tool_calls.jsonl for cache-on sessions "
+        f"(found {len(expand_calls)})")
+    direct = [c for c in calls if c.get("tool_name") in ("browser_navigate", "write_file", "terminal")]
+    check.assert_(
+        len(direct) == 3
+        and all(c.get("was_initially_active") is True for c in direct)
+        and not any(c.get("expansion_provided_access") is True for c in direct),
+        f"gated-under-narrowing tools were initially active and never credited to "
+        f"expansion (calls: {len(direct)})")
 
-    # ─── on_session_end did NOT evict the freeze ───
-    # After the multi-turn scenarios, each scenario called on_session_end.
-    # The freeze entries remain because that Hermes hook fires per turn and
-    # must not evict session-scoped state.
-    # Confirmed by: frozen_reuse_count > 1 above (which requires the
-    # snapshot to have survived intervening on_session_end calls).
+    # ─── api_calls.jsonl rows carry the provider verdict ───
+    check.assert_(len(api_rows) == expected_turns,
+        f"one api_calls.jsonl row per dispatch (found {len(api_rows)}, expected {expected_turns})")
+    missing_pc = [r for r in api_rows if "provider_caches" not in r]
+    check.assert_(api_rows and not missing_pc,
+        f"every api_calls.jsonl row carries the provider_caches key "
+        f"(missing: {len(missing_pc)})")
+    bad_pc = [r for r in api_rows if r.get("provider_caches") is not True]
+    check.assert_(not bad_pc,
+        f"provider_caches is True under forced cache_mode=on "
+        f"(other values: {sorted({repr(r.get('provider_caches')) for r in bad_pc})})")
+    api_by_session: dict[str, set[str]] = defaultdict(set)
+    for r in api_rows:
+        api_by_session[r.get("session_id", "")].add(str(r.get("tool_list_hash") or ""))
+    check.assert_(api_by_session and all(len(v) == 1 for v in api_by_session.values()),
+        "api_calls.jsonl sees one tool_list_hash per session too")
+
+    # ─── Posture pin lifecycle ───
+    # on_session_end fires PER TURN and must leave the session's posture pin
+    # in place; on_session_reset is the true reset and must evict it.
+    probe = _canonical_key("cache-on-reset-probe", "telegram")
+    plugin._CACHE_DECISION_BY_SESSION[probe] = {"mode": "on", "provider": "openrouter"}
+    with mock.patch.dict(os.environ, {"HERMES_SESSION_KEY": probe}, clear=False):
+        plugin._on_session_end(session_id=probe)
+    check.assert_(probe in plugin._CACHE_DECISION_BY_SESSION,
+        "on_session_end LEAVES the session's posture pin (per-turn hook)")
+    plugin._on_session_reset(session_id="cache-on-reset-probe-new-uuid",
+                             platform="telegram", session_key=probe)
+    check.assert_(probe not in plugin._CACHE_DECISION_BY_SESSION,
+        "on_session_reset evicts the session's posture pin")
 
 
 def _reset_plugin_state() -> None:
+    """Clear every per-session / cross-session global so blocks don't bleed.
+    Mirrors tests/test_cache_aware.py's helper of the same name."""
     plugin._STICKY_BY_KEY.clear()
     plugin._POLICY_TURN_BY_SCOPE.clear()
     plugin._PRIOR_MESSAGES_BY_SESSION.clear()
-    plugin._FROZEN_BY_SESSION.clear()
-    plugin._CACHE_MODE_BY_SESSION.clear()
+    plugin._CACHE_MODE_BY_SESSION.clear()       # per-session detection buckets
+    plugin._CACHE_DECISION_BY_SESSION.clear()   # per-session posture pin
+    plugin._LAST_CANONICAL_BY_PLATFORM.clear()
+    plugin._DETECTION_CACHE.clear()             # cross-session scope|provider locks
+    plugin._DETECTION_CACHE_LOADED = False
+    WIRE_LOG.clear()
 
 
 # Tools the smoke scenarios treat as expand_only. Under the full-start
@@ -545,14 +625,16 @@ def main() -> int:
             run_cache_off_assertions(off_state, check)
             off_rc = check.report()
 
-            # ──────── Block 2: cache-on (session-boundary freeze) ────────
+            # ──────── Block 2: cache-on (carry-all) ────────
             _reset_plugin_state()
             plugin._CONFIG["cache_mode"] = "on"
-            plugin._CONFIG["bypass_rate"] = 0.0  # bypass would freeze the no-narrowing sentinel; not what we test here
+            # bypass is the OTHER unnarrowed cohort (policy_source "bypass");
+            # keep it out so every row here is cache_on_carry_all.
+            plugin._CONFIG["bypass_rate"] = 0.0
 
             print(f"\n[cache-on] Running {len(CACHE_ON_SCENARIOS)} multi-turn scenarios in {on_state}...")
             for sc in CACHE_ON_SCENARIOS:
-                run_scenario(sc, on_home)
+                run_scenario(sc, on_home, api_usage=CACHE_ON_USAGE)
             print(f"  → {sum(1 for f in on_state.iterdir())} state files written")
 
             on_check = Check()

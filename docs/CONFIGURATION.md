@@ -1,7 +1,7 @@
 # CONFIGURATION
 
 Reference for every configuration surface in `tool-belt`. For
-behavior — what the plugin does at runtime, when freezes happen, how
+behavior — what the plugin does at runtime, when it carries vs narrows, how
 the cache-mode state machine evolves — see
 [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -175,17 +175,20 @@ Toggles all JSONL telemetry writers
 
 Type: `string`. One of `auto`, `on`, `off`. Default: `auto`.
 
-Decides whether the plugin freezes tools per session or re-narrows per
-turn. See [ARCHITECTURE.md](ARCHITECTURE.md) for the two-mode model.
+Decides whether the plugin carries the whole ceiling (caching providers)
+or narrows per turn (non-caching). See [ARCHITECTURE.md](ARCHITECTURE.md)
+for the two-posture model.
 
-- `on` — freeze tools at session start. Skips sticky + lookback.
-- `off` — per-turn narrowing with sticky residency.
-- `auto` — consult the cross-session detection cache; default `on` on a
-  miss. The per-session detection state machine still runs and can
-  lock the session to `on`/`off` after enough calls.
+- `on` — carry-all: ship the full ceiling minus `expand_tools`, byte-stable
+  for the session, no predictor. For prefix-caching providers.
+- `off` — per-turn narrowing with sticky residency and `expand_tools`.
+- `auto` — consult the cross-session detection cache (keyed `scope|provider`);
+  default `on` on a miss. The per-provider detection state machine still runs
+  and can lock the provider's bucket to `on`/`off` after enough calls.
 
 Resolved by
-[`_resolve_cache_mode_for_session`](../__init__.py).
+[`_resolve_cache_mode_for_session`](../__init__.py) against the session's
+provider (configured `model.provider`, or the provider it's observed on).
 
 ### `learned_mode`
 
@@ -382,8 +385,8 @@ the session locks `off`. Ratio is
 
 Type: `list[str]`. Default: `["kimi-k2.6:cloud", "gpt-5.4-mini"]`.
 
-Model identifiers that skip the observation window and lock `off`
-immediately. Provider-blocklist locks are *not* persisted to the
+Model identifiers **or provider names** that skip the observation window
+and lock `off` immediately. Provider-blocklist locks are *not* persisted to the
 cross-session detection cache — they're a config statement, not an
 observation.
 
@@ -654,18 +657,20 @@ file is for auto-tuned state.
 ## Cache mode detection state
 
 Path: `$HERMES_HOME/state/tool-belt/cache_mode_detection.json`.
-Owned by the runtime; written on every per-session lock event by
-[`_persist_detection_lock`](../__init__.py).
+Owned by the runtime; written on every per-bucket lock event by
+[`_persist_detection_lock`](../__init__.py). Keys are `scope|provider`
+(one bucket per route the scope runs on); a legacy bare-`scope` key from an
+older build is migrated to `scope|<configured primary provider>` on load.
 
 ```json
 {
-  "default:telegram": {
+  "default:telegram|openai-codex": {
     "mode": "on",
     "locked_at": 1717200000.0,
     "lock_reason": "threshold_met",
     "hit_rate_at_lock": 0.82,
     "sessions_locked": 14,
-    "last_model": "claude-opus-4-7"
+    "last_model": "gpt-5.6-terra"
   }
 }
 ```
@@ -673,13 +678,13 @@ Owned by the runtime; written on every per-session lock event by
 ### Fields
 
 - `mode` — `on` or `off`.
-- `locked_at` — Unix timestamp of the most recent lock for this scope.
+- `locked_at` — Unix timestamp of the most recent lock for this bucket.
 - `lock_reason` — `threshold_met`, `threshold_failed`, `forced_on`,
   `forced_off`. `provider_blocklist` locks are intentionally *not*
   persisted.
 - `hit_rate_at_lock` — cache-hit ratio at the lock decision.
 - `sessions_locked` — count of consecutive same-mode locks for the
-  scope. Resets to `1` when the mode flips.
+  bucket. Resets to `1` when the mode flips.
 - `last_model` — model identifier at the most recent lock.
 
 ### Override precedence
@@ -687,9 +692,9 @@ Owned by the runtime; written on every per-session lock event by
 - Setting `cache_mode: on` or `cache_mode: off` in `config.yaml` wins
   over any persisted state — the explicit mode is forced for every
   session and no detection runs.
-- Under `cache_mode: auto`, this cache supplies the initial freeze
-  decision; the per-session detection state machine still runs and may
-  rewrite the entry at lock time.
+- Under `cache_mode: auto`, this cache supplies the initial posture
+  decision for the session's provider; the per-provider detection state
+  machine still runs and may rewrite the bucket at lock time.
 - Deleting the file is safe. The next dispatch defaults to `on` and
   rebuilds entries as sessions lock.
 
@@ -726,12 +731,12 @@ Key fields:
   `trigger_tools_by_group` and `trigger_activated_tools` (T),
   `expanded_tools` (R), `sticky_tools`, `sticky_categories`,
   `sticky_remaining_turns`.
-- `policy_source` — `preset`, `learned`, or `bypass`.
+- `policy_source` — `preset`, `learned`, `bypass`, or `cache_on_carry_all` (the caching-provider carry-all cohort).
 - `learned_mode`, `learned_scope`, `learned_changes`
 - `lookback_used`, `lookback_turns_config`
 - `tool_list_hash` — sha256 prefix of the wire-level tool schemas.
 - `provider`, `model`, `schema_version`
-- `frozen_reuse`, `frozen_reuse_count` — true on cache-on dispatches
+- `frozen_reuse`, `frozen_reuse_count` — vestigial (always `false`/`0`); historical rows had `true` under the removed per-session freeze
   after the first, with index within the session.
 
 ### `tool_calls.jsonl`
@@ -778,10 +783,11 @@ Key fields:
   `cache_write_tokens`, `reasoning_tokens`, `prompt_tokens`,
   `total_tokens`
 - `api_duration`, `finish_reason`, `message_count`
-- `cache_mode` — current detection state (`pending`, `on`, `off`).
+- `cache_mode` — this call's `scope|provider` bucket state (`pending`, `on`, `off`).
+- `provider_caches` — `true`/`false`/`null`: whether this call's provider prefix-caches (its bucket locked on/off, or pending).
 - `cache_ttl_expired` — true when a stable-hash call returned zero
   `cache_read_tokens` after a >5 minute idle gap (provider-side TTL
-  expiry, not a freeze regression).
+  expiry, not a Tool Belt regression).
 
 Joining `tool_calls.jsonl` and `api_calls.jsonl` to `predictions.jsonl`
 on `prediction_id` is the supported analysis path.

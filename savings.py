@@ -15,9 +15,11 @@ One engine, two separately-labeled cohorts that are **never** summed together:
 This module is the single home for:
 
   * the per-model USD price table + cost classifier (``PRICE_TABLE`` /
-    ``price_for`` / ``classify_cost``) — ``scripts/cache-freeze-replay.py``
+    ``price_for`` / ``classify_cost``) — ``scripts/cache-stability-replay.py``
     imports the table from here rather than defining its own;
-  * the explicit-expansion overhead constant (``EXPAND_ROUND_TRIP_TOKENS``);
+  * cache-aware accounting: the priced-gross factor (``price_factor_for``),
+    the measured per-cohort expansion cost (``measure_expand_overhead``) and
+    its thin-data fallback constant (``EXPAND_ROUND_TRIP_TOKENS``);
   * full-definition schema tokenization (``schema_tokens``) built on
     ``logger_io.estimate_tokens`` — the one token estimator in the codebase;
   * agent/scope discovery for the public ``tool-belt savings`` command;
@@ -30,7 +32,7 @@ sessions. It is safe to run against a live Hermes home.
 Import styles
 -------------
 Imported as ``tool_belt_plugin.savings`` (the normal path, via the package)
-*and* standalone as ``savings`` (how ``scripts/cache-freeze-replay.py`` pulls in
+*and* standalone as ``savings`` (how ``scripts/cache-stability-replay.py`` pulls in
 the price table after inserting the plugin dir on ``sys.path``). The lightweight
 pricing/estimator surface loads in both contexts; the heavier projection path
 lazily imports ``presets`` / ``predictor`` / ``learned`` only when a projection
@@ -62,19 +64,26 @@ except ImportError:  # pragma: no cover - standalone load (plugin dir on path)
 
 # ─── Canonical constants ──────────────────────────────────────────────────────
 
-#: Estimated total token cost of one explicit ``expand_tools`` round-trip: the
-#: model's tool-call output, the tool result, and the extra API request carrying
-#: the widened schemas. The single canonical estimator for expansion overhead;
-#: ``analyze.py`` exposes it as the ``--expand-round-trip-tokens`` default and
-#: ``scripts/savings-report.py`` reads it from here. Trigger *activation* is not
-#: an ``expand_tools`` round trip and is never charged this cost.
+#: FALLBACK per-event cost of one explicit ``expand_tools`` round-trip, used
+#: only when telemetry is too thin to measure the real cost (see
+#: :func:`measure_expand_overhead`). It is NOT the model: the measured cost is
+#: a prefix-cache BREAK on caching providers (the whole history re-billed at
+#: the input rate — tens of thousands of tokens per event) and one extra
+#: full-price API call on non-caching providers. This constant is the
+#: pre-measurement estimate (tool-call output + result + the widened schemas)
+#: and is kept so a fresh install can still charge *something*. ``analyze.py``
+#: exposes it as the ``--expand-round-trip-tokens`` fallback override and
+#: ``shaping.py`` re-imports it as its thin-data penalty. Trigger *activation*
+#: is not an ``expand_tools`` round trip and is never charged this cost.
 EXPAND_ROUND_TRIP_TOKENS = 1500
 
 #: Single source of truth for per-model token economics. Tokens-per-million in
-#: USD; ``miss_premium`` is the input/cache_read ratio the cache correction
-#: uses. Unknown models fall back to ``generic``. A price row is necessary but
-#: NOT sufficient to show dollars — see :func:`classify_cost`: a public list
-#: price does not turn an OAuth/subscription route into known variable costing.
+#: USD; ``miss_premium`` is the input/cache_read ratio: ``1 / miss_premium`` is
+#: the input-token-equivalent worth of a schema token that would have been a
+#: cache read (see :func:`price_factor_for`). Unknown models fall back to
+#: ``generic``. A price row is necessary but NOT sufficient to show dollars —
+#: see :func:`classify_cost`: a public list price does not turn an
+#: OAuth/subscription route into known variable costing.
 PRICE_TABLE: dict[str, dict[str, float]] = {
     # Anthropic
     "claude-sonnet-4-6": {"input": 3.00, "cache_read": 0.30, "cache_write": 3.75, "output": 15.00, "miss_premium": 10.0},
@@ -96,6 +105,36 @@ PRICE_TABLE_RATE_BASIS = "list-2026-05"
 def price_for(model: str) -> dict[str, float]:
     """Return the price row for ``model``, falling back to ``generic``."""
     return PRICE_TABLE.get(model, PRICE_TABLE["generic"])
+
+
+#: Provider-level prompt-caching hints, consulted only for api_calls rows that
+#: predate the per-call ``provider_caches`` field. Keyed by the row's
+#: ``provider`` string (lower-cased). ``False`` = the route never serves a
+#: prefix-cache hit, whatever ``cache_mode`` the session was tagged with (the
+#: session posture reflects the provider that locked it, so a fallback route's
+#: calls can carry a misleading ``on``). Overridable: callers may pass their own
+#: table to :func:`provider_caches_for_call`. A provider absent here has no
+#: hint and falls through to the cohort posture.
+PROVIDER_CACHE_HINTS: dict[str, bool] = {
+    # Ollama Cloud: flat cloud route, 0% observed cache_read hits.
+    "ollama-cloud": False,
+    "ollama": False,
+}
+
+
+def price_factor_for(model: str, provider_caches: bool | None) -> float:
+    """Input-token-equivalent worth of one saved schema token.
+
+    On a caching provider the unsent schema tokens would have lived in the
+    cached prefix and billed at the cache_read rate, so each one is worth
+    ``1 / miss_premium`` input tokens (~0.1). On a non-caching provider — or
+    when the cache status is unknown — every saved token was a full-price
+    input token (factor 1.0, the pre-D4 accounting).
+    """
+    if provider_caches is not True:
+        return 1.0
+    premium = float(price_for(model).get("miss_premium") or 0.0)
+    return (1.0 / premium) if premium > 0 else 1.0
 
 
 # ─── Cost classification ──────────────────────────────────────────────────────
@@ -427,20 +466,104 @@ def aggregate_api_call_totals(
     return totals
 
 
+def index_api_calls_by_prediction(
+    api_calls: list[dict[str, Any]]
+) -> dict[str, list[dict[str, Any]]]:
+    """All api_calls rows per prediction_id, in ``api_call_idx`` order."""
+    by_pred: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in api_calls:
+        pid = str(row.get("prediction_id") or "")
+        if pid:
+            by_pred[pid].append(row)
+    for rows in by_pred.values():
+        rows.sort(key=lambda r: int(r.get("api_call_idx") or 0))
+    return dict(by_pred)
+
+
+def provider_caches_for_call(
+    row: dict[str, Any],
+    hints: dict[str, bool] | None = None,
+) -> bool | None:
+    """Whether this one API call was served by a prompt-caching route.
+
+    The per-call ``provider_caches`` field (True/False = that call's
+    scope|provider detection bucket locked on/off; None while pending) is
+    authoritative. Rows written before the field existed fall back to the
+    provider hint table (:data:`PROVIDER_CACHE_HINTS`, or ``hints``); a
+    provider with no hint returns None — "unknown", for the caller to resolve
+    from the cohort posture. Never guessed from ``cache_mode``: that is the
+    SESSION posture, and a fallback provider's calls inherit it wrongly.
+    """
+    explicit = row.get("provider_caches")
+    if explicit is True or explicit is False:
+        return explicit
+    table = PROVIDER_CACHE_HINTS if hints is None else hints
+    provider = str(row.get("provider") or "").strip().lower()
+    if provider in table:
+        return bool(table[provider])
+    return None
+
+
+def prediction_provider_caches(
+    calls: list[dict[str, Any]] | None,
+    cohort_mode: str | None = None,
+    hints: dict[str, bool] | None = None,
+) -> bool | None:
+    """Resolve one prediction's cache status from its API calls.
+
+    The last call's explicit/hinted status wins (it is the most-evolved
+    route); otherwise any call with a known status; otherwise the cohort the
+    prediction was classified into (``"on"`` → caching, ``"off"`` → not).
+    Returns None only when nothing resolves (pending/bypass rows with no
+    per-call facts) — such a prediction is priced at full input rate and
+    excluded from overhead measurement.
+    """
+    calls = calls or []
+    if calls:
+        last = max(calls, key=lambda r: int(r.get("api_call_idx") or 0))
+        status = provider_caches_for_call(last, hints)
+        if status is not None:
+            return status
+        for row in calls:
+            status = provider_caches_for_call(row, hints)
+            if status is not None:
+                return status
+    if cohort_mode == "on":
+        return True
+    if cohort_mode == "off":
+        return False
+    return None
+
+
 def cohort_stats(
     predictions: list[dict[str, Any]],
     api_last: dict[str, dict[str, Any]],
     api_calls: list[dict[str, Any]],
     mode_filter: str,
+    calls_by_pred: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     """Compute realized savings for one cache-mode cohort within a scope.
 
     ``mode_filter`` is ``"on"``, ``"off"``, ``"pending"``, or ``"bypass"``.
     This is the observed-savings math ``scripts/savings-report.py`` re-exports.
+
+    Two gross figures are emitted. ``saved_tokens_total`` is the RAW schema
+    token reduction (Σ ceiling − narrowed), kept for continuity and as the
+    basis of ``reduction_pct`` (a schema-size stat, not a cost stat).
+    ``saved_input_equiv_total`` is the PRICED reduction: each prediction's
+    saving × :func:`price_factor_for` (``1 / miss_premium`` on a caching
+    route, 1.0 otherwise) — what the unsent tokens were actually worth.
+    ``calls_by_pred`` is the :func:`index_api_calls_by_prediction` index;
+    built from ``api_calls`` when not supplied.
     """
     rows = [p for p in predictions if classify_prediction_mode(p, api_last) == mode_filter]
     if not rows:
         return {"n_predictions": 0, "n_sessions": 0}
+    if calls_by_pred is None:
+        calls_by_pred = index_api_calls_by_prediction(api_calls)
+    # Cohort fallback for rows with no per-call cache fact: only the locked
+    # postures resolve; pending/bypass stay unknown (priced at full rate).
+    cohort_mode = mode_filter if mode_filter in ("on", "off") else None
 
     sessions = {k for k in (_session_key(p) for p in rows) if k}
     n_predictions = len(rows)
@@ -452,6 +575,30 @@ def cohort_stats(
     ceiling_count_avg = sum(int(p.get("ceiling_count") or 0) for p in rows) / n_predictions
     narrowed_count_avg = sum(int(p.get("narrowed_count") or 0) for p in rows) / n_predictions
     reduction_pct = (saved_total / ceiling_total * 100) if ceiling_total else 0.0
+
+    saved_input_equiv = 0.0
+    saved_input_equiv_caching = 0.0
+    saved_input_equiv_noncaching = 0.0
+    n_caching = 0
+    n_noncaching = 0
+    for p in rows:
+        pid = str(p.get("prediction_id") or "")
+        calls = calls_by_pred.get(pid, [])
+        caches = prediction_provider_caches(calls, cohort_mode)
+        model = str((api_last.get(pid) or {}).get("model") or "")
+        saved = int(p.get("ceiling_tokens") or 0) - int(p.get("narrowed_tokens") or 0)
+        priced = saved * price_factor_for(model, caches)
+        saved_input_equiv += priced
+        if caches is True:
+            n_caching += 1
+            saved_input_equiv_caching += priced
+        elif caches is False:
+            n_noncaching += 1
+            saved_input_equiv_noncaching += priced
+        else:
+            # Unknown provider-cache status (pending/bypass) — priced at full
+            # rate and treated as ongoing (non-caching) for the forward view.
+            saved_input_equiv_noncaching += priced
 
     pred_ids = {str(p.get("prediction_id") or "") for p in rows if p.get("prediction_id")}
     api_totals = aggregate_api_call_totals(api_calls, pred_ids)
@@ -465,6 +612,11 @@ def cohort_stats(
         "narrowed_tokens_total": narrowed_total,
         "saved_tokens_total": saved_total,
         "saved_tokens_per_turn_avg": (saved_total / n_predictions) if n_predictions else 0,
+        "saved_input_equiv_total": int(round(saved_input_equiv)),
+        "saved_input_equiv_caching": int(round(saved_input_equiv_caching)),
+        "saved_input_equiv_noncaching": int(round(saved_input_equiv_noncaching)),
+        "n_predictions_caching": n_caching,
+        "n_predictions_noncaching": n_noncaching,
         "reduction_pct": reduction_pct,
         "api_input_tokens": api_totals["input"],
         "api_cache_read_tokens": api_totals["cache_read"],
@@ -480,6 +632,271 @@ def _count_expand_events(tool_calls: list[dict[str, Any]]) -> int:
     return sum(1 for t in tool_calls if t.get("tool_name") == "expand_tools")
 
 
+# ─── Measured expand_tools overhead ───────────────────────────────────────────
+#
+# What one explicit expansion actually costs, measured from the same telemetry
+# the savings are computed from, per cache cohort:
+#
+#   caching     — an expand_tools call mutates the tool list mid-session and
+#                 breaks the provider prefix cache; the next call re-bills the
+#                 whole history at the input rate instead of cache_read. Cost
+#                 per event = (excess cache-miss rate caused by expanding) ×
+#                 (median re-billed premium on a missed expand turn).
+#   non-caching — nothing to break; the cost is one extra full-price API call
+#                 (the expand meta-call), i.e. its input_tokens.
+#
+# Thin data falls back to EXPAND_ROUND_TRIP_TOKENS and says so.
+
+#: Calls with a prompt this small are cold-start/system-only and cannot tell a
+#: cache break from an ordinary miss; they never count as a miss.
+CACHE_MISS_MIN_PROMPT_TOKENS = 2000
+#: Below these sample sizes the measured figures are noise; fall back.
+MEASURED_OVERHEAD_MIN_EXPAND_EVENTS = 5
+MEASURED_OVERHEAD_MIN_BASELINE_PREDICTIONS = 10
+
+
+def _call_prompt_tokens(row: dict[str, Any]) -> int:
+    """Provider-reported prompt size (cached + uncached); reconstructed from
+    ``input_tokens + cache_read_tokens`` for rows that predate the field."""
+    prompt = row.get("prompt_tokens")
+    if prompt is not None:
+        return int(prompt or 0)
+    return int(row.get("input_tokens") or 0) + int(row.get("cache_read_tokens") or 0)
+
+
+def _call_is_cache_miss(row: dict[str, Any]) -> bool:
+    return (
+        int(row.get("cache_read_tokens") or 0) == 0
+        and _call_prompt_tokens(row) > CACHE_MISS_MIN_PROMPT_TOKENS
+    )
+
+
+def _rebill_premium(calls: list[dict[str, Any]]) -> float:
+    """Tokens re-billed at the input rate by this prediction's cache misses.
+
+    Σ over the prediction's MISSED calls of ``prompt_tokens × (input −
+    cache_read) / input`` at the call model's rates — the part of the prompt
+    that would have been a cache read had the prefix survived. Hit calls are
+    not summed: their prompt was billed at cache_read as intended.
+    """
+    total = 0.0
+    for row in calls:
+        if not _call_is_cache_miss(row):
+            continue
+        prices = price_for(str(row.get("model") or ""))
+        inp = float(prices.get("input") or 0.0)
+        ratio = ((inp - float(prices.get("cache_read") or 0.0)) / inp) if inp > 0 else 0.0
+        total += _call_prompt_tokens(row) * max(0.0, ratio)
+    return total
+
+
+def _median(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    if len(ordered) % 2:
+        return float(ordered[mid])
+    return (ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+@dataclass
+class MeasuredExpandOverhead:
+    """Per-cohort per-event cost of an explicit expansion, from telemetry.
+
+    ``*_basis`` is ``"measured"`` when the figure came from the data and
+    ``"fallback"`` when it is :data:`EXPAND_ROUND_TRIP_TOKENS` (or the
+    caller's override) because the cohort was too thin. The measurement
+    inputs are kept so a report can show its work.
+    """
+
+    caching_per_event: int = EXPAND_ROUND_TRIP_TOKENS
+    caching_basis: str = "fallback"
+    noncaching_per_event: int = EXPAND_ROUND_TRIP_TOKENS
+    noncaching_basis: str = "fallback"
+    fallback_per_event: int = EXPAND_ROUND_TRIP_TOKENS
+    # Caching-cohort inputs.
+    n_expand_events_caching: int = 0
+    n_expand_predictions_caching: int = 0
+    n_baseline_predictions: int = 0
+    baseline_miss_rate: float = 0.0
+    expand_miss_rate: float = 0.0
+    median_rebill_premium: int = 0
+    # Non-caching-cohort inputs.
+    n_expand_events_noncaching: int = 0
+    n_expand_predictions_noncaching: int = 0
+    median_expand_call_input: int = 0
+
+    def per_event(self, provider_caches: bool | None) -> int:
+        """Per-event cost for a prediction with the given cache status.
+        Unknown status is charged as non-caching (the full-price call)."""
+        return self.caching_per_event if provider_caches is True else self.noncaching_per_event
+
+    def basis_for(self, provider_caches: bool | None) -> str:
+        return self.caching_basis if provider_caches is True else self.noncaching_basis
+
+    @property
+    def blended_per_event(self) -> int:
+        """Event-weighted per-event cost across both cohorts (for callers
+        that only have an event count, e.g. the analyzer's scope totals)."""
+        n = self.n_expand_events_caching + self.n_expand_events_noncaching
+        if n <= 0:
+            return self.noncaching_per_event
+        total = (self.n_expand_events_caching * self.caching_per_event
+                 + self.n_expand_events_noncaching * self.noncaching_per_event)
+        return int(round(total / n))
+
+    @property
+    def blended_basis(self) -> str:
+        bases = set()
+        if self.n_expand_events_caching:
+            bases.add(self.caching_basis)
+        if self.n_expand_events_noncaching:
+            bases.add(self.noncaching_basis)
+        if not bases:
+            # No events: the figure blended_per_event reports is the
+            # non-caching one, so label it as that figure's basis.
+            return self.noncaching_basis
+        return bases.pop() if len(bases) == 1 else "mixed"
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "caching_per_event": self.caching_per_event,
+            "caching_basis": self.caching_basis,
+            "noncaching_per_event": self.noncaching_per_event,
+            "noncaching_basis": self.noncaching_basis,
+            "fallback_per_event": self.fallback_per_event,
+            "n_expand_events_caching": self.n_expand_events_caching,
+            "n_expand_predictions_caching": self.n_expand_predictions_caching,
+            "n_baseline_predictions": self.n_baseline_predictions,
+            "baseline_miss_rate": round(self.baseline_miss_rate, 4),
+            "expand_miss_rate": round(self.expand_miss_rate, 4),
+            "median_rebill_premium": self.median_rebill_premium,
+            "n_expand_events_noncaching": self.n_expand_events_noncaching,
+            "n_expand_predictions_noncaching": self.n_expand_predictions_noncaching,
+            "median_expand_call_input": self.median_expand_call_input,
+        }
+
+
+def measure_expand_overhead(
+    predictions: list[dict[str, Any]],
+    api_calls: list[dict[str, Any]],
+    tool_calls: list[dict[str, Any]],
+    *,
+    scope: str | None = None,
+    api_last: dict[str, dict[str, Any]] | None = None,
+    calls_by_pred: dict[str, list[dict[str, Any]]] | None = None,
+    fallback_per_event: int = EXPAND_ROUND_TRIP_TOKENS,
+    min_expand_events: int = MEASURED_OVERHEAD_MIN_EXPAND_EVENTS,
+    min_baseline_predictions: int = MEASURED_OVERHEAD_MIN_BASELINE_PREDICTIONS,
+    hints: dict[str, bool] | None = None,
+) -> MeasuredExpandOverhead:
+    """Measure the per-event cost of an explicit expansion, per cache cohort.
+
+    Pure read over the three telemetry lists (``scope`` restricts to one
+    ``agent:platform``). Each prediction is placed in the caching or
+    non-caching cohort by :func:`prediction_provider_caches` (per-call fact,
+    provider hint, then its cache-mode cohort); unresolved rows are skipped.
+
+    Caching cohort — ``per_event = max(0, expand_miss_rate −
+    baseline_miss_rate) × median_rebill_premium``:
+      * a prediction *missed* iff any of its calls has ``cache_read_tokens ==
+        0`` with a prompt above :data:`CACHE_MISS_MIN_PROMPT_TOKENS`;
+      * ``baseline_miss_rate`` is over caching predictions that made no
+        ``expand_tools`` call and were not the session's cold first turn
+        (``frozen_reuse``, or a carry-all row, which never expands);
+      * ``expand_miss_rate`` is over caching predictions that expanded;
+      * ``median_rebill_premium`` is the median :func:`_rebill_premium` over
+        the missed expand predictions.
+    Non-caching cohort — ``per_event`` = median over expand predictions of
+    the expand meta-call's ``input_tokens`` (the prediction's call with the
+    smallest ``output_tokens``: the model's "expand_tools" turn is its
+    shortest output).
+
+    Fallback: a cohort with fewer than ``min_expand_events`` events, or
+    (caching) fewer than ``min_baseline_predictions`` baseline rows, is
+    charged ``fallback_per_event`` and marked ``"fallback"``.
+    """
+    if scope is not None:
+        want = scope.strip().lower()  # analyzer scope keys are normalized this way
+        predictions = [p for p in predictions
+                       if str(p.get("scope") or "").strip().lower() == want]
+        tool_calls = [t for t in tool_calls
+                      if str(t.get("scope") or "").strip().lower() == want]
+    if api_last is None:
+        api_last = last_api_call_by_prediction(api_calls)
+    if calls_by_pred is None:
+        calls_by_pred = index_api_calls_by_prediction(api_calls)
+
+    expand_events: dict[str, int] = defaultdict(int)
+    for t in tool_calls:
+        if t.get("tool_name") == "expand_tools":
+            pid = str(t.get("prediction_id") or "")
+            if pid:
+                expand_events[pid] += 1
+
+    out = MeasuredExpandOverhead(
+        caching_per_event=int(fallback_per_event),
+        noncaching_per_event=int(fallback_per_event),
+        fallback_per_event=int(fallback_per_event),
+    )
+
+    baseline_missed = 0
+    n_baseline = 0
+    expand_missed = 0
+    n_expand_caching = 0
+    rebill: list[float] = []
+    expand_inputs: list[float] = []
+    for p in predictions:
+        pid = str(p.get("prediction_id") or "")
+        if not pid:
+            continue
+        mode = classify_prediction_mode(p, api_last)
+        cohort_mode = mode if mode in ("on", "off") else None
+        calls = calls_by_pred.get(pid, [])
+        caches = prediction_provider_caches(calls, cohort_mode, hints)
+        if caches is None:
+            continue
+        n_events = expand_events.get(pid, 0)
+        if caches:
+            if n_events:
+                n_expand_caching += 1
+                out.n_expand_events_caching += n_events
+                if calls and any(_call_is_cache_miss(c) for c in calls):
+                    expand_missed += 1
+                    rebill.append(_rebill_premium(calls))
+            elif calls and (
+                p.get("frozen_reuse")
+                or str(p.get("policy_source") or "") == "cache_on_carry_all"
+            ):
+                n_baseline += 1
+                if any(_call_is_cache_miss(c) for c in calls):
+                    baseline_missed += 1
+        elif n_events:
+            out.n_expand_events_noncaching += n_events
+            out.n_expand_predictions_noncaching += 1
+            if calls:
+                meta = min(calls, key=lambda r: int(r.get("output_tokens") or 0))
+                expand_inputs.append(float(meta.get("input_tokens") or 0))
+
+    out.n_expand_predictions_caching = n_expand_caching
+    out.n_baseline_predictions = n_baseline
+    out.baseline_miss_rate = (baseline_missed / n_baseline) if n_baseline else 0.0
+    out.expand_miss_rate = (expand_missed / n_expand_caching) if n_expand_caching else 0.0
+    out.median_rebill_premium = int(round(_median(rebill)))
+    out.median_expand_call_input = int(round(_median(expand_inputs)))
+
+    if (out.n_expand_events_caching >= min_expand_events
+            and n_baseline >= min_baseline_predictions):
+        excess = max(0.0, out.expand_miss_rate - out.baseline_miss_rate)
+        out.caching_per_event = int(round(excess * out.median_rebill_premium))
+        out.caching_basis = "measured"
+    if out.n_expand_events_noncaching >= min_expand_events and expand_inputs:
+        out.noncaching_per_event = out.median_expand_call_input
+        out.noncaching_basis = "measured"
+    return out
+
+
 @dataclass
 class ObservedCohort:
     """Realized savings from organic telemetry (never summed with projected)."""
@@ -487,14 +904,37 @@ class ObservedCohort:
     label: str = "observed"
     n_predictions: int = 0
     n_sessions: int = 0
-    # Realized schema-token reduction (Σ ceiling − narrowed across cache-on and
-    # cache-off cohorts; bypass/pending excluded from the headline).
+    # RAW realized schema-token reduction (Σ ceiling − narrowed across cache-on
+    # and cache-off cohorts; bypass/pending excluded from the headline). A
+    # schema-size figure, kept as the detail line.
     realized_schema_token_reduction: int = 0
-    # Observed explicit-expansion overhead: expand_tools events × the canonical
-    # per-event estimator. Trigger activations are not counted.
+    # PRICED reduction: the same tokens weighed by what they were worth —
+    # 1/miss_premium on a caching route (they would have been cache reads),
+    # 1.0 on a non-caching one. The gross the headline nets from.
+    saved_input_equiv_total: int = 0
+    # Observed explicit-expansion overhead: each expand_tools event × the
+    # MEASURED per-event cost of its prediction's cache cohort (see
+    # measure_expand_overhead), or EXPAND_ROUND_TRIP_TOKENS when thin.
+    # Trigger activations are not counted.
     expansion_events: int = 0
     expansion_overhead: int = 0
+    overhead_per_event_caching: int = EXPAND_ROUND_TRIP_TOKENS
+    overhead_per_event_noncaching: int = EXPAND_ROUND_TRIP_TOKENS
+    overhead_basis: str = "fallback"  # measured | fallback | mixed
+    # Historical (blended) net: saved_input_equiv_total − expansion_overhead
+    # (input-token equivalent). What actually happened over the window.
     net_token_reduction: int = 0
+    # Forward (ongoing) net: the non-caching cohort only. Under D1 a caching
+    # provider carries everything — it narrows nothing and ships no
+    # expand_tools going forward — so its historical figures (below) are a
+    # sunk one-time retrospective, not a pace to project. This is the number
+    # to quote and to annualize.
+    net_forward: int = 0
+    saved_input_equiv_noncaching: int = 0
+    overhead_noncaching: int = 0
+    # The caching cohort's historical net, eliminated by carry-all — kept for
+    # transparency (usually negative: old expand breaks > cache-read savings).
+    net_caching_historical: int = 0
     # Wall-clock span of the measured traffic (epoch seconds; 0 when empty) —
     # lets reports annualize the observed pace.
     first_ts: float = 0.0
@@ -503,6 +943,8 @@ class ObservedCohort:
     cache_off: dict[str, Any] = field(default_factory=dict)
     pending: dict[str, Any] = field(default_factory=dict)
     bypass: dict[str, Any] = field(default_factory=dict)
+    # The measurement behind the per-event figures (shows its work).
+    overhead_measurement: dict[str, Any] = field(default_factory=dict)
     token_estimator: str = ""
 
     def to_json(self) -> dict[str, Any]:
@@ -511,15 +953,24 @@ class ObservedCohort:
             "n_predictions": self.n_predictions,
             "n_sessions": self.n_sessions,
             "realized_schema_token_reduction": self.realized_schema_token_reduction,
+            "saved_input_equiv_total": self.saved_input_equiv_total,
             "expansion_events": self.expansion_events,
             "expansion_overhead": self.expansion_overhead,
+            "overhead_per_event_caching": self.overhead_per_event_caching,
+            "overhead_per_event_noncaching": self.overhead_per_event_noncaching,
+            "overhead_basis": self.overhead_basis,
             "net_token_reduction": self.net_token_reduction,
+            "net_forward": self.net_forward,
+            "saved_input_equiv_noncaching": self.saved_input_equiv_noncaching,
+            "overhead_noncaching": self.overhead_noncaching,
+            "net_caching_historical": self.net_caching_historical,
             "first_ts": self.first_ts,
             "last_ts": self.last_ts,
             "cache_on": self.cache_on,
             "cache_off": self.cache_off,
             "pending": self.pending,
             "bypass": self.bypass,
+            "overhead_measurement": self.overhead_measurement,
             "token_estimator": self.token_estimator,
         }
 
@@ -555,26 +1006,74 @@ def compute_observed(
         tool_calls = [t for t in tool_calls if str(t.get("scope") or "") in scope_set]
 
     api_last = last_api_call_by_prediction(api_calls)
-    on = cohort_stats(predictions, api_last, api_calls, "on")
-    off = cohort_stats(predictions, api_last, api_calls, "off")
-    pending = cohort_stats(predictions, api_last, api_calls, "pending")
-    bypass = cohort_stats(predictions, api_last, api_calls, "bypass")
+    calls_by_pred = index_api_calls_by_prediction(api_calls)
+    on = cohort_stats(predictions, api_last, api_calls, "on", calls_by_pred)
+    off = cohort_stats(predictions, api_last, api_calls, "off", calls_by_pred)
+    pending = cohort_stats(predictions, api_last, api_calls, "pending", calls_by_pred)
+    bypass = cohort_stats(predictions, api_last, api_calls, "bypass", calls_by_pred)
 
     # Realized reduction: the narrowed cohorts only (bypass never narrows;
     # pending is not yet classified). expand_tools overhead is observed, not
     # estimated per-turn — and it is charged over the SAME cohorts whose
     # savings are summed: an expansion in a bypass or pending session has no
-    # counted saving to net against.
+    # counted saving to net against. Each event is charged its own cohort's
+    # MEASURED per-event cost (a caching prediction's expansion broke the
+    # prefix cache; a non-caching one paid an extra full-price call).
     realized = on.get("saved_tokens_total", 0) + off.get("saved_tokens_total", 0)
-    counted_pids = {
-        str(p.get("prediction_id") or "") for p in predictions
-        if classify_prediction_mode(p, api_last) in ("on", "off")
+    saved_input_equiv = (on.get("saved_input_equiv_total", 0)
+                         + off.get("saved_input_equiv_total", 0))
+    counted_mode = {
+        str(p.get("prediction_id") or ""): mode for p in predictions
+        for mode in (classify_prediction_mode(p, api_last),)
+        if mode in ("on", "off")
     }
-    expand_events = _count_expand_events(
-        [t for t in tool_calls
-         if str(t.get("prediction_id") or "") in counted_pids])
-    overhead = expand_events * EXPAND_ROUND_TRIP_TOKENS
-    net = realized - overhead
+    measured = measure_expand_overhead(
+        predictions, api_calls, tool_calls, api_last=api_last,
+        calls_by_pred=calls_by_pred,
+    )
+    expand_events = 0
+    overhead = 0
+    overhead_caching = 0
+    overhead_noncaching = 0
+    bases: set[str] = set()
+    for t in tool_calls:
+        if t.get("tool_name") != "expand_tools":
+            continue
+        pid = str(t.get("prediction_id") or "")
+        if pid not in counted_mode:
+            continue
+        caches = prediction_provider_caches(calls_by_pred.get(pid), counted_mode[pid])
+        expand_events += 1
+        per_event = measured.per_event(caches)
+        overhead += per_event
+        if caches is True:
+            overhead_caching += per_event
+        else:
+            overhead_noncaching += per_event
+        bases.add(measured.basis_for(caches))
+    if not bases:
+        overhead_basis = "measured"  # no events: nothing charged, nothing estimated
+    elif len(bases) == 1:
+        overhead_basis = bases.pop()
+    else:
+        overhead_basis = "mixed"
+    net = saved_input_equiv - overhead
+
+    # Forward (ongoing) view. Under D1 a caching provider carries the whole
+    # ceiling: it narrows nothing (so claims no savings) AND ships no
+    # expand_tools (so pays no break) going forward. The caching cohort's
+    # historical figures are therefore a sunk, one-time retrospective — the
+    # net that describes what Tool Belt will keep saving is the non-caching
+    # cohort alone. ``net_token_reduction`` stays the honest blended history;
+    # ``net_forward`` is what to project.
+    saved_input_equiv_noncaching = (on.get("saved_input_equiv_noncaching", 0)
+                                    + off.get("saved_input_equiv_noncaching", 0))
+    saved_input_equiv_caching = (on.get("saved_input_equiv_caching", 0)
+                                 + off.get("saved_input_equiv_caching", 0))
+    net_forward = saved_input_equiv_noncaching - overhead_noncaching
+    # The caching cohort's historical net — negative when old expand breaks
+    # outweighed the cache-read-priced schema savings; eliminated by carry-all.
+    net_caching_historical = saved_input_equiv_caching - overhead_caching
 
     n_pred = on.get("n_predictions", 0) + off.get("n_predictions", 0)
     n_sess = len({
@@ -594,13 +1093,22 @@ def compute_observed(
         first_ts=min(measured_ts) if measured_ts else 0.0,
         last_ts=max(measured_ts) if measured_ts else 0.0,
         realized_schema_token_reduction=realized,
+        saved_input_equiv_total=saved_input_equiv,
         expansion_events=expand_events,
         expansion_overhead=overhead,
+        overhead_per_event_caching=measured.caching_per_event,
+        overhead_per_event_noncaching=measured.noncaching_per_event,
+        overhead_basis=overhead_basis,
         net_token_reduction=net,
+        net_forward=net_forward,
+        saved_input_equiv_noncaching=saved_input_equiv_noncaching,
+        overhead_noncaching=overhead_noncaching,
+        net_caching_historical=net_caching_historical,
         cache_on=on,
         cache_off=off,
         pending=pending,
         bypass=bypass,
+        overhead_measurement=measured.to_json(),
         token_estimator=token_estimator_name(),
     )
 
@@ -773,6 +1281,9 @@ class ProjectedModelRow:
     expansion_overhead: int
     net_token_reduction: int
     estimated_usd_savings: float | None  # only for known variable cost
+    # Priced gross (input-token equivalent) the net is taken from; equals the
+    # raw gross under a cache-off replay.
+    gross_input_equiv_reduction: int = 0
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -782,6 +1293,7 @@ class ProjectedModelRow:
             "reason": self.reason,
             "rate_basis": self.rate_basis,
             "gross_schema_token_reduction": self.gross_schema_token_reduction,
+            "gross_input_equiv_reduction": self.gross_input_equiv_reduction,
             "expansion_overhead": self.expansion_overhead,
             "net_token_reduction": self.net_token_reduction,
             "estimated_usd_savings": self.estimated_usd_savings,
@@ -798,8 +1310,17 @@ class ProjectedCohort:
     sessions_analyzed: int = 0
     user_turns_analyzed: int = 0
     gross_schema_token_reduction: int = 0
+    # Priced gross: under a cache-on replay each saved schema token is worth
+    # 1/miss_premium input tokens (it would have been a cache read); under
+    # cache-off it equals the raw gross. The net is taken from this.
+    gross_input_equiv_reduction: int = 0
     expansion_events: int = 0
     estimated_expansion_overhead: int = 0
+    # Per-event cost charged: the agent's MEASURED figure for the replayed
+    # cache mode (measure_expand_overhead over its observed telemetry), or
+    # EXPAND_ROUND_TRIP_TOKENS when that telemetry is too thin.
+    overhead_per_event: int = EXPAND_ROUND_TRIP_TOKENS
+    overhead_basis: str = "fallback"  # measured | fallback
     net_token_reduction: int = 0
     ceiling_tokens_total: int = 0
     # Schema-only reduction pct — explicitly NOT the session-input percentage.
@@ -826,8 +1347,11 @@ class ProjectedCohort:
             "sessions_analyzed": self.sessions_analyzed,
             "user_turns_analyzed": self.user_turns_analyzed,
             "gross_schema_token_reduction": self.gross_schema_token_reduction,
+            "gross_input_equiv_reduction": self.gross_input_equiv_reduction,
             "expansion_events": self.expansion_events,
             "estimated_expansion_overhead": self.estimated_expansion_overhead,
+            "overhead_per_event": self.overhead_per_event,
+            "overhead_basis": self.overhead_basis,
             "net_token_reduction": self.net_token_reduction,
             "ceiling_tokens_total": self.ceiling_tokens_total,
             "schema_reduction_pct": self.schema_reduction_pct,
@@ -1012,6 +1536,7 @@ def project_sessions(
     proposed_by_scope: dict[str, dict[str, Any]] | None = None,
     provider_input_by_session: dict[str, int] | None = None,
     route_by_session: dict[str, SessionRoute] | None = None,
+    expand_overhead: MeasuredExpandOverhead | None = None,
 ) -> ProjectedCohort:
     """Replay a set of historical sessions into one projected cohort.
 
@@ -1026,12 +1551,22 @@ def project_sessions(
     production source of ``provider``/``api_mode`` for costing, because live
     Hermes ``session_meta`` records carry neither field. A value recorded in
     ``session_meta`` still wins as an explicit override.
+    ``expand_overhead`` is the agent's measured per-event expansion cost
+    (:func:`measure_expand_overhead` over its observed telemetry); the
+    replayed ``cache_mode`` selects the cohort figure. Absent, every event is
+    charged the :data:`EXPAND_ROUND_TRIP_TOKENS` fallback.
     """
     proposed_by_scope = proposed_by_scope or {}
     provider_input_by_session = provider_input_by_session or {}
     route_by_session = route_by_session or {}
+    replay_caches = cache_mode == "on"
+    if expand_overhead is None:
+        expand_overhead = MeasuredExpandOverhead()
+    per_event = expand_overhead.per_event(replay_caches)
+    overhead_basis = expand_overhead.basis_for(replay_caches)
 
     gross = 0
+    gross_priced = 0.0
     ceiling_total = 0
     expansion_events = 0
     turns_analyzed = 0
@@ -1046,6 +1581,7 @@ def project_sessions(
 
     # Per-model accumulation of gross/net for costing.
     per_model_gross: dict[tuple[str, str, str], int] = defaultdict(int)
+    per_model_gross_priced: dict[tuple[str, str, str], float] = defaultdict(float)
     per_model_overhead: dict[tuple[str, str, str], int] = defaultdict(int)
     assignment_source = "proposed" if proposed_by_scope else "current_effective"
 
@@ -1075,8 +1611,12 @@ def project_sessions(
             narrowed_tok = schema_tokens(active_defs)
             session_gross += max(0, ceiling_tok - narrowed_tok)
 
-        overhead = exp_events * EXPAND_ROUND_TRIP_TOKENS
+        overhead = exp_events * per_event
+        # Priced gross: under a cache-on replay the unsent schema tokens
+        # would have been cache reads, worth 1/miss_premium each.
+        session_priced = session_gross * price_factor_for(session.model, replay_caches)
         gross += session_gross
+        gross_priced += session_priced
         ceiling_total += ceiling_tok * len(user_indices)
         expansion_events += exp_events
         turns_analyzed += len(user_indices)
@@ -1102,6 +1642,7 @@ def project_sessions(
 
         key = (session.model or "generic", provider, api_mode)
         per_model_gross[key] += session_gross
+        per_model_gross_priced[key] += session_priced
         per_model_overhead[key] += overhead
 
         # Denominator: provider-reported wins per session.
@@ -1118,9 +1659,14 @@ def project_sessions(
     cohort.sessions_analyzed = sessions_analyzed
     cohort.user_turns_analyzed = turns_analyzed
     cohort.gross_schema_token_reduction = gross
+    cohort.gross_input_equiv_reduction = int(round(gross_priced))
     cohort.expansion_events = expansion_events
-    cohort.estimated_expansion_overhead = expansion_events * EXPAND_ROUND_TRIP_TOKENS
-    cohort.net_token_reduction = gross - cohort.estimated_expansion_overhead
+    cohort.estimated_expansion_overhead = expansion_events * per_event
+    cohort.overhead_per_event = per_event
+    cohort.overhead_basis = overhead_basis
+    cohort.net_token_reduction = (
+        cohort.gross_input_equiv_reduction - cohort.estimated_expansion_overhead
+    )
     cohort.ceiling_tokens_total = ceiling_total
     cohort.schema_reduction_pct = (
         round(gross / ceiling_total * 100, 2) if ceiling_total else None
@@ -1208,8 +1754,9 @@ def project_sessions(
         model, provider, api_mode = key
         cc = classify_cost(model, provider, api_mode)
         g = per_model_gross[key]
+        g_priced = int(round(per_model_gross_priced[key]))
         oh = per_model_overhead[key]
-        net = g - oh
+        net = g_priced - oh
         usd: float | None = None
         if cc.dollars_allowed:
             any_known = True
@@ -1224,6 +1771,7 @@ def project_sessions(
             reason=cc.reason, rate_basis=cc.rate_basis,
             gross_schema_token_reduction=g, expansion_overhead=oh,
             net_token_reduction=net, estimated_usd_savings=usd,
+            gross_input_equiv_reduction=g_priced,
         ))
 
     if incomplete_schema:
@@ -1268,6 +1816,16 @@ def compute_projected(
     # api_calls join: provider-reported input_tokens (denominator) and the
     # billing route each session was actually served on (costing evidence).
     provider_input, routes = _api_call_evidence(location.state_dir, since_ts)
+    # The per-event expansion cost is measured from the agent's own observed
+    # telemetry (whole history — a thin --since window would only push it
+    # back to the fallback); thin data falls back inside the helper.
+    expand_overhead = measure_expand_overhead(
+        [logger_io.normalize_prediction_row(p)
+         for p in load_jsonl(location.state_dir / "predictions.jsonl")],
+        load_jsonl(location.state_dir / "api_calls.jsonl"),
+        [logger_io.normalize_tool_call_row(t)
+         for t in load_jsonl(location.state_dir / "tool_calls.jsonl")],
+    )
 
     return project_sessions(
         sessions, plugin_config,
@@ -1275,6 +1833,7 @@ def compute_projected(
         proposed_by_scope=proposed_by_scope,
         provider_input_by_session=provider_input,
         route_by_session=routes,
+        expand_overhead=expand_overhead,
     )
 
 
@@ -1423,8 +1982,10 @@ class SavingsReport:
         # Aggregate token totals are complete across every agent; USD sums only
         # over known-cost projected rows.
         agg_observed_realized = sum(a.observed.realized_schema_token_reduction for a in self.agents)
+        agg_observed_priced = sum(a.observed.saved_input_equiv_total for a in self.agents)
         agg_observed_net = sum(a.observed.net_token_reduction for a in self.agents)
         agg_proj_gross = sum(a.projected.gross_schema_token_reduction for a in self.agents)
+        agg_proj_priced = sum(a.projected.gross_input_equiv_reduction for a in self.agents)
         agg_proj_net = sum(a.projected.net_token_reduction for a in self.agents)
         known_usd = 0.0
         any_known = False
@@ -1454,12 +2015,14 @@ class SavingsReport:
                 "observed": {
                     "label": "observed",
                     "realized_schema_token_reduction": agg_observed_realized,
+                    "saved_input_equiv_total": agg_observed_priced,
                     "net_token_reduction": agg_observed_net,
                 },
                 "projected": {
                     "label": "projected",
                     "counterfactual": True,
                     "gross_schema_token_reduction": agg_proj_gross,
+                    "gross_input_equiv_reduction": agg_proj_priced,
                     "net_token_reduction": agg_proj_net,
                     "estimated_usd_savings": usd,
                     "usd_coverage": coverage,

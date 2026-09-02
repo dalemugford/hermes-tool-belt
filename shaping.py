@@ -48,7 +48,7 @@ from .logger_io import (
     normalize_prediction_row,
     normalize_tool_call_row,
 )
-from .savings import EXPAND_ROUND_TRIP_TOKENS
+from .savings import EXPAND_ROUND_TRIP_TOKENS, measure_expand_overhead
 from .yaml_required import require_yaml
 
 logger = logging.getLogger("tool_belt_plugin.shaping")
@@ -191,21 +191,108 @@ def _merge_shape_defaults(overrides: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+def resolve_primary_detection_entry(
+    detection_cache: dict[str, Any],
+    scope: str,
+    primary_provider: str | None = None,
+) -> dict[str, Any]:
+    """The detection entry that defines a scope's effective cache posture.
+
+    ``cache_mode_detection.json`` is keyed ``"<scope>|<provider>"`` (one
+    bucket per route the scope has been served on; legacy files carry a bare
+    ``"<scope>"`` key). A scope's posture for shaping is the bucket of its
+    PRIMARY provider, resolved in order:
+
+      1. ``"<scope>|<primary_provider>"`` when the caller names the configured
+         primary (``model.provider``) and that bucket exists;
+      2. else the ``"<scope>|…"`` bucket with the highest ``sessions_locked``
+         (ties → most recent ``locked_at``) — the route the scope actually
+         runs on most;
+      3. else the legacy scope-only key.
+
+    Returns the whole entry (``mode``, ``hit_rate_at_lock``,
+    ``sessions_locked``, ``last_model``, …) so display callers get the full
+    record; ``{}`` when nothing resolves.
+    """
+    if not isinstance(detection_cache, dict):
+        return {}
+    # The hot path writes keys with the provider lowercased/stripped
+    # (``__init__._detection_key``); normalise the lookup the same way so a
+    # mixed-case ``model.provider`` in config still lands on its bucket.
+    primary_provider = str(primary_provider or "").strip().lower()
+    if primary_provider:
+        entry = detection_cache.get(f"{scope}|{primary_provider}")
+        if isinstance(entry, dict):
+            return entry
+    prefix = f"{scope}|"
+    best: dict[str, Any] | None = None
+    best_key: tuple[int, float] | None = None
+    for key, entry in detection_cache.items():
+        if not (isinstance(key, str) and key.startswith(prefix) and isinstance(entry, dict)):
+            continue
+        try:
+            rank = (int(entry.get("sessions_locked") or 0), float(entry.get("locked_at") or 0.0))
+        except (TypeError, ValueError):
+            rank = (0, 0.0)
+        if best_key is None or rank > best_key:
+            best, best_key = entry, rank
+    if best is not None:
+        return best
+    legacy = detection_cache.get(scope)
+    return legacy if isinstance(legacy, dict) else {}
+
+
+def _profile_primary_provider(state_dir: Path) -> str | None:
+    """Best-effort ``model.provider`` for the profile owning ``state_dir``.
+
+    ``state_dir`` is ``<profile_home>/state/tool-belt``, so the profile's own
+    ``config.yaml`` sits two levels up — read that first, which keeps offline
+    CLI runs against another profile's state dir honest. Falls back to the
+    Hermes config loader (the running profile) when the file is absent or
+    unreadable. None when neither resolves.
+    """
+    config_path = Path(state_dir).parent.parent / "config.yaml"
+    try:
+        yaml = require_yaml()
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+        model = raw.get("model") if isinstance(raw, dict) else None
+        provider = model.get("provider") if isinstance(model, dict) else None
+        if isinstance(provider, str) and provider.strip():
+            return provider.strip()
+    except Exception:
+        pass
+    try:
+        from hermes_cli.config import load_config, cfg_get  # type: ignore[import-not-found]
+        provider = cfg_get(load_config(), "model", "provider", default=None)
+        if isinstance(provider, str) and provider.strip():
+            return provider.strip()
+    except Exception:
+        pass
+    return None
+
+
 def read_cache_mode(state_dir: Path, scope: str) -> str | None:
     """The scope's locked prompt-cache mode ('on'/'off'), or None when unknown.
 
     Read from ``cache_mode_detection.json`` (written by the hot path's cache
-    detector). Unknown is treated by the economics as cache-on (fewest billable
-    exposures) — the conservative direction, biasing toward carrying.
+    detector) through :func:`resolve_primary_detection_entry`: the scope's
+    effective posture is the bucket of its PRIMARY provider (configured
+    ``model.provider`` → most-locked ``<scope>|<provider>`` bucket → legacy
+    scope-only key). Under ``"on"`` the plugin carries everything and ships
+    no ``expand_tools`` (D1), so shaping is moot for the scope; ``"off"``
+    shapes on the measured non-caching economics; unknown is treated by the
+    economics as cache-on exposures (one per session) — the conservative
+    direction, biasing toward carrying.
     """
     try:
         with (state_dir / "cache_mode_detection.json").open("r", encoding="utf-8") as fh:
             doc = json.load(fh)
-        entry = doc.get(scope)
-        if isinstance(entry, dict):
-            mode = entry.get("mode")
-            if mode in ("on", "off"):
-                return str(mode)
+        entry = resolve_primary_detection_entry(
+            doc, scope, _profile_primary_provider(state_dir)
+        )
+        mode = entry.get("mode")
+        if mode in ("on", "off"):
+            return str(mode)
     except Exception:
         pass
     return None
@@ -319,8 +406,23 @@ def compute_scope_recommendations(
     schema_sizes: dict[str, int] | None = None,
     cache_mode: str | None = None,
     api_call_counts: dict[str, int] | None = None,
+    expand_round_trip_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Per-scope promote/demote analysis over canonical v2 rows.
+
+    ``cache_mode == "on"`` short-circuits: on a caching provider the plugin
+    carries everything and ships no ``expand_tools`` (decision D1), so there
+    is nothing to demote or promote — the result carries empty lists and
+    ``reason: "caching_provider_carry_all"``. ``expand_round_trip_tokens`` is
+    the per-session expansion penalty for the non-caching economics: the
+    scope's MEASURED expand meta-call cost (``savings.measure_expand_overhead``),
+    falling back to :data:`EXPAND_ROUND_TRIP_TOKENS` when None.
+
+    Carry-all rows (``policy_source == "cache_on_carry_all"``) still count as
+    USAGE evidence here — which tools were actually called — but can never be
+    expansion evidence: they carry no expansion flags and no ``expand_tools``
+    calls, so they feed the demote arm's use/no-use sessions and never the
+    promote arm.
 
     Promote evidence: a tool-call row whose ``activated_by_expansion`` or
     ``expansion_provided_access`` flag is set — direct evidence the model reached
@@ -371,6 +473,21 @@ def compute_scope_recommendations(
                 name = str(tc.get("tool_name") or "")
                 if name:
                     enabled_names.add(name)
+
+    if cache_mode == "on":
+        # Caching provider → carry-all (D1): no expand_tools is ever shipped,
+        # so demotion saves nothing and promotion has nothing to recover
+        # from. Explicit no-op so callers/porcelain can say why.
+        return {
+            "scope": scope,
+            "computed_at": _utc_iso(),
+            "sessions_considered": len(recent_sessions),
+            "window_requested": window,
+            "promote": [],
+            "demote": [],
+            "enabled_tool_names": sorted(enabled_names),
+            "reason": "caching_provider_carry_all",
+        }
 
     def _valid(tool_name: str, kind: str) -> bool:
         # Assertion: Tool Search bridge tools are pass-through (outside the
@@ -444,17 +561,22 @@ def compute_scope_recommendations(
     # never reached for:
     #
     #     saving  = schema_size(tool) × billable exposures in sessions WITHOUT use
-    #     penalty = EXPAND_ROUND_TRIP_TOKENS × sessions WITH use
+    #     penalty = per_event_cost × sessions WITH use
     #     demote when saving > k × penalty;  promote when penalty > saving
     #
     # Token-denominated by design — no price table. Zero uses makes penalty 0,
     # so the old binary unused-→-demote rule falls out as the limit case.
-    # Billable exposures per session follow the scope's locked prompt-cache
-    # mode: cache off pays the manifest on every API call (counted from
-    # api_calls.jsonl per prediction, min 1); cache on (or unknown — the
-    # conservative read) roughly once per session. Trigger activations don't
-    # count as use: triggers stay free for a demoted tool. Only adaptive
-    # carry residents from residency-inferred rows are demotable.
+    # ``per_event_cost`` is what one expansion actually costs on THIS scope's
+    # non-caching route — the measured expand meta-call input (one extra
+    # full-price API call; tens of thousands of tokens on a long session),
+    # not a flat guess; EXPAND_ROUND_TRIP_TOKENS is only the thin-data
+    # fallback. Caching scopes never reach this math (carry-all, above).
+    # Billable exposures per session: cache off pays the manifest on every
+    # API call (counted from api_calls.jsonl per prediction, min 1); an
+    # unknown posture — the conservative read — roughly once per session.
+    # Trigger activations don't count as use: triggers stay free for a
+    # demoted tool. Only adaptive carry residents from residency-inferred
+    # rows are demotable.
     carry_observed: set[str] = set()
     tools_called: set[str] = set()
     # Sessions where each tool saw a non-trigger call (v1 rows without
@@ -462,12 +584,6 @@ def compute_scope_recommendations(
     # toward carrying). ``demand_uses`` keeps raw call counts for reporting.
     demand_use_sessions: dict[str, set[str]] = defaultdict(set)
     demand_uses: Counter[str] = Counter()
-    # Sessions where a trigger activated the tool AFTER the session's first
-    # prediction. Post-demotion, such a late fire mutates the frozen tool
-    # list under prompt caching — busting the provider prefix cache — so the
-    # demote arm must price it; a first-message fire is free (it lands in
-    # the freeze snapshot before anything is cached).
-    late_trigger_sessions: dict[str, set[str]] = defaultdict(set)
     # Sessions in which each tool was actually observed CARRIED — demotion
     # saving is only real where the schema was actually being shipped, so a
     # tool carried in part of the window (or absent from bypass sessions)
@@ -483,11 +599,6 @@ def compute_scope_recommendations(
             )
         else:
             session_exposures[sid] = 1
-        first_ts = min((p.get("ts", 0) for p in plist), default=0)
-        for p in plist:
-            if p.get("ts", 0) > first_ts:
-                for t in (p.get("trigger_activated_tools") or []):
-                    late_trigger_sessions[str(t)].add(sid)
         for p in plist:
             if p.get("residency_inferred"):
                 residency = p.get("residency") or {}
@@ -510,6 +621,11 @@ def compute_scope_recommendations(
     total_exposures = sum(session_exposures.values())
     sizes = schema_sizes or {}
     k = float(demote_k) if demote_k and demote_k > 0 else 1.5
+    per_event_cost = (
+        int(expand_round_trip_tokens)
+        if expand_round_trip_tokens is not None and int(expand_round_trip_tokens) > 0
+        else EXPAND_ROUND_TRIP_TOKENS
+    )
 
     def _economics(
         tool_name: str, use_sessions: set[str],
@@ -536,7 +652,7 @@ def compute_scope_recommendations(
             session_exposures.get(sid, 0) for sid in use_pool
         )
         saving = size * max(0, pool_exposures - exposures_with_use)
-        penalty = EXPAND_ROUND_TRIP_TOKENS * len(use_sessions)
+        penalty = per_event_cost * len(use_sessions)
         return saving, penalty
 
     # ── Promotion finalization: the reversed inequality. ──────────────────
@@ -573,18 +689,6 @@ def compute_scope_recommendations(
             saving, penalty = _economics(
                 tool_name, use_sessions,
                 session_pool=carried_sessions.get(tool_name, set()))
-            # Under prompt caching, a demoted tool's LATE trigger fire is not
-            # free: it mutates the frozen tool list and busts the provider
-            # prefix cache. Charge one round-trip per such session (sessions
-            # already paying a demand-use round-trip aren't double-charged).
-            # Trigger evidence never promotes, so without this charge a
-            # trigger-only tool's demotion was a one-way door that could
-            # cost more than it saved.
-            late_trig = late_trigger_sessions.get(tool_name, set())
-            trigger_sessions = (late_trig - use_sessions
-                                if cache_mode != "off" else set())
-            if trigger_sessions:
-                penalty += EXPAND_ROUND_TRIP_TOKENS * len(trigger_sessions)
             if saving <= k * penalty:
                 continue  # carrying is (or may be) the cheaper side — hold
             if not _valid(tool_name, "demote"):
@@ -600,8 +704,6 @@ def compute_scope_recommendations(
                 "k": k,
                 "evidence": "carry_unused" if uses == 0 else "carry_uneconomic",
             }
-            if trigger_sessions:
-                entry["late_trigger_sessions"] = len(trigger_sessions)
             demote.append(entry)
 
     return {
@@ -612,6 +714,7 @@ def compute_scope_recommendations(
         "promote": promote,
         "demote": demote,
         "enabled_tool_names": sorted(enabled_names),
+        "expand_round_trip_tokens": per_event_cost,
     }
 
 
@@ -1516,6 +1619,14 @@ def auto_shape_run(
       · The per-scope debounce interval has elapsed since the scope's
         ``shaping.last_auto_shape_at`` (default 24h,
         ``auto_shape_interval_hours`` to override).
+      · The scope's cache posture (:func:`read_cache_mode`) is not ``"on"``:
+        a caching provider runs carry-all (D1) and ships no ``expand_tools``,
+        so there is nothing to shape — such scopes are listed under
+        ``skipped_carry_all`` and left unstamped.
+
+    The non-caching demote/promote penalty is the scope's MEASURED expansion
+    cost (``savings.measure_expand_overhead``), falling back to
+    :data:`EXPAND_ROUND_TRIP_TOKENS` on thin data.
 
     Evidence thresholds are the shaper's own (``policy.yaml`` →
     ``learning.shape_ceiling``, falling back to :data:`DEFAULTS`) — the auto
@@ -1532,10 +1643,10 @@ def auto_shape_run(
     caller (``_maybe_auto_shape`` in ``__init__``) holds an in-process lock
     so two session-ends in one gateway can't run concurrently.
 
-    Cache-on invariant: this function only writes ``learned.json``. It never
-    touches any live session state (frozen tool sets, sticky residency, cache
-    mode) — a live session keeps its frozen carrying; the new assignment is
-    picked up naturally when a future session resolves its preset.
+    Live-state invariant: this function only writes ``learned.json``. It never
+    touches any live session state (the cache-mode posture pin, sticky
+    residency, detection buckets) — the new assignment is picked up naturally
+    when a future session resolves its preset.
     """
     now = time.time() if now is None else float(now)
     summary: dict[str, Any] = {
@@ -1582,9 +1693,17 @@ def auto_shape_run(
     stamps = _read_auto_shape_stamps(sd)
 
     eligible: list[str] = []
+    skipped_carry_all: list[str] = []
+    cache_modes: dict[str, str | None] = {}
     for scope in sorted(grouped):
         if learned.learned_mode(plugin_config, scope) != "apply":
             continue  # no standing consent — never auto-write
+        cache_modes[scope] = read_cache_mode(sd, scope)
+        if cache_modes[scope] == "on":
+            # Caching provider → carry-all (D1): nothing to shape. Not
+            # stamped, so a posture flip re-qualifies the scope at once.
+            skipped_carry_all.append(scope)
+            continue
         entry = scopes_state.get(scope) or {}
         shaping_meta = entry.get("shaping") if isinstance(entry, dict) else {}
         last = _parse_utc_iso(stamps.get(scope))
@@ -1595,14 +1714,32 @@ def auto_shape_run(
             continue  # debounced
         eligible.append(scope)
 
+    summary["skipped_carry_all"] = skipped_carry_all
     if not eligible:
         summary["reason"] = "no_eligible_scopes"
         return summary
 
     thresholds = load_shape_ceiling_defaults()
-    calls_by_pred = index_tool_calls_by_prediction(load_jsonl(sd / "tool_calls.jsonl"))
+    tool_call_rows = load_jsonl(sd / "tool_calls.jsonl")
+    calls_by_pred = index_tool_calls_by_prediction(tool_call_rows)
     schema_sizes = load_schema_sizes(sd)
-    api_counts = index_api_call_counts(load_jsonl(sd / "api_calls.jsonl"))
+    api_call_rows = load_jsonl(sd / "api_calls.jsonl")
+    api_counts = index_api_call_counts(api_call_rows)
+
+    def _penalty_per_event(scope: str) -> int | None:
+        # The scope's measured non-caching expansion cost; None → the
+        # shaper's EXPAND_ROUND_TRIP_TOKENS fallback. Fail-open: a
+        # measurement problem never blocks shaping.
+        try:
+            return measure_expand_overhead(
+                preds, api_call_rows, tool_call_rows, scope=scope,
+            ).noncaching_per_event
+        except Exception as exc:
+            logger.warning(
+                "tool-belt: expand overhead measurement failed for %s "
+                "(fail-open to fallback): %s", scope, exc,
+            )
+            return None
 
     per_scope = {
         scope: compute_scope_recommendations(
@@ -1615,8 +1752,9 @@ def auto_shape_run(
             demote_min_sessions_no_use=thresholds["demote_min_sessions_no_use"],
             demote_k=thresholds["demote_k"],
             schema_sizes=schema_sizes,
-            cache_mode=read_cache_mode(sd, scope),
+            cache_mode=cache_modes.get(scope),
             api_call_counts=api_counts,
+            expand_round_trip_tokens=_penalty_per_event(scope),
         )
         for scope in eligible
     }

@@ -35,7 +35,7 @@ def _load_script(module_name: str, filename: str):
 
 bootstrap = _load_script("tool_belt_bootstrap_portability", "bootstrap.py")
 harvest = _load_script("tool_belt_harvest_portability", "harvest-replay.py")
-cache_replay = _load_script("tool_belt_cache_replay_portability", "cache-freeze-replay.py")
+cache_replay = _load_script("tool_belt_cache_replay_portability", "cache-stability-replay.py")
 savings = _load_script("tool_belt_savings_portability", "savings-report.py")
 shape = _load_script("tool_belt_shape_portability", "shape-ceiling.py")
 

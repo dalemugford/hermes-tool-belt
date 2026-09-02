@@ -13,13 +13,13 @@ labelled `default`; named profiles keep their directory names.
 | Script | Purpose | Typical use |
 |---|---|---|
 | [`configure.py`](configure.py) | Mode-setter. Detects every agent scope, sets the shaping mode (learning / history / off) and protected tools, and writes the configuration through `hermes config`. | The first command to run after installing. Re-run any time. |
-| [`bootstrap.py`](bootstrap.py) | Mode-aware first-install warm start. Uses live `expand_tools` evidence for cache-on scopes and session replay for cache-off scopes. | Optional, once after installation. |
+| [`bootstrap.py`](bootstrap.py) | Posture-aware first-install warm start for narrowing (non-caching) scopes: live `expand_tools` evidence via the shaper plus session-history replay. Caching scopes are carry-all and are reported as "nothing to bootstrap". | Optional, once after installation. |
 | [`shape-ceiling.py`](shape-ceiling.py) | Builds per-scope promote/demote recommendations from recent sessions and writes the learned overlay. | Run after enough organic sessions; inspect with `--dry-run` first. |
 | [`harvest-replay.py`](harvest-replay.py) | Replays existing Hermes sessions through the per-turn predictor and writes privacy-reduced synthetic telemetry. | Tune trigger coverage for cache-off scopes. |
-| [`cache-freeze-replay.py`](cache-freeze-replay.py) | Measures frozen-tool-list efficacy and estimates cache cost from matched API-call positions. **Also a hard library dependency of `analyze.py`**, which imports it via `importlib` for the cache-aware savings section; its CLI is an optional focused diagnostic. | Investigate cache behavior or verify analyzer savings. |
-| [`savings-report.py`](savings-report.py) | **Deprecated wrapper.** Kept for backward compatibility; delegates to the canonical engine in [`../savings.py`](../savings.py). Prefer `tool-belt savings`. | Legacy per-scope cache-on/off view. |
+| [`cache-stability-replay.py`](cache-stability-replay.py) | Measures per-session tool-list stability against each session's first-call hash and estimates the cache cost of mutations from matched API-call positions. On a caching (carry-all) scope every mutation counter must be zero — a non-zero count is a regression. **Also a hard library dependency of `analyze.py`**, which imports it via `importlib` for the cache-aware savings section; its CLI is an optional focused diagnostic. | Verify carry-all held on a caching scope; investigate cache behavior; verify analyzer savings. |
+| [`savings-report.py`](savings-report.py) | **Deprecated wrapper.** Kept for backward compatibility; delegates to the canonical engine in [`../savings.py`](../savings.py). Resolves each scope's lock from its primary provider's `scope\|provider` bucket. Prefer `tool-belt savings`. | Legacy per-scope cache-on (carry-all) / cache-off view. |
 | [`../tool-belt`](../tool-belt) `savings` | Canonical, read-only savings command. Reports every enabled agent (or one via `--agent`) with separately-labeled **observed** and **projected** cohorts; `--json` for a stable schema. Backed by [`../savings.py`](../savings.py). | The supported way to inspect savings. |
-| [`smoke-test.py`](smoke-test.py) | Exercises cache-on and cache-off behavior in isolated temporary state. | Before committing hook, freeze, expansion, or telemetry changes. |
+| [`smoke-test.py`](smoke-test.py) | Exercises the carry-all (cache-on) and narrowing (cache-off) postures in isolated temporary state. | Before committing hook, carry-all, expansion, or telemetry changes. |
 | [`rotate-telemetry.sh`](rotate-telemetry.sh) | Moves live JSONL telemetry into a timestamped archive without stopping the gateway. | Start a clean measurement window. |
 | [`../tests/seed_sessions.py`](../tests/seed_sessions.py) | Populates a throwaway Hermes home with telemetry generated from the scripted conversations in `tests/scripts/`, using the real policy resolver and predictor. | Demo or debug onboarding without a live gateway: `.venv/bin/python tests/seed_sessions.py --home /tmp/demo-home`, then run `configure.py` against it with `HERMES_HOME` set. Requires the development environment from `CONTRIBUTING.md` (PyYAML). |
 
@@ -119,18 +119,24 @@ to `$HERMES_HOME/state/tool-belt/learned.json`.
 ```bash
 ./tool-belt savings                       # canonical: all agents, both cohorts
 ./tool-belt savings --agent=default --json # machine-readable, one agent
-python3 scripts/cache-freeze-replay.py
-python3 scripts/cache-freeze-replay.py --scope assistant-a:telegram
+python3 scripts/cache-stability-replay.py
+python3 scripts/cache-stability-replay.py --scope assistant-a:telegram
 python3 scripts/savings-report.py --json   # deprecated wrapper
 ```
 
 `tool-belt savings` is the public entry point. Pricing (`PRICE_TABLE`), the
-token estimator, and the expand-round-trip overhead constant are single-sourced
-in `savings.py`; `cache-freeze-replay.py` imports the price table from there and
+token estimator, and the expansion overhead (measured per cohort, with
+`EXPAND_ROUND_TRIP_TOKENS` as the thin-data fallback) are single-sourced in
+`savings.py`; `cache-stability-replay.py` imports the price table from there and
 `savings-report.py` re-exports the observed-cohort math — no duplicate tables.
 
+On a caching scope the plugin is carry-all (full ceiling, no `expand_tools`,
+no mid-session mutation), so `cache-stability-replay.py --scope <caching scope>`
+should report zero mutations of every kind; that is the quickest check that
+the posture held.
+
 The standard `analyze.py` report already includes cache-aware matched-
-counterfactual figures. It computes them by importing `cache-freeze-replay.py`
+counterfactual figures. It computes them by importing `cache-stability-replay.py`
 as a library (via `importlib`, because of the hyphenated filename), so the
 script is a hard analyzer dependency, not just a standalone tool — do not move
 or remove it. Run these scripts directly when you need focused or
@@ -145,7 +151,9 @@ python3 scripts/bootstrap.py --profile assistant-a
 
 The bootstrap command discovers the root Hermes profile and named profiles
 under `$HERMES_HOME/profiles/`. It does not modify plugin policy; the shaper
-writes only the learned overlay.
+writes only the learned overlay. Scopes whose primary provider prompt-caches
+are carry-all and produce no expansion evidence by design; bootstrap reports
+them as "nothing to bootstrap" rather than waiting for data that never comes.
 
 ### Validate behavior
 
@@ -154,8 +162,12 @@ python3 tests/run_tests.py
 python3 scripts/smoke-test.py
 ```
 
-The smoke test currently checks nine cache-off invariants and five cache-on
-invariants, including frozen snapshot reuse and expansion persistence.
+The smoke test checks the cache-off (narrowing) invariants — sticky
+residency, expansion attribution, cross-session isolation, session lifecycle
+— and the cache-on (carry-all) contract: every prediction row is
+`cache_on_carry_all` with ceiling == shipped, `expand_tools` is absent from
+the wire, exactly one `tool_list_hash` per session, no `expand_tools` calls,
+and `provider_caches` present on every `api_calls.jsonl` row.
 
 ### Rotate telemetry
 

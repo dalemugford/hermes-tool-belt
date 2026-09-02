@@ -1,33 +1,42 @@
 #!/usr/bin/env python3
-"""Day-one warm start for the tool-belt plugin — mode-aware.
+"""Day-one warm start for the tool-belt plugin — posture-aware.
 
-The plugin runs in two modes per scope (cache-on by default for providers
-with automatic prompt caching; cache-off fallback for providers without it).
-This script runs the right warm-start for each:
+The plugin runs one of two postures per scope, keyed by the scope's
+primary provider (see ``__init__.py``):
 
-  · Cache-on scopes → ``shape-ceiling.py`` reports per-tool promote /
-    demote candidates from real ``expand_tools`` evidence in live
-    telemetry. Conservative thresholds; nothing surfaces until ≥2
-    sessions of data per scope.
+  · Caching provider → **carry-all**. The full ceiling ships on every
+    call, ``expand_tools`` is not shipped, and the tool list never
+    changes mid-session. There is nothing to narrow, nothing to expand,
+    and therefore nothing to bootstrap: no expansion evidence is ever
+    produced and the shaper returns a no-op for the scope. This script
+    reports those scopes as "carry-all: nothing to bootstrap" and moves
+    on. That is the correct outcome, not a thin-data one.
 
-  · Cache-off scopes → ``harvest-replay.py`` replays your existing
-    Hermes session JSONLs through the per-turn predictor, then the
-    analyzer mines trigger-keyword candidates and tool promotions.
-    Useful on day one because it leverages history you already have.
+  · Non-caching provider → **narrowing** (cache-off). This is the real
+    bootstrap. Two sources feed it:
 
-Both paths produce a unified ranked **TOP ACTIONS** summary. If neither
-finds anything, that's reported honestly — usually means thin sample
-size, not that the plugin has nothing to do.
+      - ``shape-ceiling.py`` (live telemetry) reports per-tool promote /
+        demote candidates from real ``expand_tools`` evidence recorded
+        by narrowing sessions. Conservative thresholds; nothing surfaces
+        until ≥2 sessions of data per scope.
+      - ``harvest-replay.py`` (history) replays your existing Hermes
+        session JSONLs through the per-turn predictor, then the analyzer
+        mines trigger-keyword candidates and tool promotions. Useful on
+        day one because it leverages history you already have.
+
+Both sources feed a unified ranked **TOP ACTIONS** summary. If neither
+finds anything for a narrowing scope, that's reported honestly — usually
+thin sample size, not that the plugin has nothing to do.
 
 Idempotent: re-runs refresh the harvest and re-read live telemetry
-without disrupting either.
+without disrupting either. Read-only: never writes ``learned.json``.
 
 Usage:
   python3 scripts/bootstrap.py
   python3 scripts/bootstrap.py --profile assistant-a  # one profile only
   python3 scripts/bootstrap.py --window-days 60   # harvest window
-  python3 scripts/bootstrap.py --skip-harvest     # cache-on path only
-  python3 scripts/bootstrap.py --skip-shape       # cache-off path only
+  python3 scripts/bootstrap.py --skip-harvest     # live-telemetry path only
+  python3 scripts/bootstrap.py --skip-shape       # harvest path only
   python3 scripts/bootstrap.py --quiet            # only print top actions
 """
 from __future__ import annotations
@@ -42,6 +51,27 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 PLUGIN_DIR = HERE.parent
 
+# The posture resolver lives in the plugin's shaping module. It is the same
+# call ``shape-ceiling.py`` uses to decide whether a scope is carry-all, so
+# bootstrap and the shaper can never disagree about a scope's posture.
+sys.path.insert(0, str(PLUGIN_DIR))
+try:
+    from shaping import read_cache_mode as _read_cache_mode  # noqa: E402
+except Exception:  # pragma: no cover — shaping needs PyYAML; degrade to "unknown"
+    _read_cache_mode = None
+
+
+def _scope_posture(state_dir: Path, scope: str) -> str:
+    """``"carry_all"`` when the scope's primary provider is locked as caching,
+    ``"narrowing"`` when locked non-caching, ``"unknown"`` otherwise."""
+    if _read_cache_mode is None:
+        return "unknown"
+    try:
+        mode = _read_cache_mode(state_dir, scope)
+    except Exception:
+        return "unknown"
+    return {"on": "carry_all", "off": "narrowing"}.get(str(mode or ""), "unknown")
+
 
 def _default_python() -> str:
     """Interpreter for child scripts, with an explicit scheduler override."""
@@ -50,7 +80,7 @@ def _default_python() -> str:
 
 def _discover_state_dirs(hermes_home: Path, profile_filter: str | None) -> list[tuple[str, Path]]:
     """Return ``[(label, state_dir), ...]`` for every profile's live state
-    directory. Used by the cache-on path (shape-ceiling reads live
+    directory. Used by the live-telemetry path (shape-ceiling reads live
     telemetry, not harvest)."""
     out: list[tuple[str, Path]] = []
     root_state = hermes_home / "state" / "tool-belt"
@@ -82,9 +112,10 @@ def _discover_harvest_dirs(hermes_home: Path, profile_filter: str | None) -> lis
     return out
 
 
-def _shape_ceiling_actions(state_dirs: list[tuple[str, Path]], python: str) -> list[dict]:
+def _shape_ceiling_actions(state_dirs: list[tuple[str, Path]], python: str,
+                           carry_all_scopes: list[dict] | None = None) -> list[dict]:
     """Run ``shape-ceiling.py --dry-run --json`` against each profile's live
-    state and collect its cache-on promote/demote candidates.
+    state and collect its promote/demote candidates for NARROWING scopes.
 
     The shaper's porcelain document is the contract consumed here (schema
     ``tool-belt/shape-ceiling``): a versioned JSON object with a ``scopes``
@@ -93,6 +124,12 @@ def _shape_ceiling_actions(state_dirs: list[tuple[str, Path]], python: str) -> l
     never reads stdout as text, so rewording the report cannot change what
     bootstrap surfaces. ``--dry-run`` is passed because bootstrap only
     reports; it never rewrites ``learned.json``.
+
+    Carry-all scopes (caching primary provider) come back from the shaper
+    as an empty no-op by construction — they produce no expansion evidence
+    because nothing is ever narrowed. They are recorded into
+    ``carry_all_scopes`` (``{"label", "scope", "sessions"}``) so the caller
+    can say so, rather than misreporting them as "no candidates yet".
     """
     actions: list[dict] = []
     for label, sdir in state_dirs:
@@ -110,6 +147,17 @@ def _shape_ceiling_actions(state_dirs: list[tuple[str, Path]], python: str) -> l
             payload = json.loads(result.stdout)
             for scope_doc in payload.get("scopes") or []:
                 scope = str(scope_doc.get("scope") or "")
+                if _scope_posture(sdir, scope) == "carry_all":
+                    # Nothing narrowed → nothing to promote or demote. Any
+                    # candidate the shaper did emit for a carry-all scope
+                    # would be a shaper bug, so don't surface one.
+                    if carry_all_scopes is not None:
+                        carry_all_scopes.append({
+                            "label": label,
+                            "scope": scope,
+                            "sessions": int(scope_doc.get("sessions_considered") or 0),
+                        })
+                    continue
                 for row in scope_doc.get("promote") or []:
                     actions.append({
                         "kind": "shape_promote",
@@ -201,9 +249,9 @@ def main() -> int:
     parser.add_argument("--window-days", type=int, default=None,
         help="harvest window for cache-off path (sessions modified within last N days)")
     parser.add_argument("--skip-shape", action="store_true",
-        help="skip the cache-on shape-ceiling path")
+        help="skip the live-telemetry shape-ceiling path")
     parser.add_argument("--skip-harvest", action="store_true",
-        help="skip the cache-off harvest path")
+        help="skip the session-history harvest path")
     parser.add_argument("--quiet", action="store_true",
         help="only print top actions, suppress per-phase status output")
     parser.add_argument("--hermes-home", type=Path,
@@ -218,7 +266,7 @@ def main() -> int:
             print(msg)
 
     info("=" * 64)
-    info("  tool-belt bootstrap — mode-aware warm start")
+    info("  tool-belt bootstrap — posture-aware warm start")
     info("=" * 64)
 
     state_dirs = _discover_state_dirs(args.hermes_home, args.profile)
@@ -226,18 +274,30 @@ def main() -> int:
         print("\nNo tool-belt state directories found under", args.hermes_home, file=sys.stderr)
         return 1
 
-    # Cache-on path — shape-ceiling against live telemetry
+    # Live-telemetry path — shape-ceiling against each profile's live state.
+    # Only narrowing (cache-off) scopes can yield candidates; carry-all
+    # scopes are collected separately and reported as such.
     shape_actions: list[dict] = []
+    carry_all_scopes: list[dict] = []
     if not args.skip_shape:
-        info(f"\n[cache-on] Running shape-ceiling across {len(state_dirs)} profile(s)...")
-        shape_actions = _shape_ceiling_actions(state_dirs, args.python)
+        info(f"\n[live telemetry] Running shape-ceiling across {len(state_dirs)} profile(s)...")
+        shape_actions = _shape_ceiling_actions(state_dirs, args.python,
+                                               carry_all_scopes=carry_all_scopes)
+        for row in carry_all_scopes:
+            info(f"  {row['label']}/{row['scope']}: carry-all (caching provider) — "
+                 f"nothing to bootstrap ({row['sessions']} session(s) seen)")
         if not shape_actions:
-            info("  No cache-on candidates yet (need ≥2 sessions per scope with expand_tools evidence).")
+            if carry_all_scopes:
+                info("  No narrowing-scope candidates yet (narrowing scopes need ≥2 sessions "
+                     "with expand_tools evidence).")
+            else:
+                info("  No candidates yet (need ≥2 sessions per narrowing scope with "
+                     "expand_tools evidence).")
 
-    # Cache-off path — harvest + analyzer
+    # History path — harvest + analyzer (narrowing economics)
     harvest_actions: list[dict] = []
     if not args.skip_harvest:
-        info("\n[cache-off] Harvesting session history...")
+        info("\n[harvest] Replaying session history through the narrowing predictor...")
         harvest_cmd = [args.python, str(PLUGIN_DIR / "scripts" / "harvest-replay.py")]
         if args.profile:
             harvest_cmd += ["--profile", args.profile]
@@ -262,39 +322,47 @@ def main() -> int:
     print("\n" + "=" * 64)
     print("  TOP ACTIONS")
     print("=" * 64)
+    # Carry-all scopes first: state the outcome plainly so nobody waits for
+    # evidence that will never arrive.
+    if carry_all_scopes:
+        print("\n  Carry-all scopes (caching provider — full ceiling shipped, no expand_tools):")
+        for row in carry_all_scopes:
+            print(f"    · {row['label']}/{row['scope']:<22} nothing to bootstrap")
+
     if not shape_actions and not harvest_actions:
         print("\n  No actionable recommendations surfaced today. Reasons:")
-        print("    · cache-on scopes need ≥2 sessions of real expand_tools evidence")
-        print("    · cache-off scopes need sessions/*.jsonl content to harvest")
+        print("    · carry-all scopes never produce expand_tools evidence (by design)")
+        print("    · narrowing scopes need ≥2 sessions of real expand_tools evidence")
+        print("    · the harvest path needs sessions/*.jsonl content to replay")
         print("    · or your current policy already covers your usage")
         print("\n  Re-run after a few days of organic use for a fuller picture.")
         return 0
 
-    # Shape-ceiling output (cache-on, organic) first — it's stronger signal
+    # Shape-ceiling output (live, organic) first — it's stronger signal
     shape_promotes = [a for a in shape_actions if a["kind"] == "shape_promote"]
     shape_demotes = [a for a in shape_actions if a["kind"] == "shape_demote"]
     if shape_promotes:
-        print("\n  [cache-on] Promote to carry (from real expand_tools evidence):")
+        print("\n  [narrowing / live] Promote to carry (from real expand_tools evidence):")
         for i, a in enumerate(shape_promotes, 1):
             print(f"    {i}. {a['scope']:<22} + {a['tool']}    ({a['detail']})")
     if shape_demotes:
-        print("\n  [cache-on] Demote to expand_only (unused across recent sessions):")
+        print("\n  [narrowing / live] Demote to expand_only (unused across recent sessions):")
         for i, a in enumerate(shape_demotes, 1):
             print(f"    {i}. {a['scope']:<22} − {a['tool']}    ({a['detail']})")
 
-    # Harvest output (cache-off, historical) second
+    # Harvest output (historical) second
     harvest_promotions = sorted([a for a in harvest_actions if a["kind"] == "harvest_promotion"],
                                 key=lambda a: -a.get("net", 0))
     harvest_keywords = sorted([a for a in harvest_actions if a["kind"] == "harvest_keyword"],
                               key=lambda a: -a["expand_only_calls"])
     if harvest_promotions:
-        print("\n  [cache-off / harvest] Carry recommendations (review/apply with configure.py or shape-ceiling.py):")
+        print("\n  [narrowing / harvest] Carry recommendations (review/apply with configure.py or shape-ceiling.py):")
         for i, p in enumerate(harvest_promotions, 1):
             tag = "PROMOTE-TO-CARRY" if p["action"] == "promote_to_carry" else "KEEP-EXPAND-ONLY"
             print(f"    {i}. [{tag}] {p['scope']:<22} {p['item']:<20} "
                   f"expand_only_calls={p['expand_only_calls']:>4}  net={p['net']:+,} tok")
     if harvest_keywords:
-        print("\n  [cache-off / harvest] Trigger keyword candidates (add to the named trigger's `keywords`):")
+        print("\n  [narrowing / harvest] Trigger keyword candidates (add to the named trigger's `keywords`):")
         for i, k in enumerate(harvest_keywords[:10], 1):
             print(f"    {i}. {k['scope']:<22} {k['target_trigger']:<14} ← \"{k['pattern']}\"")
             print(f"       (expand_only_calls {k['expand_only_calls']}, precision {k['precision']:.2f} — "
@@ -302,9 +370,11 @@ def main() -> int:
 
     # Activation goes through Hermes-owned config paths only: the guided
     # command or `hermes config set`. Never tell an operator to hand-edit a
-    # config file — configure.py and scripts/README.md forbid it.
+    # config file — configure.py and scripts/README.md forbid it. Only
+    # narrowing scopes have anything to activate; the shaper leaves
+    # carry-all scopes untouched even when run without --dry-run.
     print()
-    print("  To activate cache-on recommendations:")
+    print("  To activate these recommendations (narrowing scopes only):")
     print("    1. Guided:  python3 scripts/configure.py --agent <agent> --mode history")
     print("       Direct:   hermes config set "
           "plugins.entries.tool-belt.settings.channels.<agent>.<platform>.learned_mode apply")
