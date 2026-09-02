@@ -42,7 +42,7 @@ Expected:
 | Command | Expected result |
 | --- | --- |
 | `tests/run_tests.py` | `OK` — 0 failures, 0 errors. One skip is expected on a clean clone outside the Hermes venv: the real-bridge test (`skipUnless(_HAVE_HERMES)`). Any other `skipped` line means something changed and needs explaining. |
-| `scripts/smoke-test.py` | Two blocks: `8/8 checks passed` (cache-off / attribution) and `5/5 checks passed` (cache-on freeze). |
+| `scripts/smoke-test.py` | Two blocks: `9/9 checks passed` (cache-off / attribution) and `5/5 checks passed` (cache-on freeze). |
 | `compileall -q .` | No output, exit 0. |
 | `bash -n scripts/rotate-telemetry.sh` | No output, exit 0. |
 

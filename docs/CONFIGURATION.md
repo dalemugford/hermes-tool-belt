@@ -60,8 +60,8 @@ its own:
 | `plugins.entries.tool-belt.settings.channels.<agent>.<platform>.bypass_rate` | reset | the value observation mode replaced, default `0.0` |
 | `plugins.entries.tool-belt.settings.always_carry` | Protected-tools picker, on confirmation | the selected tool list |
 
-Scope keys are the same `agent:platform` identifiers used by telemetry — see
-[`channels`](#channels).
+Scope keys are the same `agent:platform` identifiers used by telemetry,
+written on disk as `channels.<agent>.<platform>` — see [`channels`](#channels).
 
 ### Observation mode
 
@@ -117,11 +117,15 @@ plugins:
       settings:
         enabled: true
         log: true
+        agent: ""
         cache_mode: auto
         learned_mode: apply
         auto_shape: true
         auto_shape_interval_hours: 24
         always_carry: []
+        bypass_rate: 0.0
+        always_on_extra: []   # removed knob — warned about, never applied
+        always_off: []        # removed knob — warned about, never applied
         cache_off:
           sticky:
             enabled: true
@@ -149,6 +153,15 @@ use (see [PRIVACY.md](PRIVACY.md)). Set `false` to opt out entirely.
 
 Master switch. When `false`, `register()` short-circuits and no
 monkey-patches are installed — the plugin is a no-op.
+
+### `agent`
+
+Type: `str`. Default: `""`.
+
+Display name for this profile's agent in `configure --status` rows and the
+savings report (e.g. `bernard` on a root profile whose directory identity
+is `default`). `configure --agent` accepts either name. Empty means the
+profile name is used.
 
 ### `log`
 
@@ -382,32 +395,41 @@ observation.
 
 Type: `dict[str, dict]`. Default: `{}`.
 
-Per-scope overrides. Scope keys are `{agent}:{platform}` (e.g.
-`default:telegram` for the root profile). Lookups try the full scope first, then
-fall back to the bare platform segment — so a `telegram` entry still applies
-to `default:telegram` when no more specific entry exists.
+Per-channel overrides, nested on disk as `channels.<agent>.<platform>`
+(Hermes forbids `:` in a settings key segment). The loader flattens them
+to the `agent:platform` scope string telemetry and `learned.json` use.
+Lookups try the full scope first, then fall back to a bare
+`channels.<platform>` entry — so a `slack` entry still applies to
+`default:slack` when no more specific entry exists. Scalar/list keys at
+the agent level (`channels.<agent>.always_carry`) are that agent's
+defaults for every platform; a platform entry wins on conflict.
 
 An explicit plugin `agent` value remains the highest-precedence label. Named
 profiles use their directory name, the root profile uses Hermes' reserved
 `default` label, and calls without any profile context remain unattributed.
 
-Each scope value mirrors the top-level shape and may set any of:
+Each platform value mirrors the top-level shape and may set any of:
 
-- `always_on_extra`
-- `always_off`
 - `learned_mode`
 - `bypass_rate`
+- `always_carry` (additive — union with the global pins, never removes)
+- `auto_shape_interval_hours`
+- `always_on_extra`, `always_off` (removed knobs — warned about, never applied)
 
 ```yaml
 channels:
-  cli:
-    always_on_extra: [terminal, execute_code]
-  default:telegram:
-    learned_mode: recommend
-    always_on_extra: [terminal]
-  slack:
+  default:                 # agent (root profile)
+    always_carry: [terminal]   # every platform of this agent
+    telegram:              # platform
+      learned_mode: recommend
+    cli:
+      auto_shape_interval_hours: 6
+  slack:                   # bare platform: platform-wide fallback
     bypass_rate: 1.0
 ```
+
+A bare-platform entry is recognised by its children being scalars/lists;
+an entry whose children are all mappings is read as an agent.
 
 ---
 
@@ -524,8 +546,8 @@ root. To run a fork:
    [`presets.py`](../presets.py).
 
 To disable narrowing on a scope without removing it, set
-`channels.<scope>.bypass_rate: 1.0` in `config.yaml` rather than
-forking the preset.
+`channels.<agent>.<platform>.bypass_rate: 1.0` in `config.yaml` rather
+than forking the preset.
 
 ---
 

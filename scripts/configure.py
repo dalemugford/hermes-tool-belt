@@ -63,7 +63,6 @@ PLUGIN_DIR = HERE.parent
 #: nest as ``channels.<agent>.<platform>`` on disk (Hermes forbids ``:`` in
 #: a settings key segment); internally they're keyed by scope string.
 CONFIG_PREFIX = "plugins.entries.tool-belt.settings"
-LEGACY_CONFIG_PREFIX = "plugins.tool-belt"
 
 
 def channel_key(scope: str) -> str:
@@ -80,14 +79,23 @@ def _flatten_channels(raw):
     if learned is not None and hasattr(learned, "flatten_channels"):
         return learned.flatten_channels(raw)
     out = {}
-    if isinstance(raw, dict):
-        for key, value in raw.items():
-            if ":" in str(key) or not isinstance(value, dict) or not all(
-                    isinstance(v, dict) for v in value.values()) or not value:
-                out[str(key)] = value
-            else:
-                for platform, cfg in value.items():
-                    out[f"{key}:{platform}"] = cfg
+    if not isinstance(raw, dict):
+        return out
+    for key, value in raw.items():
+        name = str(key)
+        if ":" in name or not isinstance(value, dict):
+            out[name] = value
+            continue
+        platforms = {str(p): v for p, v in value.items() if isinstance(v, dict)}
+        defaults = {str(k): v for k, v in value.items() if not isinstance(v, dict)}
+        if platforms:
+            # channels.<agent>.<platform> — any scalar/list keys sitting at
+            # the agent level are that agent's defaults for every platform
+            # (the platform entry wins on conflict).
+            for platform, cfg in platforms.items():
+                out[f"{name}:{platform}"] = {**defaults, **cfg}
+        else:
+            out[name] = value  # a bare-platform entry (older configs)
     return out
 
 #: Sidecar remembering the per-scope bypass value that observation mode
@@ -1152,7 +1160,7 @@ def _confirm_writes(
         ctx.out(line)
     if not ctx.have_hermes:
         print_manual_commands(writes, ctx.out)
-        return False
+        return False  # preview: callers must not treat this as a decline
     if ctx.dry_run:
         ctx.out("  [dry-run] nothing will be written.")
         return True
@@ -1190,8 +1198,9 @@ def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
         overlay = build_overlay_diff(info, current_assignment(info), proposal,
                                      ceiling=scope_ceiling(info, recs))
         if not _confirm_writes(ctx, f"Changes for {info.scope}:", writes, overlay):
-            ctx.out(f"  Skipped {info.scope}. Nothing written.")
-            declined_any = True
+            if ctx.have_hermes:
+                ctx.out(f"  Skipped {info.scope}. Nothing written.")
+                declined_any = True
             continue
 
         changed = write_learned_overlay(info, recs, dry_run=ctx.dry_run)
@@ -1547,8 +1556,9 @@ def _apply_mode(ctx: RunContext, infos: Sequence[ScopeInfo], mode: str) -> int:
                 "    automatic shaping is paused for it.",
             ]
         if not _confirm_writes(ctx, f"Changes for {info.scope}:", [write], extra):
-            ctx.out(f"  Skipped {info.scope}. Nothing written.")
-            declined_any = True
+            if ctx.have_hermes:
+                ctx.out(f"  Skipped {info.scope}. Nothing written.")
+                declined_any = True
             continue
         ctx.applied.extend(apply_writes([write], ctx.runner, ctx.dry_run, ctx.out))
         applied_any = True
@@ -1975,18 +1985,27 @@ def _main_with_home(args: argparse.Namespace, hermes_home: Path) -> int:
     args.platform = split_platform_args(args.platform)
     infos = discover_scopes(hermes_home, profile_filter, args.platform)
     channels = split_platform_args(args.channel)
-    if channels:
-        # A filter, unlike --platform (a hint for telemetry-less profiles):
-        # a non-interactive --mode run must be able to target ONE channel
-        # instead of every channel the agent has.
-        matched = [i for i in infos if i.platform in set(channels)]
-        if not matched:
-            have = sorted({i.platform for i in infos})
-            ctx.out(f"\n  No channel matching {', '.join(channels)!r}"
-                    + (f" for {profile_filter}" if profile_filter else "") + ".")
-            ctx.out("  Channels found: " + (", ".join(have) or "none"))
+
+    def _filter_channels(scopes: list[ScopeInfo]) -> list[ScopeInfo] | None:
+        # --channel is a filter, unlike --platform (a hint for telemetry-less
+        # profiles): a non-interactive --mode run must be able to target ONE
+        # channel. Applied after fresh-install recovery so an empty install
+        # still gets asked which platforms it runs. None = no match (exit 2).
+        if not channels:
+            return scopes
+        matched = [i for i in scopes if i.platform in set(channels)]
+        if matched:
+            return matched
+        have = sorted({i.platform for i in scopes})
+        ctx.out(f"\n  No channel matching {', '.join(channels)!r}"
+                + (f" for {profile_filter}" if profile_filter else "") + ".")
+        ctx.out("  Channels found: " + (", ".join(have) or "none"))
+        return None
+
+    if infos:
+        infos = _filter_channels(infos)
+        if infos is None:
             return 2
-        infos = matched
 
     # A filter that matches nothing on a populated install is a wrong NAME,
     # not an empty install — say so, and name what exists (M3/P3: the generic
@@ -2024,6 +2043,9 @@ def _main_with_home(args: argparse.Namespace, hermes_home: Path) -> int:
             infos = _recover_fresh_install(ctx, profile_filter, args)
             if not infos:
                 return 0
+            infos = _filter_channels(infos)
+            if infos is None:
+                return 2
 
         if args.reset:
             rc = flow_reset(ctx, infos)
@@ -2038,6 +2060,11 @@ def _main_with_home(args: argparse.Namespace, hermes_home: Path) -> int:
     except Abort:
         ctx.out("\n\n  Stopped. No changes were written.")
         return 0
+    if rc is _BACK:
+        # A non-interactive --mode/--path run declined at its confirm: the
+        # menu's walk-back sentinel has no menu to return to — it is a
+        # clean "nothing written" exit, never a non-int exit code.
+        rc = 0
 
     if ctx.applied:
         ctx.out("\n  Would apply:" if ctx.dry_run else "\n  Applied:")

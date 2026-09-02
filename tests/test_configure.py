@@ -1254,6 +1254,57 @@ class ModeFlagTests(TempHomeTestCase):
                        expanded_tool="terminal", expanded_sessions=12,
                        expanded_calls_each=2)
 
+    def test_declined_non_interactive_run_exits_zero_not_sentinel(self) -> None:
+        # Review find C1: flow_shape/_apply_mode return the menu's _BACK
+        # sentinel when every scope is declined, and they are also the
+        # --mode entry points — main() must translate that to 0, never
+        # leak an object() to sys.exit / the Hermes CLI handler.
+        self._seed()
+        runner = FakeRunner()
+        lines: list[str] = []
+        with contextlib.ExitStack() as stack:
+            for patch in isolate(runner, "/usr/bin/hermes", lines):
+                stack.enter_context(patch)
+            with mock.patch("builtins.input", lambda _p="": "n"):
+                rc = configure.main(["--mode", "off", "--hermes-home",
+                                     str(self.home)])
+        self.assertEqual(rc, 0)
+        self.assertIsInstance(rc, int)
+        self.assertEqual(runner.writes, [])
+
+    def test_preview_mode_without_hermes_exits_zero(self) -> None:
+        # No `hermes` on PATH: _confirm_writes prints the manual commands
+        # and returns False — that is a preview, NOT a decline, so the
+        # run ends 0 and the interactive loop does not re-show the picker.
+        self._seed()
+        runner = FakeRunner()
+        lines: list[str] = []
+        with contextlib.ExitStack() as stack:
+            for patch in isolate(runner, None, lines):
+                stack.enter_context(patch)
+            rc = configure.main(["--mode", "off", "--yes", "--hermes-home",
+                                 str(self.home)])
+        self.assertEqual(rc, 0)
+        self.assertIn("hermes config set", "\n".join(lines))
+        self.assertNotIn("Skipped", "\n".join(lines))
+
+    def test_channel_filter_waits_for_fresh_install_recovery(self) -> None:
+        # Review find C4: on a profile with no telemetry --channel used to
+        # exit 2 before recovery could ask which platforms exist.
+        runner = FakeRunner()
+        lines: list[str] = []
+        answers = iter(["telegram", "n"])  # platforms prompt, then decline
+        with contextlib.ExitStack() as stack:
+            for patch in isolate(runner, "/usr/bin/hermes", lines):
+                stack.enter_context(patch)
+            with mock.patch("builtins.input", lambda _p="": next(answers)):
+                rc = configure.main(["--mode", "off", "--channel", "telegram",
+                                     "--hermes-home", str(self.home)])
+        out = "\n".join(lines)
+        self.assertNotIn("No channel matching", out)
+        self.assertEqual(rc, 0)
+        self.assertIn("default:telegram", out)
+
     def test_channel_filters_to_one_of_the_agents_channels(self) -> None:
         # --platform is only a hint for telemetry-less profiles, so a
         # non-interactive --mode run used to hit EVERY channel the agent

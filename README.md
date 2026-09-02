@@ -132,8 +132,9 @@ hermes tool-belt configure --status
 
 `--status` is read-only. It prints `Tool Belt: enabled|disabled`, then
 an `Agents` list with one row per scope:
-`N. scope  shaping ON/OFF (…)` — the parenthetical shows the learned
-carry/expansion counts once a scope is shaped, `learning` while
+`N. scope  shaping ON/OFF (…)` — the parenthetical shows how many
+tools the scope carries each session beyond its pins and how many are
+available by expansion once a scope is shaped, `learning` while
 evidence is still accumulating, or `observing` when shaping is off.
 
 ### Optional: real-tokenizer counts
@@ -200,12 +201,15 @@ observation mode.
 
 ```yaml
 plugins:
-  tool-belt:
-    channels:
-      default:telegram:
-        bypass_rate: 1.0   # narrowing off on this scope; telemetry stays on
-    # or the plugin entirely:
-    enabled: false
+  entries:
+    tool-belt:
+      settings:
+        channels:
+          default:              # agent (Hermes calls the root profile "default")
+            telegram:           # platform
+              bypass_rate: 1.0  # narrowing off on this scope; telemetry stays on
+        # or the plugin entirely:
+        enabled: false
 ```
 
 Restart the gateway after either. `bypass_rate: 1.0` keeps telemetry
@@ -226,38 +230,44 @@ who wants to drive them directly.
 
 ```yaml
 plugins:
-  tool-belt:
-    enabled: true
-    log: true
+  entries:
+    tool-belt:
+      settings:
+        enabled: true
+        log: true
 
-    # A/B baseline cohort — deterministically ship the full toolset for
-    # a fraction of sessions so savings have a control to compare
-    # against. 1.0 on a scope fully disables narrowing there.
-    bypass_rate: 0.0
+        # A/B baseline cohort — deterministically ship the full toolset
+        # for a fraction of sessions so savings have a control to compare
+        # against. 1.0 on a scope fully disables narrowing there.
+        bypass_rate: 0.0
 
-    # Per-agent always-carry pins: union with the shipped structural
-    # baseline, never demotable, inert for tools Hermes has disabled.
-    always_carry: []
+        # Per-agent always-carry pins: union with the shipped structural
+        # baseline, never demotable, inert for tools Hermes has disabled.
+        always_carry: []
 
-    # Learned overlay: apply (the default) merges learned.json during
-    # preset resolution; recommend is the opt-in observe/trial mode that
-    # never applies it.
-    learned_mode: apply        # apply (default) | recommend
+        # Learned overlay: apply (the default) merges learned.json during
+        # preset resolution; recommend is the opt-in observe/trial mode
+        # that never applies it.
+        learned_mode: apply    # apply (default) | recommend
 
-    # Per-scope overrides
-    channels:
-      default:telegram:        # agent-scoped override
-        learned_mode: recommend
-        always_carry: []       # adds to the global pins (union, never removes)
-        bypass_rate: 0.05      # 5% baseline cohort on this scope only
-      slack:                    # platform-wide fallback
-        bypass_rate: 1.0       # disable narrowing on Slack entirely
+        # Per-channel overrides: channels.<agent>.<platform>
+        channels:
+          default:               # agent
+            always_carry: []     # agent-wide default for every platform below
+            telegram:            # platform
+              learned_mode: recommend
+              bypass_rate: 0.05  # 5% baseline cohort on this scope only
+          slack:                 # bare platform = platform-wide fallback
+            bypass_rate: 1.0     # disable narrowing on Slack entirely
 ```
 
-Scope keys are `{agent}:{platform}`; Hermes calls the root profile
-`default`. Lookups try the full scope first, then fall back to the bare
-platform. The legacy `off` / `auto` / `audit` values for `learned_mode`
-migrate automatically (`off` → `recommend`, `auto`/`audit` → `apply`).
+On disk a scope is `channels.<agent>.<platform>` (Hermes calls the root
+profile `default`, and forbids `:` in a settings key); a bare
+`channels.<platform>` entry is the platform-wide fallback. The plugin
+flattens these to the `agent:platform` scope string used by telemetry and
+`learned.json`. The legacy `off` / `auto` / `audit` values for
+`learned_mode` migrate automatically (`off` → `recommend`, `auto`/`audit`
+→ `apply`).
 
 Every knob — cache-off sticky residency, predictor lookback, dampener
 tuning, learned.json shape, full telemetry field reference — is
@@ -340,8 +350,10 @@ Either:
 
 ```yaml
 plugins:
-  tool-belt:
-    enabled: false
+  entries:
+    tool-belt:
+      settings:
+        enabled: false
 ```
 
 …or remove the directory entirely:

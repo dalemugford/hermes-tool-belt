@@ -48,6 +48,88 @@ class FlattenChannelsTests(unittest.TestCase):
         self.assertEqual(learned.flatten_channels("x"), {})
 
 
+class MixedAgentBlockTests(unittest.TestCase):
+    """Review find C3: `channels.<agent>.always_carry` next to nested
+    platform entries used to demote the whole agent to a bare-platform key,
+    silently disabling its platform overrides. Agent-level scalars are now
+    defaults for every platform; the platform entry wins on conflict."""
+
+    def test_agent_level_scalars_default_into_each_platform(self):
+        flat = learned.flatten_channels({"bernard": {
+            "always_carry": ["terminal"],
+            "learned_mode": "recommend",
+            "telegram": {"learned_mode": "apply"},
+            "slack": {},
+        }})
+        self.assertEqual(flat, {
+            "bernard:telegram": {"always_carry": ["terminal"],
+                                 "learned_mode": "apply"},
+            "bernard:slack": {"always_carry": ["terminal"],
+                              "learned_mode": "recommend"},
+        })
+        # And configure.py's degraded-mode mirror agrees.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "tb_configure_mirror",
+            Path(__file__).resolve().parent.parent / "scripts" / "configure.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod  # dataclasses need the module registered
+        spec.loader.exec_module(mod)
+        with mock.patch.object(mod, "load_learned", lambda: None):
+            self.assertEqual(mod._flatten_channels({"bernard": {
+                "always_carry": ["terminal"],
+                "telegram": {"learned_mode": "apply"}}}),
+                {"bernard:telegram": {"always_carry": ["terminal"],
+                                      "learned_mode": "apply"}})
+
+
+class HarvestReplayConfigTests(unittest.TestCase):
+    """Review find C2: harvest-replay loaded the raw settings block without
+    flattening channels, so every per-channel override was ignored during
+    replay back-tests."""
+
+    def test_replay_config_flattens_nested_channels(self):
+        import importlib.util, tempfile
+        spec = importlib.util.spec_from_file_location(
+            "tb_harvest_replay",
+            Path(__file__).resolve().parent.parent / "scripts" / "harvest-replay.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = mod  # dataclasses need the module registered
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "config.yaml").write_text(
+                "plugins:\n  entries:\n    tool-belt:\n      settings:\n"
+                "        channels:\n          default:\n            telegram:\n"
+                "              learned_mode: recommend\n", encoding="utf-8")
+            cfg = mod._load_plugin_config(home)
+        self.assertEqual(cfg["channels"],
+                         {"default:telegram": {"learned_mode": "recommend"}})
+
+
+class SchemaMirrorsDefaultsTests(unittest.TestCase):
+    """plugin.yaml config_schema must declare every top-level _CONFIG key
+    with a matching default (TESTING.md meta-rule: deployed defaults are
+    pinned, not assumed)."""
+
+    def test_every_config_key_is_declared_with_its_default(self):
+        import yaml
+        manifest = yaml.safe_load(
+            (Path(__file__).resolve().parent.parent / "plugin.yaml").read_text())
+        schema = manifest["config_schema"]
+        missing = set(plugin._CONFIG) - set(schema)
+        self.assertEqual(missing, set(), f"undeclared settings: {sorted(missing)}")
+        from tool_belt_plugin import shaping
+        # Keys resolved outside _CONFIG: compare against the live resolver.
+        resolved = {"auto_shape_interval_hours":
+                    shaping.auto_shape_interval_hours({}, "any:scope")}
+        for key, spec in schema.items():
+            if "default" in spec:
+                actual = plugin._CONFIG.get(key, resolved.get(key))
+                self.assertEqual(spec["default"], actual,
+                                 f"schema default for {key} drifted from code")
+
+
 class _FakeHermesConfig(types.ModuleType):
     def __init__(self, doc):
         super().__init__("hermes_cli.config")

@@ -32,8 +32,8 @@ learning:
 # it into three classes:
 #   A = always_carry ∩ E             immutable residents (never shaped); the
 #                                    effective set also unions the per-agent
-#                                    config pins (plugins.tool-belt.always_carry
-#                                    and channels.<scope>.always_carry)
+#                                    config pins (plugins.entries.tool-belt.settings.
+#                                    always_carry and channels.<agent>.<platform>.always_carry)
 #   C = ((E − A) − demoted) ∪ carry  adaptive residents — EVERYTHING enabled is
 #                                    carried until evidence demotes it; `demoted`
 #                                    and the explicit `carry` promotions live in
@@ -62,7 +62,7 @@ learning:
 #     it back; if a future Hermes re-registers it, users can pin via config.
 #   todo — evidence-ruled since 1.0: demotion is recoverable via expand_tools
 #     and 20 sessions of no-use is real evidence on a chat-only scope. Users
-#     who want it resident can pin it back via plugins.tool-belt.always_carry.
+#     who want it resident can pin it back via plugins.entries.tool-belt.settings.always_carry.
 always_carry:
   # Class 2 — asking the user. No alternative expression; demotion is silent
   # and self-confirming (a demoted clarify yields zero clarify calls forever).

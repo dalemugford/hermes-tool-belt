@@ -106,10 +106,6 @@ def normalize_mode(value: Any) -> str:
 #: ``config_schema`` validation and ``hermes plugins`` all key off it).
 CONFIG_PREFIX = "plugins.entries.tool-belt.settings"
 
-#: The pre-2026.9 location. Never read any more; a block found there is
-#: reported once at load so an operator knows to move it.
-LEGACY_CONFIG_PREFIX = "plugins.tool-belt"
-
 
 def flatten_channels(raw: Any) -> dict[str, Any]:
     """On-disk ``channels`` → the internal ``{"agent:platform": {...}}`` map.
@@ -119,7 +115,9 @@ def flatten_channels(raw: Any) -> dict[str, Any]:
     every consumer keys by the scope string (which is also how telemetry
     and learned.json name scopes), so the loader flattens once here. A
     flat ``"agent:platform"`` key is passed through unchanged (in-memory
-    configs built by tests and scripts already use that form).
+    configs built by tests and scripts already use that form). Scalar/list
+    keys at the agent level (``channels.<agent>.always_carry``) are defaults
+    for every platform of that agent; a platform entry wins on conflict.
     """
     out: dict[str, Any] = {}
     if not isinstance(raw, dict):
@@ -129,10 +127,14 @@ def flatten_channels(raw: Any) -> dict[str, Any]:
         if ":" in name or not isinstance(value, dict):
             out[name] = value
             continue
-        nested = {str(p): v for p, v in value.items() if isinstance(v, dict)}
-        if nested and all(isinstance(v, dict) for v in value.values()):
-            for platform, cfg in nested.items():
-                out[f"{name}:{platform}"] = cfg
+        platforms = {str(p): v for p, v in value.items() if isinstance(v, dict)}
+        defaults = {str(k): v for k, v in value.items() if not isinstance(v, dict)}
+        if platforms:
+            # channels.<agent>.<platform> — any scalar/list keys sitting at
+            # the agent level are that agent's defaults for every platform
+            # (the platform entry wins on conflict).
+            for platform, cfg in platforms.items():
+                out[f"{name}:{platform}"] = {**defaults, **cfg}
         else:
             out[name] = value  # a bare-platform entry (older configs)
     return out

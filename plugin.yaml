@@ -14,9 +14,12 @@ tags: [tools, prompt-caching, optimization, telemetry]
 python_dependencies:
   - "PyYAML>=6.0,<7"
 # Settings live at plugins.entries.tool-belt.settings.* (Hermes' reserved
-# plugin-settings subtree). Per-channel overrides nest as
-# channels.<agent>.<platform>.{learned_mode,bypass_rate,always_carry,
-# auto_shape_interval_hours}; see docs/CONFIGURATION.md.
+# plugin-settings subtree). Every top-level key is declared here; Hermes
+# type-checks the block at gateway load (warnings, never load failures).
+# Per-channel overrides nest as channels.<agent>.<platform>.{learned_mode,
+# bypass_rate,always_carry,auto_shape_interval_hours}; see
+# docs/CONFIGURATION.md. Defaults mirror _CONFIG in __init__.py (locked by
+# tests/test_config_path.py).
 config_schema:
   enabled:
     type: bool
@@ -48,6 +51,22 @@ config_schema:
   always_carry:
     type: list
     description: Tools pinned into every manifest; never shaped.
+  bypass_rate:
+    type: number
+    default: 0.0
+    description: Internal testing feature — fraction of sessions shipped unnarrowed.
+  always_on_extra:
+    type: list
+    description: Removed pre-1.0 knob; a value is warned about and never applied.
+  always_off:
+    type: list
+    description: Removed pre-1.0 knob; a value is warned about and never applied.
+  cache_off:
+    type: dict
+    description: Cache-off pipeline (sticky residency, predictor lookback).
+  cache_auto:
+    type: dict
+    description: Cache-mode auto-detection thresholds.
   channels:
     type: dict
     description: Per-channel overrides, nested channels.<agent>.<platform>.

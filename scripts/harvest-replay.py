@@ -66,6 +66,7 @@ predictor = importlib.import_module("tool_belt_plugin.predictor")
 presets_mod = importlib.import_module("tool_belt_plugin.presets")
 logger_io = importlib.import_module("tool_belt_plugin.logger_io")
 savings_mod = importlib.import_module("tool_belt_plugin.savings")
+learned_mod = importlib.import_module("tool_belt_plugin.learned")
 require_yaml = importlib.import_module("tool_belt_plugin.yaml_required").require_yaml
 
 
@@ -413,6 +414,10 @@ def _load_plugin_config(profile_home: Path) -> dict[str, Any]:
     # harvest is to back-test what WOULD have happened).
     out = dict(dt_cfg)
     out["enabled"] = True
+    if "channels" in out:
+        # register() flattens channels.<agent>.<platform> to the scope-keyed
+        # form every lookup uses; replay must see the same shape.
+        out["channels"] = learned_mod.flatten_channels(out["channels"])
     return out
 
 
