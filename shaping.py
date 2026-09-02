@@ -1604,6 +1604,36 @@ def auto_shape_interval_hours(plugin_config: dict[str, Any], scope: str) -> floa
     return AUTO_SHAPE_DEFAULT_INTERVAL_HOURS
 
 
+def measured_expand_penalty(
+    preds: list[dict[str, Any]],
+    api_calls: list[dict[str, Any]],
+    tool_calls: list[dict[str, Any]],
+    scope: str,
+) -> int | None:
+    """The scope's MEASURED non-caching expand_tools cost, per event.
+
+    The single source of the ``expand_round_trip_tokens`` value every shaping
+    entrypoint must feed :func:`compute_scope_recommendations` — the production
+    ``auto_shape_run`` and the ``shape-ceiling`` / ``configure`` scripts alike.
+    Returns ``None`` on thin data or any measurement error (fail-open): the
+    caller then lands on :data:`EXPAND_ROUND_TRIP_TOKENS`. Pricing an on-demand
+    expansion at that flat fallback instead of the measured figure (tens of
+    thousands of tokens on a long uncached session) makes demotion look far
+    cheaper than it is, so a manual/interactive run must not silently diverge
+    from what production applies.
+    """
+    try:
+        return measure_expand_overhead(
+            preds, api_calls, tool_calls, scope=scope,
+        ).noncaching_per_event
+    except Exception as exc:  # pragma: no cover - defensive fail-open
+        logger.warning(
+            "tool-belt: expand overhead measurement failed for %s "
+            "(fail-open to fallback): %s", scope, exc,
+        )
+        return None
+
+
 def auto_shape_run(
     plugin_config: dict[str, Any],
     state_dir: Path | None = None,
@@ -1728,18 +1758,9 @@ def auto_shape_run(
 
     def _penalty_per_event(scope: str) -> int | None:
         # The scope's measured non-caching expansion cost; None → the
-        # shaper's EXPAND_ROUND_TRIP_TOKENS fallback. Fail-open: a
-        # measurement problem never blocks shaping.
-        try:
-            return measure_expand_overhead(
-                preds, api_call_rows, tool_call_rows, scope=scope,
-            ).noncaching_per_event
-        except Exception as exc:
-            logger.warning(
-                "tool-belt: expand overhead measurement failed for %s "
-                "(fail-open to fallback): %s", scope, exc,
-            )
-            return None
+        # shaper's EXPAND_ROUND_TRIP_TOKENS fallback. Shared with the
+        # shape-ceiling/configure scripts so all entrypoints price alike.
+        return measured_expand_penalty(preds, api_call_rows, tool_call_rows, scope)
 
     per_scope = {
         scope: compute_scope_recommendations(

@@ -823,9 +823,9 @@ def compute_recommendations(info: ScopeInfo, thresholds: dict[str, int]) -> dict
     sessions = grouped.get(info.scope)
     if not sessions:
         return None
-    calls_by_pred = shaper.index_tool_calls_by_prediction(
-        shaper.load_jsonl(info.state_dir / "tool_calls.jsonl")
-    )
+    tool_calls = shaper.load_jsonl(info.state_dir / "tool_calls.jsonl")
+    api_calls = shaper.load_jsonl(info.state_dir / "api_calls.jsonl")
+    calls_by_pred = shaper.index_tool_calls_by_prediction(tool_calls)
     return shaper.compute_scope_recommendations(
         scope=info.scope,
         sessions=sessions,
@@ -837,8 +837,12 @@ def compute_recommendations(info: ScopeInfo, thresholds: dict[str, int]) -> dict
         demote_k=float(thresholds.get("demote_k", 1.5)),
         schema_sizes=shaper.load_schema_sizes(info.state_dir),
         cache_mode=shaper.read_cache_mode(info.state_dir, info.scope),
-        api_call_counts=shaper.index_api_call_counts(
-            shaper.load_jsonl(info.state_dir / "api_calls.jsonl")),
+        api_call_counts=shaper.index_api_call_counts(api_calls),
+        # Price on-demand expansion at the scope's MEASURED cost — same source
+        # as production auto_shape_run — so interactive review never shows a
+        # cheaper-than-reality (over-aggressive) demotion picture.
+        expand_round_trip_tokens=shaper.measured_expand_penalty(
+            preds, api_calls, tool_calls, info.scope),
     )
 
 

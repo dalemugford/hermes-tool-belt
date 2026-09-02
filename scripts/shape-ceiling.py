@@ -136,6 +136,7 @@ merge_into_learned = _shaping.merge_into_learned
 load_schema_sizes = _shaping.load_schema_sizes
 read_cache_mode = _shaping.read_cache_mode
 index_api_call_counts = _shaping.index_api_call_counts
+measured_expand_penalty = _shaping.measured_expand_penalty
 
 
 def _activation_hint(scopes: list[str]) -> str:
@@ -186,6 +187,11 @@ def build_porcelain(
             "sessions_considered": considered,
             "window_requested": int(recs.get("window_requested") or 0),
             "computed_at": recs.get("computed_at"),
+            # The per-event expansion cost that priced this scope's demote/
+            # promote economics — the MEASURED figure (or the fallback on thin
+            # data). Surfaced so a run's aggressiveness is auditable and so the
+            # value is verifiably identical to what auto_shape_run applies.
+            "expand_round_trip_tokens": int(recs.get("expand_round_trip_tokens") or 0),
             "promote": [
                 {
                     "tool": str(p.get("tool") or ""),
@@ -294,7 +300,8 @@ def main() -> int:
     grouped = group_predictions_by_scope_session(preds)
     calls_by_pred = index_tool_calls_by_prediction(tool_calls)
     schema_sizes = load_schema_sizes(state_dir)
-    api_counts = index_api_call_counts(load_jsonl(state_dir / "api_calls.jsonl"))
+    api_calls = load_jsonl(state_dir / "api_calls.jsonl")
+    api_counts = index_api_call_counts(api_calls)
 
     per_scope: dict[str, dict[str, Any]] = {}
     for scope, sessions in grouped.items():
@@ -312,6 +319,8 @@ def main() -> int:
             schema_sizes=schema_sizes,
             cache_mode=read_cache_mode(state_dir, scope),
             api_call_counts=api_counts,
+            expand_round_trip_tokens=measured_expand_penalty(
+                preds, api_calls, tool_calls, scope),
         )
 
     if not per_scope:
