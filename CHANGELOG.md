@@ -8,6 +8,14 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ### Fixed
 
+- **"N carried" now counts what the agent actually carries.** The status
+  row and the shaping preview reported `len(learned.carry)` — only tools
+  promoted *back* from expansion, which is empty right after a shape — so a
+  freshly shaped scope read `0 carried, 53 by expansion`. "Carried" is now
+  the real per-session set beyond pins: enabled ceiling − expand-only −
+  (policy + config) pins. The preview's per-list diff keeps the learned
+  `carry` line under its honest name, `Promoted back to carried`, beneath a
+  `Carried each session (beyond pins): N → M` headline.
 - **`configure` mode picker opens on the current mode.** The "Shaping mode"
   radio list always opened on "On — learning" regardless of the scope's
   `learned_mode`; it now opens on the mode in effect (or, when the chosen

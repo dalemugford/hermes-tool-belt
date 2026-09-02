@@ -247,7 +247,7 @@ class OnboardingArcTests(OnboardingTestCase):
         entry = self.learned()["scopes"][result.scope]
         lines = output.splitlines()
         carry_line = next(
-            l for l in lines if "Tools carried:" in l
+            l for l in lines if "Promoted back to carried:" in l
         )
         expand_line = next(
             l for l in lines if "Tools available by expansion:" in l
@@ -317,7 +317,14 @@ class OnboardingArcTests(OnboardingTestCase):
             ["--status"],
             tc.FakeRunner({f"plugins.tool-belt.channels.{terminal.scope}.learned_mode": "apply"}),
         )
-        self.assertIn(f"{terminal.scope:<24} shaping ON (1 carried", status)
+        # "carried" is the real per-session set beyond pins (ceiling −
+        # expansion − pins), not the promoted-back `carry` list alone.
+        info = infos[terminal.scope]
+        carried = configure.carried_each_session(
+            info, configure.current_assignment(info))
+        self.assertGreater(len(carried), len(self.learned()["scopes"][terminal.scope]["carry"]),
+                           "fixture must have never-demoted tools so the two counts differ")
+        self.assertIn(f"{terminal.scope:<24} shaping ON ({len(carried)} carried", status)
         # The untouched scope defaults ON and has no assignment: learning.
         self.assertIn(f"{browser.scope:<24} shaping ON (learning)", status)
 

@@ -689,11 +689,11 @@ class WriteDisclosureTests(TempHomeTestCase):
         blob = "\n".join(sink)
         # Compact disclosure (Dale): counts, not a per-tool wall. The overlay
         # change is still shown, and still before the ask.
-        self.assertIn("Tools carried:", blob)
+        self.assertIn("Promoted back to carried:", blob)
         self.assertIn("Tools available by expansion:", blob)
 
         overlay_at = next(
-            i for i, l in enumerate(sink) if "Tools carried:" in l
+            i for i, l in enumerate(sink) if "Promoted back to carried:" in l
         )
         prompt_at = next(i for i, l in enumerate(sink) if l.startswith("<<PROMPT>>"))
         self.assertLess(overlay_at, prompt_at, "the overlay diff must precede the ask")
@@ -724,7 +724,7 @@ class WriteDisclosureTests(TempHomeTestCase):
             info.scope
         ]
         # The disclosed COUNT equals what was written (compact-diff contract).
-        carry_line = next(l for l in sink if "Tools carried:" in l)
+        carry_line = next(l for l in sink if "Promoted back to carried:" in l)
         n = len(entry["carry"])
         self.assertTrue(carry_line.rstrip().endswith(f"→ {n}")
                         or carry_line.rstrip().endswith("→ unchanged"),
@@ -1408,6 +1408,28 @@ class StatusRowTests(TempHomeTestCase):
             info, configure.STATE_SHAPED, self.thresholds, index=2)
         self.assertIn("2. default:cli", row)
         self.assertIn("shaping ON (1 carried, 3 by expansion)", row)
+
+    def test_carried_counts_the_real_active_set_beyond_pins(self) -> None:
+        # Dale's read of bernard:telegram "0 carried, 53 by expansion": the
+        # learned `carry` list is only the promoted-back half and is empty
+        # after a fresh shape. "Carried" = ceiling − expand_only − pins:
+        # everything shaping keeps in every session that isn't a pin.
+        (self.home / "config.yaml").write_text(
+            "plugins:\n  tool-belt:\n    always_carry: [terminal]\n",
+            encoding="utf-8")
+        ceiling = ["clarify", "terminal", "todo", "browser_click",
+                   "read_file", "web_search", "patch", "process"]
+        info = self._info({"carry": [],
+                           "expand_only": ["read_file", "web_search", "patch"],
+                           "shaping": {"enabled_tool_names": ceiling}})
+        row = configure.render_status_row(
+            info, configure.STATE_SHAPED, self.thresholds)
+        # 8 enabled − 3 expansion − clarify (policy pin) − terminal (config
+        # pin) = todo, browser_click, process.
+        self.assertIn("shaping ON (3 carried, 3 by expansion)", row)
+        self.assertEqual(
+            configure.carried_each_session(info, configure.current_assignment(info)),
+            ["browser_click", "process", "todo"])
 
     def test_fresh_row_shows_on_learning(self) -> None:
         row = configure.render_status_row(

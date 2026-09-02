@@ -604,18 +604,26 @@ def build_diff(write: ConfigWrite) -> str:
 
 
 def build_overlay_diff(
-    info: ScopeInfo, before: dict[str, list[str]], after: dict[str, list[str]]
+    info: ScopeInfo, before: dict[str, list[str]], after: dict[str, list[str]],
+    ceiling: set[str] | None = None,
 ) -> list[str]:
     """``before → after`` lines for the ``learned.json`` overlay write.
 
     The config diff alone under-discloses: the substantive change a confirmed
     shaping makes is to the learned overlay, not to the two config scalars.
     Every list that changes is shown with its per-tool moves, so nothing is
-    written that did not appear in the diff.
+    written that did not appear in the diff. A headline gives the real
+    carried count (ceiling − expansion − pins) when the ceiling is known.
     """
-    labels = {"carry": "Tools carried",
+    labels = {"carry": "Promoted back to carried",
               "expand_only": "Tools available by expansion"}
     lines: list[str] = []
+    was = carried_each_session(info, before, ceiling)
+    now = carried_each_session(info, after, ceiling)
+    if was is not None and now is not None:
+        change = "unchanged" if was == now else str(len(now))
+        lines.append(f"    :: Carried each session (beyond pins): "
+                     f"{len(was)} → {change}")
     for key in ("carry", "expand_only"):
         old = sorted({str(t) for t in (before.get(key) or [])})
         new = sorted({str(t) for t in (after.get(key) or [])})
@@ -835,6 +843,51 @@ def current_assignment(info: ScopeInfo) -> dict[str, list[str]]:
     return _assignment_of(state, info.scope)
 
 
+def scope_ceiling(info: ScopeInfo, recs: dict[str, Any] | None = None) -> set[str]:
+    """The scope's enabled tool set — what full-start carries before any
+    demotion. From a fresh recommendation when given, else the stamp in
+    ``learned.json``, else the recorded ceilings; empty when unknown."""
+    if recs and recs.get("enabled_tool_names"):
+        return {str(t) for t in recs["enabled_tool_names"]}
+    try:
+        doc = json.loads((info.state_dir / "learned.json").read_text(encoding="utf-8"))
+        entry = (doc.get("scopes") or {}).get(info.scope) or {}
+        names = (entry.get("shaping") or {}).get("enabled_tool_names") or []
+        if names:
+            return {str(t) for t in names}
+    except Exception:
+        pass
+    try:
+        return set(agent_tool_inventory([info]))
+    except Exception:
+        return set()
+
+
+def scope_pins(info: ScopeInfo) -> set[str]:
+    """Policy pins plus the profile's config pins — never counted as carried."""
+    preset = load_base_preset()
+    pins = set(preset.always_carry) if preset else set()
+    # <home>/state/tool-belt → <home>; the profile home, not the agent name.
+    pins.update(read_config_pins(info.state_dir.parent.parent))
+    return pins
+
+
+def carried_each_session(
+    info: ScopeInfo, assignment: dict[str, list[str]],
+    ceiling: set[str] | None = None,
+) -> list[str] | None:
+    """Tools the agent carries in every session BEYOND its pins: the enabled
+    ceiling minus expand-only minus pins. Under full-start that is "never
+    demoted" ∪ "promoted back" — everything shaping says to keep around.
+    The learned ``carry`` list alone is only the promoted-back half and reads
+    "0 carried" on a freshly shaped scope. None when the ceiling is unknown."""
+    ceiling = ceiling if ceiling is not None else scope_ceiling(info)
+    if not ceiling:
+        return None
+    expand = {str(t) for t in assignment.get("expand_only") or []}
+    return sorted(ceiling - expand - scope_pins(info))
+
+
 def proposed_assignment(info: ScopeInfo, recs: dict[str, Any]) -> dict[str, list[str]]:
     """The carrying assignment shaping would write, without writing it.
 
@@ -959,7 +1012,9 @@ def render_status_row(
         carry, expand = assignment["carry"], assignment["expand_only"]
         mode = "ON"
         if carry or expand:
-            detail = f"{len(carry)} carried, {len(expand)} by expansion"
+            carried = carried_each_session(info, assignment)
+            n_carried = len(carry) if carried is None else len(carried)
+            detail = f"{n_carried} carried, {len(expand)} by expansion"
         else:
             detail = "learning"
     overlay_count = _overlay_trigger_count(info)
@@ -1077,7 +1132,8 @@ def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
         # report answers "what did it do".
         proposal = proposed_assignment(info, recs)
         writes = plan_shape_writes(info, ctx.settings(info.scope))
-        overlay = build_overlay_diff(info, current_assignment(info), proposal)
+        overlay = build_overlay_diff(info, current_assignment(info), proposal,
+                                     ceiling=scope_ceiling(info, recs))
         if not _confirm_writes(ctx, f"Changes for {info.scope}:", writes, overlay):
             ctx.out(f"  Skipped {info.scope}. Nothing written.")
             continue
