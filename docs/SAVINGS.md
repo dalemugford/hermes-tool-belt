@@ -107,29 +107,28 @@ sessions skip the observation window. See
 [ARCHITECTURE.md](ARCHITECTURE.md#mode-detection) for the full state
 machine.
 
-## The A/B baseline cohort
+## Bypassed sessions
 
-When `bypass_rate > 0` is set (globally or per-scope in `config.yaml`),
+When `bypass_rate > 0` is set (an internal testing feature — see
+[CONFIGURATION.md](CONFIGURATION.md#bypass_rate-internal-testing-feature)),
 a deterministic fraction of sessions ship the **full toolset** with no
 narrowing. The hash `sha1(scope|session_id)` decides — same session is
-always in or out of the cohort so behavior stays internally consistent.
+always in or out so behavior stays internally consistent.
 
 Bypass rows are written to `predictions.jsonl` with `policy_source:
 "bypass"` and `ceiling_count == narrowed_count` (nothing was narrowed
-by design). They serve as a real control group:
+by design):
 
-- **They are excluded from the cache-on and cache-off savings figures.**
-  Including them would tank the average with rows that intentionally
-  didn't narrow. The headline numbers reflect only the rows where
-  narrowing actually applied.
-- **They appear as their own cohort in the savings report.** The
-  "Bypass cohort" section shows how many sessions ran without
-  narrowing and the full-toolset token volume — the apples-to-apples
-  baseline for "what would the bill look like without Tool Belt?"
+- **They are excluded from the savings figures.** The headline reflects
+  only rows where narrowing actually applied; a bypassed session spends
+  the full manifest and improves no measurement — savings are measured
+  directly per narrowed turn, so no control cohort is needed.
+- **They are counted separately in `--json`** (`bypass` and `pending`
+  keys per agent) for anyone reconciling the raw rows; the text report
+  does not print them.
 
-To turn narrowing off entirely on a scope without disabling the plugin,
-set `bypass_rate: 1.0` on it. To run a small control sample for
-comparison, set `bypass_rate: 0.05` (5% of sessions).
+`bypass_rate: 1.0` is how observation mode turns narrowing off on a
+scope without disabling the plugin.
 
 ## What's excluded
 
@@ -143,9 +142,8 @@ explicitly excluded from the savings figures. They're still logged to
 | `cron` | Hermes' cron runner uses `cron_<hash>_<ts>` session ids and bypasses `pre_gateway_dispatch` entirely; cron jobs get explicit per-job tool sets from Hermes itself. | Tool Belt's narrowing never ran for these. |
 | `subagent` | A subagent (`delegate_task`-spawned) made a tool call inside a parent gateway session. The subagent inherits the parent's tools but doesn't see the prediction context. | Tool Belt's narrowing doesn't apply transitively to subagents. |
 
-If you run the savings report on a profile with heavy cron use, you'll
-see the cron row count as an "Excluded" line. The savings numbers above
-don't include those rows.
+Cron and subagent rows never enter the savings arithmetic — they are
+filtered on `source` before any cohort is built.
 
 ## What we don't claim
 
@@ -233,8 +231,10 @@ The fields most relevant to savings:
 |---|---|---|
 | `ts` | float | Unix timestamp |
 | `prediction_id` | string | Join key for `tool_calls.jsonl` and `api_calls.jsonl` |
-| `session_id` | string | Canonical Hermes session key (`agent:main:<platform>:...`) |
+| `session_id` | string | Canonical Hermes session key (`agent:main:<platform>:...`), constant per chat |
+| `hermes_session_id` | string | Hermes' rotating session UUID — the shaper's distinct-session unit |
 | `scope` | string | `<agent>:<platform>` (e.g. `default:telegram`) |
+| `tokens_estimator` | string | `tiktoken-cl100k` or `chars-div-4` |
 | `ceiling_count` | int | Tools in the platform_toolsets ceiling |
 | `narrowed_count` | int | Tools actually shipped |
 | `ceiling_tokens` | int | Tokenized size of the ceiling toolset |

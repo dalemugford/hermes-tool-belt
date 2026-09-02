@@ -33,7 +33,8 @@ with the normal test suite. End-to-end onboarding coverage lives in
 ### Configure the plugin (start here)
 
 ```bash
-python3 scripts/configure.py            # interactive
+hermes tool-belt configure              # canonical form
+python3 scripts/configure.py            # same code, run directly
 python3 scripts/configure.py --status   # read-only state report
 ```
 
@@ -52,9 +53,9 @@ tools** (a picker over the agent's inventory — selections are written to
   is kept but not applied.
 
 `--status` classifies each scope from its settings: the row shows
-`shaping ON/OFF` with learned carry/expansion counts once a scope is
-shaped, `learning` while evidence accumulates, `observing` when shaping
-is off.
+`shaping ON/OFF` with, once a scope is shaped, how many tools it carries
+each session beyond its pins and how many are available by expansion;
+`learning` while evidence accumulates; `observing` when shaping is off.
 
 Config is written only through `hermes config set` / `hermes config unset`;
 `config.yaml` is never edited directly. Every write is preceded by its
@@ -153,7 +154,7 @@ python3 tests/run_tests.py
 python3 scripts/smoke-test.py
 ```
 
-The smoke test currently checks eight cache-off invariants and five cache-on
+The smoke test currently checks nine cache-off invariants and five cache-on
 invariants, including frozen snapshot reuse and expansion persistence.
 
 ### Rotate telemetry

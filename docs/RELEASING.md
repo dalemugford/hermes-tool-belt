@@ -184,8 +184,10 @@ tail -f "$HERMES_HOME/state/tool-belt/predictions.jsonl" | \
    python3 "$HERMES_HOME/plugins/tool-belt/scripts/shape-ceiling.py" --dry-run
    ```
 
-   Expect per-scope promote/demote candidates and the closing line
-   `[dry-run] No changes written to learned.json`.
+   Expect per-scope promote/demote candidates and a closing
+   `[dry-run] …` line — either `Recommendations differ from learned.json;
+   nothing was written.` or `No changes — recommendations match current
+   learned.json content.` Either is a pass; anything else is not.
 
 10. **Disable and uninstall leave nothing behind.** Set `enabled: false`, then
     remove the directory and confirm Hermes starts clean without it:

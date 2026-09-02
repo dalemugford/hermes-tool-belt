@@ -69,8 +69,9 @@ auto-cache).
 Used for providers without effective prefix caching.
 
 1. On **every dispatch**, the predictor runs against the resolved policy.
-   It produces an allowed set from the union of `always_on` and any
-   triggered groups.
+   It produces an allowed set from the carried strata (`always_carry`
+   pins plus every tool not demoted to expand-only) and any triggered
+   groups.
 2. Recently expanded categories carry forward via **sticky residency** —
    tools admitted by a prior turn's `expand_tools` stay loaded for
    `ttl_turns` further turns without needing re-expansion.
@@ -78,8 +79,8 @@ Used for providers without effective prefix caching.
    (lookback) before running its regex classifier, so short replies like
    `"yes"` or `"go ahead"` inherit intent from the prior turn.
 4. The on-the-wire tool list is the intersection of
-   `(always_on ∪ triggered ∪ expanded ∪ sticky)` with the user's
-   ceiling.
+   `(always_carry ∪ carry ∪ triggered ∪ expanded ∪ sticky)` with the
+   user's ceiling.
 
 Both modes share the safety properties: the ceiling is never widened
 beyond what the user's `platform_toolsets` already allowed, and any
@@ -94,8 +95,10 @@ Configuration:
 
 ```yaml
 plugins:
-  tool-belt:
-    cache_mode: auto    # auto | on | off
+  entries:
+    tool-belt:
+      settings:
+        cache_mode: auto    # auto | on | off
 ```
 
 - `cache_mode: on` and `cache_mode: off` are honored verbatim.
@@ -118,14 +121,16 @@ Tunable under `cache_auto`:
 
 ```yaml
 plugins:
-  tool-belt:
-    cache_auto:
-      detect_calls: 5              # min calls before locking
-      detect_min_input_tokens: 5000 # min cumulative input before locking
-      on_threshold: 0.40
-      providers_off_models:        # known-uncached models, lock immediately
-        - kimi-k2.6:cloud
-        - gpt-5.4-mini
+  entries:
+    tool-belt:
+      settings:
+        cache_auto:
+          detect_calls: 5              # min calls before locking
+          detect_min_input_tokens: 5000 # min cumulative input before locking
+          on_threshold: 0.40
+          providers_off_models:        # known-uncached models, lock immediately
+            - kimi-k2.6:cloud
+            - gpt-5.4-mini
 ```
 
 Locked decisions persist per-scope (`{agent}:{platform}`) to
@@ -150,8 +155,10 @@ The plugin registers two distinct hooks:
 
 - `on_session_end` — fires after every `run_conversation` call (i.e.
   once per turn in multi-turn sessions; the hook's name in Hermes is
-  misleading). The handler **does not evict** the freeze. It only
-  resets the per-turn contextvar and clears sticky / lookback state.
+  misleading). The handler **evicts nothing** — not the freeze, not
+  sticky residency, not the lookback ring (those are session-scoped and
+  self-trim). It resets the per-turn contextvar and runs the debounced
+  auto-shape pass.
 - `on_session_reset` — fires on a true `/reset` or `/new`. The handler
   **evicts** the freeze, the cache-mode detection state, and all
   per-session sticky / lookback state.
@@ -235,9 +242,14 @@ into future sessions' starting ceilings.
 
 ## Between-session shaping
 
-[scripts/shape-ceiling.py](../scripts/shape-ceiling.py) reads
+The shaping engine lives in [shaping.py](../shaping.py). It reads
 `predictions.jsonl` and `tool_calls.jsonl`, groups by scope and session,
-and produces per-scope promote / demote recommendations.
+and produces per-scope promote / demote assignments. It runs in three
+places: the in-process auto-shape pass at session end (the normal path —
+debounced per scope via `auto_shape_stamp.json`, apply-mode scopes only),
+`tool-belt configure --mode history` (interactive, diffed and confirmed),
+and [scripts/shape-ceiling.py](../scripts/shape-ceiling.py) (the CLI
+wrapper for on-demand or scripted runs).
 
 Promote evidence:
 
@@ -319,8 +331,8 @@ wrapper:
 3. Filters `kwargs["tools"]` down to the prediction's allowed set,
    plus any expansions added by `expand_tools` since the prediction
    was set up.
-4. Tools whose names aren't in any policy entry are kept on by default
-   (safe fallback for plugin-provided tools).
+4. Tools no policy or learned entry names are carried (full-start): a
+   newly shipped plugin tool is on the wire until evidence demotes it.
 5. Records per-call hashes for response-side cache correlation.
 6. Under cache-on mode, propagates new expansions back into the
    session's frozen snapshot so they survive into later dispatches.
@@ -350,13 +362,14 @@ In addition to the patches, the plugin registers:
 - `pre_gateway_dispatch` — resolve cache mode, run predictor or reuse
   frozen snapshot, populate the prediction context.
 - `post_tool_call` — log each actual tool call linked by
-  `prediction_id`, with attribution flags (`was_initially_available`,
-  `was_cut`, `was_expanded`, `after_expand_tools`, etc.).
+  `prediction_id`, with attribution (`source`, `was_initially_active`,
+  `was_expand_only`, `activated_by_expansion`, `activation_source`).
 - `post_api_request` — capture per-call cache_read / cache_write
   tokens, run the cache-mode detection state machine, detect cache TTL
   expiry (stable hash + cold cache after >5min idle).
-- `on_session_end` — per-turn cleanup only; does **not** evict the
-  freeze or cache-mode state.
+- `on_session_end` — per-turn: clears the prediction contextvar and
+  runs the debounced in-process auto-shape pass. Evicts **nothing**
+  (freeze, cache-mode, sticky, lookback all survive across turns).
 - `on_session_reset` — true session reset; evicts the freeze, the
   cache-mode state, and all per-session sticky / lookback state.
 
@@ -366,14 +379,15 @@ Each dispatch resolves an effective policy through this chain
 ([presets.py](../presets.py) and [learned.py](../learned.py)):
 
 ```
-User ceiling (platform_toolsets)
-  → Base policy (policy.yaml)
-  → Global always_on_extra / always_off
-  → Per-scope channels.<scope> overrides
-  → Learned overlay (only when learned_mode is apply)
+User ceiling (platform_toolsets)                      E
+  → Base policy (policy.yaml always_carry + triggers)
+  → Config pins (always_carry, global ∪ per-channel)  A = pins ∩ E
+  → Per-channel settings (channels.<agent>.<platform>)
+  → Learned overlay (only when learned_mode is apply) C / X split
+  → Trigger activation (policy ∪ learned overlay)     T = triggered ∩ X
   → expand_tools admissions (per session under cache-on; per turn under cache-off)
   → Sticky residency (cache-off only)
-  → A/B bypass (deterministic per (scope, session_id) when bypass_rate > 0)
+  → Bypass (deterministic per (scope, session_id) when bypass_rate > 0)
 ```
 
 The ceiling is the upper bound. The plugin can only narrow within it,

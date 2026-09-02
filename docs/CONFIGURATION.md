@@ -282,20 +282,16 @@ internally.
 Per-scope override: `channels.<scope>.bypass_rate`. See
 [`_bypass_rate_for_scope`](../__init__.py).
 
-### `always_on_extra`
+### `always_on_extra` / `always_off` (removed)
 
-Type: `list[str]`. Default: `[]`.
+Type: `list[str]`. Default: `[]`. **No effect.**
 
-Tool names *added* to the preset's `always_on` baseline. Applied
-globally; layered before per-scope overrides.
-
-### `always_off`
-
-Type: `list[str]`. Default: `[]`.
-
-Tool names *removed* from the resolved always-on list and from every
-trigger group's tool set. Applied globally; layered before per-scope
-overrides.
+Pre-1.0 knobs from before the full-start carrying model. They are still
+parsed so that a value left in an old config produces one warning at
+load naming the replacement, and are never applied. Use `always_carry`
+to pin a tool; there is no disable list — under full-start a tool
+leaves the carried set only through evidence-driven demotion, and
+Hermes' own `platform_toolsets` is where a tool is removed entirely.
 
 ### `cache_off`
 
@@ -540,7 +536,7 @@ The shipped loader points at the single `policy.yaml` at the plugin
 root. To run a fork:
 
 1. Copy `policy.yaml` to a new file.
-2. Edit `name`, `always_on`, `triggers`, and (optionally) `learning`.
+2. Edit `name`, `always_carry`, `triggers`, and (optionally) `learning`.
 3. Replace `policy.yaml` in place — the loader path is hard-coded to
    `Path(__file__).parent / "policy.yaml"` in
    [`presets.py`](../presets.py).
@@ -576,11 +572,16 @@ the configure flows, and inventory reconciliation — all through
         "window_requested": 100,
         "source": "auto",
         "applied_at": "2026-08-01T00:00:00Z",
+        "last_auto_shape_at": "2026-08-01T00:00:00Z",
+        "enabled_tool_names": ["browser_navigate", "image_generate", "..."],
         "promote": [
-          {"tool": "browser_navigate", "sessions": 4, "calls": 7, "evidence": "expansion"}
+          {"tool": "browser_navigate", "sessions": 4, "calls": 7,
+           "carry_tokens": 9800, "expansion_tokens": 10500, "evidence": "expansion"}
         ],
         "demote": [
-          {"tool": "image_generate", "sessions_without_use": 29, "sessions_with_use": 1, "evidence": "carry_uneconomic", "k": 1.5}
+          {"tool": "image_generate", "sessions_without_use": 29, "sessions_with_use": 1,
+           "uses_in_window": 1, "carry_tokens": 17385, "demote_tokens": 1500,
+           "k": 1.5, "evidence": "carry_uneconomic"}
         ]
       }
     }
@@ -605,9 +606,13 @@ Per scope:
 - `carry` — learned promotions into adaptive residency.
 - `expand_only` — evidence-driven demotions out of residency; the only
   way an enabled tool leaves the full-start carry set.
-- `shaping` — the shaper's rationale block (`promote`, `demote`,
-  economics, `computed_at`, and the apply stamp: `source`
-  `auto|configure` + `applied_at`). Human-readable; nothing at runtime
+- `shaping` — the shaper's rationale block: `promote` / `demote` with
+  per-tool economics (`carry_tokens` vs `expansion_tokens` /
+  `demote_tokens`, `k`, `evidence` ∈ `expansion | carry_unused |
+  carry_uneconomic`), `enabled_tool_names` (the ceiling the pass saw —
+  also what `configure --status` counts "carried" against),
+  `computed_at`, and the apply stamp (`source` `auto|configure`,
+  `applied_at`, `last_auto_shape_at`). Human-readable; nothing at runtime
   branches on it.
 
 > **Learned trigger overlay (schema v2, supersedes the above for triggers).**
@@ -704,20 +709,28 @@ the turn by [`_maybe_log_prediction`](../__init__.py). Schema is the
 
 Key fields:
 
-- `ts`, `prediction_id`, `session_id`, `scope`, `agent`, `platform`
+- `ts`, `prediction_id`, `session_id` (the session *key*, constant per
+  chat), `hermes_session_id` (Hermes' rotating session UUID — the
+  shaper's distinct-session unit), `scope`, `agent`, `platform`, `channel`
 - `message_hash`, `message_preview` — sha1 prefix + first 80 chars.
   Full text is never logged.
-- `preset`, `triggers_fired`, `triggers_suppressed`, `always_on_count`
+- `preset`, `policy_version`, `triggers_fired`, `triggers_suppressed`
 - `ceiling_count` / `narrowed_count` and `ceiling_tokens` /
-  `narrowed_tokens` — before/after the narrowing filter.
-- `ceiling_tools`, `allowed_tools`, `cut_tools`, `unknown_kept_tools`,
-  `always_on_tools`, `expanded_tools`, `sticky_tools`,
-  `sticky_categories`, `sticky_remaining_turns`
+  `narrowed_tokens` / `tokens_saved` / `reduction_pct` — before/after
+  the narrowing filter; `tokens_estimator` names the estimator.
+- Carrying strata (the 1.0 carrying model): `always_carry_tools` (A) and
+  `always_carry_count`, `carry_tools` (C) and `carry_count`,
+  `expand_only_tools` (X = E − (A ∪ C)), `ceiling_tools` (E),
+  `mcp_passthrough_tools` (outside the partition, never shaped).
+- Activation this turn: `active_tools` (what the model saw: A ∪ C ∪ T ∪ R),
+  `trigger_tools_by_group` and `trigger_activated_tools` (T),
+  `expanded_tools` (R), `sticky_tools`, `sticky_categories`,
+  `sticky_remaining_turns`.
 - `policy_source` — `preset`, `learned`, or `bypass`.
-- `policy_version`, `learned_mode`, `learned_scope`, `learned_changes`
+- `learned_mode`, `learned_scope`, `learned_changes`
 - `lookback_used`, `lookback_turns_config`
 - `tool_list_hash` — sha256 prefix of the wire-level tool schemas.
-- `provider`, `model`
+- `provider`, `model`, `schema_version`
 - `frozen_reuse`, `frozen_reuse_count` — true on cache-on dispatches
   after the first, with index within the session.
 
@@ -728,18 +741,20 @@ One row per actual tool call during a session. Written by
 
 Key fields:
 
-- `ts`, `prediction_id`, `session_id`, `tool_name`
+- `ts`, `prediction_id`, `session_id`, `tool_name`, `schema_version`
 - `agent`, `platform`, `scope`
-- `was_initially_available` — was the tool in the pre-sticky baseline?
-- `was_cut` — was the tool present in the ceiling but removed by the
-  narrower?
-- `was_expanded` — did the tool get added via in-turn `expand_tools`?
-- `expand_tools_used`, `expanded_tool`, `expand_category`,
-  `turns_until_used`, `expansion_prediction_id` — populated when the
-  call is a payoff of a prior expansion. Only credited when the tool
-  was *not* initially available.
-- `after_expand_tools`, `expand_resolved_tools`, `expand_tools_added` —
-  context fields when an expansion happened in this turn.
+- `source` — `gateway` (narrowing applied; counts toward savings),
+  `cron`, or `subagent` (never narrowed; excluded — see
+  [SAVINGS.md](SAVINGS.md#whats-excluded)).
+- `was_initially_active` — was the tool in the turn's active set before
+  any expansion?
+- `was_expand_only` — was the tool assigned to the expand-only stratum
+  (the shaper's demotion evidence reads this).
+- `activated_by_expansion` — did an `expand_tools` call make this tool
+  available? The promotion signal.
+- `activation_source` — how the tool came to be active:
+  `always_carry`, `carry`, `full_ceiling` (bypass / no narrowing), or
+  `external` (expansion or trigger).
 - For `tool_name == "expand_tools"`: the row also carries `args` and
   `result` of the meta-tool call.
 

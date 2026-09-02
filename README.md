@@ -18,8 +18,9 @@ may remove tools from a payload and restore them on demand, nothing
 more. Five capabilities:
 
 1. **Adaptive tool narrowing.** Each API call ships only the tools
-   predicted to be relevant. Unfamiliar tools stay available — Tool
-   Belt never silently removes something it doesn't recognize.
+   predicted to be relevant. Every enabled tool starts carried
+   (full-start); only accumulated evidence of non-use ever moves one
+   to expand-only, so Tool Belt never silently drops something new.
 
 2. **Deterministic intent prediction.** A regex/keyword classifier with
    dampeners and an attachment check chooses the relevant tool groups.
@@ -39,8 +40,8 @@ more. Five capabilities:
    IS the promotion vote.**
 
 5. **Safety guarantees.** Fails open — any internal error leaves your
-   full tool set untouched. Never widens the ceiling. Keeps unknown
-   tools available. Isolates all state per session.
+   full tool set untouched. Never widens the ceiling. Demotes only on
+   evidence. Isolates all state per session.
 
 ```text
 User: "search the docs for X and read me the relevant section"
@@ -85,16 +86,22 @@ methodology for measuring your own is in
 
 ## Install and configure
 
-Two commands. Install, then configure:
+Install, enable, configure:
 
 ```bash
-hermes plugins install dalemugford/hermes-tool-belt
+hermes plugins install dalemugford/hermes-tool-belt   # prompts to enable; --enable skips the prompt
+hermes gateway restart
 hermes tool-belt configure
 ```
 
+Standalone plugins are opt-in in Hermes, so the installer asks before
+adding `tool-belt` to `plugins.enabled` (`hermes plugins enable
+tool-belt` later if you said no). The gateway loads plugins at start,
+hence the restart.
+
 `hermes tool-belt configure` and `hermes tool-belt savings` are the
-canonical commands. Onboarding also offers to install a `tool-belt`
-launcher after your first apply (or link it by hand: `mkdir -p
+canonical commands. The **history** path also offers to install a
+`tool-belt` launcher after a confirmed apply (or link it by hand: `mkdir -p
 ~/.local/bin && ln -s ~/.hermes/plugins/tool-belt/tool-belt
 ~/.local/bin/tool-belt`); the launcher takes identical flags and runs
 identical code — pure convenience.
@@ -157,7 +164,7 @@ absolute counts are more accurate with `tiktoken`. See
 After restarting the gateway, confirm it's alive:
 
 ```bash
-tool-belt configure --status
+hermes tool-belt configure --status
 ```
 
 To watch decisions as they happen:
@@ -191,11 +198,13 @@ Protected tools picker in `hermes tool-belt configure` writes the same
 key. Check `hermes tool-belt configure --status` to see what shaping is
 active for that agent.
 
-**"Tools load that I never use."** That's carry cost the shaper will
-eventually demote — or help it along: run
-`python3 ~/.hermes/plugins/tool-belt/analyze.py` for demotion candidates, or
-`tool-belt configure --mode off --agent <agent>` to switch an agent to
-observation mode.
+**"Tools load that I never use."** That's carry cost the in-process
+auto-shape pass demotes once the evidence is there (20 sessions of
+non-use by default). To shape from the sessions already recorded
+instead of waiting, run `hermes tool-belt configure --mode history
+--agent <agent>` and review the diff; `python3
+~/.hermes/plugins/tool-belt/analyze.py` lists the candidates without
+writing anything.
 
 **"I want it off right now."** Two switches, per scope or global:
 
@@ -224,7 +233,7 @@ Methodology and caveats: [docs/SAVINGS.md](docs/SAVINGS.md).
 
 ## Advanced configuration
 
-`configure.py` covers the normal path. Everything it writes is a
+`hermes tool-belt configure` covers the normal path. Everything it writes is a
 documented config key; the underlying knobs stay available for anyone
 who wants to drive them directly.
 
@@ -236,9 +245,9 @@ plugins:
         enabled: true
         log: true
 
-        # A/B baseline cohort — deterministically ship the full toolset
-        # for a fraction of sessions so savings have a control to compare
-        # against. 1.0 on a scope fully disables narrowing there.
+        # Internal testing feature — fraction of sessions shipped with the
+        # full toolset. Savings are measured directly, so leave it at 0.0;
+        # 1.0 on a scope disables narrowing there (observation mode).
         bypass_rate: 0.0
 
         # Per-agent always-carry pins: union with the shipped structural
@@ -256,7 +265,6 @@ plugins:
             always_carry: []     # agent-wide default for every platform below
             telegram:            # platform
               learned_mode: recommend
-              bypass_rate: 0.05  # 5% baseline cohort on this scope only
           slack:                 # bare platform = platform-wide fallback
             bypass_rate: 1.0     # disable narrowing on Slack entirely
 ```
@@ -294,9 +302,12 @@ One mechanism, two cadences, chosen per scope:
   tools, plus every trigger group whose regexes match the message,
   plus expanded/sticky tools, intersected with your configured
   ceiling.
-- **Between sessions**, the shaper reads accumulated `expand_tools`
-  evidence and writes per-tool promote/demote recommendations into
-  `learned.json`, applied at runtime only when `learned_mode: apply`.
+- **Between sessions**, the in-process auto-shape pass (session end,
+  debounced per scope) reads accumulated use and `expand_tools`
+  evidence and writes per-tool promote/demote assignments into
+  `learned.json`; `configure --mode history` and `scripts/shape-ceiling.py`
+  run the same engine on demand. Applied at runtime only when
+  `learned_mode: apply` (the default).
 
 The full lifecycle — hooks, freeze mechanics, compaction handling,
 telemetry joins — is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
@@ -309,8 +320,9 @@ telemetry joins — is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
   the parent's tool curation is inherited; the predictor doesn't run again.
 - **Cron jobs are not narrowed.** Cron sessions get explicit per-job
   toolsets via Hermes' own `_resolve_cron_enabled_toolsets`.
-- **Unknown plugin tools default to always-on.** Tools whose names aren't
-  in the policy's known sets are kept on (safer for shipping new plugins).
+- **New tools start carried.** A tool Hermes enables that no policy or
+  learned entry names is carried on every call until evidence demotes it
+  (full-start) — safe for shipping new plugins, at some carry cost first.
 - **In-memory session state doesn't survive gateway restarts.** Both the
   cache-on frozen snapshot and cache-off sticky residency live in process
   memory. A restart between turns will re-freeze (cache-on) or clear
@@ -394,7 +406,7 @@ latest changes. See [CHANGELOG.md](CHANGELOG.md) for what has changed.
 ├── CHANGELOG.md      # unreleased and tagged user-facing changes
 ├── CONTRIBUTING.md   # contributor workflow and verification rules
 ├── LICENSE           # MIT license
-├── docs/             # architecture, configuration, savings, known issues
+├── docs/             # architecture, configuration, savings, privacy, known issues, releasing
 ├── scripts/          # configure (front door) + operator and verification commands
 └── tests/            # regression and integration tests
 ```

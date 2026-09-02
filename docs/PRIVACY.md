@@ -150,7 +150,10 @@ That removes:
   [`scripts/harvest-replay.py`](../scripts/harvest-replay.py), which
   carry the same hash-plus-preview shape as live rows
 - `learned.json` and `learned_recommendations.json`
-- `cache_mode_detection.json`
+- `cache_mode_detection.json`, `schema_sizes.json` (per-tool schema
+  token sizes — tool names and integers), `auto_shape_stamp.json`
+  (per-scope debounce timestamps), `inventory.json` (tool-absence
+  timestamps for reconciliation)
 - `configure-state.json` (the `scripts/configure.py` sidecar)
 
 One derived artifact lives **outside** the state directory: the
