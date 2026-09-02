@@ -403,7 +403,8 @@ class SharedCursesContractTests(unittest.TestCase):
     def test_radiolist_accepts_the_kwargs_we_pass(self):
         import inspect
         params = inspect.signature(self.ui.curses_radiolist).parameters
-        for name in ("title", "items", "selected", "cancel_returns"):
+        for name in ("title", "items", "selected", "cancel_returns",
+                     "description"):
             self.assertIn(name, params, f"curses_radiolist lost `{name}`")
 
     def test_widget_cancel_maps_to_back_navigation(self):
@@ -412,7 +413,8 @@ class SharedCursesContractTests(unittest.TestCase):
         # sentinel (multi) so callers walk BACK a level instead of writing.
         class FakeUI:
             @staticmethod
-            def curses_radiolist(title, items, selected=0, cancel_returns=None):
+            def curses_radiolist(title, items, selected=0, cancel_returns=None,
+                                 description=None):
                 return cancel_returns
             @staticmethod
             def curses_checklist(title, items, selected, cancel_returns=None,
@@ -430,6 +432,105 @@ class SharedCursesContractTests(unittest.TestCase):
             self.assertIs(
                 configure._curses_multi("t", ["a", "b"], {0}),
                 configure._CURSES_CANCEL, "checklist cancel → sentinel")
+
+    def test_mode_picker_opens_on_the_current_mode(self):
+        # Dale's bug: the radio list always opened on "On — learning"
+        # regardless of the scope's setting. The current mode must be the
+        # preselected row: a recommend (OFF) scope opens on "Off".
+        seen = {}
+
+        class FakeUI:
+            @staticmethod
+            def curses_radiolist(title, items, selected=0, cancel_returns=None,
+                                 description=None):
+                seen["selected"] = selected
+                seen["description"] = description
+                return cancel_returns  # cancel — nothing written
+
+            @staticmethod
+            def curses_checklist(title, items, selected, cancel_returns=None,
+                                 status_fn=None):
+                # Both channels first; cancel on the redisplay after the
+                # mode cancel walks back, so the menu exits.
+                if seen.pop("channels_shown", False):
+                    return cancel_returns
+                seen["channels_shown"] = True
+                return {0, 1}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            state = home / "state" / "tool-belt"
+            state.mkdir(parents=True)
+            seed_telemetry(state, "default:telegram", 3)
+            seed_telemetry(state, "default:slack", 3, append=True)
+            infos = configure.discover_scopes(home)
+            off_all = {"channels": {
+                "default:telegram": {"learned_mode": "recommend"},
+                "default:slack": {"learned_mode": "recommend"}}}
+            ctx = make_ctx(home, FakeRunner(), assume_yes=False,
+                           reader=lambda _p: "", plugin_config=off_all)
+            with mock.patch.object(configure, "_hermes_curses", lambda: FakeUI):
+                self.assertIs(configure._shaping_menu(ctx, "default", infos),
+                              configure._BACK)
+            off_row = [o[1] for o in configure._MODE_OPTIONS].index("off")
+            self.assertEqual(seen["selected"], off_row,
+                             "both channels OFF → picker opens on Off")
+            self.assertIsNone(seen["description"])
+            # Mixed: one ON, one OFF → row 0 plus a per-channel summary.
+            mixed = {"channels": {
+                "default:slack": {"learned_mode": "recommend"}}}
+            ctx = make_ctx(home, FakeRunner(), assume_yes=False,
+                           reader=lambda _p: "", plugin_config=mixed)
+            with mock.patch.object(configure, "_hermes_curses", lambda: FakeUI):
+                configure._shaping_menu(ctx, "default", infos)
+            self.assertEqual(seen["selected"], 0)
+            self.assertIn("slack OFF", seen["description"])
+            self.assertIn("telegram ON", seen["description"])
+
+    def test_channel_checklist_starts_unchecked_and_shows_state(self):
+        # Dale's other bug: every channel came pre-checked, so ENTER on
+        # "slack" applied the mode to slack AND telegram. Rows now start
+        # unchecked, carry their current ON/OFF, and confirming with nothing
+        # checked walks back (no silent write to every channel).
+        seen = {}
+
+        class FakeUI:
+            @staticmethod
+            def curses_checklist(title, items, selected, cancel_returns=None,
+                                 status_fn=None):
+                seen["items"], seen["selected"] = list(items), set(selected)
+                return set()  # ENTER with nothing checked
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            state = home / "state" / "tool-belt"
+            state.mkdir(parents=True)
+            seed_telemetry(state, "default:telegram", 3)
+            seed_telemetry(state, "default:slack", 3, append=True)
+            infos = configure.discover_scopes(home)
+            cfg = {"channels": {"default:slack": {"learned_mode": "recommend"}}}
+            ctx = make_ctx(home, FakeRunner(), assume_yes=False,
+                           reader=lambda _p: "", plugin_config=cfg)
+            with mock.patch.object(configure, "_hermes_curses", lambda: FakeUI):
+                picked = configure._pick_scopes(ctx, infos)
+        self.assertEqual(seen["selected"], set(), "no channel pre-checked")
+        by_platform = {l.split()[0]: l for l in seen["items"]}
+        self.assertIn("shaping OFF", by_platform["slack"])
+        self.assertIn("shaping ON", by_platform["telegram"])
+        self.assertEqual(picked, [], "nothing checked + ENTER = back")
+
+    def test_numbered_fallback_marks_the_current_mode(self):
+        lines = []
+
+        class _Ctx:
+            reader = staticmethod(lambda _p: "")
+            out = staticmethod(lines.append)
+        configure._pick_one(_Ctx(), ["a", "b", "c"], lambda x: x, "Pick",
+                            current=2, description="Currently: x")
+        out = "\n".join(lines)
+        self.assertIn("3. c  (current)", out)
+        self.assertNotIn("1. a  (current)", out)
+        self.assertIn("Currently: x", out)
 
     def test_adapter_gates_on_tty(self):
         # Off a TTY (pipes, tests, --yes) the adapter must decline so the

@@ -922,6 +922,22 @@ def _overlay_trigger_count(info: ScopeInfo) -> int:
     return 0
 
 
+def shaping_is_off(settings: dict[str, Any]) -> bool:
+    """True when the scope is in observation — ``learned_mode: recommend`` or
+    a full-ceiling bypass. Shaping defaults ON, so only an explicit setting
+    reads OFF. The single definition behind the status row's ON/OFF, the
+    channel checklist labels and the mode picker's preselected row."""
+    mode_val = settings.get("learned_mode")
+    bypass = settings.get("scope_bypass_rate")
+    if bypass is None:
+        bypass = settings.get("bypass_rate")
+    bypass_f = _to_float(bypass)
+    return (
+        (mode_val is not None and normalize_mode(mode_val) == "recommend")
+        or (bypass_f is not None and bypass_f >= OBSERVATION_BYPASS)
+    )
+
+
 def render_status_row(
     info: ScopeInfo, state: str, thresholds: dict[str, int], index: int = 1,
     settings: dict[str, Any] | None = None,
@@ -936,17 +952,7 @@ def render_status_row(
     assignment exists, ``learning`` while one is still accumulating,
     ``observing`` when shaping is off.
     """
-    settings = settings or {}
-    mode_val = settings.get("learned_mode")
-    bypass = settings.get("scope_bypass_rate")
-    if bypass is None:
-        bypass = settings.get("bypass_rate")
-    bypass_f = _to_float(bypass)
-    in_observation = (
-        (mode_val is not None and normalize_mode(mode_val) == "recommend")
-        or (bypass_f is not None and bypass_f >= OBSERVATION_BYPASS)
-    )
-    if in_observation:
+    if shaping_is_off(settings or {}):
         mode, detail = "OFF", "observing"
     else:
         assignment = current_assignment(info)
@@ -1247,8 +1253,12 @@ def _hermes_curses():
         return None
 
 
-def _curses_single(title: str, labels: Sequence[str]) -> int | None:
+def _curses_single(title: str, labels: Sequence[str], selected: int = 0,
+                   description: str | None = None) -> int | None:
     """Single-select via the shared radio list. None = unavailable/cancel.
+
+    ``selected`` is the row the cursor starts on (the current setting, so the
+    picker reflects reality rather than always opening on row 0).
 
     Returns the chosen index, ``-1`` on user cancel, or ``None`` when the
     shared UI can't be used (caller then runs its own numbered path).
@@ -1257,8 +1267,8 @@ def _curses_single(title: str, labels: Sequence[str]) -> int | None:
     if ui is None:
         return None
     try:
-        idx = ui.curses_radiolist(title, list(labels), selected=0,
-                                  cancel_returns=-1)
+        idx = ui.curses_radiolist(title, list(labels), selected=selected,
+                                  cancel_returns=-1, description=description)
     except Exception:
         return None
     return idx
@@ -1282,8 +1292,14 @@ def _curses_multi(title: str, labels: Sequence[str], checked: set[int],
         return None
 
 
-def _pick_one(ctx: RunContext, items: Sequence, render, prompt_label: str):
+def _pick_one(ctx: RunContext, items: Sequence, render, prompt_label: str,
+              current: int | None = None, description: str | None = None):
     """Single-pick. Returns the item, or None to cancel.
+
+    ``current`` is the index of the item that is already in effect: the radio
+    list opens on it, and the numbered fallback marks it ``(current)``.
+    ``description`` is context shown under the title (curses) or before the
+    list (numbered).
 
     Uses the shared Hermes radio list on a real terminal; falls back to a
     numbered prompt everywhere else (pipes, tests, no ``hermes_cli``).
@@ -1291,12 +1307,16 @@ def _pick_one(ctx: RunContext, items: Sequence, render, prompt_label: str):
     if len(items) == 1:
         return items[0]
     labels = [render(item) for item in items]
-    picked = _curses_single(f"{prompt_label}:", labels)
+    picked = _curses_single(f"{prompt_label}:", labels,
+                            selected=current or 0, description=description)
     if picked is not None:
         return None if picked < 0 else items[picked]
     ctx.out("")
+    if description:
+        ctx.out(f"  {description}")
     for idx, item in enumerate(items, 1):
-        ctx.out(f"    {idx}. {render(item)}")
+        mark = "  (current)" if idx - 1 == current else ""
+        ctx.out(f"    {idx}. {render(item)}{mark}")
     while True:
         answer = prompt(f"  {prompt_label} (number, or blank to cancel): ",
                         ctx.reader)
@@ -1313,23 +1333,26 @@ def _pick_one(ctx: RunContext, items: Sequence, render, prompt_label: str):
 
 
 def _pick_scopes(ctx: RunContext, infos: Sequence[ScopeInfo]) -> list[ScopeInfo]:
-    """Pick one, several, or all channels for the chosen agent.
+    """Pick one or several channels for the chosen agent.
 
-    Uses the shared Hermes checklist on a real terminal (all channels
-    pre-checked — configuring every channel is the common case); falls back
-    to a numbered/'all' prompt everywhere else.
+    Uses the shared Hermes checklist on a real terminal — every row starts
+    UNCHECKED and shows the channel's current shaping state, so the only
+    channels written are the ones the user pointed at (pre-checking all of
+    them made ENTER apply a mode to every channel at once, which read as a
+    bug). Confirming with nothing checked walks back like ESC. Falls back to
+    a numbered/'all' prompt everywhere else.
     """
     if len(infos) == 1:
         return list(infos)
-    labels = [f"{i.platform}  ({i.sessions} session(s))" for i in infos]
-    chosen = _curses_multi("Channels:", labels, set(range(len(infos))))
+    labels = [_channel_label(ctx, i) for i in infos]
+    chosen = _curses_multi("Channels:", labels, set())
     if chosen is not None:
-        if chosen is _CURSES_CANCEL:
+        if chosen is _CURSES_CANCEL or not chosen:
             return []
         return [infos[i] for i in sorted(chosen)]
     ctx.out("\n  Channels:")
-    for idx, info in enumerate(infos, 1):
-        ctx.out(f"    {idx}. {info.platform}  ({info.sessions} session(s))")
+    for idx, label in enumerate(labels, 1):
+        ctx.out(f"    {idx}. {label}")
     while True:
         answer = prompt("  Numbers (comma-separated) or 'all', blank to cancel: ",
                         ctx.reader).lower()
@@ -1354,6 +1377,18 @@ def _pick_scopes(ctx: RunContext, infos: Sequence[ScopeInfo]) -> list[ScopeInfo]
         if ok and picked:
             return picked
         ctx.out("    Enter numbers from the list, or 'all'.")
+
+
+def _mode_value(ctx: RunContext, info: ScopeInfo) -> str:
+    """The scope's current shaping mode as a :data:`_MODE_OPTIONS` value:
+    ``"off"`` in observation, else ``"learning"`` ("history" is an action,
+    never a resting state)."""
+    return "off" if shaping_is_off(ctx.settings(info.scope)) else "learning"
+
+
+def _channel_label(ctx: RunContext, info: ScopeInfo) -> str:
+    state = "OFF" if _mode_value(ctx, info) == "off" else "ON"
+    return f"{info.platform}  ({info.sessions} session(s))  shaping {state}"
 
 
 def _plan_mode_write(info: ScopeInfo, settings: dict[str, Any],
@@ -1636,10 +1671,22 @@ def _shaping_menu(ctx: RunContext, agent: str,
         selected = _pick_scopes(ctx, agent_scopes)
         if not selected:
             return _BACK  # channel picker cancelled — up to step-2
+        # Open on the mode already in effect; when the chosen channels
+        # disagree, open on row 0 and say what each one is set to.
+        modes = {i.platform: _mode_value(ctx, i) for i in selected}
+        values = [o[1] for o in _MODE_OPTIONS]
+        if len(set(modes.values())) == 1:
+            current = values.index(next(iter(modes.values())))
+            description = None
+        else:
+            current = None
+            description = "Currently: " + ", ".join(
+                f"{p} {'OFF' if m == 'off' else 'ON'}" for p, m in modes.items())
         picked = _pick_one(
             ctx, _MODE_OPTIONS, lambda o: o[0],
             f"Shaping mode for {agent} "
-            f"({', '.join(i.platform for i in selected)})")
+            f"({', '.join(i.platform for i in selected)})",
+            current=current, description=description)
         if picked is None:
             if single_channel:
                 return _BACK  # no channel step to fall back to

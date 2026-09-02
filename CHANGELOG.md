@@ -6,6 +6,18 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`configure` mode picker opens on the current mode.** The "Shaping mode"
+  radio list always opened on "On — learning" regardless of the scope's
+  `learned_mode`; it now opens on the mode in effect (or, when the chosen
+  channels disagree, on row 0 with a `Currently: slack OFF, telegram ON`
+  line). The numbered fallback marks the current row `(current)`.
+- **`configure` channel checklist no longer pre-checks every channel.**
+  ENTER with the cursor on one channel used to apply the mode to all of
+  them. Rows now start unchecked and show each channel's current
+  `shaping ON/OFF`; confirming with nothing checked walks back like ESC.
+
 ## [2026.8.31] - 2026-08-31
 
 The initial public capabilities of the plugin:
