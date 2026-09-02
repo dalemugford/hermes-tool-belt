@@ -285,7 +285,7 @@ class AgentSelectorTests(_HomeCase):
             ceiling=CEILING, turns=[{"user": "old telemetry"}],
         )
         disabled.joinpath("config.yaml").write_text(
-            "plugins:\n  enabled: []\n  tool-belt:\n    enabled: false\n",
+            "plugins:\n  enabled: []\n  entries:\n    tool-belt:\n      settings:\n        enabled: false\n",
             encoding="utf-8",
         )
         self.assertEqual(savings.discover_agents(self.home), [])
@@ -821,7 +821,8 @@ class NoWriteTests(_HomeCase):
         state = self.home / "state" / "tool-belt"
         (state / "learned.json").write_text(
             json.dumps({"version": 2, "scopes": {}}), encoding="utf-8")
-        (self.home / "config.yaml").write_text("plugins:\n  tool-belt:\n    enabled: true\n",
+        (self.home / "config.yaml").write_text(
+            "plugins:\n  entries:\n    tool-belt:\n      settings:\n        enabled: true\n",
                                                encoding="utf-8")
 
     def test_engine_and_cli_never_write(self):

@@ -826,7 +826,7 @@ def effective_always_carry(plugin_config: dict[str, Any], scope: str) -> set[str
     """The full undemotable surface for a scope.
 
     Shipped policy ``always_carry`` (structural baseline) ∪ the per-agent
-    config pins (``plugins.tool-belt.always_carry`` plus the scope's additive
+    config pins (``always_carry`` plus the scope's additive
     ``channels.<scope>.always_carry`` — resolved via
     ``learned.config_always_carry``). Never raises; a load failure degrades
     to whatever half resolved.
@@ -1003,8 +1003,8 @@ def default_config_pin_remover(tool: str) -> bool:
     importable; an equivalent standalone path against ``$HERMES_HOME/
     config.yaml`` with the same atomic-replace semantics is used instead.
 
-    Edits ``plugins.tool-belt.always_carry`` and every
-    ``plugins.tool-belt.channels.<scope>.always_carry`` list. Returns True
+    Edits ``always_carry`` and every ``channels.<agent>.<platform>.
+    always_carry`` list under ``plugins.entries.tool-belt.settings``. Returns True
     when the file changed. Raises on failure — the caller logs a warning and
     skips (never propagates).
     """
@@ -1053,21 +1053,29 @@ def default_config_pin_remover(tool: str) -> bool:
         return False
 
     changed = False
-    plugin_cfg = (doc.get("plugins") or {}).get("tool-belt") \
-        if isinstance(doc.get("plugins"), dict) else None
+    plugin_cfg: Any = doc
+    for part in ("plugins", "entries", "tool-belt", "settings"):
+        plugin_cfg = plugin_cfg.get(part) if isinstance(plugin_cfg, dict) else None
     if isinstance(plugin_cfg, dict):
         pins = plugin_cfg.get("always_carry")
         if isinstance(pins, list) and tool in pins:
             plugin_cfg["always_carry"] = [t for t in pins if t != tool]
             changed = True
-        channels = plugin_cfg.get("channels")
-        if isinstance(channels, dict):
-            for cfg in channels.values():
-                if isinstance(cfg, dict):
-                    ch_pins = cfg.get("always_carry")
-                    if isinstance(ch_pins, list) and tool in ch_pins:
-                        cfg["always_carry"] = [t for t in ch_pins if t != tool]
-                        changed = True
+
+        def _prune(node: Any) -> None:
+            # channels.<agent>.<platform>.always_carry — walk every dict
+            # level so a flat or nested layout is handled alike.
+            nonlocal changed
+            if not isinstance(node, dict):
+                return
+            ch_pins = node.get("always_carry")
+            if isinstance(ch_pins, list) and tool in ch_pins:
+                node["always_carry"] = [t for t in ch_pins if t != tool]
+                changed = True
+            for child in node.values():
+                if isinstance(child, dict):
+                    _prune(child)
+        _prune(plugin_cfg.get("channels"))
     if changed:
         writer(config_path, doc)
     return changed

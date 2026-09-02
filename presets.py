@@ -8,7 +8,7 @@ full-start contract it declares the structural
     never shaped by the learned/adaptive layer (partition class ``A`` once
     intersected with Hermes's enabled built-in ceiling ``E``). The effective
     always_carry set is this shipped structural baseline unioned with the
-    per-agent config pins (``plugins.tool-belt.always_carry`` and additive
+    per-agent config pins (``always_carry`` and additive
     ``channels.<scope>.always_carry``) — the union lives in
     ``learned.apply_to_preset``, the single precedence home.
   - ``triggers``: trigger groups that *activate* an enabled-but-not-resident

@@ -154,10 +154,10 @@ def _activation_hint(scopes: list[str]) -> str:
     if len(agents) > 1:
         lines.append("           (repeat per agent: %s)" % ", ".join(agents[1:]))
     lines.append("  Direct:  hermes config set "
-                 "plugins.tool-belt.channels.<scope>.learned_mode apply")
+                 "plugins.entries.tool-belt.settings.channels.<agent>.<platform>.learned_mode apply")
     for scope in scopes[:5]:
         lines.append("             e.g. hermes config set "
-                     f"plugins.tool-belt.channels.{scope}.learned_mode apply")
+                     f"plugins.entries.tool-belt.settings.channels.{scope.replace(':', '.')}.learned_mode apply")
     return "\n".join(lines)
 
 

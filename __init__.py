@@ -127,7 +127,8 @@ _PREDICTION_CV: contextvars.ContextVar[dict[str, Any] | None] = contextvars.Cont
 _CONFIG: dict[str, Any] = {
     # Zero-config default: hooks are live as soon as Hermes loads the plugin
     # (the `plugins.enabled` list already gates whether the plugin loads at
-    # all). `plugins.tool-belt.enabled: false` is the explicit opt-out; an
+    # all). `plugins.entries.tool-belt.settings.enabled: false` is the
+    # explicit opt-out; an
     # UNSET key must not silently disable every hook while register() still
     # exposes expand_tools (seen live: a dangling expand_tools with no
     # narrowing behind it).
@@ -297,7 +298,19 @@ def _load_user_config() -> None:
     try:
         from hermes_cli.config import load_config, cfg_get  # type: ignore[import-not-found]
         cfg = load_config()
-        plugin_cfg = cfg_get(cfg, "plugins", "tool-belt", default={})
+        # Canonical: the plugin-settings subtree Hermes reserves for every
+        # plugin. The pre-2026.9 `plugins.tool-belt` block is NOT read —
+        # say so once rather than silently ignore an operator's settings.
+        legacy = cfg_get(cfg, "plugins", "tool-belt", default=None)
+        if isinstance(legacy, dict) and legacy:
+            logger.warning(
+                "tool-belt: ignoring settings at plugins.tool-belt — they now "
+                "live under plugins.entries.tool-belt.settings (channels nest "
+                "as channels.<agent>.<platform>); move them and remove the "
+                "old block"
+            )
+        plugin_cfg = cfg_get(cfg, "plugins", "entries", "tool-belt", "settings",
+                             default={})
         if not isinstance(plugin_cfg, dict):
             return
         for key in (
@@ -312,6 +325,9 @@ def _load_user_config() -> None:
         for key in ("channels", "always_on_extra", "always_off"):
             if key in plugin_cfg and plugin_cfg[key] is not None:
                 _CONFIG[key] = plugin_cfg[key]
+        if "channels" in plugin_cfg:
+            from .learned import flatten_channels
+            _CONFIG["channels"] = flatten_channels(plugin_cfg["channels"])
         if isinstance(plugin_cfg.get("cache_off"), dict):
             cache_off = dict(_CONFIG.get("cache_off") or {})
             user_cache_off = plugin_cfg["cache_off"]
@@ -2619,7 +2635,8 @@ def register(ctx) -> None:
     if not _CONFIG.get("enabled", True):
         logger.warning(
             "tool-belt: registered but disabled by config "
-            "(plugins.tool-belt.enabled is false) — hooks inert, no narrowing, "
+            "(plugins.entries.tool-belt.settings.enabled is false) — hooks "
+            "inert, no narrowing, "
             "no telemetry; expand_tools stays registered but idle"
         )
 

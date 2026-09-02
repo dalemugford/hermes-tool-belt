@@ -93,12 +93,15 @@ class ReconcileBase(unittest.TestCase):
     def seed_config_yaml(self):
         (self.home / "config.yaml").write_text(
             "plugins:\n"
-            "  tool-belt:\n"
-            "    enabled: true\n"
-            f"    always_carry: [{GHOST}, {LIVE}]\n"
-            "    channels:\n"
-            f"      {SCOPE}:\n"
-            f"        always_carry: [{GHOST}]\n",
+            "  entries:\n"
+            "    tool-belt:\n"
+            "      settings:\n"
+            "        enabled: true\n"
+            f"        always_carry: [{GHOST}, {LIVE}]\n"
+            "        channels:\n"
+            f"          {SCOPE.split(':')[0]}:\n"
+            f"            {SCOPE.split(':')[1]}:\n"
+            f"              always_carry: [{GHOST}]\n",
             encoding="utf-8",
         )
 

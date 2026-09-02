@@ -6,7 +6,25 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ## [Unreleased]
 
+### Changed
+
+- **Config moved to Hermes' plugin-settings subtree.** Tool Belt's settings
+  now live at `plugins.entries.tool-belt.settings.*` — the path Hermes
+  reserves for every plugin, which `ctx.get_config`, `config_schema`
+  validation and `hermes plugins` all key off — instead of the ad-hoc
+  `plugins.tool-belt.*` block. Per-channel entries nest as
+  `channels.<agent>.<platform>` (Hermes forbids `:` in a settings key
+  segment); the loader flattens them to the `agent:platform` scope string
+  the rest of the plugin uses. A block left at the old path is not read;
+  the plugin logs one warning at load naming the move. `configure` writes
+  only the new path. Migration is a copy of each key with `hermes config
+  set` and an `unset` of the old block (see docs/CONFIGURATION.md).
+
 ### Added
+
+- **`plugin.yaml` declares `python_dependencies` and a `config_schema`**
+  for the top-level settings so `hermes plugins doctor`/`show` can surface
+  them and Hermes can type-check the settings block.
 
 - **`configure --channel <platform>`** restricts a non-interactive `--mode`
   run to one (or several) of the agent's channels; a name matching nothing

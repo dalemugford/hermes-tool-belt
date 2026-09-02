@@ -120,7 +120,7 @@ The shipped defaults are `enabled: true` and `log: true`
 ([`__init__.py:_CONFIG`](../__init__.py)): telemetry — including the
 `message_preview` excerpt (up to 80 characters) and `message_hash`
 described above — is recorded from first use. Two independent opt-out
-switches in the `plugins.tool-belt` block of Hermes' `config.yaml`
+switches in the `plugins.entries.tool-belt.settings` block of Hermes' `config.yaml`
 (see [CONFIGURATION.md](CONFIGURATION.md#log)):
 
 - `log: false` — stops every JSONL writer. All three logging hooks

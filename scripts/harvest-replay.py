@@ -385,7 +385,7 @@ def _load_plugin_config(profile_home: Path) -> dict[str, Any]:
     configuration.
 
     Returns a config dict shaped exactly like what the plugin's
-    register() builds from ``cfg_get("plugins.tool-belt.*")``, with
+    register() builds from ``cfg_get("plugins.entries.tool-belt.settings.*")``, with
     ``enabled: True`` so resolve_preset proceeds. Returns ``{"enabled":
     True}`` (no overrides) if the config file is missing or unparseable —
     matches the live fail-safe behavior.
@@ -402,8 +402,10 @@ def _load_plugin_config(profile_home: Path) -> dict[str, Any]:
         data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
     except Exception:
         return {"enabled": True}
-    plugins = (data.get("plugins") or {}) if isinstance(data.get("plugins"), dict) else {}
-    dt_cfg = plugins.get("tool-belt") or {}
+    dt_cfg = data
+    for part in ("plugins", "entries", "tool-belt", "settings"):
+        dt_cfg = dt_cfg.get(part) if isinstance(dt_cfg, dict) else None
+    dt_cfg = dt_cfg or {}
     if not isinstance(dt_cfg, dict):
         return {"enabled": True}
     # Force-enable for harvest so resolve_preset doesn't short-circuit on

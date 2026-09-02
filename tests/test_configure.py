@@ -185,7 +185,7 @@ class ScopeDiscoveryTests(TempHomeTestCase):
 
 class AgentNameFilterTests(TempHomeTestCase):
     """B1/M3/P3 locks: --agent must accept the agent name the tool itself
-    displays (plugins.tool-belt.agent), not only the profile directory name;
+    displays (plugins.entries.tool-belt.settings.agent), not only the profile directory name;
     a filter miss on a populated install must name what exists and exit 2,
     never claim the install is empty (or silently no-op a --dry-run). B2:
     --platform comma-splits like the interactive prompt. No other tests
@@ -193,7 +193,8 @@ class AgentNameFilterTests(TempHomeTestCase):
 
     def _root_with_configured_name(self, name="bernard"):
         (self.home / "config.yaml").write_text(
-            f"plugins:\n  tool-belt:\n    agent: {name}\n", encoding="utf-8")
+            f"plugins:\n  entries:\n    tool-belt:\n      settings:\n        agent: {name}\n",
+            encoding="utf-8")
         seed_telemetry(self.root_state, f"{name}:telegram", 3)
 
     def test_filter_accepts_configured_agent_name(self) -> None:
@@ -261,7 +262,7 @@ class ConfigureModeFlowTests(TempHomeTestCase):
         self.assertEqual(rc, 0)
         keys = {c[3]: c[4] for c in runner.writes}
         self.assertEqual(
-            keys.get("plugins.tool-belt.channels.default:slack.learned_mode"),
+            keys.get("plugins.entries.tool-belt.settings.channels.default.slack.learned_mode"),
             "recommend", "OFF sets learned_mode=recommend (overlay not applied)")
         self.assertIn("Shaping is OFF", out)
 
@@ -272,7 +273,7 @@ class ConfigureModeFlowTests(TempHomeTestCase):
         self.assertEqual(rc, 0)
         keys = {c[3]: c[4] for c in runner.writes}
         self.assertEqual(
-            keys.get("plugins.tool-belt.channels.default:telegram.learned_mode"),
+            keys.get("plugins.entries.tool-belt.settings.channels.default.telegram.learned_mode"),
             "apply", "learning sets learned_mode=apply")
         # No learned overlay written on the learning path (that's history's job).
         self.assertFalse((self.root_state / "learned.json").exists(),
@@ -292,7 +293,7 @@ class ConfigureModeFlowTests(TempHomeTestCase):
         self.assertIn("load a tighter tool set", out)
         keys = {c[3]: c[4] for c in runner.writes}
         self.assertEqual(
-            keys.get("plugins.tool-belt.channels.default:slack.learned_mode"),
+            keys.get("plugins.entries.tool-belt.settings.channels.default.slack.learned_mode"),
             "apply", "history also sets learned_mode=apply")
 
     def test_cancel_walks_back_one_level_not_quit(self):
@@ -333,7 +334,7 @@ class ConfigureModeFlowTests(TempHomeTestCase):
 class ProtectedToolsFlowTests(TempHomeTestCase):
     """Step-2 'Protected tools': spacebar/numbered picker over the agent's
     observed inventory; policy pins excluded (union-only, not toggleable);
-    result written to plugins.tool-belt.always_carry via the disclosed
+    result written to plugins.entries.tool-belt.settings.always_carry via the disclosed
     confirm. No other test drives the pin-management flow."""
 
     def _seed(self):
@@ -366,8 +367,8 @@ class ProtectedToolsFlowTests(TempHomeTestCase):
         # from the directory identity — pins must still preselect (the
         # profile home comes from the scope's state dir, never the name).
         (self.home / "config.yaml").write_text(
-            "plugins:\n  tool-belt:\n    agent: bernard\n"
-            "    always_carry:\n      - terminal\n", encoding="utf-8")
+            "plugins:\n  entries:\n    tool-belt:\n      settings:\n        agent: bernard\n"
+            "        always_carry:\n          - terminal\n", encoding="utf-8")
         seed_telemetry(self.root_state, "bernard:telegram", 3,
                        always_on=["web_search", "terminal"])
         rc, out, _ = self._run("1\nq\n\n")
@@ -380,7 +381,7 @@ class ProtectedToolsFlowTests(TempHomeTestCase):
         rc, out, runner = self._run("1\n1\n\ny\n")
         self.assertEqual(rc, 0)
         keys = {c[3]: c[4] for c in runner.writes}
-        self.assertIn("plugins.tool-belt.always_carry", keys)
+        self.assertIn("plugins.entries.tool-belt.settings.always_carry", keys)
         self.assertIn("Now protected:", out)
 
     def test_cancel_writes_nothing(self):
@@ -553,14 +554,14 @@ class SharedCursesContractTests(unittest.TestCase):
             reader = staticmethod(lambda _p: (_ for _ in ()).throw(
                 AssertionError("y/n prompt must not run on a TTY")))
             out = staticmethod(lambda _m: None)
-        write = configure.ConfigWrite(key="plugins.tool-belt.x", after="1",
+        write = configure.ConfigWrite(key="plugins.entries.tool-belt.settings.x", after="1",
                                       before=None)
         with mock.patch.object(configure, "_hermes_curses", lambda: FakeUI):
             ok = configure._confirm_writes(_Ctx(), "Changes for a:b:", [write],
                                            ["    :: extra line"])
         self.assertFalse(ok)
         self.assertEqual(seen["items"], ["Apply", "Back"])
-        self.assertIn("plugins.tool-belt.x", seen["description"])
+        self.assertIn("plugins.entries.tool-belt.settings.x", seen["description"])
         self.assertIn(":: extra line", seen["description"])
 
     def test_numbered_fallback_marks_the_current_mode(self):
@@ -810,8 +811,8 @@ class ApplyFlowTests(TempHomeTestCase):
         self.assertEqual(
             emitted,
             {
-                "plugins.tool-belt.channels.default:telegram.learned_mode": "apply",
-                "plugins.tool-belt.channels.default:telegram.bypass_rate": "0.0",
+                "plugins.entries.tool-belt.settings.channels.default.telegram.learned_mode": "apply",
+                "plugins.entries.tool-belt.settings.channels.default.telegram.bypass_rate": "0.0",
             },
         )
         self.assertTrue(all(c[-1] == "--force" for c in runner.writes))
@@ -849,7 +850,7 @@ class ApplyFlowTests(TempHomeTestCase):
         self.assertTrue((named_state / "learned.json").exists())
         self.assertFalse((self.root_state / "learned.json").exists())
         self.assertIn(
-            "plugins.tool-belt.channels.assistant-a:slack.learned_mode",
+            "plugins.entries.tool-belt.settings.channels.assistant-a.slack.learned_mode",
             [c[3] for c in runner.writes],
         )
 
@@ -870,8 +871,8 @@ class ApplyFlowTests(TempHomeTestCase):
         self.assertEqual(
             emitted,
             {
-                "plugins.tool-belt.channels.default:telegram.learned_mode": "recommend",
-                "plugins.tool-belt.channels.default:telegram.bypass_rate": "1.0",
+                "plugins.entries.tool-belt.settings.channels.default.telegram.learned_mode": "recommend",
+                "plugins.entries.tool-belt.settings.channels.default.telegram.bypass_rate": "1.0",
             },
         )
         self.assertEqual(configure.previous_full_ceiling_rate(self.root_state, "default:telegram"), 0.05)
@@ -928,8 +929,8 @@ class ResetFlowTests(TempHomeTestCase):
         self.assertEqual(
             emitted,
             {
-                "plugins.tool-belt.channels.default:telegram.learned_mode": "recommend",
-                "plugins.tool-belt.channels.default:telegram.bypass_rate": "0.05",
+                "plugins.entries.tool-belt.settings.channels.default.telegram.learned_mode": "recommend",
+                "plugins.entries.tool-belt.settings.channels.default.telegram.bypass_rate": "0.05",
             },
         )
         learned = json.loads((self.root_state / "learned.json").read_text())
@@ -943,7 +944,7 @@ class ResetFlowTests(TempHomeTestCase):
         ctx = make_ctx(self.home, runner, assume_yes=True, thresholds=self.thresholds)
         configure.flow_reset(ctx, [info])
         emitted = {c[3]: c[4] for c in runner.writes}
-        self.assertEqual(emitted["plugins.tool-belt.channels.default:telegram.bypass_rate"], "0.0")
+        self.assertEqual(emitted["plugins.entries.tool-belt.settings.channels.default.telegram.bypass_rate"], "0.0")
 
     def test_reset_leaves_other_scopes_alone(self) -> None:
         info = self._shaped_scope()
@@ -1103,8 +1104,8 @@ class FreshInstallFrontDoorTests(TempHomeTestCase):
         self.assertEqual(
             {c[3]: c[4] for c in runner.writes},
             {
-                "plugins.tool-belt.channels.default:telegram.learned_mode": "recommend",
-                "plugins.tool-belt.channels.default:telegram.bypass_rate": "1.0",
+                "plugins.entries.tool-belt.settings.channels.default.telegram.learned_mode": "recommend",
+                "plugins.entries.tool-belt.settings.channels.default.telegram.bypass_rate": "1.0",
             },
         )
 
@@ -1171,26 +1172,26 @@ class DegradedModeTests(TempHomeTestCase):
 class ConfigReadTests(unittest.TestCase):
     def test_not_set_sentinel_reads_as_none(self) -> None:
         runner = FakeRunner()
-        self.assertIsNone(configure.hermes_config_get("plugins.tool-belt.nope", runner=runner))
+        self.assertIsNone(configure.hermes_config_get("plugins.entries.tool-belt.settings.nope", runner=runner))
 
     def test_scalar_value_is_returned_verbatim(self) -> None:
-        runner = FakeRunner({"plugins.tool-belt.learned_mode": "apply"})
+        runner = FakeRunner({"plugins.entries.tool-belt.settings.learned_mode": "apply"})
         self.assertEqual(
-            configure.hermes_config_get("plugins.tool-belt.learned_mode", runner=runner), "apply"
+            configure.hermes_config_get("plugins.entries.tool-belt.settings.learned_mode", runner=runner), "apply"
         )
 
     def test_nonzero_returncode_reads_as_none(self) -> None:
-        runner = FakeRunner({"plugins.tool-belt.learned_mode": "apply"}, returncode=2)
+        runner = FakeRunner({"plugins.entries.tool-belt.settings.learned_mode": "apply"}, returncode=2)
         self.assertIsNone(
-            configure.hermes_config_get("plugins.tool-belt.learned_mode", runner=runner)
+            configure.hermes_config_get("plugins.entries.tool-belt.settings.learned_mode", runner=runner)
         )
 
     def test_block_is_parsed_into_a_dict(self) -> None:
         runner = FakeRunner(
             {
-                "plugins.tool-belt": (
+                "plugins.entries.tool-belt.settings": (
                     "enabled: true\nlearned_mode: recommend\n"
-                    "channels:\n  default:telegram:\n    bypass_rate: 1.0\n"
+                    "channels:\n  default:\n    telegram:\n      bypass_rate: 1.0\n"
                 )
             }
         )
@@ -1201,8 +1202,8 @@ class ConfigReadTests(unittest.TestCase):
     def test_scope_settings_falls_back_to_scalar_reads(self) -> None:
         runner = FakeRunner(
             {
-                "plugins.tool-belt.channels.default:telegram.bypass_rate": "1.0",
-                "plugins.tool-belt.learned_mode": "recommend",
+                "plugins.entries.tool-belt.settings.channels.default.telegram.bypass_rate": "1.0",
+                "plugins.entries.tool-belt.settings.learned_mode": "recommend",
             }
         )
         settings = configure.scope_settings("default:telegram", {}, runner=runner)
@@ -1265,7 +1266,7 @@ class ModeFlagTests(TempHomeTestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(
             {c[3] for c in runner.writes},
-            {"plugins.tool-belt.channels.default:slack.learned_mode"},
+            {"plugins.entries.tool-belt.settings.channels.default.slack.learned_mode"},
             "only the named channel is written")
         rc, out, runner = self._run(["--mode", "off", "--channel", "discord"])
         self.assertEqual(rc, 2)
@@ -1279,7 +1280,7 @@ class ModeFlagTests(TempHomeTestCase):
         modes = {c[3]: c[4] for c in runner.writes}
         self.assertEqual(
             modes,
-            {"plugins.tool-belt.channels.default:telegram.learned_mode":
+            {"plugins.entries.tool-belt.settings.channels.default.telegram.learned_mode":
              "apply"})
         self.assertFalse((self.root_state / "learned.json").exists(),
                          "learning mode must not run a history shape")
@@ -1293,7 +1294,7 @@ class ModeFlagTests(TempHomeTestCase):
                  if c[3].endswith("learned_mode")}
         self.assertEqual(
             modes,
-            {"plugins.tool-belt.channels.default:telegram.learned_mode":
+            {"plugins.entries.tool-belt.settings.channels.default.telegram.learned_mode":
              "apply"})
 
     def test_mode_off_writes_recommend_and_keeps_overlay(self) -> None:
@@ -1304,7 +1305,7 @@ class ModeFlagTests(TempHomeTestCase):
         modes = {c[3]: c[4] for c in runner.writes}
         self.assertEqual(
             modes,
-            {"plugins.tool-belt.channels.default:telegram.learned_mode":
+            {"plugins.entries.tool-belt.settings.channels.default.telegram.learned_mode":
              "recommend"})
         doc = json.loads((self.root_state / "learned.json").read_text())
         self.assertIn("default:telegram", doc["scopes"],
@@ -1383,7 +1384,7 @@ class ResetArgvWiringTests(TempHomeTestCase):
                  if c[3].endswith("learned_mode")}
         self.assertEqual(
             modes,
-            {"plugins.tool-belt.channels.default:telegram.learned_mode":
+            {"plugins.entries.tool-belt.settings.channels.default.telegram.learned_mode":
              "recommend"})
 
 
@@ -1478,7 +1479,7 @@ class StatusRowTests(TempHomeTestCase):
         # after a fresh shape. "Carried" = ceiling − expand_only − pins:
         # everything shaping keeps in every session that isn't a pin.
         (self.home / "config.yaml").write_text(
-            "plugins:\n  tool-belt:\n    always_carry: [terminal]\n",
+            "plugins:\n  entries:\n    tool-belt:\n      settings:\n        always_carry: [terminal]\n",
             encoding="utf-8")
         ceiling = ["clarify", "terminal", "todo", "browser_click",
                    "read_file", "web_search", "patch", "process"]

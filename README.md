@@ -109,7 +109,7 @@ without your explicit confirmation.
 Interactively you pick an agent, then one of two areas:
 
 1. **Protected tools** — a picker over the agent's tool inventory.
-   Selected tools are written to `plugins.tool-belt.always_carry`:
+   Selected tools are written to `plugins.entries.tool-belt.settings.always_carry`:
    always carried, never shaped.
 2. **Tool shaping options** — pick channels, then a mode:
    - **learning** — shaping on (`learned_mode: apply`); the plugin
@@ -184,8 +184,8 @@ tool, or switch an agent's mode.
 **"A tool I need isn't loading."** The model should call
 `expand_tools(category=...)` to recover it — that's the designed path,
 and repeated use gets the category promoted in future sessions. For an
-immediate, permanent fix, pin it with `plugins.tool-belt.always_carry:
-[tool_name]` (global, or additively under `channels.<scope>.`) — the
+immediate, permanent fix, pin it with `plugins.entries.tool-belt.settings.always_carry:
+[tool_name]` (global, or additively under `channels.<agent>.<platform>.`) — the
 Protected tools picker in `hermes tool-belt configure` writes the same
 key. Check `hermes tool-belt configure --status` to see what shaping is
 active for that agent.

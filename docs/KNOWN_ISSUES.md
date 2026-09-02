@@ -110,3 +110,16 @@ or is replaced on the next reset of the owning chat.
 Hermes-core hook-contract change so `on_session_reset` passes the
 canonical session key directly; a per-platform heuristic inside the
 plugin cannot disambiguate concurrent chats on the same platform.
+
+### `pre_gateway_dispatch` is not in Hermes' documented hook table
+
+Tool Belt registers five hooks; four (`post_tool_call`, `post_api_request`,
+`on_session_end`, `on_session_reset`) appear in the plugin developer guide's
+hook table with a stated compatibility promise. `pre_gateway_dispatch` is
+real — `hermes_cli/plugins.py`, `gateway/run.py`, and an upstream test cover
+it — but undocumented, so it carries a weaker stability promise. The plugin
+already registers it fail-open (a missing or renamed hook costs only the
+gateway-dispatch freeze/eviction path, never tool registration); if it
+disappears upstream, `KNOWN_ISSUES` gains a "gateway freeze" entry and the
+session-start hook becomes the fallback.
+

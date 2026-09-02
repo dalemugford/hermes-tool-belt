@@ -16,7 +16,7 @@ shaping mode —
                     tool set, the learned overlay is kept but not applied.
 
 The agent step also offers a Protected-tools picker that pins tools as
-always-carried (``plugins.tool-belt.always_carry``). ``--status`` classifies
+always-carried (the ``always_carry`` setting). ``--status`` classifies
 each scope (fresh / observing / ready / shaped) for reporting only.
 
 Config is written **only** through ``hermes config set`` / ``hermes config
@@ -58,8 +58,37 @@ from typing import Any, Callable, Sequence
 HERE = Path(__file__).resolve().parent
 PLUGIN_DIR = HERE.parent
 
-#: Root of the plugin's live config block inside ``~/.hermes/config.yaml``.
-CONFIG_PREFIX = "plugins.tool-belt"
+#: Root of the plugin's live config block inside ``~/.hermes/config.yaml`` —
+#: the plugin-settings subtree Hermes reserves for every plugin. Channels
+#: nest as ``channels.<agent>.<platform>`` on disk (Hermes forbids ``:`` in
+#: a settings key segment); internally they're keyed by scope string.
+CONFIG_PREFIX = "plugins.entries.tool-belt.settings"
+LEGACY_CONFIG_PREFIX = "plugins.tool-belt"
+
+
+def channel_key(scope: str) -> str:
+    """``agent:platform`` → the on-disk ``channels.<agent>.<platform>`` path
+    (relative to :data:`CONFIG_PREFIX`)."""
+    return "channels." + str(scope).replace(":", ".")
+
+
+def _flatten_channels(raw):
+    """On-disk nested channels → internal ``{"agent:platform": cfg}``; see
+    ``learned.flatten_channels`` (used when importable, mirrored here so the
+    script degrades without the package)."""
+    learned = load_learned()
+    if learned is not None and hasattr(learned, "flatten_channels"):
+        return learned.flatten_channels(raw)
+    out = {}
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            if ":" in str(key) or not isinstance(value, dict) or not all(
+                    isinstance(v, dict) for v in value.values()) or not value:
+                out[str(key)] = value
+            else:
+                for platform, cfg in value.items():
+                    out[f"{key}:{platform}"] = cfg
+    return out
 
 #: Sidecar remembering the per-scope bypass value that observation mode
 #: replaced, so a reset can restore it. Deliberately *not* ``learned.json`` —
@@ -202,7 +231,7 @@ class ScopeInfo:
 
     @property
     def config_prefix(self) -> str:
-        return f"{CONFIG_PREFIX}.channels.{self.scope}"
+        return f"{CONFIG_PREFIX}.{channel_key(self.scope)}"
 
 
 def default_hermes_home() -> Path:
@@ -210,7 +239,7 @@ def default_hermes_home() -> Path:
 
 
 def configured_agent_name(profile_home: Path) -> str:
-    """The profile's ``plugins.tool-belt.agent`` config value, or ''.
+    """The profile's ``agent`` setting, or ''.
 
     This is the agent name the tool's own output (status rows, savings
     report) shows for the profile — e.g. ``bernard`` on a root profile whose
@@ -221,7 +250,7 @@ def configured_agent_name(profile_home: Path) -> str:
         yaml = require_yaml()
         raw = yaml.safe_load((profile_home / "config.yaml").read_text(
             encoding="utf-8")) or {}
-        name = ((raw.get("plugins") or {}).get("tool-belt") or {}).get("agent")
+        name = _settings_block(raw).get("agent")
         if isinstance(name, str) and name.strip():
             return name.strip()
     except SystemExit:
@@ -381,8 +410,17 @@ def hermes_config_get(key: str, runner: Runner = _default_runner) -> str | None:
     return out
 
 
+def _settings_block(raw: Any) -> dict[str, Any]:
+    """``plugins.entries.tool-belt.settings`` out of a parsed config.yaml."""
+    node = raw
+    for part in ("plugins", "entries", "tool-belt", "settings"):
+        node = node.get(part) if isinstance(node, dict) else None
+    return node if isinstance(node, dict) else {}
+
+
 def read_plugin_config(runner: Runner = _default_runner) -> dict[str, Any]:
-    """Read the whole ``plugins.tool-belt`` block as a dict.
+    """Read the whole settings block (:data:`CONFIG_PREFIX`) as a dict, with
+    channels flattened to the internal scope-keyed form.
 
     Returns ``{}`` when the block is unset or unparseable. A *missing PyYAML*
     is not a degraded mode: it means the wrong interpreter, and
@@ -398,7 +436,11 @@ def read_plugin_config(runner: Runner = _default_runner) -> dict[str, Any]:
         data = yaml.safe_load(raw)
     except Exception:
         return {}
-    return data if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        return {}
+    if "channels" in data:
+        data["channels"] = _flatten_channels(data["channels"])
+    return data
 
 
 def _to_float(value: Any) -> float | None:
@@ -430,7 +472,7 @@ def scope_settings(
             "scope_bypass_rate": _to_float(entry.get("bypass_rate")),
             "configured": bool(entry) or bool(plugin_config),
         }
-    prefix = f"{CONFIG_PREFIX}.channels.{scope}"
+    prefix = f"{CONFIG_PREFIX}.{channel_key(scope)}"
     scope_mode = hermes_config_get(f"{prefix}.learned_mode", runner=runner)
     scope_bypass = _to_float(hermes_config_get(f"{prefix}.bypass_rate", runner=runner))
     global_mode = hermes_config_get(f"{CONFIG_PREFIX}.learned_mode", runner=runner)
@@ -1516,7 +1558,7 @@ def _apply_mode(ctx: RunContext, infos: Sequence[ScopeInfo], mode: str) -> int:
 
 
 def read_config_pins(profile_home: Path) -> list[str]:
-    """The profile's ``plugins.tool-belt.always_carry`` config pins.
+    """The profile's ``always_carry`` config pins.
 
     Read directly from config.yaml (read-only; every WRITE still goes through
     ``hermes config set`` — Hermes owns the file).
@@ -1525,7 +1567,7 @@ def read_config_pins(profile_home: Path) -> list[str]:
         yaml = require_yaml()
         raw = yaml.safe_load((profile_home / "config.yaml").read_text(
             encoding="utf-8")) or {}
-        pins = ((raw.get("plugins") or {}).get("tool-belt") or {}).get("always_carry")
+        pins = _settings_block(raw).get("always_carry")
         if isinstance(pins, list):
             return [str(p) for p in pins if str(p).strip()]
     except SystemExit:
@@ -1622,7 +1664,7 @@ def flow_protected(ctx: RunContext, agent: str,
     Policy pins are shown as a note and are not toggleable (union-only:
     users add pins, never remove shipped ones). The toggle list is the
     agent's observed tool inventory; checked = current config pins. The
-    result is written to ``plugins.tool-belt.always_carry`` via
+    result is written to the ``always_carry`` setting via
     ``hermes config set`` after the usual disclosed confirm.
     """
     # Profile home from the scope's state dir (<home>/state/tool-belt) —

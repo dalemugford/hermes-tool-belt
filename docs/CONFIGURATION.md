@@ -44,7 +44,7 @@ a `before → after` line first and requires confirmation.
 
 `configure` is a mode-setter: pick the agent, then either its
 **Protected tools** (a picker whose selections are written to
-`plugins.tool-belt.always_carry`) or **Tool shaping options** — channels,
+`plugins.entries.tool-belt.settings.always_carry`) or **Tool shaping options** — channels,
 then a mode. Non-interactively: `--agent <name> --mode learning|history|off`,
 optionally `--channel <platform>` to target one channel (defaults to all).
 
@@ -53,12 +53,12 @@ its own:
 
 | Key | Written when | Value |
 |---|---|---|
-| `plugins.tool-belt.channels.<scope>.learned_mode` | mode learning / history | `apply` |
-| `plugins.tool-belt.channels.<scope>.learned_mode` | mode off, reset | `recommend` |
-| `plugins.tool-belt.channels.<scope>.bypass_rate` | observation (legacy recommend path) | `1.0` (full observation) |
-| `plugins.tool-belt.channels.<scope>.bypass_rate` | mode history, on acceptance | `0.0` (narrow immediately) |
-| `plugins.tool-belt.channels.<scope>.bypass_rate` | reset | the value observation mode replaced, default `0.0` |
-| `plugins.tool-belt.always_carry` | Protected-tools picker, on confirmation | the selected tool list |
+| `plugins.entries.tool-belt.settings.channels.<agent>.<platform>.learned_mode` | mode learning / history | `apply` |
+| `plugins.entries.tool-belt.settings.channels.<agent>.<platform>.learned_mode` | mode off, reset | `recommend` |
+| `plugins.entries.tool-belt.settings.channels.<agent>.<platform>.bypass_rate` | observation (legacy recommend path) | `1.0` (full observation) |
+| `plugins.entries.tool-belt.settings.channels.<agent>.<platform>.bypass_rate` | mode history, on acceptance | `0.0` (narrow immediately) |
+| `plugins.entries.tool-belt.settings.channels.<agent>.<platform>.bypass_rate` | reset | the value observation mode replaced, default `0.0` |
+| `plugins.entries.tool-belt.settings.always_carry` | Protected-tools picker, on confirmation | the selected tool list |
 
 Scope keys are the same `agent:platform` identifiers used by telemetry — see
 [`channels`](#channels).
@@ -98,34 +98,46 @@ harmless — a reset then restores the shipped default of `0.0`.
 
 ## `config.yaml` reference
 
-User config lives under the `plugins.tool-belt` key of Hermes'
-`config.yaml`. The loader is
+User config lives under `plugins.entries.tool-belt.settings` in Hermes'
+`config.yaml` — the plugin-settings subtree Hermes reserves for every
+plugin (`ctx.get_config`, `config_schema` validation and `hermes plugins`
+all key off it). Per-channel entries nest as
+`channels.<agent>.<platform>` because Hermes forbids `:` in a settings
+key segment; the loader flattens them to the `agent:platform` scope
+string every other file (telemetry, `learned.json`) uses. A block left at
+the pre-2026.9 location `plugins.tool-belt` is **not read**; the plugin
+logs one warning at load naming the move. The loader is
 [`_load_user_config`](../__init__.py); defaults come from the
 `_CONFIG` dict in the same file.
 
 ```yaml
 plugins:
-  tool-belt:
-    enabled: true
-    log: true
-    cache_mode: auto
-    learned_mode: apply
-    auto_shape: true
-    auto_shape_interval_hours: 24
-    always_carry: []
-    cache_off:
-      sticky:
+  entries:
+    tool-belt:
+      settings:
         enabled: true
-        ttl_turns: 3
-        categories: [terminal, file, browser, web, code_execution, delegation]
-      predictor:
-        lookback_turns: 1
-    cache_auto:
-      detect_calls: 5
-      detect_min_input_tokens: 5000
-      on_threshold: 0.40
-      providers_off_models: ["kimi-k2.6:cloud", "gpt-5.4-mini"]
-    channels: {}
+        log: true
+        cache_mode: auto
+        learned_mode: apply
+        auto_shape: true
+        auto_shape_interval_hours: 24
+        always_carry: []
+        cache_off:
+          sticky:
+            enabled: true
+            ttl_turns: 3
+            categories: [terminal, file, browser, web, code_execution, delegation]
+          predictor:
+            lookback_turns: 1
+        cache_auto:
+          detect_calls: 5
+          detect_min_input_tokens: 5000
+          on_threshold: 0.40
+          providers_off_models: ["kimi-k2.6:cloud", "gpt-5.4-mini"]
+        channels:
+          bernard:            # <agent>
+            telegram:         # <platform>
+              learned_mode: apply
 ```
 
 ### `enabled`

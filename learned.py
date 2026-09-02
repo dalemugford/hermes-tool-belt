@@ -101,6 +101,43 @@ def normalize_mode(value: Any) -> str:
     return mode if mode in _ALLOWED_MODES else DEFAULT_MODE
 
 
+#: Where Tool Belt's settings live in Hermes' config.yaml — the plugin
+#: settings subtree Hermes reserves for every plugin (``ctx.get_config``,
+#: ``config_schema`` validation and ``hermes plugins`` all key off it).
+CONFIG_PREFIX = "plugins.entries.tool-belt.settings"
+
+#: The pre-2026.9 location. Never read any more; a block found there is
+#: reported once at load so an operator knows to move it.
+LEGACY_CONFIG_PREFIX = "plugins.tool-belt"
+
+
+def flatten_channels(raw: Any) -> dict[str, Any]:
+    """On-disk ``channels`` → the internal ``{"agent:platform": {...}}`` map.
+
+    On disk, channels nest as ``channels.<agent>.<platform>`` because
+    Hermes' plugin-settings API forbids ``:`` in a key segment. Internally
+    every consumer keys by the scope string (which is also how telemetry
+    and learned.json name scopes), so the loader flattens once here. A
+    flat ``"agent:platform"`` key is passed through unchanged (in-memory
+    configs built by tests and scripts already use that form).
+    """
+    out: dict[str, Any] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, value in raw.items():
+        name = str(key)
+        if ":" in name or not isinstance(value, dict):
+            out[name] = value
+            continue
+        nested = {str(p): v for p, v in value.items() if isinstance(v, dict)}
+        if nested and all(isinstance(v, dict) for v in value.values()):
+            for platform, cfg in nested.items():
+                out[f"{name}:{platform}"] = cfg
+        else:
+            out[name] = value  # a bare-platform entry (older configs)
+    return out
+
+
 def scope_candidates(scope: str) -> list[str]:
     """Return lookup order for a scope.
 
@@ -539,7 +576,7 @@ def scope_state(state: dict[str, Any], scope: str) -> tuple[str, dict[str, Any]]
 def config_always_carry(plugin_config: dict[str, Any], scope: str) -> list[str]:
     """Per-agent always_carry config pins for a scope, in stable order.
 
-    The union of the global ``plugins.tool-belt.always_carry`` list and the
+    The union of the global ``always_carry`` setting and the
     scope's ``channels.<scope>.always_carry`` list (platform fallback via
     :func:`scope_candidates`; the first matching channel entry contributes).
     Union semantics only — a scope entry can add pins, never remove the

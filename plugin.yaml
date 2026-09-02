@@ -11,6 +11,46 @@ author: Dale Mugford
 license: MIT
 homepage: https://github.com/dalemugford/hermes-tool-belt
 tags: [tools, prompt-caching, optimization, telemetry]
+python_dependencies:
+  - "PyYAML>=6.0,<7"
+# Settings live at plugins.entries.tool-belt.settings.* (Hermes' reserved
+# plugin-settings subtree). Per-channel overrides nest as
+# channels.<agent>.<platform>.{learned_mode,bypass_rate,always_carry,
+# auto_shape_interval_hours}; see docs/CONFIGURATION.md.
+config_schema:
+  enabled:
+    type: bool
+    default: true
+    description: Master switch; false makes the plugin a no-op.
+  log:
+    type: bool
+    default: true
+    description: Write telemetry JSONL under state/tool-belt.
+  agent:
+    type: str
+    description: Display name for this profile's agent in reports.
+  learned_mode:
+    type: str
+    default: apply
+    description: apply (shape automatically) or recommend (observe only).
+  auto_shape:
+    type: bool
+    default: true
+    description: Periodic in-process auto-shaping for apply-mode scopes.
+  auto_shape_interval_hours:
+    type: number
+    default: 24
+    description: Per-scope debounce between automatic shaping passes.
+  cache_mode:
+    type: str
+    default: auto
+    description: auto | on | off — prompt-cache posture assumed by the shaper.
+  always_carry:
+    type: list
+    description: Tools pinned into every manifest; never shaped.
+  channels:
+    type: dict
+    description: Per-channel overrides, nested channels.<agent>.<platform>.
 provides_tools:
   - expand_tools
 provides_hooks:

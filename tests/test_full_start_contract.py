@@ -8,7 +8,7 @@ shipped curated warm-start ``carry`` list from runtime resolution. The
 default ``learned_mode`` flips ``recommend`` → ``apply``.
 
 Promise #3 (2026-08-30): per-agent config pinning via
-``plugins.tool-belt.always_carry: [...]`` (global, plus additive
+``plugins.entries.tool-belt.settings.always_carry: [...]`` (global, plus additive
 ``channels.<scope>.always_carry``). Pins union with the shipped structural
 baseline, are validated ∩ E at resolution, and are undemotable by
 construction.

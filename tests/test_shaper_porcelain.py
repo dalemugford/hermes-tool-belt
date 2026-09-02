@@ -283,7 +283,7 @@ class ActivationGuidanceTests(unittest.TestCase):
         self.assertNotIn("``", combined)  # no raw RST rendered to a terminal
         self.assertIn("configure.py", combined)
         self.assertIn(
-            "hermes config set plugins.tool-belt.channels.", combined)
+            "hermes config set plugins.entries.tool-belt.settings.channels.", combined)
 
     def test_bootstrap_top_actions_guidance(self):
         hermes_home = self.tmp / "home"
@@ -306,7 +306,7 @@ class ActivationGuidanceTests(unittest.TestCase):
         self.assertNotIn(self.FORBIDDEN, out)
         self.assertIn("configure.py", out)
         self.assertIn(
-            "hermes config set plugins.tool-belt.channels.", out)
+            "hermes config set plugins.entries.tool-belt.settings.channels.", out)
 
 
 class MissingPyYAMLTests(unittest.TestCase):

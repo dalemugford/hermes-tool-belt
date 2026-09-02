@@ -83,8 +83,8 @@ class OnboardingTestCase(tc.TempHomeTestCase):
     def observing_config(scope: str) -> dict[str, str]:
         """``FakeRunner`` reads that put ``scope`` in observation mode."""
         return {
-            f"plugins.tool-belt.channels.{scope}.bypass_rate": "1.0",
-            f"plugins.tool-belt.channels.{scope}.learned_mode": "recommend",
+            f"plugins.entries.tool-belt.settings.channels.{scope.replace(':', '.')}.bypass_rate": "1.0",
+            f"plugins.entries.tool-belt.settings.channels.{scope.replace(':', '.')}.learned_mode": "recommend",
         }
 
 
@@ -171,8 +171,8 @@ class OnboardingArcTests(OnboardingTestCase):
         self.assertEqual(
             emitted,
             {
-                f"plugins.tool-belt.channels.{result.scope}.learned_mode": "recommend",
-                f"plugins.tool-belt.channels.{result.scope}.bypass_rate": "1.0",
+                f"plugins.entries.tool-belt.settings.channels.{result.scope.replace(':', '.')}.learned_mode": "recommend",
+                f"plugins.entries.tool-belt.settings.channels.{result.scope.replace(':', '.')}.bypass_rate": "1.0",
             },
         )
         # The sidecar remembers the bypass value observation mode replaced.
@@ -226,14 +226,14 @@ class OnboardingArcTests(OnboardingTestCase):
         self.assertEqual(
             {c[3]: c[4] for c in runner.writes},
             {
-                f"plugins.tool-belt.channels.{result.scope}.learned_mode": "apply",
-                f"plugins.tool-belt.channels.{result.scope}.bypass_rate": "0.0",
+                f"plugins.entries.tool-belt.settings.channels.{result.scope.replace(':', '.')}.learned_mode": "apply",
+                f"plugins.entries.tool-belt.settings.channels.{result.scope.replace(':', '.')}.bypass_rate": "0.0",
             },
         )
 
         _rc, status = self.run_main(
             ["--status"],
-            tc.FakeRunner({f"plugins.tool-belt.channels.{result.scope}.learned_mode": "apply"}),
+            tc.FakeRunner({f"plugins.entries.tool-belt.settings.channels.{result.scope.replace(':', '.')}.learned_mode": "apply"}),
         )
         self.assertIn("shaping ON (", status)
 
@@ -311,11 +311,11 @@ class OnboardingArcTests(OnboardingTestCase):
 
         self.assertEqual(list(self.learned()["scopes"]), [terminal.scope])
         self.assertEqual([c[3] for c in runner.writes],
-                         [f"plugins.tool-belt.channels.{terminal.scope}.learned_mode"])
+                         [f"plugins.entries.tool-belt.settings.channels.{terminal.scope.replace(':', '.')}.learned_mode"])
 
         _rc, status = self.run_main(
             ["--status"],
-            tc.FakeRunner({f"plugins.tool-belt.channels.{terminal.scope}.learned_mode": "apply"}),
+            tc.FakeRunner({f"plugins.entries.tool-belt.settings.channels.{terminal.scope.replace(':', '.')}.learned_mode": "apply"}),
         )
         # "carried" is the real per-session set beyond pins (ceiling −
         # expansion − pins), not the promoted-back `carry` list alone.

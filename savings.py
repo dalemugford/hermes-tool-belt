@@ -209,10 +209,18 @@ class AgentLocation:
     sessions_dir: Path       # <profile_home>/sessions
 
 
+def _settings_block(raw):
+    """``plugins.entries.tool-belt.settings`` out of a parsed config.yaml."""
+    node = raw
+    for part in ("plugins", "entries", "tool-belt", "settings"):
+        node = node.get(part) if isinstance(node, dict) else None
+    return node if isinstance(node, dict) else {}
+
+
 def agent_display_name(profile_home: Path, fallback: str) -> str:
     """Human name for a profile in reports.
 
-    Prefers the plugin config's own ``plugins.tool-belt.agent`` (the scope
+    Prefers the plugin config's own ``agent`` setting (the scope
     agent name, e.g. ``bernard`` on a root profile whose directory identity is
     ``default``); falls back to the profile name. Display-only — JSON output
     and telemetry keep the canonical profile name.
@@ -222,7 +230,7 @@ def agent_display_name(profile_home: Path, fallback: str) -> str:
         import yaml
 
         raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-        name = ((raw.get("plugins") or {}).get("tool-belt") or {}).get("agent")
+        name = _settings_block(raw).get("agent")
         if isinstance(name, str) and name.strip():
             return name.strip()
     except Exception:
@@ -235,7 +243,7 @@ def _tool_belt_explicitly_disabled(profile_home: Path) -> bool:
 
     Missing or unreadable config remains discoverable: directory presence is the
     compatibility fallback. An explicit ``plugins.enabled`` exclusion or
-    ``plugins.tool-belt.enabled: false`` prevents stale telemetry from reviving a
+    ``enabled: false`` prevents stale telemetry from reviving a
     disabled profile.
     """
     config_path = profile_home / "config.yaml"
@@ -255,8 +263,7 @@ def _tool_belt_explicitly_disabled(profile_home: Path) -> bool:
         str(name) for name in enabled_plugins
     }:
         return True
-    plugin_config = plugins.get("tool-belt")
-    return isinstance(plugin_config, dict) and plugin_config.get("enabled") is False
+    return _settings_block(raw).get("enabled") is False
 
 
 def discover_agents(

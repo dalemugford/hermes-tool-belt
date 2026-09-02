@@ -40,7 +40,7 @@ python3 scripts/configure.py --status   # read-only state report
 `configure.py` is a mode-setter. It discovers every `agent:platform` scope
 from telemetry; interactively you pick an agent, then either **Protected
 tools** (a picker over the agent's inventory — selections are written to
-`plugins.tool-belt.always_carry`, always carried and never shaped) or
+`plugins.entries.tool-belt.settings.always_carry`, always carried and never shaped) or
 **Tool shaping options** (pick channels, then a mode):
 
 - **learning** — shaping on (`learned_mode: apply`); the plugin shapes

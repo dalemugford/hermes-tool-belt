@@ -307,7 +307,7 @@ def main() -> int:
     print("  To activate cache-on recommendations:")
     print("    1. Guided:  python3 scripts/configure.py --agent <agent> --mode history")
     print("       Direct:   hermes config set "
-          "plugins.tool-belt.channels.<scope>.learned_mode apply")
+          "plugins.entries.tool-belt.settings.channels.<agent>.<platform>.learned_mode apply")
     print("    2. Then write them: python3 scripts/shape-ceiling.py (without --dry-run)")
     print()
     return 0
