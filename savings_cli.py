@@ -342,7 +342,9 @@ def ensure_launcher(
             return False
         existing = _launcher_exec_target(content)
         if existing == desired_exec and Path(desired_exec).exists():
-            out(f"Launcher already present: {target}")
+            # Already installed and pointing at this checkout: say nothing
+            # (a confirmed apply is not the moment for launcher trivia);
+            # the PATH note still fires if the shim isn't reachable.
             _maybe_path_note(hermes_home, out)
             return True
         if not existing:

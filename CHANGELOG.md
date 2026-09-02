@@ -15,6 +15,13 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ### Fixed
 
+- **`configure` no longer drops out of the terminal UI at the confirm.**
+  The "Apply these changes?" question is now the same radio list as the
+  pickers (Apply / Back, with the disclosed diff repeated as its
+  description; the diff also stays in the scrollback), and declining walks
+  back to the mode picker instead of ending the run. The
+  `Launcher already present` line after a confirmed apply is gone — a
+  current launcher is silent; only the missing-PATH note still prints.
 - **"N carried" now counts what the agent actually carries.** The status
   row and the shaping preview reported `len(learned.carry)` — only tools
   promoted *back* from expansion, which is empty right after a shape — so a

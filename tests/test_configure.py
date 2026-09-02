@@ -307,6 +307,19 @@ class ConfigureModeFlowTests(TempHomeTestCase):
         # exit line, so a bare escape leaves no stacked "Nothing ..." noise.
         self.assertNotIn("Nothing selected", out)
 
+    def test_declined_confirm_returns_to_the_mode_picker(self):
+        # Dale's "spills back out": answering no at the confirm used to end
+        # the run. It now re-shows the mode picker: shaping → channels 'all'
+        # → learning → n, n (both scopes) → mode picker again → blank ×3
+        # walks back out. Nothing written, and the picker was shown twice.
+        self._seed_two_channels()
+        rc, out, runner = self._run("2\nall\n1\nn\nn\n\n\n\n")
+        self.assertEqual(rc, 0)
+        self.assertEqual(runner.writes, [])
+        self.assertIn("Skipped default:slack", out)
+        self.assertEqual(out.count("On — learning"), 2,
+                         "the mode picker must be shown again after a decline")
+
     def test_mode_cancel_returns_to_channel_pick(self):
         # shaping → channels 'all' → blank at mode → back to channels →
         # blank at channels → back to step-2 → blank → quit. Four blanks
@@ -518,6 +531,37 @@ class SharedCursesContractTests(unittest.TestCase):
         self.assertIn("shaping OFF", by_platform["slack"])
         self.assertIn("shaping ON", by_platform["telegram"])
         self.assertEqual(picked, [], "nothing checked + ENTER = back")
+
+    def test_confirm_uses_the_shared_radio_list_with_the_diff(self):
+        # The apply question stays inside the same curses flow as the
+        # pickers, with the disclosed diff repeated as the description;
+        # "Back" (row 1 / ESC) declines.
+        seen = {}
+
+        class FakeUI:
+            @staticmethod
+            def curses_radiolist(title, items, selected=0, cancel_returns=None,
+                                 description=None):
+                seen.update(title=title, items=list(items),
+                            description=description)
+                return 1  # Back
+
+        class _Ctx:
+            have_hermes = True
+            dry_run = False
+            assume_yes = False
+            reader = staticmethod(lambda _p: (_ for _ in ()).throw(
+                AssertionError("y/n prompt must not run on a TTY")))
+            out = staticmethod(lambda _m: None)
+        write = configure.ConfigWrite(key="plugins.tool-belt.x", after="1",
+                                      before=None)
+        with mock.patch.object(configure, "_hermes_curses", lambda: FakeUI):
+            ok = configure._confirm_writes(_Ctx(), "Changes for a:b:", [write],
+                                           ["    :: extra line"])
+        self.assertFalse(ok)
+        self.assertEqual(seen["items"], ["Apply", "Back"])
+        self.assertIn("plugins.tool-belt.x", seen["description"])
+        self.assertIn(":: extra line", seen["description"])
 
     def test_numbered_fallback_marks_the_current_mode(self):
         lines = []

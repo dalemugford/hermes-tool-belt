@@ -905,7 +905,9 @@ class LauncherStalenessTests(_HomeCase):
             user_home=self.user_home)
         self.assertTrue(created)
         self.assertEqual(self.target.read_text(encoding="utf-8"), first)
-        self.assertTrue(any("already present" in m for m in msgs), msgs)
+        # A current launcher is silent (a confirmed apply is not the moment
+        # for launcher trivia); only a missing-PATH note may still print.
+        self.assertFalse(any("already present" in m for m in msgs), msgs)
 
     def test_stale_exec_target_is_refreshed(self):
         gone = Path(self.tmp.name) / "moved-plugin" / "tool-belt"

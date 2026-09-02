@@ -1116,12 +1116,25 @@ def _confirm_writes(
         return True
     if ctx.assume_yes:
         return True
+    # On a real terminal the question is the same radio list as the rest of
+    # the flow, with the diff repeated as its description (the lines above
+    # stay in the scrollback either way). Off-TTY: plain y/n.
+    picked = _curses_single("Apply these changes?", ["Apply", "Back"],
+                            description="\n".join(
+                                [f"  {title}"] + [build_diff(w) for w in writes]
+                                + list(extra)))
+    if picked is not None:
+        return picked == 0
     return confirm("  Apply these changes?", ctx.reader)
 
 
 def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
-    """Path 1 — read the history, show the shaping, apply on confirmation."""
+    """Path 1 — read the history, show the shaping, apply on confirmation.
+
+    Returns ``_BACK`` when every scope was declined so the interactive menu
+    can re-show the mode picker instead of dropping out of the flow."""
     shaped_any = False
+    declined_any = False
     for info in infos:
         recs = compute_recommendations(info, ctx.thresholds)
         if not recs:
@@ -1136,6 +1149,7 @@ def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
                                      ceiling=scope_ceiling(info, recs))
         if not _confirm_writes(ctx, f"Changes for {info.scope}:", writes, overlay):
             ctx.out(f"  Skipped {info.scope}. Nothing written.")
+            declined_any = True
             continue
 
         changed = write_learned_overlay(info, recs, dry_run=ctx.dry_run)
@@ -1156,6 +1170,8 @@ def flow_shape(ctx: RunContext, infos: Sequence[ScopeInfo]) -> int:
         ctx.out("    · Shaped agents load a tighter tool set from their next session on.")
         ctx.out("    · Anything moved to expand-only comes back instantly via expand_tools.")
         ctx.out("    · Re-run this command any time to review or reset an agent.")
+    if declined_any and not shaped_any:
+        return _BACK
     return 0
 
 
@@ -1472,6 +1488,7 @@ def _apply_mode(ctx: RunContext, infos: Sequence[ScopeInfo], mode: str) -> int:
         return flow_shape(ctx, infos)
 
     after = "apply" if mode == "learning" else "recommend"
+    applied_any = declined_any = False
     for info in infos:
         settings = ctx.settings(info.scope)
         write = _plan_mode_write(info, settings, after)
@@ -1489,8 +1506,12 @@ def _apply_mode(ctx: RunContext, infos: Sequence[ScopeInfo], mode: str) -> int:
             ]
         if not _confirm_writes(ctx, f"Changes for {info.scope}:", [write], extra):
             ctx.out(f"  Skipped {info.scope}. Nothing written.")
+            declined_any = True
             continue
         ctx.applied.extend(apply_writes([write], ctx.runner, ctx.dry_run, ctx.out))
+        applied_any = True
+    if declined_any and not applied_any:
+        return _BACK  # nothing written — the menu re-shows the mode picker
     return 0
 
 
@@ -1723,10 +1744,12 @@ def _shaping_menu(ctx: RunContext, agent: str,
     """Channels → mode. Returns an int rc when a mode was applied, or
     ``_BACK`` to redisplay the step-2 menu."""
     single_channel = len(agent_scopes) == 1
+    selected: list[ScopeInfo] = []
     while True:
-        selected = _pick_scopes(ctx, agent_scopes)
         if not selected:
-            return _BACK  # channel picker cancelled — up to step-2
+            selected = _pick_scopes(ctx, agent_scopes)
+            if not selected:
+                return _BACK  # channel picker cancelled — up to step-2
         # Open on the mode already in effect; when the chosen channels
         # disagree, open on row 0 and say what each one is set to.
         modes = {i.platform: _mode_value(ctx, i) for i in selected}
@@ -1746,8 +1769,12 @@ def _shaping_menu(ctx: RunContext, agent: str,
         if picked is None:
             if single_channel:
                 return _BACK  # no channel step to fall back to
+            selected = []
             continue  # redisplay the channel picker
-        return _apply_mode(ctx, selected, picked[1])
+        result = _apply_mode(ctx, selected, picked[1])
+        if result is _BACK:
+            continue  # declined at the confirm — pick again
+        return result
 
 
 def _ask_platforms(ctx: RunContext) -> list[str]:
