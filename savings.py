@@ -939,6 +939,15 @@ class ObservedCohort:
     # lets reports annualize the observed pace.
     first_ts: float = 0.0
     last_ts: float = 0.0
+    # Uncached-only slice of the above, for the forward view. Tool Belt is an
+    # uncached-API tool, so the per-session average and the annualized pace
+    # scope to the sessions/span that actually accrued ``net_forward`` — the
+    # non-caching predictions (``caches is not True``, the same rows priced
+    # into ``saved_input_equiv_noncaching``). Counting caching sessions in
+    # those denominators dilutes both. 0 when there is no uncached traffic.
+    n_sessions_noncaching: int = 0
+    first_ts_noncaching: float = 0.0
+    last_ts_noncaching: float = 0.0
     cache_on: dict[str, Any] = field(default_factory=dict)
     cache_off: dict[str, Any] = field(default_factory=dict)
     pending: dict[str, Any] = field(default_factory=dict)
@@ -966,6 +975,9 @@ class ObservedCohort:
             "net_caching_historical": self.net_caching_historical,
             "first_ts": self.first_ts,
             "last_ts": self.last_ts,
+            "n_sessions_noncaching": self.n_sessions_noncaching,
+            "first_ts_noncaching": self.first_ts_noncaching,
+            "last_ts_noncaching": self.last_ts_noncaching,
             "cache_on": self.cache_on,
             "cache_off": self.cache_off,
             "pending": self.pending,
@@ -1027,6 +1039,30 @@ def compute_observed(
         for mode in (classify_prediction_mode(p, api_last),)
         if mode in ("on", "off")
     }
+    # Uncached-only denominators for the forward view. Walk the SAME rows that
+    # price into ``saved_input_equiv_noncaching`` (caches is not True) and
+    # record their distinct sessions and wall-clock span, so the per-session
+    # average and pace annualize over uncached traffic only — not the caching
+    # sessions that contribute nothing to ``net_forward``.
+    noncaching_sessions: set[str] = set()
+    noncaching_ts: list[float] = []
+    for p in predictions:
+        pid = str(p.get("prediction_id") or "")
+        mode = counted_mode.get(pid)
+        if mode is None:
+            continue
+        if prediction_provider_caches(calls_by_pred.get(pid), mode) is True:
+            continue
+        sk = _session_key(p)
+        if sk:
+            noncaching_sessions.add(sk)
+        ts = float(p.get("ts") or 0)
+        if ts > 0:
+            noncaching_ts.append(ts)
+    n_sessions_noncaching = len(noncaching_sessions)
+    first_ts_noncaching = min(noncaching_ts) if noncaching_ts else 0.0
+    last_ts_noncaching = max(noncaching_ts) if noncaching_ts else 0.0
+
     measured = measure_expand_overhead(
         predictions, api_calls, tool_calls, api_last=api_last,
         calls_by_pred=calls_by_pred,
@@ -1092,6 +1128,9 @@ def compute_observed(
         n_sessions=n_sess,
         first_ts=min(measured_ts) if measured_ts else 0.0,
         last_ts=max(measured_ts) if measured_ts else 0.0,
+        n_sessions_noncaching=n_sessions_noncaching,
+        first_ts_noncaching=first_ts_noncaching,
+        last_ts_noncaching=last_ts_noncaching,
         realized_schema_token_reduction=realized,
         saved_input_equiv_total=saved_input_equiv,
         expansion_events=expand_events,

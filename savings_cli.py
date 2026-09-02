@@ -74,6 +74,15 @@ def _green(text: str) -> str:
     return _color(text, _Colors.GREEN)
 
 
+#: ANSI italic (SGR 3) — not in the shared Colors table, but ``_color`` just
+#: concatenates codes, so this rides the same NO_COLOR/TTY gating as the rest.
+_ITALIC = "\033[3m"
+
+
+def _ital(text: str) -> str:
+    return _color(text, _ITALIC)
+
+
 def _fmt_int(n: int) -> str:
     return f"{n:,}"
 
@@ -92,13 +101,6 @@ def _basis_tag(basis: str, fallback_per_event: int = _savings.EXPAND_ROUND_TRIP_
     if basis == "mixed":
         return f"overhead partly measured, partly fallback {_fmt_int(fallback_per_event)} tok/event"
     return f"fallback: {_fmt_int(fallback_per_event)} tok/event"
-
-
-def _combined_basis(bases: list[str]) -> str:
-    seen = {b for b in bases if b}
-    if not seen:
-        return "measured"
-    return seen.pop() if len(seen) == 1 else "mixed"
 
 
 def _render_projection(out: list[str], proj: _savings.ProjectedCohort, indent: str) -> None:
@@ -164,30 +166,30 @@ def render_text(report: _savings.SavingsReport) -> str:
     carried = [a for a in measured if _carried_whole(a.observed)]
 
     total_saved = sum(a.observed.net_forward for a in shaped)
-    total_sessions = sum(a.observed.n_sessions for a in shaped)
+    # Tool Belt is an uncached-API tool: count only the uncached sessions that
+    # actually accrued net_forward, so the per-session average and pace are not
+    # diluted by caching sessions that contributed nothing.
+    total_sessions = sum(a.observed.n_sessions_noncaching for a in shaped)
     if shaped:
-        basis = _combined_basis([a.observed.overhead_basis for a in shaped])
         gross = sum(a.observed.saved_input_equiv_noncaching for a in shaped)
         overhead = sum(a.observed.overhead_noncaching for a in shaped)
         out.append("")
         out.append(
             "  " + _b("NET TOKENS SAVED:") + " "
             + _color(_fmt_int(total_saved), _Colors.BOLD, _Colors.GREEN)
-            + f"  ({_basis_tag(basis)})"
+            + f" over {total_sessions} session(s)"
         )
         out.append(
-            f"  measured across {total_sessions} session(s) of real traffic."
+            "  Calculation: tool-definition tokens saved: "
+            f"({_fmt_int(gross)}) minus expand_tools usage ({_fmt_int(overhead)})"
         )
-        out.append(_dim(
-            f"    tool-definition tokens unsent: {_fmt_int(gross)}"
-            f"  —  minus expand_tools overhead: {_fmt_int(overhead)}"
-        ))
         per_session = total_saved // total_sessions if total_sessions else 0
         if per_session > 0:
+            out.append("")
             out.append(
                 "  Agent conversations use "
                 + _green(f"≈{_fmt_int(per_session)} fewer")
-                + " tokens with Tool Belt."
+                + " tokens on average with Tool Belt."
             )
         # Illustrative dollar equivalents at public input list prices. These
         # are what the saved tokens would have billed on a metered API route —
@@ -211,11 +213,12 @@ def render_text(report: _savings.SavingsReport) -> str:
                 usd = total_saved / 1_000_000 * rate
                 out.append(f"    {label:<16} " + _green(f"≈ ${usd:,.2f}")
                            + _dim(f"  ({model})"))
-        # Annualized pace: net saved / measured wall-clock span, projected to
-        # 12 months. Needs a week of history to say anything defensible.
-        first = min((a.observed.first_ts for a in shaped
-                     if a.observed.first_ts > 0), default=0.0)
-        last = max((a.observed.last_ts for a in shaped), default=0.0)
+        # Annualized pace: net saved / uncached wall-clock span, projected to
+        # 12 months. Span scopes to uncached traffic (the same cohort the
+        # savings come from). Needs a week of history to say anything defensible.
+        first = min((a.observed.first_ts_noncaching for a in shaped
+                     if a.observed.first_ts_noncaching > 0), default=0.0)
+        last = max((a.observed.last_ts_noncaching for a in shaped), default=0.0)
         span_days = (last - first) / 86400.0
         if total_saved > 0 and span_days >= 7.0:
             yearly = int(total_saved * 365.0 / span_days)
@@ -226,33 +229,28 @@ def render_text(report: _savings.SavingsReport) -> str:
                 usd_txt = f" (≈${lo:,.0f}–${hi:,.0f} at the rates above)"
             out.append("")
             out.append(
-                f"  At this pace ({span_days:.0f} days measured), 12 months of"
-                f" Tool Belt saves"
+                "  12 months of Tool Belt is estimated to save approximately "
+                + _green(f"≈{_fmt_int(yearly)} tokens") + f"{usd_txt}."
             )
-            out.append("  " + _green(f"≈{_fmt_int(yearly)} tokens") + f"{usd_txt}.")
         if carried:
-            names = ", ".join(a.display_name or a.agent for a in carried)
+            names = ", ".join(_ital(a.display_name or a.agent) for a in carried)
             out.append("")
+            out.append(
+                f"  Agent(s) currently excluded from Tool Belt (no shaping): {names}."
+            )
             out.append(_dim(
-                f"  {len(carried)} agent(s) on prompt-caching providers carry the"
-                f" full tool set (no shaping needed): {names}."
+                "  Agents using caching providers exclusively do not require Tool Belt."
             ))
         out.append("")
-        out.append("  " + _b("PER AGENT"))
+        out.append("  " + _b("PER AGENT SAVINGS"))
         for a in shaped:
             obs = a.observed
             name = a.display_name or a.agent
             out.append(
                 "    " + _b(f"{name:<12}") + " "
                 + _green(f"{_fmt_int(obs.net_forward):>12} tok")
-                + _dim(f"   {obs.n_sessions} session(s)")
+                + _dim(f"   {obs.n_sessions_noncaching} session(s)")
             )
-        out.append("")
-        out.append(_dim(
-            "  Calculation: tool-definition tokens Tool Belt kept off the wire "
-            "(vs carrying the full set), minus the measured cost of each "
-            "expand_tools round-trip that recovered a tool narrowing had gated."
-        ))
 
     for a in unmeasured:
         out.append("")

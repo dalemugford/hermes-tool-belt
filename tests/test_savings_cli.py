@@ -532,6 +532,21 @@ class ForwardVsHistoricalNetTests(_HomeCase):
         # saved, no expand overhead on it).
         self.assertGreater(obs.net_forward, 0)
 
+    def test_uncached_denominators_exclude_the_caching_session(self):
+        # Two sessions: S1 caching (ts 1.0), S2 non-caching (ts 2.0). The
+        # forward per-session/pace denominators must scope to the uncached
+        # cohort only — the caching session neither counts nor stretches span.
+        state = self.home / "state" / "tool-belt"
+        self._seed(state)
+        obs = savings.compute_observed(state)
+        self.assertEqual(obs.n_sessions, 2)            # both sessions overall
+        self.assertEqual(obs.n_sessions_noncaching, 1)  # only the uncached one
+        # Span scopes to the non-caching prediction's timestamp (2.0), not the
+        # caching session's earlier 1.0.
+        self.assertEqual(obs.first_ts_noncaching, 2.0)
+        self.assertEqual(obs.last_ts_noncaching, 2.0)
+        self.assertEqual(obs.first_ts, 1.0)  # blended span still spans both
+
 
 class ExpansionVsTriggerTests(_HomeCase):
     """(7) Trigger activation adds no expansion charge; explicit expansion
@@ -1022,11 +1037,15 @@ class AnnualizedPaceTests(_HomeCase):
             n_predictions=10, n_sessions=5,
             realized_schema_token_reduction=100_000,
             net_token_reduction=100_000,
-            # The headline and pace project the ONGOING (non-caching) net.
+            # The headline and pace project the ONGOING (non-caching) net, and
+            # the average/pace scope to the uncached sessions/span.
             net_forward=100_000,
             saved_input_equiv_noncaching=100_000,
+            n_sessions_noncaching=5,
             first_ts=1_780_000_000.0,
-            last_ts=1_780_000_000.0 + span_days * 86400.0)
+            last_ts=1_780_000_000.0 + span_days * 86400.0,
+            first_ts_noncaching=1_780_000_000.0,
+            last_ts_noncaching=1_780_000_000.0 + span_days * 86400.0)
         return savings.SavingsReport(
             generated_for="all", cache_mode="on",
             agents=[savings.AgentSavings(
@@ -1036,14 +1055,13 @@ class AnnualizedPaceTests(_HomeCase):
 
     def test_pace_line_present_with_enough_span(self):
         text = savings_cli.render_text(self._report(30))
-        self.assertIn("At this pace (30 days measured)", text)
-        self.assertIn("12 months", text)
+        self.assertIn("12 months of Tool Belt is estimated to save", text)
         # 100k tokens saved over 30 days → ≈1,216,666/yr
         self.assertIn("1,216,66", text)
 
     def test_pace_line_absent_below_a_week(self):
         text = savings_cli.render_text(self._report(3))
-        self.assertNotIn("At this pace", text)
+        self.assertNotIn("is estimated to save", text)
 
     def test_display_name_used_in_per_agent_block(self):
         text = savings_cli.render_text(self._report(30))
@@ -1159,6 +1177,54 @@ class ColorGatingTests(_HomeCase):
         payload = out.getvalue()
         self.assertNotIn("\x1b[", payload)
         json.loads(payload)  # still valid JSON
+
+
+class CarriedAgentEmphasisTests(_HomeCase):
+    """The 'excluded from Tool Belt' line names caching-only agents. Each name
+    is italicized (gated ANSI, so plain when captured) and multiple agents are
+    comma-separated."""
+
+    def _report(self, names):
+        agents = []
+        for i, disp in enumerate(names):
+            # Caching-dominant => _carried_whole() True => listed as excluded.
+            obs = savings.ObservedCohort(
+                n_predictions=5, n_sessions=1,
+                cache_on={"n_predictions_caching": 5,
+                          "n_predictions_noncaching": 0})
+            agents.append(savings.AgentSavings(
+                agent=f"a{i}", platforms=[f"a{i}:t"], observed=obs,
+                projected=savings.ProjectedCohort(), display_name=disp))
+        # A shaped agent so the report renders its savings body at all.
+        shaped = savings.ObservedCohort(
+            n_predictions=4, n_sessions=2, net_forward=100_000,
+            saved_input_equiv_noncaching=100_000, n_sessions_noncaching=2,
+            cache_off={"n_predictions_caching": 0,
+                       "n_predictions_noncaching": 4})
+        agents.insert(0, savings.AgentSavings(
+            agent="default", platforms=["default:t"], observed=shaped,
+            projected=savings.ProjectedCohort(), display_name="bernard"))
+        return savings.SavingsReport(
+            generated_for="all", cache_mode="on", agents=agents,
+            hermes_home=str(self.home), token_estimator="tiktoken-cl100k")
+
+    def test_multiple_carried_agents_are_comma_separated(self):
+        text = savings_cli.render_text(self._report(["sue", "ada"]))
+        self.assertIn("excluded from Tool Belt (no shaping): sue, ada.", text)
+
+    def test_names_italicized_only_when_color_is_on(self):
+        from hermes_cli import colors
+        real = colors.should_use_color
+        colors.should_use_color = lambda: True
+        try:
+            text = savings_cli.render_text(self._report(["sue", "ada"]))
+        finally:
+            colors.should_use_color = real
+        # Each name wrapped in the italic SGR (\x1b[3m ... \x1b[0m).
+        self.assertIn("\x1b[3msue\x1b[0m", text)
+        self.assertIn("\x1b[3mada\x1b[0m", text)
+        # Still comma-separated between the two wrapped names.
+        self.assertIn("\x1b[0m, \x1b[3m", text)
 
 
 if __name__ == "__main__":
