@@ -1213,7 +1213,14 @@ class CarriedAgentEmphasisTests(_HomeCase):
         self.assertIn("excluded from Tool Belt (no shaping): sue, ada.", text)
 
     def test_names_italicized_only_when_color_is_on(self):
-        from hermes_cli import colors
+        try:
+            from hermes_cli import colors
+        except Exception:
+            # Standalone/bare clone (CI): savings_cli falls back to its own
+            # no-op _color, so there is no gating hook to flip and italics
+            # never render — nothing to assert. The comma-separation test
+            # above locks the structural behavior that matters everywhere.
+            self.skipTest("hermes_cli not importable (bare clone)")
         real = colors.should_use_color
         colors.should_use_color = lambda: True
         try:
