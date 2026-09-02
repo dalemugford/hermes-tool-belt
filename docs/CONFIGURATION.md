@@ -45,7 +45,8 @@ a `before → after` line first and requires confirmation.
 `configure` is a mode-setter: pick the agent, then either its
 **Protected tools** (a picker whose selections are written to
 `plugins.tool-belt.always_carry`) or **Tool shaping options** — channels,
-then a mode. Non-interactively: `--agent <name> --mode learning|history|off`.
+then a mode. Non-interactively: `--agent <name> --mode learning|history|off`,
+optionally `--channel <platform>` to target one channel (defaults to all).
 
 It writes only ordinary documented settings — it introduces no key of
 its own:

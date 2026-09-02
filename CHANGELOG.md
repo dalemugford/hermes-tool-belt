@@ -6,6 +6,13 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ## [Unreleased]
 
+### Added
+
+- **`configure --channel <platform>`** restricts a non-interactive `--mode`
+  run to one (or several) of the agent's channels; a name matching nothing
+  exits 2 and lists the channels found. `--platform` stays what it was — a
+  hint for profiles with no telemetry, not a filter.
+
 ### Fixed
 
 - **"N carried" now counts what the agent actually carries.** The status

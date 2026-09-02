@@ -1209,6 +1209,25 @@ class ModeFlagTests(TempHomeTestCase):
                        expanded_tool="terminal", expanded_sessions=12,
                        expanded_calls_each=2)
 
+    def test_channel_filters_to_one_of_the_agents_channels(self) -> None:
+        # --platform is only a hint for telemetry-less profiles, so a
+        # non-interactive --mode run used to hit EVERY channel the agent
+        # has. --channel is a real filter: one channel written, and a name
+        # that matches nothing is exit 2 naming what exists.
+        self._seed()
+        seed_telemetry(self.root_state, "default:slack", sessions=self.needed,
+                       always_on=["web_search"], append=True)
+        rc, _out, runner = self._run(["--mode", "off", "--channel", "slack"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(
+            {c[3] for c in runner.writes},
+            {"plugins.tool-belt.channels.default:slack.learned_mode"},
+            "only the named channel is written")
+        rc, out, runner = self._run(["--mode", "off", "--channel", "discord"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(runner.writes, [])
+        self.assertIn("Channels found: slack, telegram", out)
+
     def test_mode_learning_writes_apply_without_history_run(self) -> None:
         self._seed()
         rc, output, runner = self._run(["--mode", "learning"])

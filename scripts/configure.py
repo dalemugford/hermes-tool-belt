@@ -1858,6 +1858,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reset", metavar="AGENT", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--yes", action="store_true", help="apply without the interactive confirmation")
     parser.add_argument("--dry-run", action="store_true", help="show every diff, write nothing")
+    parser.add_argument("--channel", action="append", default=None, help="restrict to these channels of the chosen agent, e.g. telegram (repeatable; comma-separated ok)")
     parser.add_argument("--platform", action="append", default=None, help="platform to assume when a profile has no telemetry (repeatable)")
     parser.add_argument("--hermes-home", type=Path, default=None, help="override HERMES_HOME discovery")
     return parser
@@ -1904,6 +1905,19 @@ def _main_with_home(args: argparse.Namespace, hermes_home: Path) -> int:
     profile_filter = args.reset or args.agent
     args.platform = split_platform_args(args.platform)
     infos = discover_scopes(hermes_home, profile_filter, args.platform)
+    channels = split_platform_args(args.channel)
+    if channels:
+        # A filter, unlike --platform (a hint for telemetry-less profiles):
+        # a non-interactive --mode run must be able to target ONE channel
+        # instead of every channel the agent has.
+        matched = [i for i in infos if i.platform in set(channels)]
+        if not matched:
+            have = sorted({i.platform for i in infos})
+            ctx.out(f"\n  No channel matching {', '.join(channels)!r}"
+                    + (f" for {profile_filter}" if profile_filter else "") + ".")
+            ctx.out("  Channels found: " + (", ".join(have) or "none"))
+            return 2
+        infos = matched
 
     # A filter that matches nothing on a populated install is a wrong NAME,
     # not an empty install — say so, and name what exists (M3/P3: the generic

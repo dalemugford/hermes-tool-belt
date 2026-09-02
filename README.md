@@ -120,7 +120,8 @@ Interactively you pick an agent, then one of two areas:
      enabled tool is carried, telemetry keeps accumulating, and the
      learned overlay is kept but not applied.
 
-Non-interactively: `--agent <name> --mode learning|history|off`.
+Non-interactively: `--agent <name> --mode learning|history|off`, optionally
+`--channel <platform>` to target one of the agent's channels (defaults to all).
 Restart the gateway afterward so Hermes picks up the new
 configuration. Re-run `configure` any time — it always detects the
 current state.

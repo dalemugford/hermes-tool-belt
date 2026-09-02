@@ -68,6 +68,7 @@ python3 scripts/configure.py --status
 python3 scripts/configure.py --agent default --mode learning --yes
 python3 scripts/configure.py --agent default --mode history --dry-run
 python3 scripts/configure.py --agent default --mode off --yes
+python3 scripts/configure.py --agent default --channel slack --mode off --yes   # one channel only
 ```
 
 `--status` never writes. `--dry-run` prints every diff and writes nothing —
