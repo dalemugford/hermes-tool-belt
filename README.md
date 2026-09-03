@@ -1,224 +1,189 @@
 # Hermes Tool Belt
 
-### Adaptive tool loadouts for agents. Carry only what you need, drop the rest. Sharpens with use.
+### Adaptive tool loadouts for uncached agents. Carry only what you need, drop the rest. Sharpens with use. Reduces tool token overhead.  
+Tool definitions are cheap on cached APIs and costly on uncached ones. Tool Belt makes uncached agents pay only for the tools they actually use.
 
 A plugin for [Hermes Agent](https://hermes-agent.nousresearch.com).
 
-> Tool shaping for uncached APIs. On a provider that doesn't prompt-cache,
-> Tool Belt narrows the tool-definition overhead shipped on every turn —
-> every tool still one ask away — and the savings compound turn over turn.
-> (On providers that prompt-cache, it carries the full set instead,
-> automatically — nothing to save there, nothing to configure.) Run
-> `hermes tool-belt savings` to see your own numbers; agents running
-> exclusively on caching providers are called out separately, not blended
-> into the total.
+## Why Tool Belt
+On a **cached API** — OpenAI, Anthropic — your tool definitions live in the
+prompt prefix the provider caches. You send them once. Every later turn reads
+them back at the cache-read rate. Tool-definition cost is a solved problem
+there.
+
+On an **uncached API** there is no prefix to cache. Every request re-sends every
+tool definition at full input price, whether the agent uses that tool or not. A
+heavy agent — web, terminal, files, browser, MCP servers, skills — can carry
+8–15k tokens of tool overhead on a message whose answer is `"yes."` You pay the
+same tool tax on `"hi"` as on `"deploy the build script,"` on every single turn.
 
 ## What it does
 
-Tool Belt narrows the tool list shipped on every API call to the tools
-the current message actually needs — and never the other direction.
-Your configured `platform_toolsets` ceiling is the contract: Tool Belt
-may remove tools from a payload and restore them on demand, nothing
-more. Five capabilities:
+Tool Belt fixes that in three ways. It never takes a tool away from your agent.
 
-1. **Adaptive tool narrowing.** Each API call ships only the tools
-   predicted to be relevant. Every enabled tool starts carried
-   (full-start); only accumulated evidence of non-use ever moves one
-   to expand-only, so Tool Belt never silently drops something new.
+1. **It shapes the loadout from real usage.** Tool Belt reads your own
+   telemetry. It learns which tools each agent actually reaches for. It then
+   decides, per tool and per agent, whether carrying a tool on every request is
+   worth the tokens.
 
-2. **Deterministic intent prediction.** A regex/keyword classifier with
-   dampeners and an attachment check chooses the relevant tool groups.
-   No LLM-as-router, no extra API call, no non-deterministic
-   mis-route — every decision is auditable in telemetry, and the
-   shipped [policy.yaml](policy.yaml) is the truth.
+2. **When a tool is not worth carrying, it defers the tool. It never deletes
+   the tool.** The tool stays fully available. Tool Belt drops it from the
+   shipped loadout and puts it behind `expand_tools`. `expand_tools` is a small
+   tool your agent calls to load any deferred tool the moment it needs one. A
+   single call recovers the tool. A tool the agent keeps reaching for is
+   promoted back into the loadout on its own. You lose prepaid overhead, never
+   capability.
 
-3. **Provider-aware loadouts.** Narrowing only pays where the provider
-   doesn't prefix-cache. On a **non-caching** provider it narrows every
-   turn — real full-price savings. On a **caching** provider it does the
-   opposite: it carries the whole set, byte-stable, so the prefix cache
-   never breaks (schema there is cache-read cheap, and a mid-session change
-   re-bills the entire history). Cache behavior is auto-detected per
-   provider; you set nothing.
+3. **It loads tools just in time.** A predictor reads each incoming message and
+   pre-loads the tools it is about to need, before the agent reaches for them.
+   Common cases never pay the `expand_tools` round-trip. The predictor is
+   deterministic. There is no LLM router, no extra API call, and no random
+   mis-route. Every decision is written to telemetry, and the shipped
+   [policy.yaml](policy.yaml) is the source of truth.
 
-4. **`expand_tools` recovery (non-caching providers).** The model's escape
-   hatch when narrowing gated a tool it needs: one call loads a missing
-   category mid-session, and repeated use gets it promoted into future
-   sessions. **The model's reach IS the promotion vote.** On caching
-   providers there is nothing to recover — everything is already carried —
-   so `expand_tools` is not shipped.
+**It also knows when to do nothing.** On a caching provider, tool definitions
+are already cheap. Shaping there would only risk breaking the prefix cache for
+pennies of benefit. So Tool Belt carries the full tool set unchanged and ships
+no `expand_tools` at all. It detects cache behavior per provider on its own. You
+configure nothing. The savings land where they are real, and the plugin stays
+out of the way everywhere else.
 
-5. **Safety guarantees.** Fails open — any internal error leaves your
-   full tool set untouched. Never widens the ceiling. Demotes only on
-   evidence. Isolates all state per session.
+Everything above is automatic. New tools start carried. A tool is only ever
+deferred on evidence that the agent does not use it. And Tool Belt **fails
+open**: if anything inside it goes wrong, it ships your full tool set untouched.
+It can save you tokens. It can never break your agent.
 
 ```text
 User: "search the docs for X and read me the relevant section"
-  loadout:     14 tools (file, web, search)
-  model calls: expand_tools(category="browser")
-  result:      12 browser tools join the loadout
-  → next session, browser is pre-loaded (shaper promoted it)
+  predicted loadout:  14 tools (file, web, search)   ← loaded just in time
+  model calls:        expand_tools(category="browser")  ← reached past the loadout
+  result:             browser tools join the session, and stay for it
+  → next session, browser is pre-loaded (the shaper promoted it)
 ```
 
-## Why narrow at all
+## How it works
 
-Every message ships tool definitions to the model. For a heavy profile —
-web, terminal, file, browser, MCP servers, custom skills — that's
-8–15k tokens of overhead on a message whose answer is `"yes."` Your
-`"hi"` costs the same as `"deploy the build script"` in tool overhead.
+Tool Belt runs on every message, before your agent runs. It follows the same
+four steps each time.
 
-The naive fix — re-narrow every turn — fights provider
-prefix-caching: changing the tool block between turns busts the cache
-and re-bills the conversation history at full input rate. On a
-multi-turn session with a caching provider, that break costs far more
-than the schema you saved — and the saved schema was cache-read cheap
-to carry anyway. So narrowing there is a bad trade in both directions.
+1. **It checks the provider.** If the provider caches (OpenAI, Anthropic), Tool
+   Belt carries every tool and stops. There is nothing to save on a cached API.
+2. **It builds the loadout.** On an uncached provider, Tool Belt ships a small
+   set of tools for this message: your always-on tools, the tools the message
+   looks like it needs, and any tools the agent asked for earlier in the
+   session.
+3. **Your agent runs.** If the agent needs a tool that is not loaded, it calls
+   `expand_tools` to load it. The tool arrives in the same session.
+4. **The session ends.** Tool Belt records what the agent used and what it
+   reached for. Over time it promotes tools the agent uses and defers tools the
+   agent ignores.
 
-Tool Belt resolves the tension by **provider**, not cadence:
+Every step is written to telemetry, so you can see why each tool was loaded. If
+any step fails, Tool Belt ships your full tool set and the message runs as
+normal.
 
-- **Caching providers** (Anthropic, OpenAI/Codex auto-cache, OpenRouter):
-  carry the whole ceiling, byte-stable every turn, so the prefix cache
-  never breaks. Narrowing is deliberately *not* done here — it would save
-  cache-read pennies and risk a full-history re-bill. `expand_tools` is not
-  shipped (nothing to recover), so there is no mid-session mutation at all.
-- **Non-caching providers** (Ollama, and any provider without prefix
-  caching): per-turn narrowing with short sticky residency for expanded
-  tools. This is where the real, full-price savings are. Illustrative: a
-  37-tool ceiling narrowed to 14 on a shell-intent message saves roughly a
-  third of the tool-schema overhead per message.
+The full lifecycle — hooks, the carry-all posture, compaction handling,
+telemetry joins — is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-The numbers above are illustrative, not measured guarantees — the
-methodology for measuring your own is in
-[docs/SAVINGS.md](docs/SAVINGS.md).
+## How to use it
 
-## What's safe about it
-
-- **Fails invisibly.** Any error — bad YAML, predictor exception, missing lookup — falls through to "no narrowing." Tool Belt can save you tokens; it can never break your agent.
-- **Strict ceiling.** Can only *narrow* what your `platform_toolsets` config already allowed. Never adds a tool you didn't sanction.
-- **Honest telemetry.** Every prediction logged with the savings math. Token counts via `tiktoken-cl100k` when installed, `chars/4` heuristic otherwise — every row records which estimator was used. Provider-billed tokens recorded directly from API responses. Anyone can verify your savings claims from the raw JSONL. See [docs/SAVINGS.md](docs/SAVINGS.md) for the methodology.
-
-## Install and configure
-
-Install, enable, configure:
+Install the plugin, restart the gateway, and configure it:
 
 ```bash
-hermes plugins install dalemugford/hermes-tool-belt   # prompts to enable; --enable skips the prompt
+hermes plugins install dalemugford/hermes-tool-belt   # add --enable to skip the enable prompt
 hermes gateway restart
 hermes tool-belt configure
 ```
 
-Standalone plugins are opt-in in Hermes, so the installer asks before
-adding `tool-belt` to `plugins.enabled` (`hermes plugins enable
-tool-belt` later if you said no). The gateway loads plugins at start,
-hence the restart.
+Tool Belt is opt-in. The installer asks before it enables the plugin. If you
+say no, enable it later with `hermes plugins enable tool-belt`. The gateway
+loads plugins when it starts, so restart it after install.
 
-`hermes tool-belt configure` and `hermes tool-belt savings` are the
-canonical commands. The **history** path also offers to install a
-`tool-belt` launcher after a confirmed apply (or link it by hand: `mkdir -p
-~/.local/bin && ln -s ~/.hermes/plugins/tool-belt/tool-belt
-~/.local/bin/tool-belt`); the launcher takes identical flags and runs
-identical code — pure convenience.
+`hermes tool-belt configure` is the front door. It finds every agent and
+platform you run. It reads the telemetry already on disk. It lets you set the
+shaping mode for each agent and channel. It writes settings only through
+`hermes config set`, never by editing `config.yaml` by hand. It shows you a
+`before → after` line for every change, and it applies nothing without your
+confirmation.
 
-`configure` is the front door: a mode-setter. It finds every agent and
-platform you run, reads the telemetry already on disk, and lets you set
-the shaping mode per agent and channel. It writes configuration only
-through `hermes config set` — never by editing `config.yaml` — shows
-you a `before → after` line for every change, and applies nothing
-without your explicit confirmation.
+Pick an agent, then pick one of two areas:
 
-Interactively you pick an agent, then one of two areas:
+1. **Protected tools.** A picker over the agent's tools. Selected tools are
+   always carried and never shaped. They are written to
+   `plugins.entries.tool-belt.settings.always_carry`.
+2. **Tool shaping.** Pick channels, then pick a mode:
+   - **learning** — shaping is on. The plugin shapes from future usage.
+   - **history** — shaping is on, and a shaping pass runs over your recorded
+     sessions now. You review a diff and confirm before anything applies.
+   - **off** — observation only. Every tool is carried, telemetry keeps
+     recording, and nothing is applied.
 
-1. **Protected tools** — a picker over the agent's tool inventory.
-   Selected tools are written to `plugins.entries.tool-belt.settings.always_carry`:
-   always carried, never shaped.
-2. **Tool shaping options** — pick channels, then a mode:
-   - **learning** — shaping on (`learned_mode: apply`); the plugin
-     shapes automatically from future usage.
-   - **history** — shaping on, and a shaping pass runs over your
-     recorded sessions right away, with a review-and-confirm diff.
-   - **off** — observation mode (`learned_mode: recommend`): every
-     enabled tool is carried, telemetry keeps accumulating, and the
-     learned overlay is kept but not applied.
+To set a mode without the menus:
 
-Non-interactively: `--agent <name> --mode learning|history|off`, optionally
-`--channel <platform>` to target one of the agent's channels (defaults to all).
-Restart the gateway afterward so Hermes picks up the new
-configuration. Re-run `configure` any time — it always detects the
-current state.
+```bash
+hermes tool-belt configure --agent <name> --mode learning|history|off
+```
+
+Add `--channel <platform>` to target one channel. It defaults to all channels.
+Restart the gateway afterward so Hermes picks up the change. You can re-run
+`configure` any time. It always reads the current state.
+
+To check status without changing anything:
 
 ```bash
 hermes tool-belt configure --status
 ```
 
-`--status` is read-only. It prints `Tool Belt: enabled|disabled`, then
-an `Agents` list with one row per scope:
-`N. scope  shaping ON/OFF (…)` — the parenthetical shows how many
-tools the scope carries each session beyond its pins and how many are
-available by expansion once a scope is shaped, `learning` while
-evidence is still accumulating, or `observing` when shaping is off.
+`--status` prints whether Tool Belt is enabled, then one line per agent scope.
+Each line shows the shaping state (`ON`, `OFF`, `learning`, or `observing`) and
+how many tools the scope carries and defers.
 
-### Optional: real-tokenizer counts
+### Daily use
 
-For exact token counts in the savings report instead of the chars/4
-heuristic:
+There is nothing to do. The plugin runs on every message. `expand_tools` is the
+model's recovery valve. At session end, Tool Belt folds real usage back into
+`learned.json` on its own. Re-run `hermes tool-belt configure` when you want to
+review what shaping did, protect a tool, or change a mode.
+
+To see what you have saved:
+
+```bash
+hermes tool-belt savings
+```
+
+The numbers are measured from your own traffic and priced at what the tokens
+were worth. Anyone can check them against the raw telemetry. The method is in
+[docs/SAVINGS.md](docs/SAVINGS.md).
+
+### Optional: exact token counts
+
+By default Tool Belt estimates tokens with a `chars/4` heuristic. For exact
+counts in the savings report, install `tiktoken`:
 
 ```bash
 pip install tiktoken
 ```
 
-Auto-detected on next gateway restart; every row in `predictions.jsonl`
-records which estimator was used (`tokens_estimator` field). The savings
-delta is honest either way — both sides use the same estimator — but
-absolute counts are more accurate with `tiktoken`. See
-[docs/SAVINGS.md](docs/SAVINGS.md#which-tokenizer) for the full story.
-
-### First-session check
-
-After restarting the gateway, confirm it's alive:
-
-```bash
-hermes tool-belt configure --status
-```
-
-To watch decisions as they happen:
-
-```bash
-tail -f ~/.hermes/state/tool-belt/predictions.jsonl | \
-  jq -c '{scope, msg: .message_preview, triggers: .triggers_fired, saved: .tokens_saved, pct: .reduction_pct}'
-```
-
-The full telemetry schema is in
-[docs/CONFIGURATION.md](docs/CONFIGURATION.md#telemetry-outputs); the
-analyzer ([analyze.py](analyze.py)) does the joins properly when you
-want real precision/recall numbers.
-
-## Daily use
-
-Nothing to do. The plugin runs on every message; `expand_tools` is the
-model's recovery valve; at session end the in-process auto-shape pass
-folds real usage back into `learned.json`. Re-run `hermes tool-belt
-configure` whenever you want to review what shaping did, protect a
-tool, or switch an agent's mode.
+Tool Belt detects it on the next gateway restart. The savings figure is honest
+either way, because both sides of the math use the same estimator. `tiktoken`
+just makes the absolute counts more accurate. Every telemetry row records which
+estimator it used, in the `tokens_estimator` field.
 
 ## If something feels off
 
-**"A tool I need isn't loading."** The model should call
-`expand_tools(category=...)` to recover it — that's the designed path,
-and repeated use gets the category promoted in future sessions. For an
-immediate, permanent fix, pin it with `plugins.entries.tool-belt.settings.always_carry:
-[tool_name]` (global, or additively under `channels.<agent>.<platform>.`) — the
-Protected tools picker in `hermes tool-belt configure` writes the same
-key. Check `hermes tool-belt configure --status` to see what shaping is
-active for that agent.
+**A tool I need is not loading.** The model should call
+`expand_tools(category=...)` to load it. That is the designed path, and repeated
+use promotes the tool for later sessions. For an immediate, permanent fix, pin
+the tool with `always_carry`. The Protected tools picker in
+`hermes tool-belt configure` writes the same key. Run
+`hermes tool-belt configure --status` to see what shaping is active.
 
-**"Tools load that I never use."** That's carry cost the in-process
-auto-shape pass demotes once the evidence is there (20 sessions of
-non-use by default). To shape from the sessions already recorded
-instead of waiting, run `hermes tool-belt configure --mode history
---agent <agent>` and review the diff; `python3
-~/.hermes/plugins/tool-belt/analyze.py` lists the candidates without
-writing anything.
+**Tools load that I never use.** That is carry cost. Tool Belt demotes those
+tools once it has the evidence — 20 sessions of non-use by default. To shape
+from your recorded sessions now instead of waiting, run
+`hermes tool-belt configure --mode history --agent <agent>` and review the diff.
 
-**"I want it off right now."** Two switches, per scope or global:
+**I want it off right now.** Two switches, per scope or global:
 
 ```yaml
 plugins:
@@ -229,25 +194,36 @@ plugins:
           default:              # agent (Hermes calls the root profile "default")
             telegram:           # platform
               bypass_rate: 1.0  # narrowing off on this scope; telemetry stays on
-        # or the plugin entirely:
+        # or turn off the whole plugin:
         enabled: false
 ```
 
-Restart the gateway after either. `bypass_rate: 1.0` keeps telemetry
-flowing (useful if you plan to turn narrowing back on); `enabled: false`
-stops everything.
+Set these through `hermes config set`, then restart the gateway.
+`bypass_rate: 1.0` keeps telemetry recording, which is useful if you plan to
+turn narrowing back on. `enabled: false` stops everything.
 
-**"The savings numbers look wrong."** Check the `tokens_estimator` field
-in your telemetry — `chars/4` without tiktoken, `tiktoken-cl100k` with.
-Run `./tool-belt savings --json` for the independently checkable math
-(the deprecated `python3 scripts/savings-report.py --json` still works).
-Methodology and caveats: [docs/SAVINGS.md](docs/SAVINGS.md).
+**The savings numbers look wrong.** Check the `tokens_estimator` field in your
+telemetry. It is `chars/4` without tiktoken and `tiktoken-cl100k` with it. Run
+`hermes tool-belt savings --json` for the checkable math. Method and caveats are
+in [docs/SAVINGS.md](docs/SAVINGS.md).
+
+## What's safe about it
+
+- **It fails invisibly.** Any error — bad YAML, a predictor exception, a missing
+  lookup — falls through to "no narrowing." A broken plugin is a silent no-op,
+  not a broken agent.
+- **It has a strict ceiling.** Tool Belt can only narrow what your
+  `platform_toolsets` config already allowed. It never adds a tool you did not
+  sanction.
+- **Its telemetry is honest.** Every prediction is logged with the savings math.
+  Provider-billed tokens are recorded straight from the API responses. Anyone
+  can verify your savings from the raw JSONL. See
+  [docs/SAVINGS.md](docs/SAVINGS.md).
 
 ## Advanced configuration
 
 `hermes tool-belt configure` covers the normal path. Everything it writes is a
-documented config key; the underlying knobs stay available for anyone
-who wants to drive them directly.
+documented config key. You can also set those keys directly.
 
 ```yaml
 plugins:
@@ -258,17 +234,16 @@ plugins:
         log: true
 
         # Internal testing feature — fraction of sessions shipped with the
-        # full toolset. Savings are measured directly, so leave it at 0.0;
-        # 1.0 on a scope disables narrowing there (observation mode).
+        # full toolset. Savings are measured directly, so leave it at 0.0.
+        # 1.0 on a scope turns narrowing off there (observation mode).
         bypass_rate: 0.0
 
-        # Per-agent always-carry pins: union with the shipped structural
-        # baseline, never demotable, inert for tools Hermes has disabled.
+        # Per-agent always-carry pins. Never demoted. Inert for tools Hermes
+        # has disabled.
         always_carry: []
 
-        # Learned overlay: apply (the default) merges learned.json during
-        # preset resolution; recommend is the opt-in observe/trial mode
-        # that never applies it.
+        # Learned overlay. apply (the default) uses learned.json. recommend is
+        # the observe-only mode that never applies it.
         learned_mode: apply    # apply (default) | recommend
 
         # Per-channel overrides: channels.<agent>.<platform>
@@ -278,95 +253,59 @@ plugins:
             telegram:            # platform
               learned_mode: recommend
           slack:                 # bare platform = platform-wide fallback
-            bypass_rate: 1.0     # disable narrowing on Slack entirely
+            bypass_rate: 1.0     # turn narrowing off on Slack entirely
 ```
 
-On disk a scope is `channels.<agent>.<platform>` (Hermes calls the root
-profile `default`, and forbids `:` in a settings key); a bare
-`channels.<platform>` entry is the platform-wide fallback. The plugin
-flattens these to the `agent:platform` scope string used by telemetry and
-`learned.json`. The legacy `off` / `auto` / `audit` values for
-`learned_mode` migrate automatically (`off` → `recommend`, `auto`/`audit`
-→ `apply`).
+A scope on disk is `channels.<agent>.<platform>`. Hermes calls the root profile
+`default` and does not allow `:` in a settings key. A bare `channels.<platform>`
+entry is the platform-wide fallback. The old `off` / `auto` / `audit` values for
+`learned_mode` migrate on their own (`off` → `recommend`, `auto`/`audit` →
+`apply`).
 
-Every knob — cache-off sticky residency, predictor lookback, dampener
-tuning, learned.json shape, full telemetry field reference — is
-documented in [docs/CONFIGURATION.md](docs/CONFIGURATION.md). The full
-operator command set (bootstrap, shaper, analyzer, savings report,
-telemetry rotation) is in [scripts/README.md](scripts/README.md).
+Every knob — sticky residency, predictor lookback, dampener tuning, the
+`learned.json` shape, the full telemetry field reference — is in
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md). The full operator command set is
+in [scripts/README.md](scripts/README.md).
 
 ```bash
 python3 ~/.hermes/plugins/tool-belt/scripts/bootstrap.py   # inspect recommendations, writes nothing
 ```
 
-## How it works
+## Limitations
 
-One mechanism, two postures, chosen per `scope|provider`:
-
-- **Caching providers** (prefix-caching): carry-all. Every dispatch ships
-  the whole ceiling (minus `expand_tools`), byte-stable, so the prefix
-  cache never breaks and no predictor runs. There is no per-session
-  snapshot and no mid-session mutation — the posture pin is evicted only at
-  moments that already cost a cache break (`/reset`, `/new`, a provider
-  switch, compaction).
-- **Non-caching providers**: per-turn narrowing — always-on tools, plus
-  every trigger group whose regexes match the message, plus
-  expanded/sticky tools, intersected with your configured ceiling.
-- **Between sessions**, the in-process auto-shape pass (session end,
-  debounced per scope) reads accumulated use and `expand_tools`
-  evidence and writes per-tool promote/demote assignments into
-  `learned.json`; `configure --mode history` and `scripts/shape-ceiling.py`
-  run the same engine on demand. Applied at runtime only when
-  `learned_mode: apply` (the default).
-
-The full lifecycle — hooks, the carry-all posture, compaction handling,
-telemetry joins — is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-## Limitations and known sharp edges
-
-- **CLI sessions don't fire `pre_gateway_dispatch`.** CLI messages bypass
-  the gateway, so neither narrowing nor the carry-all posture applies. No
-  telemetry written.
-- **Subagents are not narrowed.** When `delegate_task` spawns a subagent,
-  the parent's tool curation is inherited; the predictor doesn't run again.
-- **Cron jobs are not narrowed.** Cron sessions get explicit per-job
-  toolsets via Hermes' own `_resolve_cron_enabled_toolsets`.
-- **New tools start carried.** A tool Hermes enables that no policy or
-  learned entry names is carried on every call until evidence demotes it
-  (full-start) — safe for shipping new plugins, at some carry cost first.
-- **In-memory session state doesn't survive gateway restarts.** The
-  cache-mode posture pin (caching providers) and sticky residency
-  (non-caching) live in process memory. A restart between turns re-resolves
-  the posture or clears sticky carry-over. The cross-session detection cache
-  and `learned.json` are on disk; only the per-session memory is volatile.
-- **Codex (gpt-5.4) reasoning trace breaks cache mid-session.** When the
-  model produces reasoning tokens, the resulting message-history mutation
-  busts cache on the next call regardless of what the plugin does.
-  Anthropic-side cache is more deterministic. See
-  [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
-- **`learned_mode: apply` IS the default** (zero-config contract): a fresh
-  scope carries every enabled tool, and evidence-driven demotions apply
-  automatically as they accumulate. Set `learned_mode: recommend` on a
-  scope to opt into observe/trial mode, where `learned.json` is never
-  merged and shaping stays a human-reviewed proposal.
+- **CLI sessions are not shaped.** CLI messages bypass the gateway, so no
+  shaping and no telemetry apply to them.
+- **Subagents are not shaped.** A subagent inherits the parent's tools. The
+  predictor does not run again for it.
+- **Cron jobs are not shaped.** Cron sessions get their tools from Hermes
+  directly.
+- **New tools start carried.** A tool that no policy or learned entry names is
+  carried on every call until the evidence demotes it. This is safe for new
+  plugins, at some carry cost at first.
+- **Session memory does not survive a gateway restart.** The in-process state
+  (cache posture, sticky tools) is rebuilt after a restart. `learned.json` and
+  the detection cache are on disk and are not affected.
+- **Codex reasoning can break the cache mid-session.** When the model produces
+  reasoning tokens, the message history changes and breaks the cache on the next
+  call, whatever the plugin does. See [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md).
 
 ## Failure modes
 
-By design, **anything that goes wrong falls through to no-narrowing**:
+By design, anything that goes wrong falls through to no narrowing:
 
-- Bad YAML syntax in policy.yaml → wildcard fallback (no narrowing)
-- policy.yaml missing → wildcard fallback (no narrowing)
-- Predictor exception → returns wildcard (no narrowing)
-- Filter exception in patched `_build_api_kwargs` → returns unfiltered tools
-- Learned-state load error → base policy returned as-is, plugin keeps running
-- `agent` not in registry when `expand_tools` is called → returns honest
-  error JSON to the model
+- Bad YAML in policy.yaml → full tool set (no narrowing)
+- policy.yaml missing → full tool set (no narrowing)
+- Predictor exception → full tool set (no narrowing)
+- Filter exception → unfiltered tools returned
+- Learned-state load error → base policy returned, plugin keeps running
+- Agent not in the registry when `expand_tools` is called → honest error JSON to
+  the model
 
-The plugin should be invisible when broken, never destructive.
+The plugin is invisible when it breaks. It is never destructive.
 
 ## Disabling
 
-Either:
+Turn it off in config:
 
 ```yaml
 plugins:
@@ -376,7 +315,7 @@ plugins:
         enabled: false
 ```
 
-…or remove the directory entirely:
+…or remove the directory:
 
 ```bash
 rm -rf ~/.hermes/plugins/tool-belt
@@ -384,11 +323,11 @@ rm -rf ~/.hermes/plugins/tool-belt
 
 ## Releases
 
-Versions use CalVer: `YYYY.M.D`, with an optional prerelease suffix
-(for example `2026.5.17-beta`). The authoritative version is the one in
-[`plugin.yaml`](plugin.yaml); each stable snapshot is marked with a
-matching release tag. Pin a tag for stability, or track `main` for the
-latest changes. See [CHANGELOG.md](CHANGELOG.md) for what has changed.
+Versions use CalVer: `YYYY.M.D`, with an optional prerelease suffix (for example
+`2026.5.17-beta`). The authoritative version is the one in
+[`plugin.yaml`](plugin.yaml). Each stable snapshot has a matching release tag.
+Pin a tag for stability, or track `main` for the latest changes. See
+[CHANGELOG.md](CHANGELOG.md) for what has changed.
 
 ## Files
 
@@ -421,14 +360,14 @@ latest changes. See [CHANGELOG.md](CHANGELOG.md) for what has changed.
 
 ## Companion docs
 
-The code is the source of truth. The active doc set is intentionally small:
+The code is the source of truth. The doc set is intentionally small:
 
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the plugin works: the two postures, carry-all vs narrowing, `expand_tools`, between-session shaping, where in the request lifecycle the patches sit.
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — every knob in `config.yaml`, `policy.yaml`, and `learned.json`, with defaults; full telemetry field reference.
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the plugin works: the two postures, carry-all vs narrowing, `expand_tools`, between-session shaping, where the patches sit in the request lifecycle.
+- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — every knob in `config.yaml`, `policy.yaml`, and `learned.json`, with defaults; the full telemetry field reference.
 - [docs/SAVINGS.md](docs/SAVINGS.md) — how the token-savings numbers are computed and how to verify them on your own data.
-- [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) — behaviors that look like bugs but aren't (Codex reasoning cache, gateway-restart posture loss).
-- [docs/PRIVACY.md](docs/PRIVACY.md) — what telemetry records and what it never records, where state lives, and how to disable collection or erase it.
-- [docs/RELEASING.md](docs/RELEASING.md) — the maintainer release checklist: pre-release verification, clean-profile install test, behavioral spot-checks, version and tag steps.
+- [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) — behaviors that look like bugs but are not (Codex reasoning cache, gateway-restart posture loss).
+- [docs/PRIVACY.md](docs/PRIVACY.md) — what telemetry records and never records, where state lives, and how to disable or erase it.
+- [docs/RELEASING.md](docs/RELEASING.md) — the maintainer release checklist.
 
 ## License
 
