@@ -390,6 +390,13 @@ and lock `off` immediately. Provider-blocklist locks are *not* persisted to the
 cross-session detection cache — they're a config statement, not an
 observation.
 
+The lock is written from `post_api_request`, so it takes effect from the
+*next* session on a fresh `scope|provider` bucket — a scope's very first
+session there still resolves under `_resolve_posture_for_provider`'s
+unlocked-bucket default (`"on"`, carry-all) before any call has run. See
+[KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the detail; it's moot once the
+bucket has locked, which the blocklist forces almost immediately.
+
 ### `channels`
 
 Type: `dict[str, dict]`. Default: `{}`.

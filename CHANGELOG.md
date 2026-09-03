@@ -19,6 +19,34 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ### Changed
 
+- **Tool Belt is reframed as tool shaping for uncached APIs; `tool-belt
+  savings` reports only the value that's actually there.** The report drops
+  the caching/non-caching/historical jargon and reads as plain "savings from
+  Tool Belt." The headline was already `net_forward` (uncached-only), but the
+  per-session average and 12-month pace still divided by / spanned *all*
+  sessions, diluting both with caching sessions that contribute nothing;
+  `compute_observed` now also records `n_sessions_noncaching` /
+  `first_ts_noncaching` / `last_ts_noncaching` from the same non-caching rows
+  that price `net_forward`, and the CLI scopes the session count, average,
+  pace span, and per-agent row to them. Agents whose sessions are
+  caching-dominant are excluded from the total and named in a separate
+  neutral line ("Agent(s) currently excluded from Tool Belt (no shaping):
+  …") — their names italicized and comma-separated when the terminal
+  supports color. `net_token_reduction` (the old blended-history figure)
+  stays available in `--json` for diagnostics but no longer appears in the
+  headline.
+- **Expansion cost is now measured consistently everywhere a scope's
+  shaping is recommended.** Production `auto_shape_run` already priced an
+  `expand_tools` round-trip at the scope's measured per-event cost
+  (`measure_expand_overhead`); the other two callers of
+  `compute_scope_recommendations` — `scripts/shape-ceiling.py` (manual CLI)
+  and `scripts/configure.py` (interactive review) — omitted
+  `expand_round_trip_tokens` and silently fell back to the flat 1,500
+  (26× too cheap on a long uncached session), so manual/interactive review
+  could recommend demotions production itself rejects. The compute is now
+  shared as `shaping.measured_expand_penalty()`, used by all three
+  entrypoints; `shape-ceiling`'s porcelain output surfaces
+  `expand_round_trip_tokens` per scope.
 - **The cache-mode axis is now per provider, not per scope, and the caching
   posture is carry-all (behavior change; expect the savings headline to drop
   ~3×).** Whether narrowing helps or hurts is a property of the *provider*,
@@ -94,6 +122,14 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
   ENTER with the cursor on one channel used to apply the mode to all of
   them. Rows now start unchecked and show each channel's current
   `shaping ON/OFF`; confirming with nothing checked walks back like ESC.
+- **Color-gating test no longer fails on a bare clone / CI.** The test
+  asserting that excluded-agent names italicize only when color is on
+  imported `hermes_cli.colors` unconditionally, raising
+  `ModuleNotFoundError` where the Hermes runtime isn't installed. Standalone,
+  `savings_cli` falls back to its own no-op color function with no gating
+  hook to flip, so italics never render there — the test now skips in that
+  case; the comma-separation behavior is still locked everywhere by a
+  separate test.
 
 ## [2026.8.31] - 2026-08-31
 

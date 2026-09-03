@@ -50,6 +50,36 @@ model instead.
 
 ---
 
+### `providers_off_models` doesn't prevent a scope's first session from running carry-all
+
+**Symptom.** A provider (or model) is listed in `cache_auto.providers_off_models` —
+a known non-caching route — but the very first session tool-belt runs for that
+`scope|provider` bucket still ships the full ceiling under `cache_on_carry_all`.
+Narrowing only starts on the next session.
+
+**Cause.** The blocklist lock is written by `_update_cache_mode_detection`
+(`__init__.py`), which only fires from the `post_api_request` hook — after at
+least one API call has already gone out. The session's posture, though, is
+resolved once, at the session's first dispatch
+(`_resolve_cache_mode_for_session` → `_resolve_posture_for_provider`), before
+any call has happened. Under `cache_mode: auto`, an unlocked bucket defaults
+to `"on"` (protect prefix-cache stability until proven uncached), so a fresh
+`scope|provider` bucket runs its first session carry-all even when the
+provider is blocklisted. The blocklist lock lands during that first session's
+calls and, like any other detection lock, takes effect starting the next one.
+
+**Impact.** One session of missed narrowing per new `scope|provider` bucket on
+a blocklisted provider. Moot once the bucket has locked, which the blocklist
+forces almost immediately — and moot entirely for a scope whose bucket is
+already locked off from prior data. Not a correctness bug: the carry-all
+session still logs full telemetry and usage evidence.
+
+**Workaround.** None needed for steady state. If the very first session's
+token cost matters, set `cache_mode: off` for that scope explicitly rather
+than relying on the blocklist to catch it in time.
+
+---
+
 ### Removed: in-memory freeze state (gateway restarts, concurrent `/new`)
 
 Earlier releases kept a per-session frozen tool snapshot in process

@@ -114,6 +114,15 @@ Defaults come from `policy.yaml` under `learning.shape_ceiling`; command-line
 flags override them for an individual run. Applied recommendations are written
 to `$HERMES_HOME/state/tool-belt/learned.json`.
 
+Every demote/promote decision is priced at the scope's **measured** per-event
+expand cost (`shaping.measured_expand_penalty`) — the same pricing
+`auto_shape_run` uses in production — not the flat `EXPAND_ROUND_TRIP_TOKENS`
+fallback. `configure.py`'s history-mode preview uses the identical call, so an
+interactive review and an automatic pass never disagree on economics. The
+`--json` / `--json-file` porcelain document includes `expand_round_trip_tokens`
+per scope so the priced basis is inspectable, not just the resulting
+recommendation.
+
 ### Analyze cache behavior
 
 ```bash

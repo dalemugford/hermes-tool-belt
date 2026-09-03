@@ -4,11 +4,14 @@
 
 A plugin for [Hermes Agent](https://hermes-agent.nousresearch.com).
 
-> Tool shaping for uncached APIs. On the install it was built against, Tool
-> Belt has saved **5.7 million tokens** of tool-definition overhead — every
-> tool still one ask away. (On providers that prompt-cache, it carries the
-> full set instead, automatically — nothing to save there, nothing to
-> configure.) Run `hermes tool-belt savings` to see yours.
+> Tool shaping for uncached APIs. On a provider that doesn't prompt-cache,
+> Tool Belt narrows the tool-definition overhead shipped on every turn —
+> every tool still one ask away — and the savings compound turn over turn.
+> (On providers that prompt-cache, it carries the full set instead,
+> automatically — nothing to save there, nothing to configure.) Run
+> `hermes tool-belt savings` to see your own numbers; agents running
+> exclusively on caching providers are called out separately, not blended
+> into the total.
 
 ## What it does
 

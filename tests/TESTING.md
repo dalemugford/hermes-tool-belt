@@ -59,12 +59,20 @@ functions with explicit fixtures.* The rebuild answers that shape directly.
 ## Running
 
 `python3 -m unittest discover tests` from the plugin dir, or
-`tests/run_tests.py`. Bare `pytest tests/` does NOT work (the hyphenated
-plugin dir breaks its import of the package `__init__`); use unittest.
-The real-bridge tests require the Hermes venv interpreter — under a bare
-python they self-skip (one expected skip on a clean clone, and in the
-shipped GitHub CI, which builds a bare venv). For the full-fidelity run,
-use `~/.hermes/hermes-agent/venv/bin/python3`.
+`tests/run_tests.py`, or `python -m pytest -q -p no:cacheprovider` run from
+inside `tests/` (system `python3` has no pytest installed; use a venv
+interpreter that does). Bare `pytest tests/` from the plugin root does NOT
+work (the hyphenated plugin dir breaks its import of the package `__init__`)
+— run it from inside `tests/`, or use unittest instead.
+
+Several tests self-skip outside the Hermes runtime: every case gated on
+`hermes_cli` or `tools.tool_search` not being importable (about a dozen,
+covering the real-bridge tests and `configure.py`'s curses-contract tests),
+plus a `tiktoken`-gated case when that package isn't installed. That is
+expected on a clean clone and in the shipped GitHub CI, which builds a bare
+venv with no Hermes runtime — any *other* skip line means something changed
+and needs explaining. For the full-fidelity, zero-skip run, use
+`~/.hermes/hermes-agent/venv/bin/python3`.
 
 ## Known hygiene debt
 

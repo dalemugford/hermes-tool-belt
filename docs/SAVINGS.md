@@ -186,6 +186,34 @@ changed:
 Expect the number to drop by roughly that factor on any install that
 mixes caching and non-caching routes. It is one honest number.
 
+## Forward-aware headline, uncached-scoped denominators
+
+The headline `NET TOKENS SAVED` is `net_forward` — the non-caching cohort's
+ongoing net, `saved_input_equiv_noncaching − overhead_noncaching`
+(`ObservedCohort` in [savings.py](../savings.py)). It does **not** blend in
+the one-time, now-eliminated caching-provider expand break from the old
+per-session-freeze era (`net_caching_historical`); that figure is kept in
+`--json` for diagnostics only, alongside `net_token_reduction`, the full
+blended-history number from before this reframe. Neither appears in the
+text report.
+
+Because the headline is scoped to non-caching sessions, the numbers built
+from it are too: the per-session average, the 12-month pace, the headline
+session count, and each agent's row in `PER AGENT SAVINGS` all divide by /
+span the **uncached sessions only** — `compute_observed` walks the same
+`caches is not True` rows that price `net_forward` and records
+`n_sessions_noncaching`, `first_ts_noncaching`, and `last_ts_noncaching`
+alongside them. A caching session that contributes nothing to the net no
+longer dilutes the per-session average either.
+
+An agent whose sessions are caching-dominant — `savings_cli`'s
+`_carried_whole` classifies this from the cohort's prediction counts — is
+excluded from the total entirely and named instead in a neutral line:
+`Agent(s) currently excluded from Tool Belt (no shaping): <names>.` followed
+by `Agents using caching providers exclusively do not require Tool Belt.`
+Names are comma-separated and, on a terminal with color, italicized
+(`savings_cli._ital`).
+
 ## Measured expansion overhead
 
 `measure_expand_overhead` in [savings.py](../savings.py) prices one
@@ -310,13 +338,16 @@ read-only report:
 ./tool-belt savings --since 2026-05-15
 ```
 
-The text report leads with `NET TOKENS SAVED` (input-equiv, with its
-overhead basis), then the raw schema tokens unsent and what they were
-worth after cache pricing, then the `expand_tools` overhead and event
-count. `--json` exposes `saved_input_equiv_total`,
-`realized_schema_token_reduction`, `expansion_overhead`,
-`overhead_per_event_caching` / `_noncaching`, `overhead_basis`, and
-`overhead_measurement` per agent.
+The text report leads with `NET TOKENS SAVED` (`net_forward`, the
+uncached-only ongoing net, with its overhead basis), then the raw schema
+tokens unsent and what they were worth after cache pricing, then the
+`expand_tools` overhead and event count. `--json` exposes `net_forward`,
+`saved_input_equiv_noncaching`, `overhead_noncaching`,
+`n_sessions_noncaching` / `first_ts_noncaching` / `last_ts_noncaching`,
+the blended-history `net_token_reduction` and `net_caching_historical`,
+`saved_input_equiv_total`, `realized_schema_token_reduction`,
+`expansion_overhead`, `overhead_per_event_caching` / `_noncaching`,
+`overhead_basis`, and `overhead_measurement` per agent.
 
 `tool-belt savings` reports two separately-labeled cohorts that are **never
 summed together**:

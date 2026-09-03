@@ -9,9 +9,13 @@
 > protected always-on set, `learned_mode: off | auto`,
 > `check-tool-drift.py`, the learned overlay being "disabled by default",
 > the runtime "never rewriting learned policy by itself" (in-process
-> auto-shape now does, under the default `learned_mode: apply`), and any
-> since-removed script describe the pre-refactor model. Current behavior
-> is documented in `docs/ARCHITECTURE.md` and `docs/CONFIGURATION.md`.
+> auto-shape now does, under the default `learned_mode: apply`), the
+> "tool sets freeze for prefix-caching models" description of cache-aware
+> loadouts (the freeze+expand mechanism was removed; caching providers now
+> run a `cache_on_carry_all` carry-all posture instead, per the locked D1
+> decision), and any since-removed script describe the pre-refactor model.
+> Current behavior is documented in `docs/ARCHITECTURE.md` and
+> `docs/CONFIGURATION.md`.
 
 ---
 

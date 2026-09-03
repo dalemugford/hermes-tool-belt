@@ -20,7 +20,7 @@ when `HERMES_HOME` is unset ([`logger_io.py:_state_dir`](../logger_io.py)):
 |---|---|---|
 | `predictions.jsonl` | inbound gateway message | which preset and triggers fired, the tool names before and after narrowing, estimated token counts, the message hash and preview |
 | `tool_calls.jsonl` | tool call in a session | the tool name and attribution flags (was it cut, was it expanded, was it available already) |
-| `api_calls.jsonl` | outbound API call | token and cache-hit counters, model/provider identifiers, and fingerprint hashes of the tool block and system message |
+| `api_calls.jsonl` | outbound API call | token and cache-hit counters, model/provider identifiers, the detected cache posture (`cache_mode`, `provider_caches`), and fingerprint hashes of the tool block and system message |
 
 The purpose is measurement: the analyzer joins the three files on
 `prediction_id` to answer whether narrowing predicted the tools the
@@ -182,11 +182,13 @@ optional trigger adjustments (`triggers`) — see
 [CONFIGURATION.md § `learned.json` reference](CONFIGURATION.md#learnedjson-reference).
 Tool names and counts, nothing more.
 
-`cache_mode_detection.json` records, per scope, whether the provider
-appears to honour prefix caching: `mode`, `locked_at`, `lock_reason`,
-`hit_rate_at_lock`, `sessions_locked`, `last_model`
+`cache_mode_detection.json` records, per `scope|provider` bucket, whether
+that provider appears to honour prefix caching: `mode`, `locked_at`,
+`lock_reason`, `hit_rate_at_lock`, `sessions_locked`, `last_model`
 ([CONFIGURATION.md § Cache mode detection state](CONFIGURATION.md#cache-mode-detection-state)).
-Deleting it is safe; detection re-runs.
+A scope observed on more than one provider (a `/model` switch mid-session,
+or failover) gets a separate bucket per provider rather than one shared
+verdict. Deleting it is safe; detection re-runs.
 
 `configure-state.json` records one number per scope — the `bypass_rate`
 that observation mode replaced, so a reset can restore it
@@ -210,17 +212,19 @@ been without the plugin.
 ## Scope and profile isolation
 
 Telemetry rows are keyed by scope, formatted `agent:platform`
-([`__init__.py`](../__init__.py)). Learned state, the detection cache,
-and the configure sidecar are all keyed the same way, so one scope's
-decisions never apply to another unless a bare-platform fallback key is
-written deliberately (see
+([`__init__.py`](../__init__.py)). Learned state and the configure
+sidecar are keyed the same way; the detection cache is keyed one level
+finer, `scope|provider`, so a scope observed on more than one provider
+gets a separate bucket per provider rather than one shared verdict. One
+scope's decisions never apply to another unless a bare-platform fallback
+key is written deliberately (see
 [`learned.py:scope_candidates`](../learned.py)).
 
 Profiles are isolated by path: every state helper resolves through
 `HERMES_HOME`, so a profile install reads and writes only its own
 directory. No file is shared between profiles.
 
-In-memory session state — the frozen tool set, the lookback ring, the
+In-memory session state — sticky tool residency, the lookback ring, the
 per-session cache-mode machine — is keyed by canonical session key and
 held in plain dicts. It is process-local and does not survive a gateway
 restart.

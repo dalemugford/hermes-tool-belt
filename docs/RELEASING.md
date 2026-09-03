@@ -41,14 +41,14 @@ Expected:
 
 | Command | Expected result |
 | --- | --- |
-| `tests/run_tests.py` | `OK` — 0 failures, 0 errors. One skip is expected on a clean clone outside the Hermes venv: the real-bridge test (`skipUnless(_HAVE_HERMES)`). Any other `skipped` line means something changed and needs explaining. |
-| `scripts/smoke-test.py` | Two blocks: `9/9 checks passed` (cache-off / attribution) and `5/5 checks passed` (cache-on freeze). |
+| `tests/run_tests.py` | `OK` — 0 failures, 0 errors. Several skips are expected on a clean clone outside the Hermes venv: every case gated on `hermes_cli` or `tools.tool_search` not being importable (about a dozen — the real-bridge tests and `configure.py`'s curses-contract tests), plus a `tiktoken`-gated case when that package isn't installed. Any other `skipped` line means something changed and needs explaining. |
+| `scripts/smoke-test.py` | Two blocks: `9/9 checks passed` (cache-off / narrowing & attribution) and `16/16 checks passed` (cache-on / carry-all contract). |
 | `compileall -q .` | No output, exit 0. |
 | `bash -n scripts/rotate-telemetry.sh` | No output, exit 0. |
 
-The smoke test prints `tool-belt: cannot import run_agent` and unknown-tool
-drift warnings from its synthetic fixtures. Those are expected fixture noise,
-not failures — only the `N/N checks passed` lines decide the result.
+The smoke test prints repeated `tool-belt: cannot import run_agent` lines from
+its synthetic fixtures. That is expected fixture noise, not a failure — only
+the `N/N checks passed` lines decide the result.
 
 Then the runtime contract check, which needs the full Hermes runtime:
 
@@ -134,21 +134,26 @@ A convenient view of the rows as you go:
 
 ```bash
 tail -f "$HERMES_HOME/state/tool-belt/predictions.jsonl" | \
-  jq -c '{scope, frozen_reuse, frozen_reuse_count, tool_list_hash, policy_source, triggers: .triggers_fired}'
+  jq -c '{scope, policy_source, ceiling_count, narrowed_count, tokens_saved, tool_list_hash, triggers: .triggers_fired}'
 ```
 
-1. **Cache-on: frozen loadout is stable across turns.** On a prefix-caching
-   model, send several turns in one session. The first dispatch writes
-   `frozen_reuse: false`; every later dispatch writes `frozen_reuse: true` with
-   `frozen_reuse_count` incrementing, and `tool_list_hash` unchanged.
+1. **Cache-on: carry-all loadout is stable across turns.** On a prefix-caching
+   model, send several turns in one session. Every dispatch writes
+   `policy_source: "cache_on_carry_all"` with `ceiling_count == narrowed_count`
+   and `tokens_saved: 0`, and `tool_list_hash` is byte-identical across every
+   turn of the session (`expand_tools` is absent from the shipped tool list
+   throughout). Note: the older `frozen_reuse` / `frozen_reuse_count` fields
+   still exist in the schema but are vestigial — carry-all rows never set
+   them, so they stay `false` / `0`; don't use them to judge this check.
 
 2. **Cache-off: per-turn narrowing and sticky residency.** On a non-caching
    model, `tool_list_hash` changes as intent changes. After an `expand_tools`
    call, the expanded tools persist for the sticky-residency window, then drop.
 
-3. **`/new` or `/reset` evicts the freeze.** Issue `/new`, then send a message.
-   Expect a fresh `frozen_reuse: false` row with `frozen_reuse_count` restarting
-   at 1.
+3. **`/new` or `/reset` starts a fresh carry-all session.** Issue `/new`, then
+   send a message. Expect a new `tool_list_hash` for the new session (still
+   stable turn-to-turn within it) and `ceiling_count == narrowed_count` again
+   from the first dispatch.
 
 4. **`expand_tools` recovery, both forms.** Confirm the model can recover by
    category and by individual tool name, and that the recovered tools appear in
