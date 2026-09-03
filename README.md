@@ -20,48 +20,28 @@ Which means agents might carry
 8–15k tokens of tool overhead in a session which doesn't use any tools at all. _What if you could significantly save tool overhead tokens while still making tools available to your agents?_
 ## What Tool Belt Adds
 
-Tool Belt fixes that in three ways. It never takes a tool away from your agent.
+Tool Belt optimzes Agent tool use in three main ways:
+1. **It shapes tool loadouts based on real usage.** Tool Belt adds and reads agent telemetry. It learns which tools each agent actually reach for, and decides (per tool and per agent) whether carrying that tool is worth the token carry cost.
+2. **If a tool is not worth carrying, it defers the tool in it's own custom tool, `expand_tools`. Tool Belt drops it from the carried loadout, and tucks it behind `expand_tools`. A single call recovers the tool. A tool the agent keeps reaching for is promoted back into the loadout on its own if it's invoked enough.
+3. **It includes a deterministic prediction loader to provide tools just in time.** A deterministic predictor reads each incoming message and pre-loads tools it guesses your agent is about to need, before the agent reaches for them. This further saves tokens Preventing your agent from needing expand_tools at all in many cases. There is no LLM router, no extra API call. Every decision is written to telemetry, and used to shape your agents toolset.  
+  
 
-1. **It shapes the loadout from real usage.** Tool Belt reads your own
-   telemetry. It learns which tools each agent actually reaches for. It then
-   decides, per tool and per agent, whether carrying a tool on every request is
-   worth the tokens.
 
-2. **When a tool is not worth carrying, it defers the tool. It never deletes
-   the tool.** The tool stays fully available. Tool Belt drops it from the
-   shipped loadout and puts it behind `expand_tools`. `expand_tools` is a small
-   tool your agent calls to load any deferred tool the moment it needs one. A
-   single call recovers the tool. A tool the agent keeps reaching for is
-   promoted back into the loadout on its own. You lose prepaid overhead, never
-   capability.
+  
 
-3. **It loads tools just in time.** A predictor reads each incoming message and
-   pre-loads the tools it is about to need, before the agent reaches for them.
-   Common cases never pay the `expand_tools` round-trip. The predictor is
-   deterministic. There is no LLM router, no extra API call, and no random
-   mis-route. Every decision is written to telemetry, and the shipped
-   [policy.yaml](policy.yaml) is the source of truth.
 
-**It also knows when to do nothing.** On a caching provider, tool definitions
-are already cheap. Shaping there would only risk breaking the prefix cache for
-pennies of benefit. So Tool Belt carries the full tool set unchanged and ships
-no `expand_tools` at all. It detects cache behavior per provider on its own. You
-configure nothing. The savings land where they are real, and the plugin stays
-out of the way everywhere else.
 
-Everything above is automatic. New tools start carried. A tool is only ever
-deferred on evidence that the agent does not use it. And Tool Belt **fails
-open**: if anything inside it goes wrong, it ships your full tool set untouched.
-It can save you tokens. It can never break your agent.
 
-```text
-User: "search the docs for X and read me the relevant section"
-  predicted loadout:  14 tools (file, web, search)   ← loaded just in time
-  model calls:        expand_tools(category="browser")  ← reached past the loadout
-  result:             browser tools join the session, and stay for it
-  → next session, browser is pre-loaded (the shaper promoted it)
-```
 
+
+
+
+
+
+## Everything is Automatic
+
+Tool Belt knows when your agent is using an uncached or cached provider  
+It picks up when new tools have been added in Hermes. It picks up when tools are removed. And Tool Belt fails open if anything goes wrong.
 ## How it works
 
 Tool Belt runs on every message, before your agent runs. It follows the same
