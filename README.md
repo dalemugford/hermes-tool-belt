@@ -304,10 +304,22 @@ rm -rf ~/.hermes/plugins/tool-belt
 
 ## Releases
 
+`hermes plugins install` clones `main`, so the default install always gets the
+latest commit. That is the intended path — `main` is kept installable.
+
+To pin a known-good snapshot instead, install a specific commit:
+
+```bash
+hermes plugins install dalemugford/hermes-tool-belt --ref <commit-sha>
+```
+
+`--ref` takes a full 40-character commit SHA, not a tag name. Each release lists
+its commit on the [Releases](https://github.com/dalemugford/hermes-tool-belt/releases)
+page; copy that SHA to pin.
+
 Versions use CalVer: `YYYY.M.D`, with an optional prerelease suffix (for example
 `2026.5.17-beta`). The authoritative version is the one in
-[`plugin.yaml`](plugin.yaml). Each stable snapshot has a matching release tag.
-Pin a tag for stability, or track `main` for the latest changes. See
+[`plugin.yaml`](plugin.yaml), and each release tag is the same string. See
 [CHANGELOG.md](CHANGELOG.md) for what has changed.
 
 ## Files

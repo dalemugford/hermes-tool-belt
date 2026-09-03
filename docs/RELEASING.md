@@ -293,14 +293,28 @@ existing `2026.5.17-beta` tag sets this convention, and README's Releases
 section promises a tag matching `plugin.yaml`.
 
 ```bash
+git push origin main                       # land the release commit first
 git tag -a 2026.8.27 -m "Release 2026.8.27"
-git push origin main
-git push origin 2026.8.27
+git push origin 2026.8.27                   # triggers .github/workflows/release.yml
 ```
 
-Create the GitHub Release from that tag and paste the version's CHANGELOG
-section as the release notes. Mark it as a pre-release when the version carries
-a prerelease suffix:
+Pushing the tag is the publish step. [`release.yml`](../.github/workflows/release.yml)
+fires on any CalVer tag, re-runs the gate (`tests/run_tests.py` +
+`scripts/smoke-test.py` on 3.11 and 3.12) against the tagged commit, **hard-fails
+if the tag string does not equal `plugin.yaml`'s `version`**, extracts that
+version's `CHANGELOG.md` section as the notes, and publishes the GitHub Release
+(marked pre-release when the tag carries a suffix). No manual `gh release create`
+is needed on the happy path.
+
+Watch it land:
+
+```bash
+gh run watch "$(gh run list --workflow release.yml --limit 1 --json databaseId --jq '.[0].databaseId')"
+```
+
+If the workflow is unavailable (or you need to re-cut notes by hand), publish
+manually — the same version guard applies, so confirm the tag matches
+`plugin.yaml` first:
 
 ```bash
 awk '/^## \[2026\.8\.27\]/{f=1; next} f && /^## \[/{exit} f' CHANGELOG.md > /tmp/release-notes.md
@@ -325,9 +339,10 @@ Announce per project conventions, if any apply.
   ```
 
 - **CI is green on the tagged commit.** [`ci.yml`](../.github/workflows/ci.yml)
-  runs `tests/run_tests.py` on Python 3.11 and 3.12 for pushes to `main`. It
-  does **not** run `hermes plugins doctor` — that check has no CI coverage and
-  only happened because you ran it in step 1.
+  runs `tests/run_tests.py` and `scripts/smoke-test.py` on Python 3.11 and 3.12
+  for pushes to `main` (and [`release.yml`](../.github/workflows/release.yml)
+  re-runs both on the tag). Neither runs `hermes plugins doctor` — that check
+  has no CI coverage and only happened because you ran it in step 1.
 
   ```bash
   gh run list --branch main --limit 3

@@ -1,0 +1,113 @@
+name: Release
+
+# Publishes a GitHub Release when a CalVer tag is pushed.
+#
+# Hermes installs this plugin by cloning `main` HEAD (`hermes plugins install
+# dalemugford/hermes-tool-belt`); it does NOT consume release assets. So this
+# workflow builds nothing and ships no artifact. Its job is to VERIFY the
+# tagged commit and ANNOUNCE it: run the full gate, assert the tag matches
+# plugin.yaml, and publish human-facing release notes from CHANGELOG.md.
+#
+# Cut a release by tagging a commit already on `main`:
+#   1. bump `version:` in plugin.yaml to today's CalVer (YYYY.M.D)
+#   2. move CHANGELOG's [Unreleased] section under a `## [YYYY.M.D]` heading
+#   3. commit + push main (CI must be green)
+#   4. git tag YYYY.M.D && git push origin YYYY.M.D   ← triggers this workflow
+
+on:
+  push:
+    tags:
+      # CalVer YYYY.M.D with an optional prerelease suffix (e.g. 2026.5.17-beta).
+      - "[0-9][0-9][0-9][0-9].[0-9]*"
+
+permissions:
+  contents: write   # required to create the GitHub Release
+
+jobs:
+  # Re-run the full gate on the exact tagged commit. A tag that fails here
+  # never becomes a Release.
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Create venv and install dev dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: .venv/bin/python tests/run_tests.py
+
+      - name: Behavioral smoke test
+        run: .venv/bin/python scripts/smoke-test.py
+
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Guard: the tag string must equal plugin.yaml's `version`. Catches the
+      # classic "tagged without bumping the manifest" (or vice versa) mistake
+      # before a mislabeled release goes public. Hard-fails on mismatch.
+      - name: Verify tag matches plugin.yaml version
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          MANIFEST="$(sed -n 's/^version:[[:space:]]*//p' plugin.yaml | head -n1 | tr -d '[:space:]')"
+          echo "tag=${TAG}  plugin.yaml=${MANIFEST}"
+          if [ -z "$MANIFEST" ]; then
+            echo "::error::Could not read 'version:' from plugin.yaml"
+            exit 1
+          fi
+          if [ "$TAG" != "$MANIFEST" ]; then
+            echo "::error::Tag '${TAG}' does not match plugin.yaml version '${MANIFEST}'. Bump plugin.yaml (or fix the tag) and re-tag."
+            exit 1
+          fi
+
+      # Pull this version's section out of CHANGELOG.md (Keep a Changelog
+      # format: `## [YYYY.M.D]` ... up to the next `## `). Falls back to a
+      # pointer if the section is missing, so a release never blocks on notes.
+      - name: Extract release notes
+        id: notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          awk -v ver="$TAG" '
+            $0 ~ "^## \\[" ver "\\]" { grab=1; next }
+            grab && /^## / { exit }
+            grab { print }
+          ' CHANGELOG.md > notes.md
+          # Trim leading/trailing blank lines.
+          sed -i -e '/./,$!d' notes.md
+          if [ ! -s notes.md ]; then
+            echo "No \`## [${TAG}]\` section found in CHANGELOG.md — see the changelog for details." > notes.md
+          fi
+          echo "----- release notes -----"
+          cat notes.md
+
+      # First-party publish via the preinstalled gh CLI + the run's own
+      # GITHUB_TOKEN — no third-party action in the supply chain. A tag with a
+      # suffix (e.g. -beta) is flagged prerelease.
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          PRERELEASE=""
+          case "$TAG" in
+            *-*) PRERELEASE="--prerelease" ;;
+          esac
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            $PRERELEASE

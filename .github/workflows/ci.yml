@@ -34,6 +34,14 @@ jobs:
       - name: Run tests
         run: .venv/bin/python tests/run_tests.py
 
+      # `main` HEAD is the install channel — `hermes plugins install` clones it
+      # directly — so every push must stay installable AND behaviorally sound.
+      # smoke-test.py is stdlib + PyYAML only (no Hermes runtime), so it runs
+      # in CI and guards the cache-off narrowing and cache-on carry-all
+      # contracts. It exits non-zero on any failed check.
+      - name: Behavioral smoke test
+        run: .venv/bin/python scripts/smoke-test.py
+
       # NOTE: `hermes plugins doctor --ci .` is intentionally NOT run here.
       # It requires the full Hermes runtime, which is not installed in CI.
       # Add a doctor step once a lightweight, dependency-free doctor path
