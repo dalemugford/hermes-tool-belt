@@ -1,7 +1,7 @@
 name: tool-belt
 label: Hermes Tool Belt
 kind: standalone
-version: 2026.8.31
+version: 2026.9.3
 manifest_version: 2
 api_version: 1
 description: >

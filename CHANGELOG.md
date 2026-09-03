@@ -6,6 +6,8 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ## [Unreleased]
 
+## [2026.9.3] - 2026-09-03
+
 ### Added
 
 - **`configure --channel <platform>`** restricts a non-interactive `--mode`
@@ -16,6 +18,15 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
   covering every top-level setting, so Hermes warns at gateway load when a
   setting has the wrong type or a declared dependency is missing, and
   `hermes plugins doctor` validates the schema's type names.
+- **Releases are automated, and installing is documented.** Pushing a CalVer
+  tag runs `.github/workflows/release.yml`, which re-runs the full gate
+  (tests + `scripts/smoke-test.py` on Python 3.11 and 3.12), hard-fails if
+  the tag does not match `plugin.yaml`'s `version`, and publishes a GitHub
+  Release with notes taken from this changelog. The smoke test now also runs
+  in CI on every push to `main` — the branch `hermes plugins install` clones
+  — so `main` stays installable. The README documents installing from `main`
+  and pinning a known-good commit with
+  `hermes plugins install … --ref <commit-sha>`.
 
 ### Changed
 
