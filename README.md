@@ -1,23 +1,24 @@
 # Hermes Tool Belt
 
-### Adaptive tool loadouts for uncached agents. Carry only what you need, drop the rest. Sharpens with use. Reduces tool token overhead.  
-Tool definitions are cheap on cached APIs and costly on uncached ones. Tool Belt makes uncached agents pay only for the tools they actually use.
+### Adaptive tool loadouts for uncached agents. Carry only what you need, drop the rest. Sharpens with use. Reduces tool token overhead.
 
 A plugin for [Hermes Agent](https://hermes-agent.nousresearch.com).
 
+Tool definitions are cheap to carry on cached APIs (OpenAI, Anthropic) yet *costly on uncached ones.* Tool Belt shapes tool carry for Agents using uncached APIs (like Ollama Cloud, Opernrouter).
+
+
+
 ## Why Tool Belt
-On a **cached API** — OpenAI, Anthropic — your tool definitions live in the
-prompt prefix the provider caches. You send them once. Every later turn reads
-them back at the cache-read rate. Tool-definition cost is a solved problem
-there.
+On a **cached API** tool definitions live in the
+prompt prefix the provider caches. You send them once. Every turn reads
+them back at the cache-read rate. Tool-definition cost is cheap.  
 
-On an **uncached API** there is no prefix to cache. Every request re-sends every
-tool definition at full input price, whether the agent uses that tool or not. A
-heavy agent — web, terminal, files, browser, MCP servers, skills — can carry
-8–15k tokens of tool overhead on a message whose answer is `"yes."` You pay the
-same tool tax on `"hi"` as on `"deploy the build script,"` on every single turn.
-
-## What it does
+However on **uncached APIs** there is no prefix to cache, and *every request re-sends every
+tool definition at full input price*... whether an agent uses that tool or not in the session.  
+  
+Which means agents might carry
+8–15k tokens of tool overhead in a session which doesn't use any tools at all. _What if you could significantly save tool overhead tokens while still making tools available to your agents?_
+## What Tool Belt Adds
 
 Tool Belt fixes that in three ways. It never takes a tool away from your agent.
 
