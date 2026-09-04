@@ -53,18 +53,21 @@ from .yaml_required import require_yaml
 
 logger = logging.getLogger("tool_belt_plugin.shaping")
 
-# Thresholds — conservative defaults that won't fire on noise. These are the
-# shaper's evidence thresholds; the auto-shape engine reuses them unchanged.
-# ``session_window`` is a ceiling, not a target: the shaper uses ALL available
-# session history up to this many sessions. The floor is enforced separately by
-# ``demote_min_sessions_no_use`` — with fewer sessions than that, demotion never
-# fires. A wider window is strictly more conservative for demotion (evidence is
-# zero uses across the entire window, so one use anywhere protects the tool).
+# Thresholds — the shaper's evidence gates; the auto-shape engine reuses them
+# unchanged. ``window_days`` is the unit of recency: only sessions whose last
+# activity falls inside the trailing window are evidence at all, so a tool that
+# stopped being used ages out instead of being protected forever by one call
+# from months ago. The floor is enforced separately by
+# ``demote_min_sessions_no_use`` — with fewer sessions *inside the window* than
+# that, demotion never fires. Chronological replay of real sessions set these:
+# a 7-day window holds the carried loadout near its steady state, and the
+# demote floor showed no protective value above 2 (floors 2..20 demote the same
+# tools) while a high floor simply delays the saving.
 DEFAULTS = {
-    "session_window": 100,
-    "promote_min_sessions": 2,
-    "promote_min_calls": 3,
-    "demote_min_sessions_no_use": 20,
+    "window_days": 7,
+    "promote_min_sessions": 1,
+    "promote_min_calls": 2,
+    "demote_min_sessions_no_use": 2,
     # Economic safety factor k: demote a carried tool only when carrying it
     # costs more than k× what reaching for it on demand would. Token-
     # denominated by design — fewer tokens is always cheaper on every route,
@@ -73,6 +76,15 @@ DEFAULTS = {
     # expand_tools when it should).
     "demote_k": 1.5,
 }
+
+#: Retired threshold key. ``session_window`` counted SESSIONS; the recency
+#: window is now wall-clock (``window_days``), so an old value cannot be
+#: translated and is ignored rather than reinterpreted. Still *parsed* — an
+#: old config must not error — and warned about once per resolution.
+DEPRECATED_THRESHOLD_KEYS = ("session_window",)
+
+#: Seconds in the day the ``window_days`` filter counts in.
+_SECONDS_PER_DAY = 86400
 
 #: Auto-shape per-scope debounce default: at most one auto run per scope per
 #: this many hours. Overridable via ``channels.<scope>.auto_shape_interval_hours``
@@ -176,6 +188,10 @@ def load_shape_ceiling_defaults(
     policy value, which itself falls through to :data:`DEFAULTS`. Per-scope
     overrides are out of scope for v1 — the whole profile shares one set.
 
+    :data:`DEPRECATED_THRESHOLD_KEYS` (``session_window``) still parse without
+    erroring but never resolve into a threshold: they are warned about once
+    and dropped.
+
     PyYAML is required: :func:`yaml_required.require_yaml` exits loudly when
     it is missing rather than degrading to a second, divergent parser. A
     missing or malformed policy file still falls back to :data:`DEFAULTS` —
@@ -184,6 +200,7 @@ def load_shape_ceiling_defaults(
     (and any external caller) keeps its exact prior behaviour.
     """
     yaml = require_yaml()
+    policy_shape: dict[str, Any] = {}
     try:
         raw = policy_path.read_text(encoding="utf-8")
     except Exception:
@@ -199,21 +216,46 @@ def load_shape_ceiling_defaults(
             if isinstance(learning, dict):
                 shape = learning.get("shape_ceiling")
                 if isinstance(shape, dict):
+                    policy_shape = shape
                     policy_merged = _merge_shape_defaults(shape)
 
     # User layer (config.yaml) merges over the resolved policy layer: only
     # valid positive values win, so a bad user value degrades to policy.
     user_shape = _config_shape_ceiling(plugin_config)
+    # One warning per resolution, whichever layer still carries a retired key
+    # (the user layer is the one an operator can act on, so it is named first).
+    _warn_deprecated_keys(user_shape or policy_shape)
     if user_shape:
         return _merge_shape_defaults(user_shape, base=policy_merged)
     return policy_merged
 
 
+def _warn_deprecated_keys(overrides: dict[str, Any]) -> None:
+    """Warn once about retired threshold keys still present in a config layer.
+
+    Retired keys are inert — this is the only place their presence is visible,
+    so the message has to name the replacement rather than just complain.
+    """
+    if not isinstance(overrides, dict):
+        return
+    stale = [key for key in DEPRECATED_THRESHOLD_KEYS if key in overrides]
+    if stale:
+        logger.warning(
+            "tool-belt: learning.shape_ceiling %s is deprecated and ignored — "
+            "the shaper's recency window is wall-clock now; set "
+            "learning.shape_ceiling.window_days (days, default %d) instead",
+            ", ".join(stale), DEFAULTS["window_days"],
+        )
+
+
 def _merge_shape_defaults(
     overrides: dict[str, Any], base: dict[str, Any] | None = None
 ) -> dict[str, Any]:
+    # Live positive-int keys only. Retired keys (DEPRECATED_THRESHOLD_KEYS) are
+    # absent from this tuple on purpose: parsing them here would resurrect them
+    # as a threshold nothing reads.
     merged = dict(base if base is not None else DEFAULTS)
-    for key in ("session_window", "promote_min_sessions", "promote_min_calls", "demote_min_sessions_no_use"):
+    for key in ("window_days", "promote_min_sessions", "promote_min_calls", "demote_min_sessions_no_use"):
         value = overrides.get(key)
         if value is None:
             continue
@@ -441,7 +483,7 @@ def compute_scope_recommendations(
     scope: str,
     sessions: dict[str, list[dict[str, Any]]],
     calls_by_pred: dict[str, list[dict[str, Any]]],
-    window: int,
+    window_days: int,
     promote_min_sessions: int,
     promote_min_calls: int,
     demote_min_sessions_no_use: int,
@@ -480,16 +522,47 @@ def compute_scope_recommendations(
     reconstruct (``residency_inferred``) contribute carry candidates — a sparse
     v1 row cannot drive demotion. always_carry is excluded by construction (it is
     a distinct residency class) and pinned by an assertion below. Only fires when
-    the window has ≥ ``demote_min_sessions_no_use`` sessions.
+    the window holds ≥ ``demote_min_sessions_no_use`` sessions — a floor in
+    SESSIONS inside a window measured in DAYS, deliberately: the two answer
+    different questions ("is there enough evidence?" vs "is it still current?").
+
+    The window is ``window_days`` days of wall-clock recency, ending at the most
+    recent activity in ``sessions`` rather than at the clock — so a replay over
+    archived telemetry sees exactly what the live run saw when that telemetry was
+    fresh, and a scope that has been quiet for a month is not judged against an
+    empty window. A session belongs to the window when its LAST activity falls
+    inside it.
 
     Every candidate is validated against the concrete enabled tool names observed
     for the scope; a toolset/category-only value can never be stored in a per-tool
     carrying list (it is dropped with a warning).
     """
-    session_ids_ordered = sorted(sessions.keys(), key=lambda sid: -max(
-        (p.get("ts", 0) for p in sessions[sid]), default=0
-    ))
-    recent_session_ids = session_ids_ordered[:window]
+    # Recency filter, newest first. "Now" is the newest activity in the data,
+    # not time.time(): the shaper is judged on the telemetry it was handed, so
+    # a replay of archived rows and the live run that produced them reach the
+    # same verdict. With no parsable timestamps anywhere the window collapses
+    # to "everything" (max of an empty sequence → 0, cutoff ≤ 0) rather than
+    # discarding the data — fail-open, as everywhere else here.
+    last_ts_by_session = {
+        sid: max((p.get("ts", 0) or 0) for p in plist) if plist else 0
+        for sid, plist in sessions.items()
+    }
+    session_ids_ordered = sorted(
+        last_ts_by_session, key=lambda sid: -last_ts_by_session[sid]
+    )
+    # A non-positive/unparsable window degrades to the default rather than
+    # raising or silently discarding every session (fail-open).
+    try:
+        days = int(window_days)
+    except Exception:
+        days = 0
+    if days <= 0:
+        days = int(DEFAULTS["window_days"])
+    now_ts = max(last_ts_by_session.values(), default=0)
+    cutoff = now_ts - days * _SECONDS_PER_DAY
+    recent_session_ids = [
+        sid for sid in session_ids_ordered if last_ts_by_session[sid] >= cutoff
+    ]
     recent_sessions = {sid: sessions[sid] for sid in recent_session_ids}
 
     # Concrete enabled tool names seen for THIS scope — the validation domain
@@ -525,7 +598,7 @@ def compute_scope_recommendations(
             "scope": scope,
             "computed_at": _utc_iso(),
             "sessions_considered": len(recent_sessions),
-            "window_requested": window,
+            "window_days": days,
             "promote": [],
             "demote": [],
             "enabled_tool_names": sorted(enabled_names),
@@ -753,7 +826,7 @@ def compute_scope_recommendations(
         "scope": scope,
         "computed_at": _utc_iso(),
         "sessions_considered": len(recent_sessions),
-        "window_requested": window,
+        "window_days": days,
         "promote": promote,
         "demote": demote,
         "enabled_tool_names": sorted(enabled_names),
@@ -1812,7 +1885,7 @@ def auto_shape_run(
             scope=scope,
             sessions=grouped[scope],
             calls_by_pred=calls_by_pred,
-            window=thresholds["session_window"],
+            window_days=thresholds["window_days"],
             promote_min_sessions=thresholds["promote_min_sessions"],
             promote_min_calls=thresholds["promote_min_calls"],
             demote_min_sessions_no_use=thresholds["demote_min_sessions_no_use"],

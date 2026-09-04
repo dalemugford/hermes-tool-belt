@@ -62,7 +62,7 @@ class EconomicDemotion(unittest.TestCase):
         # k2 × penalty (1×1500 = 1500) → demote. Pre-economic code never
         # demoted a tool with ANY use.
         preds, calls = self._sessions(30, browser_use_sessions={7})
-        recs = _compute(self.SCOPE, preds, calls, window=100,
+        recs = _compute(self.SCOPE, preds, calls, window_days=7,
                         schema_sizes={"browser_exec": 2000}, cache_mode="off")
         entry = {d["tool"]: d for d in recs["demote"]}
         self.assertIn("browser_exec", entry)
@@ -80,7 +80,7 @@ class EconomicDemotion(unittest.TestCase):
         # pre-economic code.
         preds, calls = self._sessions(30, browser_use_sessions={3},
                                       calls_per_use_session=25)
-        recs = _compute(self.SCOPE, preds, calls, window=100,
+        recs = _compute(self.SCOPE, preds, calls, window_days=7,
                         schema_sizes={"browser_exec": 2000}, cache_mode="off")
         entry = {d["tool"]: d for d in recs["demote"]}
         self.assertIn("browser_exec", entry)
@@ -93,7 +93,7 @@ class EconomicDemotion(unittest.TestCase):
         # Used in 25 of 30 sessions: saving = 2000×5 = 10000 ≤
         # k2 × penalty (25×1500 = 37500) → carrying is cheaper, hold.
         preds, calls = self._sessions(30, browser_use_sessions=set(range(25)))
-        recs = _compute(self.SCOPE, preds, calls, window=100,
+        recs = _compute(self.SCOPE, preds, calls, window_days=7,
                         schema_sizes={"browser_exec": 2000}, cache_mode="off")
         self.assertNotIn("browser_exec", {d["tool"] for d in recs["demote"]})
 
@@ -113,7 +113,7 @@ class EconomicDemotion(unittest.TestCase):
                 active=self.E, ts=float(i),
             ))
             calls.append(_use_call(pid, "terminal"))
-        recs = _compute(self.SCOPE, preds, calls, window=100,
+        recs = _compute(self.SCOPE, preds, calls, window_days=7,
                         schema_sizes={"browser_exec": 2000}, cache_mode="off")
         entry = {d["tool"]: d for d in recs["demote"]}
         self.assertIn("browser_exec", entry)
@@ -145,7 +145,7 @@ class EconomicDemotion(unittest.TestCase):
         # saving 1000×30 = 30000 ≤ 1.5×22500 → hold. Fails on the
         # trigger-is-always-free math (penalty 0 → demote).
         preds, calls = self._late_trigger_sessions(30, set(range(15)))
-        recs = _compute(self.SCOPE, preds, calls, window=100,
+        recs = _compute(self.SCOPE, preds, calls, window_days=7,
                         schema_sizes={"browser_exec": 1000}, cache_mode="on")
         self.assertNotIn("browser_exec", {d["tool"] for d in recs["demote"]})
 
@@ -153,7 +153,7 @@ class EconomicDemotion(unittest.TestCase):
         # Same shape, cache OFF: no frozen list to mutate, no cache to bust —
         # the trigger charge must not apply, and the unused carry demotes.
         preds, calls = self._late_trigger_sessions(30, set(range(15)))
-        recs = _compute(self.SCOPE, preds, calls, window=100,
+        recs = _compute(self.SCOPE, preds, calls, window_days=7,
                         schema_sizes={"browser_exec": 1000}, cache_mode="off")
         entry = {d["tool"]: d for d in recs["demote"]}
         self.assertIn("browser_exec", entry)
@@ -164,7 +164,7 @@ class EconomicDemotion(unittest.TestCase):
         # defend a carry slot: 5 trigger-only sessions count as no-use.
         preds, calls = self._sessions(30, browser_use_sessions=set(range(5)),
                                       calls_factory=_trigger_call)
-        recs = _compute(self.SCOPE, preds, calls, window=100,
+        recs = _compute(self.SCOPE, preds, calls, window_days=7,
                         schema_sizes={"browser_exec": 2000}, cache_mode="off")
         entry = {d["tool"]: d for d in recs["demote"]}
         self.assertIn("browser_exec", entry)
@@ -175,13 +175,13 @@ class EconomicDemotion(unittest.TestCase):
         # Cache on (1 exposure/session), 150-token schema, used in 2
         # sessions: saving = 150×28 = 4200 ≤ k2×(2×1500) = 6000 → hold.
         preds, calls = self._sessions(30, browser_use_sessions={0, 1})
-        recs = _compute(self.SCOPE, preds, calls, window=100,
+        recs = _compute(self.SCOPE, preds, calls, window_days=7,
                         schema_sizes={"browser_exec": 150}, cache_mode="on")
         self.assertNotIn("browser_exec", {d["tool"] for d in recs["demote"]})
 
     def test_zero_use_limit_case_still_demotes_as_unused(self):
         preds, calls = self._sessions(30)
-        recs = _compute(self.SCOPE, preds, calls, window=100)
+        recs = _compute(self.SCOPE, preds, calls, window_days=7)
         entry = {d["tool"]: d for d in recs["demote"]}
         self.assertIn("browser_exec", entry)
         self.assertEqual(entry["browser_exec"]["evidence"], "carry_unused")
@@ -193,7 +193,7 @@ class EconomicDemotion(unittest.TestCase):
         # prediction count. Fails before api_call_counts existed.
         preds, calls = self._sessions(30)
         api_counts = {f"p{i}": 10 for i in range(30)}
-        recs = _compute(self.SCOPE, preds, calls, window=100,
+        recs = _compute(self.SCOPE, preds, calls, window_days=7,
                         schema_sizes={"browser_exec": 2000}, cache_mode="off",
                         api_call_counts=api_counts)
         entry = {d["tool"]: d for d in recs["demote"]}
@@ -227,7 +227,7 @@ class EconomicPromotion(unittest.TestCase):
         preds, calls = self._expansion_history(
             30, use_sessions={0, 1}, preds_per_session=5,
             calls_in_use_session=2)
-        recs = _compute(self.SCOPE, preds, calls, window=100, cache_mode="off")
+        recs = _compute(self.SCOPE, preds, calls, window_days=7, cache_mode="off")
         self.assertNotIn("web_extract", {p["tool"] for p in recs["promote"]})
 
     def test_promotion_granted_when_expansion_spend_exceeds_carry(self):

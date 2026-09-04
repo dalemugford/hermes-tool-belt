@@ -71,7 +71,9 @@ records what the predictor *would* have selected — so a later shaping run has
 real evidence without any narrowing having happened in the meantime. The
 command reports how many more sessions each scope needs; that minimum is
 derived from [`learning.shape_ceiling`](#learningshape_ceiling) in
-`policy.yaml`, never hardcoded.
+`policy.yaml`, never hardcoded. Under the shipped defaults it is small — the
+demote floor is `2` sessions inside the `7`-day window — so a scope usually
+becomes shapeable within a few days of ordinary use.
 
 ### Reset behavior
 
@@ -477,10 +479,10 @@ description: >
 
 learning:
   shape_ceiling:
-    session_window: 100
-    promote_min_sessions: 2
-    promote_min_calls: 3
-    demote_min_sessions_no_use: 20
+    window_days: 7
+    promote_min_sessions: 1
+    promote_min_calls: 2
+    demote_min_sessions_no_use: 2
     demote_k: 1.5
 
 always_carry:
@@ -558,11 +560,33 @@ auto-shape engine. All entrypoints resolve them through
 
 | Key | Default | Meaning |
 |---|---|---|
-| `session_window` | `100` | Ceiling on history the shaper reads — it uses all available sessions up to this many. `demote_min_sessions_no_use` is the floor: below that, demotion never fires. |
-| `promote_min_sessions` | `2` | Anti-flap gate: a tool needs `expand_tools`-driven use across this many distinct sessions to be a promote candidate. |
-| `promote_min_calls` | `3` | And this many total calls. Candidates then promote only when their observed expansion spend exceeds what carrying them would have cost. |
-| `demote_min_sessions_no_use` | `20` | Window must contain this many sessions before any carried tool can be demoted. |
+| `window_days` | `7` | The evidence window, in **days**. The shaper considers only sessions whose last activity falls within this many days of "now" — where *now* is the most recent activity in the telemetry, not wall-clock time (a replay of an old archive windows against that archive's own end, so results are reproducible). `14` and `30` are the other sensible values; larger windows carry stale-use tools for longer. |
+| `promote_min_sessions` | `1` | Anti-flap gate: a tool needs `expand_tools`-driven use across this many distinct sessions to be a promote candidate. |
+| `promote_min_calls` | `2` | And this many total calls. Candidates then promote only when their observed expansion spend exceeds what carrying them would have cost. |
+| `demote_min_sessions_no_use` | `2` | Demote floor, in **sessions**: the day window must contain at least this many sessions before any carried tool can be demoted. A quiet week with 0–1 sessions simply doesn't shape. |
 | `demote_k` | `1.5` | Economic safety factor: demote a carried tool only when carrying it costs more than k × what expanding it on demand would (token-denominated — no price table). |
+
+The two windows are deliberately in **different units** and are not clamped
+against each other: `window_days` bounds *how far back* evidence is read,
+`demote_min_sessions_no_use` bounds *how much* evidence must sit inside that
+span. A floor larger than the number of sessions a window happens to contain is
+not a misconfiguration — it just means that window is too thin to demote on,
+which is the intended behavior.
+
+#### Deprecated: `session_window`
+
+The old session-**count** window (`session_window`, formerly defaulting to
+`100`) is deprecated. It is still parsed, logs one warning at load naming
+`window_days` as its replacement, and is then ignored. The day window is the
+only unit the shaper uses. Remove the key from `config.yaml` (or a forked
+`policy.yaml`) to silence the warning.
+
+The replacement is not cosmetic. Measured on 153 real sessions of one live
+scope, varying the session-count window changed demotion timing almost not at
+all, while the day window is what ages out tools whose last use is old: at
+window 100 the scope kept carrying `cronjob` (1,359 tok) and `delegate_task`
+(837 tok) on months-old usage — 2,196 tok/turn, about a quarter of the
+remaining per-turn cost — that a 30-day window demoted.
 
 #### Where the thresholds come from (config precedence)
 
@@ -583,18 +607,21 @@ value, or the wrong type) is ignored and the key falls through to the layer
 below — bad config never raises and never breaks shaping (fail-open). Only
 `demote_k` accepts a positive float; the other four accept positive ints.
 
-CLI flags on `scripts/shape-ceiling.py` (`--window`, `--demote-k`, …) still
-override the resolved value for that one ad-hoc run.
+CLI flags on `scripts/shape-ceiling.py` (`--window-days`, `--demote-k`, …)
+still override the resolved value for that one ad-hoc run.
 
 **Scope:** the resolved set applies to the **whole profile** — per-scope
 threshold overrides (e.g. `channels.<scope>.learning.shape_ceiling`) are
 **not** supported yet.
 
-#### Worked example — a tighter rolling cadence
+#### Worked example — a longer memory
 
-To rotate evidence faster on a busy install (smaller window, quicker
-demotion of tools that stop being used), set the keys you want to change in
-`config.yaml`; unset keys keep their `policy.yaml` / default value:
+The shipped default (`window_days: 7`) is the aggressive setting: it holds a
+tool carried only while it has been used in the last week, and lets everything
+else fall back to `expand_tools`. If your work is lumpier than that — tools you
+reach for once a fortnight, or a scope with long idle stretches — widen the
+window. Set only the keys you want to change; unset keys keep their
+`policy.yaml` / default value:
 
 ```yaml
 plugins:
@@ -603,16 +630,38 @@ plugins:
       settings:
         learning:
           shape_ceiling:
-            session_window: 30      # faster evidence rotation (default 100)
-            demote_min_sessions_no_use: 8   # demote after fewer idle sessions (default 20)
+            window_days: 14         # looser: two weeks of memory (default 7)
 ```
 
-**Warning:** a smaller window demotes on thinner evidence — fewer protected
-sessions per tool — and can flap near the promote/demote hysteresis band.
-The anti-flap gates (`promote_min_sessions`, `promote_min_calls`, `demote_k`)
-still bound it, but step down gradually (e.g. 100 → 60 → 30) and watch the
-shaper's promote/demote churn rather than jumping straight to aggressive
-values.
+`30` is the loosest value worth using; past that the window stops aging
+anything out and tools ride carried on stale evidence.
+
+**What you're trading.** A longer window carries more tools, for longer, on
+older evidence. Measured over 153 real sessions of one live scope (floor `2`,
+promote gates `1`/`2`):
+
+| `window_days` | Steady state | Expansion events over the replay |
+|---|---|---|
+| `7` (default) | 5,125 tok/turn | 14 |
+| `14` | 5,962 tok/turn | 14 |
+| `30` | 7,803 tok/turn | 11 |
+
+Every window first demotes at session 2 and converges by session 56. Seven
+days saved roughly 616K carried tokens against 30 days over that replay; net of
+its three extra expansions (~38K each) it was still ~500K ahead, and its steady
+state beats the same operator's hand-tuned tool list (~6.3K/turn). Widening the
+window buys fewer expansion round-trips, not lower cost.
+
+**On the demote floor.** Under a day window, `demote_min_sessions_no_use` must
+be low or demotion starves: the floor counts sessions *inside* the window, so
+at 7 days a floor of `20` cannot fire until a single week holds twenty
+sessions. Replayed at 7 days, floor `20` first demoted at session 79 (floor
+`2`: session 2), converged at 119 (vs 56), and carried about 3.1M more tokens
+over the replay for near-identical final assignments (49 vs 51 tools
+demoted). A high floor buys no protection it
+can be shown to need: a wrong demotion costs one expansion round-trip and
+corrects itself through promotion, which is why the promote gates are also low
+(`1` session / `2` calls).
 
 ### Authoring a new preset
 
@@ -653,7 +702,7 @@ the configure flows, and inventory reconciliation — all through
         "scope": "default:telegram",
         "computed_at": "2026-08-01T00:00:00Z",
         "sessions_considered": 30,
-        "window_requested": 100,
+        "window_days": 7,
         "source": "auto",
         "applied_at": "2026-08-01T00:00:00Z",
         "last_auto_shape_at": "2026-08-01T00:00:00Z",
@@ -695,9 +744,13 @@ Per scope:
   `demote_tokens`, `k`, `evidence` ∈ `expansion | carry_unused |
   carry_uneconomic`), `enabled_tool_names` (the ceiling the pass saw —
   also what `configure --status` counts "carried" against),
+  `window_days` (the day window the pass resolved) alongside
+  `sessions_considered` (how many sessions fell inside it),
   `computed_at`, and the apply stamp (`source` `auto|configure`,
   `applied_at`, `last_auto_shape_at`). Human-readable; nothing at runtime
-  branches on it.
+  branches on it. (Blocks written before the day window landed record
+  `window_requested` — a session count — instead; the field is historical
+  and is not read back.)
 
 > **Learned trigger overlay (schema v2, supersedes the above for triggers).**
 > Under the 1.0 carrying model a scope's learned entry may carry a

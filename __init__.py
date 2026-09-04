@@ -220,7 +220,7 @@ _CONFIG: dict[str, Any] = {
     #          expand_tools shipped.
     "cache_mode": "auto",
     # User-layer shaper thresholds. The five ``shape_ceiling`` keys
-    # (session_window, promote_min_sessions, promote_min_calls,
+    # (window_days, promote_min_sessions, promote_min_calls,
     # demote_min_sessions_no_use, demote_k) resolve config.yaml → policy.yaml
     # → shaping.DEFAULTS via shaping.load_shape_ceiling_defaults(); this dict
     # is the config.yaml layer, empty by default so shipped policy.yaml

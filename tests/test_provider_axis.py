@@ -186,7 +186,7 @@ class CacheAwareSavingsTests(unittest.TestCase):
     def test_caching_scope_shaping_is_a_no_op(self):
         recs = shaping.compute_scope_recommendations(
             scope="assistant-a:telegram", sessions={}, calls_by_pred={},
-            window=20, promote_min_sessions=2, promote_min_calls=3,
+            window_days=7, promote_min_sessions=2, promote_min_calls=3,
             demote_min_sessions_no_use=20, cache_mode="on",
         )
         self.assertEqual(recs.get("reason"), "caching_provider_carry_all")

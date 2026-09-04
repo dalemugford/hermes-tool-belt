@@ -345,12 +345,24 @@ class OverlayLifecycleTests(unittest.TestCase):
             "scopes": {SCOPE: {"carry": [], "expand_only": [TOOL], "shaping": {}}},
         }), encoding="utf-8")
 
-        cfg = {"enabled": True, "channels": {SCOPE: {"learned_mode": "apply"}}}
+        # The overlay can only ACTIVATE expand_only tools, so this fixture's
+        # precondition is that TOOL stays demoted. Under the shipped promote
+        # gates (1 session / 2 calls) the four mining events would themselves
+        # promote it, leaving nothing to mine — so the promote arm is held off
+        # explicitly here rather than by luck of the thresholds.
+        cfg = {
+            "enabled": True,
+            "channels": {SCOPE: {"learned_mode": "apply"}},
+            "learning": {"shape_ceiling": {"promote_min_calls": 99}},
+        }
         summary = shaping.auto_shape_run(cfg, self.state_dir, now=now)
         self.assertTrue(summary["ran"])
         self.assertIn(SCOPE, summary.get("overlay", {}))
 
         doc = json.loads((self.state_dir / "learned.json").read_text(encoding="utf-8"))
+        self.assertIn(TOOL, doc["scopes"][SCOPE].get("expand_only") or [],
+                      "precondition: the mined tool is still expand_only, "
+                      "which is the only class the overlay can activate")
         overlay = doc["scopes"][SCOPE].get("triggers") or []
         self.assertTrue(any(
             g["name"] == f"auto:{TOOL}" and g["tools"] == [TOOL]

@@ -161,7 +161,13 @@ class OnboardingArcTests(OnboardingTestCase):
 
     def test_recommend_to_observing(self) -> None:
         """recommend → the two config writes, the sidecar, then ``observing``."""
-        result = self.seed("observing")
+        # ``observing`` is the sub-threshold state, so the fixture's session
+        # count is derived from required_sessions() rather than from the
+        # script's own (the shipped floor is 2 now, well under the script's 5).
+        if self.needed <= 1:
+            self.skipTest("no sub-threshold session count exists when "
+                          "required_sessions() is 1")
+        result = self.seed("observing", sessions_override=self.needed - 1)
         self.assertLess(result.sessions, self.needed)
 
         runner = tc.FakeRunner()

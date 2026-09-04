@@ -137,8 +137,12 @@ class PorcelainDocumentTests(unittest.TestCase):
             [{"tool": "grep_files", "sessions": 3, "calls": 3, "evidence": "expansion"}],
         )
         self.assertEqual(scope_doc["demote"], [])
-        self.assertTrue(scope_doc["demote_skipped_insufficient_sessions"])
-        for key in ("session_window", "promote_min_sessions", "promote_min_calls",
+        # Three sessions clears the shipped floor (demote_min_sessions_no_use
+        # = 2), so the demote arm RAN and found nothing — a distinct state
+        # from "skipped for want of sessions". The skipped branch is locked in
+        # tests/test_day_window.py against an in-window session count of 1.
+        self.assertIs(scope_doc["demote_skipped_insufficient_sessions"], False)
+        for key in ("window_days", "promote_min_sessions", "promote_min_calls",
                     "demote_min_sessions_no_use"):
             self.assertIsInstance(doc["thresholds"][key], int)
 

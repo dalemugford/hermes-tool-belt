@@ -669,7 +669,7 @@ def _compute(scope, pred_rows, call_rows, **overrides):
     grouped = shaper.group_predictions_by_scope_session(pred_rows)
     calls = shaper.index_tool_calls_by_prediction(call_rows)
     kwargs = dict(
-        window=20, promote_min_sessions=2, promote_min_calls=3,
+        window_days=7, promote_min_sessions=2, promote_min_calls=3,
         demote_min_sessions_no_use=20,
     )
     kwargs.update(overrides)
@@ -816,7 +816,7 @@ class ShaperMergeContract(unittest.TestCase):
             "scope": self.SCOPE,
             "computed_at": "2026-01-01T00:00:00Z",
             "sessions_considered": 20,
-            "window_requested": 20,
+            "window_days": 7,
             "promote": [{"tool": t, "sessions": 3, "calls": 5, "evidence": "expansion"}
                         for t in promote],
             "demote": [{"tool": t, "sessions_without_use": 20, "evidence": "carry_unused"}

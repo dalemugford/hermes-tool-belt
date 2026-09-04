@@ -55,8 +55,8 @@ class DeployedDefaults(unittest.TestCase):
         # Promise: auto-shape runs itself with a daily cadence per scope.
         self.assertEqual(shaping.AUTO_SHAPE_DEFAULT_INTERVAL_HOURS, 24.0)
         # Economic levers ship at their documented values.
-        self.assertEqual(shaping.DEFAULTS["session_window"], 100)
-        self.assertEqual(shaping.DEFAULTS["demote_min_sessions_no_use"], 20)
+        self.assertEqual(shaping.DEFAULTS["window_days"], 7)
+        self.assertEqual(shaping.DEFAULTS["demote_min_sessions_no_use"], 2)
         self.assertEqual(shaping.DEFAULTS["demote_k"], 1.5)
         self.assertEqual(shaping.INVENTORY_GRACE_DAYS, 7)
         self.assertEqual(logger_io.DEFAULT_PER_TOOL_TOKENS, 388)
@@ -84,8 +84,8 @@ class PolicyIntegrity(unittest.TestCase):
         # test_telemetry_schema.FallbackBaselineDriftTests; this asserts the
         # thresholds' single home the same way).
         self.assertEqual(shaping.load_shape_ceiling_defaults(), {
-            "session_window": 100, "promote_min_sessions": 2,
-            "promote_min_calls": 3, "demote_min_sessions_no_use": 20,
+            "window_days": 7, "promote_min_sessions": 1,
+            "promote_min_calls": 2, "demote_min_sessions_no_use": 2,
             "demote_k": 1.5,
         }, "policy.yaml thresholds match the documented levers")
 

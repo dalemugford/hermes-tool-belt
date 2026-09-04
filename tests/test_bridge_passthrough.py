@@ -191,7 +191,7 @@ class ShaperBridgeAssertionTests(unittest.TestCase):
             scope="a:cli",
             sessions=sessions,
             calls_by_pred={},
-            window=25,
+            window_days=7,
             promote_min_sessions=2,
             promote_min_calls=3,
             demote_min_sessions_no_use=20,

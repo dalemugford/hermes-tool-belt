@@ -6,6 +6,70 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ## [Unreleased]
 
+### Changed
+
+- **Shaping defaults are now aggressive and time-windowed.** The evidence
+  window is measured in days, not sessions: the new
+  `learning.shape_ceiling.window_days` (default `7`; `14` and `30` are the
+  other sensible values) keeps only sessions whose last activity falls within
+  that many days of "now", where *now* is the most recent activity in the
+  telemetry rather than wall-clock time — so a replay of an archived
+  telemetry set windows against that archive and stays reproducible. The
+  shipped thresholds move with it: `demote_min_sessions_no_use` `20` → `2`,
+  `promote_min_sessions` `2` → `1`, `promote_min_calls` `3` → `2`
+  (`demote_k` unchanged at `1.5`), in both `shaping.DEFAULTS` and
+  `policy.yaml`. The demote floor stays denominated in **sessions** —
+  demotion needs at least that many sessions *inside* the day window, so a
+  quiet week with 0–1 sessions simply doesn't shape — and is deliberately not
+  clamped against the window, because the two are different units.
+  `scripts/shape-ceiling.py`'s `--window` becomes `--window-days`; the other
+  flags are unchanged. The shaper's `learned.json` rationale block now records
+  `window_days` in place of `window_requested`.
+
+  The change is measured, on 153 real sessions of a live scope
+  (2026-06-01 → 2026-09-04). Replayed at floor `2` and promote gates `1`/`2`,
+  a 7-day window settles at 5,125 tok/turn (51 tools demoted, 14 expansion
+  events, no flap), 14 days at 5,962 (50 demoted, 14 events), and 30 days at
+  7,803 (48 demoted, 11 events); every window first demotes at session 2 and
+  converges by session 56. Seven days saved ~616K carried tokens against 30
+  over the replay — ~+500K net of its three extra expansions at ~38K each —
+  and its steady state beats the operator's hand-tuned live tool list
+  (~6.3K/turn). The shorter window is what ages out stale-use tools: a 30-day
+  window demoted `cronjob` (1,359 tok) and `delegate_task` (837 tok) that a
+  100-session window kept carrying on months-old usage — 2,196 tok/turn, about
+  a quarter of the remaining per-turn cost. Under a day window the session
+  floor is not merely cheap to lower but *required* to be low: at 7 days a
+  floor of `20` cannot fire until a single week holds twenty sessions, so it
+  first demoted at session 79, converged at 119, and carried ~3.1M more tokens
+  than floor `2` over the same replay for near-identical final assignments
+  (49 vs 51 demoted). A wrong demotion costs one expansion round-trip and
+  corrects itself through promotion, which is why the promote gates drop too.
+
+- **`learning.shape_ceiling.session_window` is deprecated.** The old
+  session-count window is still parsed and logs one warning at load naming
+  `window_days` as its replacement, then is ignored. The day window is the
+  only unit the shaper uses.
+
+- **Named cadence presets were trialled and dropped.** An `aggressive` /
+  `balanced` / `patient` preset trio was built and then falsified by the same
+  replay data: every preset was strictly dominated by a low demote floor plus
+  a short day window, so the defaults above ship instead of a dial.
+
+### Added
+
+- **`scripts/replay-shaping.py` — read-only shaping replay.** Walks one
+  scope's telemetry forward in time, from an empty learned state through the
+  real shaper, and reports where the carried set converges, the ramp cost of
+  getting there, the `expand_tools` events the cadence implies (counting
+  primary model dispatches only — "reached-for-while-demoted" counts taken
+  from pre-2026.9.4 telemetry were 97–100% inflated by nested-dispatch rows,
+  with `browser_exec` and `memory` showing zero real primary dispatches),
+  promotions, and flap. `--window-days` and
+  `--floor` accept comma-separated lists to sweep settings side by side.
+  Stated blind spot: it scores recorded traffic only, so it cannot capture the
+  "presence is an invitation" effect — sessions that would have gone
+  differently had a demoted tool still been on the wire.
+
 ### Documentation
 
 - **RELEASING.md §7 now spells out the community-index `ref` bump.** The index

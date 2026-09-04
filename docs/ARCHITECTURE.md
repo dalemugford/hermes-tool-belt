@@ -394,19 +394,41 @@ promote when penalty > saving                     (after the anti-flap gates)
   tool holds its current class, so assignments don't flap.
 - Demotion fires only when the window contains at least
   `demote_min_sessions_no_use` sessions, so capability isn't pulled on
-  thin evidence.
+  thin evidence. The floor is counted in **sessions**; the window is
+  measured in **days**. They are not clamped against each other — a day
+  window that happens to hold fewer sessions than the floor simply
+  doesn't shape that pass.
+
+The evidence window is a **day window**: the shaper reads only sessions
+whose last activity falls within `window_days` days of "now", where *now*
+is the most recent activity present in the telemetry rather than
+wall-clock time. Windowing data-relative keeps a replay of an archived
+telemetry set reproducible, and keeps a scope that has been idle for a
+month from windowing itself down to nothing. The older session-**count**
+window (`session_window`) is deprecated: it is parsed, warned about once
+at load, and ignored.
 
 Defaults are inherited from `policy.yaml` under `learning.shape_ceiling`:
 
 ```yaml
 learning:
   shape_ceiling:
-    session_window: 100
-    promote_min_sessions: 2
-    promote_min_calls: 3
-    demote_min_sessions_no_use: 20
+    window_days: 7
+    promote_min_sessions: 1
+    promote_min_calls: 2
+    demote_min_sessions_no_use: 2
     demote_k: 1.5
 ```
+
+These are deliberately aggressive, and measured rather than chosen: on 153
+real sessions of a live scope, a 7-day window settled ~2,700 tok/turn below a
+30-day one (5,125 vs 7,803) and saved ~616K carried tokens over the replay
+with no flap; and because the floor counts sessions *inside* that window, a
+floor of `20` starved demotion until session 79 and carried ~3.1M more
+tokens than floor `2` for near-identical final assignments. Wrong demotions are bounded — one expansion round-trip — and correct
+themselves through promotion, which is why the promote gates are low too.
+[scripts/replay-shaping.py](../scripts/replay-shaping.py) is the tool that
+produced those numbers and can reproduce them on your own telemetry.
 
 CLI flags override per-run. Output is merged into
 `~/.hermes/state/tool-belt/learned.json` as schema v2: promotions land in
