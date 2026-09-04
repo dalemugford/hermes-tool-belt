@@ -217,7 +217,7 @@ class OnboardingArcTests(OnboardingTestCase):
         """shape → overlay on disk, ``learned_mode: apply``, bypass off, ``shaped``."""
         result = self.seed("terminal-heavy")
         runner = tc.FakeRunner(self.observing_config(result.scope))
-        rc, output = self.run_main(["--path", "shape", "--yes"], runner)
+        rc, output = self.run_main(["--mode", "history", "--yes"], runner)
         self.assertEqual(rc, 0)
 
         entry = self.learned()["scopes"][result.scope]
@@ -247,7 +247,7 @@ class OnboardingArcTests(OnboardingTestCase):
         """The terminal diff names every tool the overlay write then contains."""
         result = self.seed("terminal-heavy")
         runner = tc.FakeRunner(self.observing_config(result.scope))
-        rc, output = self.run_main(["--path", "shape", "--yes"], runner)
+        rc, output = self.run_main(["--mode", "history", "--yes"], runner)
         self.assertEqual(rc, 0)
 
         entry = self.learned()["scopes"][result.scope]
@@ -280,7 +280,7 @@ class OnboardingArcTests(OnboardingTestCase):
         self.assertEqual(result.state_dir, profile_state)
 
         runner = tc.FakeRunner(self.observing_config(result.scope))
-        rc, _out = self.run_main(["--agent", "assistant-b", "--path", "shape", "--yes"], runner)
+        rc, _out = self.run_main(["--agent", "assistant-b", "--mode", "history", "--yes"], runner)
         self.assertEqual(rc, 0)
 
         # The overlay lands in the profile's state dir, not the root's.

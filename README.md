@@ -228,9 +228,7 @@ plugins:
 
 A scope on disk is `channels.<agent>.<platform>`. Hermes calls the root profile
 `default` and does not allow `:` in a settings key. A bare `channels.<platform>`
-entry is the platform-wide fallback. The old `off` / `auto` / `audit` values for
-`learned_mode` migrate on their own (`off` → `recommend`, `auto`/`audit` →
-`apply`).
+entry is the platform-wide fallback.
 
 Every knob — sticky residency, predictor lookback, dampener tuning, the
 `learned.json` shape, the full telemetry field reference — is in
@@ -341,8 +339,8 @@ Versions use CalVer: `YYYY.M.D`, with an optional prerelease suffix (for example
 ├── expand_tools.py   # dynamic recovery meta-tool
 ├── logger_io.py      # telemetry writers
 ├── analyze.py        # telemetry analyzer
-├── savings.py        # savings-report computation
-├── savings_cli.py    # savings-report rendering and CLI
+├── savings.py        # savings computation
+├── savings_cli.py    # savings rendering and CLI
 ├── cli.py            # `hermes tool-belt` subcommand registration
 ├── yaml_required.py  # PyYAML availability guard for the operator scripts
 ├── tool-belt         # public command launcher (configure, savings, …)
@@ -363,7 +361,7 @@ The code is the source of truth. The doc set is intentionally small:
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — how the plugin works: the two postures, carry-all vs narrowing, `expand_tools`, between-session shaping, where the patches sit in the request lifecycle.
 - [docs/CONFIGURATION.md](docs/CONFIGURATION.md) — every knob in `config.yaml`, `policy.yaml`, and `learned.json`, with defaults; the full telemetry field reference.
 - [docs/SAVINGS.md](docs/SAVINGS.md) — how the token-savings numbers are computed and how to verify them on your own data.
-- [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) — behaviors that look like bugs but are not (Codex reasoning cache, gateway-restart posture loss).
+- [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) — behaviors that look like bugs but are not (the Codex reasoning trace breaking prefix cache mid-session).
 - [docs/PRIVACY.md](docs/PRIVACY.md) — what telemetry records and never records, where state lives, and how to disable or erase it.
 - [docs/RELEASING.md](docs/RELEASING.md) — the maintainer release checklist.
 

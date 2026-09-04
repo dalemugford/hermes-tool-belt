@@ -30,8 +30,8 @@ would write, and each is a determinism trade made knowingly:
   CI and a laptop. Neither ``configure.py`` nor ``shape-ceiling.py`` reads
   these fields, so the constants cost nothing and the estimator name keeps
   the provenance honest. **Seeded telemetry is therefore not a valid
-  fixture source for ``scripts/savings-report.py``** — a savings assertion
-  over these rows would be measuring the seed constant.
+  fixture source for ``tool-belt savings``** — a savings assertion over
+  these rows would be measuring the seed constant.
 * **``ts`` is a seeded monotonic constant** (``BASE_TS + session*1000 +
   turn``), never ``time.time()``, so the shaper's recency window is stable
   across runs.

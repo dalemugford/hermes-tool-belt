@@ -388,9 +388,6 @@ def _handle_inner(args: dict, prediction_cv: Any, sticky_refresh_fn: Any = None)
     # ceiling-present (activatable) tools are added; a ceiling-absent tool
     # must not leak into the active set on the next request.
     expansions = state.setdefault("expansions", set())
-    if not isinstance(expansions, set):
-        expansions = set(expansions or [])
-        state["expansions"] = expansions
 
     # Honest accounting: a tool counts as "newly added by this call" only
     # if it's activatable here, wasn't already on the model's initial active

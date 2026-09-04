@@ -1,10 +1,4 @@
-"""Carrying-model contract tests for Tool Belt 1.0 (Phase 1 — the *red* layer).
-
-These tests pin the locked carrying model **before** the production v2 code
-lands. They are expected to FAIL today: the v2 carrying partition does not
-exist yet. The point of this file is to state the contract precisely so the
-implementation has an unambiguous target and so any later regression against
-the model is caught.
+"""Carrying-model contract tests for Tool Belt 1.0.
 
 The locked model (Hermes supplies the enabled built-in ceiling ``E``)::
 
@@ -13,7 +7,7 @@ The locked model (Hermes supplies the enabled built-in ceiling ``E``)::
     X = E − (A ∪ C)                          # expand_only — the demoted remainder
     T = triggered ∩ X                        # trigger-activated expand_only tools
     R = expanded  ∩ X                        # explicitly expanded expand_only tools
-    active = A ∪ C ∪ T ∪ R (∪ passthrough)   # what the model sees this message
+    active = A ∪ C ∪ T ∪ R                   # what the model sees this message
 
 Key invariants pinned here (full-start contract, Promise #2 2026-08-30):
 
@@ -31,19 +25,13 @@ Key invariants pinned here (full-start contract, Promise #2 2026-08-30):
   * expand_only tools may be *activated* by a trigger or by expand_tools
     without changing residency.
   * Disabled/absent tools (not in E) can never re-enter through policy,
-    learning, triggers, sticky/prior-active carry-forward, or explicit
-    expansion.
+    learning, triggers, or explicit expansion.
   * Malformed overlap fails safe toward carrying and warns.
   * Internal failures fail open — the original Hermes ceiling is returned.
-  * MCP/plugin tools pass through, outside the built-in partition.
-  * v1 learned state / v1 telemetry normalize into v2 in memory (no
-    read-time write; ``residency_inferred`` only when membership is complete).
-  * Under cache-on the carrying assignment is frozen per session while trigger
-    matching still runs each message, monotonically unioning newly triggered
-    tools into the frozen active set.
+  * v1 telemetry normalizes into v2 in memory (``residency_inferred`` only
+    when membership is complete).
 
-Expected v2 contract surface (referenced lazily so a missing implementation
-produces a clean test *failure*, never an import-time collection error)::
+The contract surface::
 
     tool_belt_plugin.carrying.resolve(
         enabled,          # E — enabled built-in ceiling (tool names)
@@ -52,10 +40,7 @@ produces a clean test *failure*, never an import-time collection error)::
         demoted=(),       # evidence-driven expand_only assignments
         triggered=(),     # names activated by trigger match this message
         expanded=(),      # names activated by explicit expand_tools
-        passthrough=(),   # MCP/plugin names — outside the built-in partition
-        prior_active=(),  # active names carried from earlier messages (cache-on)
-    ) -> model exposing .always_carry(A) .carry(C) .expand_only(X)
-                        .active .passthrough .warnings
+    ) -> model exposing .always_carry(A) .carry(C) .expand_only(X) .active
 
 Learned demotion *reconciliation* (always_carry immunity, carry-wins
 overlap) lives upstream in ``learned.apply_to_preset``; the reconciled
@@ -117,22 +102,20 @@ ALWAYS_CARRY = frozenset(
      "tool_search", "tool_describe", "tool_call"}
 )
 
-# ─── Strict access to the shipped v2 surface ───────────────────────────────
-# The red-TDD lazy resolver and tolerant field aliases are retired: the API
-# shipped (carrying.resolve → CarryingModel). Aliases could mask a rename —
-# a renamed field must FAIL these contracts, not silently fall back.
+# ─── Strict access to the shipped surface ─────────────────────────────────
+# Field aliases could mask a rename — a renamed field must FAIL these
+# contracts, not silently fall back.
 
 from tool_belt_plugin import carrying as _carrying_mod
 from tool_belt_plugin import logger_io as _logger_io_mod
 
-_Model = namedtuple("_Model", "A C X active passthrough warnings")
+_Model = namedtuple("_Model", "A C X active")
 
 
 def _read_model(raw):
     return _Model(
         A=set(raw.always_carry), C=set(raw.carry), X=set(raw.expand_only),
-        active=set(raw.active), passthrough=set(raw.passthrough),
-        warnings=list(raw.warnings),
+        active=set(raw.active),
     )
 
 
@@ -185,13 +168,13 @@ def _temp_learned_state(doc):
 
 
 class _CarryingContract(unittest.TestCase):
-    """Base class: resolve the v2 partition API and normalize its result."""
+    """Base class: resolve the partition API and normalize its result."""
 
     def _resolve_raw(self, **kwargs):
         return _carrying_mod.resolve(**kwargs)
 
     def resolve(self, *, enabled, always_carry, carry, demoted=(), triggered=(),
-                expanded=(), passthrough=(), prior_active=()):
+                expanded=()):
         raw = self._resolve_raw(
             enabled=set(enabled),
             always_carry=set(always_carry),
@@ -199,8 +182,6 @@ class _CarryingContract(unittest.TestCase):
             demoted=set(demoted),
             triggered=set(triggered),
             expanded=set(expanded),
-            passthrough=set(passthrough),
-            prior_active=set(prior_active),
         )
         m = _read_model(raw)
         self.assertIsNotNone(m.A, "carrying result exposes no always_carry (A) set")
@@ -230,8 +211,8 @@ class ThreeWayPartitionContract(_CarryingContract):
 
         # Class contents follow the locked definitions (precedence AC > C > X).
         self.assertEqual(m.A, set(ALWAYS_CARRY) & set(E))
-        # send_message is no longer pinned (2026-08-30 audit) — as an
-        # undemoted enabled tool it is an ordinary class-C resident here.
+        # send_message is not pinned; as an undemoted enabled tool it is an
+        # ordinary class-C resident here.
         self.assertEqual(m.C, {"read_file", "send_message"})
         self.assertEqual(m.X, {"web_extract", "browser_exec"})
 
@@ -322,7 +303,6 @@ class DisabledToolContract(_CarryingContract):
             carry={"ghost_tool"},                             # learned/adaptive reference
             triggered={"ghost_tool"},                         # trigger reference
             expanded={"ghost_tool"},                          # explicit expansion
-            prior_active={"ghost_tool"},                      # stale frozen active
         )
         for label, bucket in (("A", m.A), ("C", m.C), ("X", m.X), ("active", m.active)):
             self.assertNotIn("ghost_tool", bucket,
@@ -385,95 +365,30 @@ class FailOpenContract(_CarryingContract):
         # _Boom is passed straight through (not coerced) to trip the resolver.
         raw = self._resolve_raw(
             enabled=set(E), always_carry=_Boom(), carry=set(),
-            triggered=set(), expanded=set(), passthrough=set(),
-            prior_active=set(),
+            triggered=set(), expanded=set(),
         )
         m = _read_model(raw)
         self.assertIsNotNone(m.active, "fail-open must still return an active set")
         self.assertTrue(set(E) <= m.active,
                         "fail-open returns the whole enabled ceiling (no narrowing)")
 
-    def test_failed_enabled_coercion_fails_open_not_closed(self):
-        # Regression: a failure while coercing the ``enabled`` ceiling itself
-        # used to fall through with E=∅ and return active=∅ — the model
-        # narrowed to ZERO tools (fail-closed), outside the fail-open handler.
-        # It must fail OPEN: every readable ceiling name stays active.
+    def test_unreadable_ceiling_entry_never_narrows_the_readable_names(self):
+        # A non-string name in the ceiling is skipped, never fatal: every
+        # readable ceiling name stays active (never active == ∅).
         class _BadName:
             def __str__(self):
                 raise RuntimeError("boom")
 
         good = {"clarify", "send_message", "read_file", "web_extract"}
-        enabled = list(good) + [_BadName()]  # strict coercion raises on _BadName
 
         raw = self._resolve_raw(
-            enabled=enabled, always_carry=set(ALWAYS_CARRY), carry=set(),
-            triggered=set(), expanded=set(), passthrough=set(),
-            prior_active=set(),
+            enabled=list(good) + [_BadName()], always_carry=set(ALWAYS_CARRY),
+            carry=set(), triggered=set(), expanded=set(),
         )
         m = _read_model(raw)
-        self.assertIsNotNone(m.active, "fail-open must still return an active set")
         self.assertTrue(good <= m.active,
-                        "a failed enabled coercion fails open — the readable "
-                        "ceiling names stay active (never active == ∅)")
+                        "the readable ceiling names stay active")
 
-
-# ─── 11. MCP/plugin pass-through outside the built-in partition ────────────
-
-class PassthroughContract(_CarryingContract):
-    def test_mcp_plugin_passthrough_outside_builtin_partition(self):
-        mcp_name = "mcp__github__create_issue"
-        # Grounded in the runtime's own notion of an MCP tool.
-        self.assertTrue(plugin._is_mcp_tool(mcp_name),
-                        "sanity: runtime recognizes the MCP tool name")
-
-        E = {"clarify", "send_message", "read_file"}
-        m = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
-                         passthrough={mcp_name})
-
-        self.assertNotIn(mcp_name, m.A)
-        self.assertNotIn(mcp_name, m.C)
-        self.assertNotIn(mcp_name, m.X,
-                         "MCP/plugin tools live outside the built-in partition")
-        self.assertEqual(m.A | m.C | m.X, set(E),
-                         "the partition covers only built-ins, not passthrough")
-        self.assertIn(mcp_name, m.active,
-                      "MCP/plugin tools pass through and are never narrowed")
-
-
-# ─── 12. v1 learned-state normalization into v2 (no read-time write) ───────
-
-class LearnedV1NormalizationContract(unittest.TestCase):
-    def test_v1_learned_state_normalizes_to_v2_without_read_time_write(self):
-        v1_doc = {
-            "version": 1,
-            "updated_at": "2026-01-01T00:00:00Z",
-            "scopes": {"assistant-a:telegram": {"always_on": ["web_extract"],
-                                                "always_off": ["memory"]}},
-            "global": {},
-        }
-        with _temp_learned_state(v1_doc) as path:
-            before_bytes = path.read_bytes()
-            before_mtime = path.stat().st_mtime_ns
-
-            # Reading a v1 file must NOT rewrite it (no read-time write). This
-            # invariant is pinned first (it already holds and must keep holding).
-            learned_mod.load_state(force=True)
-            self.assertEqual(path.read_bytes(), before_bytes,
-                             "loading learned state must not rewrite the file")
-            self.assertEqual(path.stat().st_mtime_ns, before_mtime,
-                             "loading learned state must not touch the file mtime")
-
-            # Missing v2 behavior: a v1 document normalizes into the v2 shape
-            # in memory (not discarded), mapping old always_on -> carry residency.
-            v2 = learned_mod.normalize_state(v1_doc)
-            self.assertEqual(v2.get("version"), 2,
-                             "v1 learned state normalizes to v2 in memory")
-            scope = (v2.get("scopes") or {}).get("assistant-a:telegram") or {}
-            self.assertIn("web_extract", set(scope.get("carry") or ()),
-                          "a v1 always_on entry becomes a v2 'carry' resident")
-
-
-# ─── 13. v1 telemetry normalization incl. conditional residency_inferred ───
 
 # ─── 14. trigger definitions byte-equivalent across promotion/demotion ─────
 
@@ -510,7 +425,7 @@ class TriggerImmutabilityContract(unittest.TestCase):
         fp0 = _trigger_fingerprint(base.triggers)
 
         # Promotion: learned promotes web_extract into residency.
-        promote_doc = {"scopes": {scope: {"always_on": ["web_extract"]}}, "global": {}}
+        promote_doc = {"scopes": {scope: {"carry": ["web_extract"]}}}
         with _temp_learned_state(promote_doc):
             promoted = learned_mod.apply_to_preset(self._base_preset(), cfg, scope)
         self.assertEqual(_trigger_fingerprint(promoted.preset.triggers), fp0,
@@ -518,60 +433,20 @@ class TriggerImmutabilityContract(unittest.TestCase):
 
         # Demotion: learned demotes web_extract. It must remain in its trigger
         # group (expand_only tools stay trigger-activatable).
-        demote_doc = {"scopes": {scope: {"always_off": ["web_extract"]}}, "global": {}}
+        demote_doc = {"scopes": {scope: {"expand_only": ["web_extract"]}}}
         with _temp_learned_state(demote_doc):
             demoted = learned_mod.apply_to_preset(self._base_preset(), cfg, scope)
         self.assertEqual(_trigger_fingerprint(demoted.preset.triggers), fp0,
                          "demotion must not alter trigger definitions")
 
 
-# ─── 15. cache-on trigger activation grows the frozen active set once ──────
-
-class CacheOnFrozenActiveSetContract(_CarryingContract):
-    def test_cache_on_trigger_activation_grows_frozen_active_set_once(self):
-        E = {"clarify", "send_message", "read_file", "web_extract", "browser_exec"}
-        carry = {"read_file"}
-        demoted = {"web_extract", "browser_exec"}
-
-        # message 0 — freeze: residency fixed, no triggers fired yet.
-        m0 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry,
-                          demoted=demoted)
-        frozen_residency = (m0.A, m0.C, m0.X)
-
-        # message 1 — web_extract (an expand_only tool) newly triggers. Prior
-        # active carries forward (the session's frozen active set).
-        m1 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry,
-                          demoted=demoted,
-                          triggered={"web_extract"}, prior_active=m0.active)
-        self.assertEqual((m1.A, m1.C, m1.X), frozen_residency,
-                         "carrying assignment is fixed per session")
-        self.assertTrue(m0.active < m1.active,
-                        "a newly triggered tool grows the active set")
-        self.assertIn("web_extract", m1.active)
-
-        # message 2 — no new trigger: the previously triggered tool STAYS active.
-        m2 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry,
-                          demoted=demoted,
-                          triggered=set(), prior_active=m1.active)
-        self.assertEqual(m2.active, m1.active,
-                         "active is monotonic — grew once, now stable")
-
-        # message 3 — re-trigger the same tool: the union is idempotent.
-        m3 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=carry,
-                          demoted=demoted,
-                          triggered={"web_extract"}, prior_active=m2.active)
-        self.assertEqual(m3.active, m2.active,
-                         "re-trigger does not regrow the frozen active set")
-
-
-# ─── 16. cache-off trigger activation is per-turn (no carry-forward) ────────
+# ─── 15. cache-off trigger activation is per-turn (no carry-forward) ────────
 
 class CacheOffTriggerEphemeralContract(_CarryingContract):
     def test_cache_off_trigger_activation_disappears_on_next_turn(self):
         E = {"clarify", "send_message", "web_extract"}
 
-        # Turn 1: web_extract triggers. Cache-off recomputes per turn, so no
-        # prior_active is carried forward.
+        # Turn 1: web_extract triggers. Cache-off recomputes per turn.
         m1 = self.resolve(enabled=E, always_carry=ALWAYS_CARRY, carry=set(),
                           demoted={"web_extract"}, triggered={"web_extract"})
         self.assertIn("web_extract", m1.active, "trigger activates the tool this turn")
@@ -861,11 +736,11 @@ class ShaperMergeContract(unittest.TestCase):
         with tempfile.TemporaryDirectory() as t:
             tmp = Path(t)
             self._write(tmp, {
-                "version": 1,
+                "version": 2,
                 "provenance": "keep-me",              # unrelated top-level key
                 "scopes": {
                     self.SCOPE: {"notes": "hand-edited"},   # unrelated per-scope key
-                    "other:cli": {"always_on": ["keepme"]},  # unrelated scope, v1 keys
+                    "other:cli": {"carry": ["keepme"]},     # unrelated scope
                 },
             })
             recs = self._recs(promote=["web_extract"], enabled=["web_extract"])
@@ -873,22 +748,15 @@ class ShaperMergeContract(unittest.TestCase):
             out = self._read(tmp)
             self.assertEqual(out["version"], 2)
             entry = out["scopes"][self.SCOPE]
-            # v2 fields written — and ONLY v2 fields: the transitional v1
-            # mirror (always_on/always_off/cache_aware) is gone for good.
             self.assertEqual(entry["carry"], ["web_extract"])
             self.assertIn("expand_only", entry)
             self.assertEqual(entry["shaping"]["scope"], self.SCOPE)
-            for stale in ("always_on", "always_off", "cache_aware"):
-                self.assertNotIn(stale, entry,
-                                 f"v1 mirror key {stale!r} must never be written")
             # … unrelated metadata (top-level, per-scope) preserved, and the
-            # untouched scope's assignment survives, normalized to v2 on write.
+            # untouched scope's assignment survives.
             self.assertEqual(out["provenance"], "keep-me")
             self.assertEqual(entry["notes"], "hand-edited")
-            other = out["scopes"]["other:cli"]
-            self.assertEqual(other["carry"], ["keepme"],
-                             "an untouched scope's v1 assignment survives as v2 carry")
-            self.assertNotIn("always_on", other)
+            self.assertEqual(out["scopes"]["other:cli"]["carry"], ["keepme"],
+                             "an untouched scope's assignment survives")
 
     def test_category_candidate_is_rejected_not_stored(self):
         with tempfile.TemporaryDirectory() as t:

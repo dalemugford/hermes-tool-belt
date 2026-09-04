@@ -83,8 +83,8 @@ In this mode:
   cache-miss re-bills. A mid-session tool-list mutation re-bills the
   whole history at the full input rate — measured at ≈42.8K tokens per
   event on a mixed-provider history and ≈54.4K on an all-Codex one, and
-  57–87% of all cache-miss re-bill cost while the plugin still narrowed
-  there. Not busting the cache is the whole contribution, and it is not
+  57–87% of all cache-miss re-bill cost measured on a narrowing route.
+  Not busting the cache is the whole contribution, and it is not
   reported as savings.
 - The cache hit rate is reported from provider-returned
   `cache_read_tokens` — it is the provider's discount, not ours.
@@ -158,44 +158,19 @@ line.
    stay unknown, are priced at full rate, and are excluded from overhead
    measurement.
 
-Step 2 exists because historical rows tagged `cache_mode: "on"` were
-tagged with the *session's* posture, and a fallback route's calls
-inherited it wrongly. The hint table corrects the one route that was
-provably never cached; from this release on the per-call tag makes the
-table unnecessary for new rows.
-
-### Why the headline dropped
-
-The previous model was cache-blind: every saved schema token was counted
-at full value, and every `expand_tools` event was charged a flat 1,500
-tokens. Recomputed honestly on the install this plugin was built against
-(two operator profiles), the old model reported ≈9.47M tokens; the priced
-net is ≈2.9M input-token equivalents — about 3.3× less. Two things
-changed:
-
-- On caching providers (OpenRouter ~98% hits, openai-codex 92–94%) the
-  saved schema tokens were worth a tenth of what was claimed, and the
-  expansions that recovered from narrowing there cost 28–36× the flat
-  1,500. Tool Belt was net-**negative** on those routes (one profile
-  −1.32M; the other −1.30M despite a reported +545K). That is why the
-  plugin no longer narrows on caching providers at all.
-- On the non-caching route (ollama-cloud) the savings were real and
-  full-price: ≈6.3M gross across both profiles, less the measured
-  expansion cost.
-
-Expect the number to drop by roughly that factor on any install that
-mixes caching and non-caching routes. It is one honest number.
+`PROVIDER_CACHE_HINTS` covers rows without a per-call cache status: it
+names the routes observed never to cache, so a row whose session-level
+`cache_mode` tag disagrees with its actual route is still priced right.
 
 ## Forward-aware headline, uncached-scoped denominators
 
 The headline `NET TOKENS SAVED` is `net_forward` — the non-caching cohort's
 ongoing net, `saved_input_equiv_noncaching − overhead_noncaching`
 (`ObservedCohort` in [savings.py](../savings.py)). It does **not** blend in
-the one-time, now-eliminated caching-provider expand break from the old
-per-session-freeze era (`net_caching_historical`); that figure is kept in
-`--json` for diagnostics only, alongside `net_token_reduction`, the full
-blended-history number from before this reframe. Neither appears in the
-text report.
+caching-provider expand breaks (`net_caching_historical`), which are
+one-time costs the carry-all posture does not incur. That figure is kept
+in `--json` for diagnostics only, alongside `net_token_reduction`, the
+blended figure over every cohort. Neither appears in the text report.
 
 Because the headline is scoped to non-caching sessions, the numbers built
 from it are too: the per-session average, the 12-month pace, the headline
@@ -203,8 +178,8 @@ session count, and each agent's row in `PER AGENT SAVINGS` all divide by /
 span the **uncached sessions only** — `compute_observed` walks the same
 `caches is not True` rows that price `net_forward` and records
 `n_sessions_noncaching`, `first_ts_noncaching`, and `last_ts_noncaching`
-alongside them. A caching session that contributes nothing to the net no
-longer dilutes the per-session average either.
+alongside them. A caching session contributes nothing to the net and so
+does not dilute the per-session average.
 
 An agent whose sessions are caching-dominant — `savings_cli`'s
 `_carried_whole` classifies this from the cohort's prediction counts — is
@@ -227,8 +202,9 @@ expansion per cohort from the telemetry itself (the report's
   no `expand_tools` call and weren't the session's cold first turn; the
   re-bill premium is the missed prompt × `(input − cache_read) / input`
   at the call model's rates. This is the causal cost of the cache break,
-  net of the misses that would have happened anyway. It applies to
-  historical rows — new caching sessions produce no expand events.
+  net of the misses that would have happened anyway. A caching session
+  under carry-all produces no expand events, so this prices only rows
+  that carry them.
 - **Non-caching cohort** — `per_event` = median `input_tokens` of the
   expand meta-call (the prediction's call with the smallest output).
 - **Fallback** — a cohort with fewer than 5 expand events, or (caching)
@@ -365,13 +341,8 @@ summed together**:
 The engine lives in [`savings.py`](../savings.py) and is the single home for the
 price table, the provider cache hints, the token estimator, the overhead
 measurement, and the thin-data fallback constant.
-`scripts/cache-stability-replay.py` imports the price table from it and the
-deprecated `scripts/savings-report.py` re-exports its observed-cohort math, so
-there is no duplicate table or constant:
-
-```bash
-python3 scripts/savings-report.py --json   # deprecated compatibility wrapper
-```
+`scripts/cache-stability-replay.py` imports the price table from it, so there
+is no duplicate table or constant.
 
 ## Field reference (predictions.jsonl)
 

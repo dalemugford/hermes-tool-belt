@@ -64,25 +64,9 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
 
 def _load_savings_cli():
     """Import the shared CLI module. Lazy — never at argparse-setup time."""
-    try:
-        from . import savings_cli  # type: ignore[no-any-return]
+    from . import savings_cli
 
-        return savings_cli
-    except ImportError:
-        # Standalone/unpackaged load: fall back to a path import. savings_cli
-        # itself handles a missing package parent (it registers the
-        # ``tool_belt_plugin`` namespace before importing its siblings).
-        import importlib.util
-        from pathlib import Path
-
-        script = Path(__file__).resolve().parent / "savings_cli.py"
-        spec = importlib.util.spec_from_file_location("tool_belt_savings_cli", script)
-        if spec is None or spec.loader is None:
-            raise
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["tool_belt_savings_cli"] = module
-        spec.loader.exec_module(module)
-        return module
+    return savings_cli
 
 
 def tool_belt_command(args: argparse.Namespace) -> int:
@@ -91,11 +75,7 @@ def tool_belt_command(args: argparse.Namespace) -> int:
     rest = list(getattr(args, "tool_belt_args", None) or [])
     argv = ([action, *rest] if action else [])
 
-    try:
-        savings_cli = _load_savings_cli()
-    except Exception as exc:  # pragma: no cover - defensive
-        print(f"error: tool-belt CLI is unavailable: {exc}", file=sys.stderr)
-        return 1
+    savings_cli = _load_savings_cli()
 
     from pathlib import Path
 

@@ -110,9 +110,9 @@ class TestFullStartDefault(unittest.TestCase):
                 )
                 self.assertEqual(model.active, set(CEILING))
 
-    def test_shipped_policy_carry_list_retired_from_runtime(self):
-        """policy.yaml no longer ships a runtime ``carry`` list — the curated
-        warm-start is retired; residency comes from E minus demotions."""
+    def test_shipped_policy_has_no_carry_list(self):
+        """policy.yaml ships no ``carry`` list; residency comes from E minus
+        demotions."""
         base = presets_mod.load_base_policy()
         self.assertEqual(list(base.carry), [],
                          "shipped policy must not seed a curated carry list")

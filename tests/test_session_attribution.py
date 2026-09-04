@@ -1,10 +1,9 @@
-"""Focused tests for the telemetry-attribution fixes.
+"""Focused tests for telemetry attribution.
 
 Covers:
-  1. Prediction ``session_id`` no longer blank for gateway-dispatched
-     events when ``session_store`` is reachable.
-  2. ``_should_bypass`` activates once ``session_id`` exists (it was a
-     no-op when the field came through empty).
+  1. Prediction ``session_id`` is populated for gateway-dispatched events
+     when ``session_store`` is reachable.
+  2. ``_should_bypass`` activates once ``session_id`` exists.
   3. Real Hermes session-key shape parsing — ``agent:main:{platform}:…``,
      where position 1 is the *literal* string ``"main"``, not the agent
      name. Recovering ``assistant-a:telegram`` from a real gateway key
@@ -374,9 +373,6 @@ class AnalyzerExcludesDegradedModeTests(unittest.TestCase):
         self.assertEqual(status, "no_policy")
 
     def test_load_preset_always_carry_reads_the_shipped_policy(self):
-        # (Formerly named for a no-PyYAML fallback it never exercised; the
-        # fallback is gone — see tests/test_shaper_porcelain.py for the
-        # loud-exit path.)
         tools, status = analyze._load_preset_always_carry(Path(plugin.__file__).parent)
         self.assertEqual(status, "ok")
         # always_carry holds only the immutable residents; adaptive carry tools
@@ -385,35 +381,6 @@ class AnalyzerExcludesDegradedModeTests(unittest.TestCase):
         self.assertIn("expand_tools", tools)
         self.assertNotIn("mnemosyne_recall", tools)
         self.assertNotIn("process", tools)
-
-    def test_dampener_candidates_emits_warning_when_degraded(self):
-        stat = analyze.ScopeStats(scope="assistant-a:telegram")
-        stat.trigger_fp_previews["browser"] = [
-            "please open browser please",
-            "please open browser please",
-            "please open browser please",
-        ]
-        args = SimpleNamespace(
-            suggest_dampeners=True,
-            dampener_min_support=2,
-            dampener_min_n=2,
-            dampener_max_n=3,
-            dampener_min_precision=0.5,
-            dampener_max_candidates=5,
-        )
-
-        def fake_load_excludes(_plugin_dir):
-            return {}, "no_yaml"
-
-        with mock.patch.object(analyze, "_load_preset_excludes", fake_load_excludes):
-            with mock.patch.object(sys, "stderr") as stderr_mock:
-                rows = analyze.dampener_candidates({"assistant-a:telegram": stat}, args)
-        printed = "".join(
-            call.args[0] for call in stderr_mock.write.call_args_list if call.args
-        )
-        self.assertIn("PyYAML", printed)
-        self.assertTrue(rows, "expected at least one dampener row to be produced")
-        self.assertEqual(rows[0]["preset_excludes_status"], "no_yaml")
 
 
 class TriggerFpLateBoundTpTests(unittest.TestCase):
@@ -694,8 +661,8 @@ class RecommendationRowProtectionTests(unittest.TestCase):
         self.assertTrue(category_rows, "expected an expanded_category row")
         row = category_rows[0]
         self.assertEqual(row["item"], "filesystem")
-        # Verify the promote branch actually fired (the branch that previously
-        # leaked the category string into the carry patch).
+        # The promote branch must fire without leaking the category string
+        # into the carry patch.
         self.assertEqual(row["action"], "promote_to_carry")
         scopes = row["proposed_learned_patch"]["scopes"]
         for scope_patch in scopes.values():

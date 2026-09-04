@@ -26,8 +26,7 @@ cache boundary that sits in the middle of the prefix. The provider then
 re-bills the conversation history at the full input rate. Measured on the
 operator install this plugin was built against, one such break cost
 ≈42.8K tokens per event on a mixed-provider history and ≈54.4K on an
-all-Codex one — 28–36× the flat 1,500-token estimate the plugin used to
-charge. On a caching provider the tool schemas themselves are only ~5% of
+all-Codex one — 28–36× the flat 1,500-token thin-data estimate. On a caching provider the tool schemas themselves are only ~5% of
 cost, because they sit in the cheap cached prefix; the cost driver is
 uncached input, mostly cache-miss re-bills. Narrowing there saves pennies
 and risks a large break.
@@ -169,10 +168,8 @@ plugins:
 
 Locked decisions persist per bucket to
 `~/.hermes/state/tool-belt/cache_mode_detection.json` under the key
-`"<scope>|<provider>"` (provider lower-cased). Pre-1.0 files keyed by bare
-`"<scope>"` are re-keyed under the configured primary provider on load —
-the only provider a scope-level lock could have been observing — or kept
-bare when the primary is unknown. Subsequent sessions on the same route
+`"<scope>|<provider>"` (provider lower-cased); a session with no provider
+name writes a bare `"<scope>"` key. Subsequent sessions on the same route
 skip the observation window.
 
 ### Which provider a session resolves against
@@ -181,7 +178,7 @@ The posture is pinned at a session's first dispatch, resolved in order
 against: (a) the provider the session has already been observed on (set
 from the per-call `provider` Hermes reports, so it follows failover and
 `/model`), (b) the configured primary — Hermes' top-level
-`model.provider`, (c) the bare-scope legacy entry. A detection lock that
+`model.provider`. A detection lock that
 lands mid-session applies to the *next* session, never the current one.
 
 For the blocklist check at this step, the model is attributed to a
@@ -341,7 +338,7 @@ a posture flip re-qualifies it at once. A scope's effective posture for
 shaping is its primary provider's bucket (`read_cache_mode` →
 `resolve_primary_detection_entry`): the profile's own `config.yaml`
 `model.provider` first, then the Hermes config loader, then the
-most-locked `scope|provider` bucket, then a legacy bare key. Carry-all
+most-locked `scope|provider` bucket. Carry-all
 prediction rows still count as *usage* evidence (which tools were called)
 but can never be expansion evidence.
 
@@ -404,9 +401,7 @@ whose last activity falls within `window_days` days of "now", where *now*
 is the most recent activity present in the telemetry rather than
 wall-clock time. Windowing data-relative keeps a replay of an archived
 telemetry set reproducible, and keeps a scope that has been idle for a
-month from windowing itself down to nothing. The older session-**count**
-window (`session_window`) is deprecated: it is parsed, warned about once
-at load, and ignored.
+month from windowing itself down to nothing.
 
 Defaults are inherited from `policy.yaml` under `learning.shape_ceiling`:
 
@@ -420,15 +415,12 @@ learning:
     demote_k: 1.5
 ```
 
-These are deliberately aggressive, and measured rather than chosen: on 153
-real sessions of a live scope, a 7-day window settled ~2,700 tok/turn below a
-30-day one (5,125 vs 7,803) and saved ~616K carried tokens over the replay
-with no flap; and because the floor counts sessions *inside* that window, a
-floor of `20` starved demotion until session 79 and carried ~3.1M more
-tokens than floor `2` for near-identical final assignments. Wrong demotions are bounded — one expansion round-trip — and correct
-themselves through promotion, which is why the promote gates are low too.
-[scripts/replay-shaping.py](../scripts/replay-shaping.py) is the tool that
-produced those numbers and can reproduce them on your own telemetry.
+These are deliberately aggressive, and measured rather than chosen — the
+replay evidence behind each value is recorded in
+[CHANGELOG.md](../CHANGELOG.md). Wrong demotions are bounded at one expansion
+round-trip and correct themselves through promotion, which is why the promote
+gates are low too. [scripts/replay-shaping.py](../scripts/replay-shaping.py)
+reproduces the measurement on your own telemetry.
 
 CLI flags override per-run. Output is merged into
 `~/.hermes/state/tool-belt/learned.json` as schema v2: promotions land in
@@ -541,8 +533,8 @@ never widen past it.
 └── learned.json                   # the learned carrying assignment (v2)
 ```
 
-`cache_mode_detection.json` is a flat object keyed `"<scope>|<provider>"`
-(legacy bare `"<scope>"` keys are migrated on load); each entry carries
+`cache_mode_detection.json` is a flat object keyed `"<scope>|<provider>"`;
+each entry carries
 `mode`, `locked_at`, `lock_reason`, `hit_rate_at_lock`, `sessions_locked`,
 `last_model`. Every `api_calls.jsonl` row carries `cache_mode` — that
 *call's* bucket outcome (`pending` / `on` / `off`), not the session

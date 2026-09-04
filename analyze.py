@@ -43,13 +43,9 @@ DEFAULT_PROMOTE_EXPAND_RATE = 0.50
 DEFAULT_PROMOTE_USE_RATE = 0.80
 DEFAULT_UNUSED_CARRY_TURNS = 10
 DEFAULT_TRIGGER_MIN_FIRES = 3
-# Per-event cost of one expand_tools round-trip. The analyzer no longer
-# charges a flat estimate: ``main`` MEASURES the cost per scope from the same
-# telemetry (``savings.measure_expand_overhead``) — on a caching provider an
-# expansion breaks the prefix cache and re-bills the whole history (tens of
-# thousands of tokens per event); on a non-caching provider it costs one extra
-# full-price API call (the expand meta-call's input_tokens). This constant is
-# the FALLBACK charged when a scope's telemetry is too thin to measure;
+# Per-event cost of one expand_tools round-trip. ``main`` MEASURES this per
+# scope from the same telemetry (``savings.measure_expand_overhead``); this
+# constant is the FALLBACK charged when a scope's telemetry is too thin, and
 # --expand-round-trip-tokens overrides only that fallback. Single-sourced in
 # the canonical savings engine so the analyzer, the savings report, the
 # projection, and the shaper all fall back to the same figure.
@@ -182,19 +178,7 @@ def string_list(value: Any) -> list[str]:
 
 
 def normalize_scope(row: dict[str, Any]) -> str:
-    scope = str(row.get("scope") or "").strip().lower()
-    if scope:
-        return scope
-    agent = str(row.get("agent") or "").strip().lower()
-    platform = str(row.get("platform") or "").strip().lower()
-    if agent and platform:
-        return f"{agent}:{platform}"
-    channel = str(row.get("channel") or "").strip().lower()
-    if channel:
-        return channel
-    if platform:
-        return platform
-    return "unknown"
+    return str(row.get("scope") or "").strip().lower() or "unknown"
 
 
 def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
@@ -256,8 +240,8 @@ def _resolved_tools_from_expand_row(row: dict[str, Any]) -> list[str]:
     """Return the canonical resolved-tools list for an expand_tools row.
 
     The plugin records this redundantly under ``expand_event.resolved_tools``
-    on the source side and ``result.resolved_tools`` on the response side.
-    Older telemetry may only have one of them.
+    on the source side and ``result.resolved_tools`` on the response side;
+    a row may carry only one of them.
     """
     for key in ("expand_event", "result"):
         source = row.get(key) if isinstance(row.get(key), dict) else {}
@@ -306,8 +290,7 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
         stat = get(scope)
         stat.predictions += 1
         # Prefer hermes_session_id (rotates on /new) for accurate per-session
-        # grouping; fall back to session_id (the stable chat key) for older
-        # rows written before the UUID was captured.
+        # grouping; fall back to session_id (the stable chat key).
         session_id = str(row.get("hermes_session_id") or row.get("session_id") or "").strip()
         if session_id:
             stat.sessions.add(session_id)
@@ -331,7 +314,7 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
         stat.total_narrowed_tokens += safe_int(row.get("narrowed_tokens"))
         # Only `carry`-class residents feed demote candidacy; immutable
         # always_carry residents can never be demoted (filtered later against
-        # the preset always_carry set, which also protects v1 rows whose
+        # the preset always_carry set, which also protects rows whose
         # residents all normalize into `carry_tools`).
         for tool in string_list(row.get("carry_tools")):
             stat.carry_turns[tool] += 1
@@ -564,9 +547,7 @@ def _load_preset_excludes(
 
     A missing PyYAML is not one of them: :func:`require_yaml` exits the
     process instead, because a run without the parser silently reports
-    "existing_exclude_keyword_count: 0" against a policy it never read. The
-    ``"no_yaml"`` status remains in :data:`_EXCLUDES_STATUS_MESSAGE` so
-    previously written payloads still render.
+    "existing_exclude_keyword_count: 0" against a policy it never read.
     """
     path = plugin_dir / "policy.yaml"
     if not path.exists():
@@ -596,15 +577,6 @@ def _load_preset_excludes(
 
 
 _EXCLUDES_STATUS_MESSAGE = {
-    # Retained for payloads written before PyYAML became a hard requirement;
-    # the loaders now exit rather than returning this status.
-    "no_yaml": (
-        "PyYAML is not installed in this Python runtime — policy.yaml "
-        "exclude_keywords are NOT being applied to dampener candidates. "
-        "Counts shown as 'existing_exclude_keyword_count: 0' reflect the "
-        "missing loader, not an empty policy. Install pyyaml or run the "
-        "analyzer under the Hermes venv to restore filtering."
-    ),
     "no_policy": (
         "policy.yaml not found alongside analyze.py — dampener candidates "
         "will not be deduplicated against existing exclude_keywords."
@@ -621,12 +593,12 @@ def _load_preset_always_carry(plugin_dir: Path) -> tuple[set[str], str]:
 
     These are the class-A residents that win every conflict and can never be
     demoted; the analyzer treats them as the do-not-suggest set (an always_carry
-    tool is never a demote candidate, and a v1 row whose residents all normalize
+    tool is never a demote candidate, and a row whose residents all normalize
     into ``carry`` is protected against spurious demotion by this set).
 
     Returns ``(tools, status)`` using the same status enum as
-    :func:`_load_preset_excludes`. PyYAML is required — the previous
-    line-oriented fallback honored ``always_carry`` but silently dropped
+    :func:`_load_preset_excludes`. PyYAML is required — a line-oriented
+    fallback would honor ``always_carry`` but silently drop
     ``exclude_keywords`` and ``triggers``, producing a half-read policy that
     looked like a complete one.
     """
@@ -1301,7 +1273,7 @@ def harvest_recommendation_rows(
             # A true rate: the share of harvest *predictions* in which this
             # tool was reached for at least once. Dividing the call count by
             # the prediction count is not a rate — one turn can make several
-            # was_expand_only calls, which pushed the old figure over 100%.
+            # was_expand_only calls, which would push the figure over 100%.
             expand_only_predictions = len(
                 stat.harvest_expand_only_predictions.get(tool, ()))
             if expand_only_predictions:
@@ -1532,7 +1504,7 @@ def recommendation_rows(
                 "reason": (
                     f"trigger fired {fires} time(s); same-prediction precision estimate {precision:.2f}; "
                     f"same-scope recall estimate {recall:.2f}. "
-                    "These are conservative proxies because older rows may lack trigger_tools_by_group."
+                    "These are conservative proxies: a row may lack trigger_tools_by_group."
                 ),
             })
     return rows
@@ -1918,8 +1890,7 @@ def markdown_report(
         lines.extend([
             "## Cache-Aware Savings (matched counterfactual)",
             "",
-            "> ⚠ No `api_calls.jsonl` data available — cache cost not computed. "
-            "The cache-stability replay script (`scripts/cache-stability-replay.py`) can be run manually.",
+            "> ⚠ No `api_calls.jsonl` data available — cache cost not computed.",
             "",
         ])
 

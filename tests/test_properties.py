@@ -5,7 +5,7 @@ generation (deterministic, no hypothesis dependency), ~200 cases per property.
 
 Justifications:
   · partition/containment — the carrying model's algebra (A/C/X disjoint,
-    active ⊆ E ∪ passthrough, full-start supremum) for arbitrary inputs
+    active ⊆ E, full-start supremum) for arbitrary inputs
     including names outside E; a fixture can't sweep this space.
   · pin immunity — always_carry ∩ E ⊆ active for ANY learned/trigger/expansion
     state; the only test proving pins are undemotable by construction rather
@@ -41,15 +41,14 @@ def _cases(seed, n=200):
         e = set(rng.sample(POOL, rng.randint(1, len(POOL))))
         pick = lambda: set(rng.sample(POOL + FOREIGN,
                                       rng.randint(0, 10)))
-        yield e, pick(), pick(), pick(), pick(), pick(), pick()
+        yield e, pick(), pick(), pick(), pick(), pick()
 
 
 class PartitionAndContainment(unittest.TestCase):
     def test_partition_algebra_holds_for_random_inputs(self):
-        for e, ac, carry, demoted, trig, exp, prior in _cases(101):
+        for e, ac, carry, demoted, trig, exp in _cases(101):
             m = carrying.resolve(enabled=e, always_carry=ac, carry=carry,
-                                 demoted=demoted, triggered=trig, expanded=exp,
-                                 passthrough=(), prior_active=prior)
+                                 demoted=demoted, triggered=trig, expanded=exp)
             a, c, x = set(m.always_carry), set(m.carry), set(m.expand_only)
             self.assertEqual(a & c, set(), "A and C disjoint")
             self.assertEqual(a & x, set(), "A and X disjoint")
@@ -66,11 +65,10 @@ class PartitionAndContainment(unittest.TestCase):
 
 class PinImmunity(unittest.TestCase):
     def test_pins_active_for_any_learned_state(self):
-        for e, ac, carry, demoted, trig, exp, prior in _cases(202):
+        for e, ac, carry, demoted, trig, exp in _cases(202):
             m = carrying.resolve(enabled=e, always_carry=ac, carry=carry,
                                  demoted=demoted | ac,  # hostile: demote the pins too
-                                 triggered=trig, expanded=exp,
-                                 passthrough=(), prior_active=prior)
+                                 triggered=trig, expanded=exp)
             self.assertLessEqual(ac & e, set(m.active),
                                  "every enabled pin is active regardless of "
                                  "learned demotions naming it")
@@ -93,13 +91,11 @@ class NeverEmpty(unittest.TestCase):
             dict(demoted=_RaisingIter()),
             dict(triggered=_RaisingIter()),
             dict(expanded=_RaisingIter()),
-            dict(prior_active=_RaisingIter()),
             dict(enabled=list(e) + [_Unstringable()]),
         ]
         for kw in hostile:
             args = dict(enabled=e, always_carry=set(), carry=set(),
-                        demoted=set(), triggered=set(), expanded=set(),
-                        passthrough=(), prior_active=set())
+                        demoted=set(), triggered=set(), expanded=set())
             args.update(kw)
             m = carrying.resolve(**args)
             self.assertTrue(set(m.active) >= e or set(m.active) >= e - {""},
