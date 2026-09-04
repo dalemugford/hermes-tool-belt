@@ -1,14 +1,14 @@
 """Recency window contract: the shaper's window is DAYS, anchored in the data.
 
-The window used to be a session count (``session_window``), which made the
-shaper's verdict depend on how chatty a scope had been rather than on how
-recent its evidence was: one call from months ago could protect a tool
-forever, and a scope that ran fifty short sessions in a day aged out
-yesterday's evidence. It is now ``window_days``: a session is evidence only
-when its LAST activity falls inside the trailing window, and "now" is the
-newest activity in the data handed to the shaper — never ``time.time()``.
+A session-count window would make the shaper's verdict depend on how chatty
+a scope had been rather than on how recent its evidence was: one call from
+months ago could protect a tool forever, and a scope that ran fifty short
+sessions in a day would age out yesterday's evidence. ``window_days`` avoids
+both: a session is evidence only when its LAST activity falls inside the
+trailing window, and "now" is the newest activity in the data handed to the
+shaper — never ``time.time()``.
 
-Locks here (each fails on the pre-change session-count shaper):
+Locks here (each fails on a session-count shaper):
 
   · Day filtering — sessions at 0/3/6/10/20 days back: a 7-day window
     considers 3 of them, a 30-day window all 5. A session-count window
@@ -20,8 +20,7 @@ Locks here (each fails on the pre-change session-count shaper):
     day window* count toward it: with 1 session in-window and a floor of 2,
     demotion never fires and the porcelain says so
     (``demote_skipped_insufficient_sessions``); with 2, it can.
-  · The result dict reports ``window_days``, not the retired
-    ``window_requested``.
+  · The result dict reports ``window_days``.
 """
 
 from __future__ import annotations
@@ -128,15 +127,12 @@ class DayWindowFiltering(unittest.TestCase):
         self.assertNotIn("web_extract", {d["tool"] for d in fresh["demote"]},
                          "inside a 30-day window the use is evidence again")
 
-    def test_result_reports_window_days_and_not_the_retired_key(self):
-        """The porcelain/merge consumers read the window off the result dict;
-        the retired ``window_requested`` (a session count) must not survive as
-        a key holding a day count."""
+    def test_result_reports_window_days(self):
+        """The porcelain/merge consumers read the window off the result dict."""
         preds, calls = self._history()
         recs = _compute(self.SCOPE, preds, calls, window_days=7,
                         demote_min_sessions_no_use=2)
         self.assertEqual(recs["window_days"], 7)
-        self.assertNotIn("window_requested", recs)
 
 
 class FloorIsCountedInSessionsInsideTheWindow(unittest.TestCase):

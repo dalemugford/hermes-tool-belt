@@ -18,7 +18,6 @@ labelled `default`; named profiles keep their directory names.
 | [`replay-shaping.py`](replay-shaping.py) | Read-only chronological replay of one scope's telemetry, from an empty learned state through the real shaper. Reports convergence, ramp cost, implied `expand_tools` events, promotions and flap; `--window-days` and `--floor` accept comma lists to sweep. | Check a shaping cadence against your own history before changing the defaults. |
 | [`harvest-replay.py`](harvest-replay.py) | Replays existing Hermes sessions through the per-turn predictor and writes privacy-reduced synthetic telemetry. | Tune trigger coverage for cache-off scopes. |
 | [`cache-stability-replay.py`](cache-stability-replay.py) | Measures per-session tool-list stability against each session's first-call hash and estimates the cache cost of mutations from matched API-call positions. On a caching (carry-all) scope every mutation counter must be zero — a non-zero count is a regression. **Also a hard library dependency of `analyze.py`**, which imports it via `importlib` for the cache-aware savings section; its CLI is an optional focused diagnostic. | Verify carry-all held on a caching scope; investigate cache behavior; verify analyzer savings. |
-| [`savings-report.py`](savings-report.py) | **Deprecated wrapper.** Kept for backward compatibility; delegates to the canonical engine in [`../savings.py`](../savings.py). Resolves each scope's lock from its primary provider's `scope\|provider` bucket. Prefer `tool-belt savings`. | Legacy per-scope cache-on (carry-all) / cache-off view. |
 | [`../tool-belt`](../tool-belt) `savings` | Canonical, read-only savings command. Reports every enabled agent (or one via `--agent`) with separately-labeled **observed** and **projected** cohorts; `--json` for a stable schema. Backed by [`../savings.py`](../savings.py). | The supported way to inspect savings. |
 | [`smoke-test.py`](smoke-test.py) | Exercises the carry-all (cache-on) and narrowing (cache-off) postures in isolated temporary state. | Before committing hook, carry-all, expansion, or telemetry changes. |
 | [`rotate-telemetry.sh`](rotate-telemetry.sh) | Moves live JSONL telemetry into a timestamped archive without stopping the gateway. | Start a clean measurement window. |
@@ -74,11 +73,10 @@ python3 scripts/configure.py --agent default --channel slack --mode off --yes   
 ```
 
 `--status` never writes. `--dry-run` prints every diff and writes nothing —
-neither files nor `hermes config` calls. The pre-1.0 spellings survive as
-hidden compatibility aliases: `--path shape` ≈ `--mode history`;
-`--path recommend` ≈ `--mode off` but additionally sets the scope's
-`bypass_rate` to `1.0` (full-ceiling observation baseline); `--reset AGENT`
-≈ `--mode off` but additionally clears the agent's learned overlay.
+neither files nor `hermes config` calls. Two hidden variants sit alongside
+`--mode`: `--path recommend` is `--mode off` plus setting the scope's
+`bypass_rate` to `1.0` (full-ceiling observation baseline), and
+`--reset AGENT` is `--mode off` plus clearing the agent's learned overlay.
 
 ### Mine dampener and trigger-keyword candidates
 
@@ -114,8 +112,7 @@ python3 scripts/shape-ceiling.py
 Defaults come from `policy.yaml` under `learning.shape_ceiling`
 (`window_days: 7`, `demote_min_sessions_no_use: 2`, `promote_min_sessions: 1`,
 `promote_min_calls: 2`, `demote_k: 1.5`); command-line flags override them for
-an individual run. `--window-days N` sets the day window for the run — it
-replaces the old `--window`, which took a session count. Applied
+an individual run. `--window-days N` sets the day window for the run. Applied
 recommendations are written to `$HERMES_HOME/state/tool-belt/learned.json`.
 
 Every demote/promote decision is priced at the scope's **measured** per-event
@@ -158,14 +155,13 @@ as a cost model, not a behavioral one.
 ./tool-belt savings --agent=default --json # machine-readable, one agent
 python3 scripts/cache-stability-replay.py
 python3 scripts/cache-stability-replay.py --scope assistant-a:telegram
-python3 scripts/savings-report.py --json   # deprecated wrapper
 ```
 
 `tool-belt savings` is the public entry point. Pricing (`PRICE_TABLE`), the
 token estimator, and the expansion overhead (measured per cohort, with
 `EXPAND_ROUND_TRIP_TOKENS` as the thin-data fallback) are single-sourced in
-`savings.py`; `cache-stability-replay.py` imports the price table from there and
-`savings-report.py` re-exports the observed-cohort math — no duplicate tables.
+`savings.py`; `cache-stability-replay.py` imports the price table from there —
+no duplicate tables.
 
 On a caching scope the plugin is carry-all (full ceiling, no `expand_tools`,
 no mid-session mutation), so `cache-stability-replay.py --scope <caching scope>`

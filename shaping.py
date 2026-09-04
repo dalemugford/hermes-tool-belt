@@ -1,10 +1,8 @@
 """Shared shaping core — the single implementation of the between-session
 tool-loadout shaper.
 
-Extracted from ``scripts/shape-ceiling.py`` so the operator script and the
-plugin runtime (in-process auto-shaping) share one implementation instead of
-drifting apart. The script remains the CLI surface (flags, porcelain JSON,
-human report) as a thin wrapper over this module.
+``scripts/shape-ceiling.py`` is the CLI surface (flags, porcelain JSON, human
+report) over this module; the plugin runtime calls into it directly.
 
 Contents:
 
@@ -54,19 +52,15 @@ from .yaml_required import require_yaml
 logger = logging.getLogger("tool_belt_plugin.shaping")
 
 # Thresholds — the shaper's evidence gates; the auto-shape engine reuses them
-# unchanged. ``window_days`` is the unit of recency: only sessions whose last
-# activity falls inside the trailing window are evidence at all, so a tool that
-# stopped being used ages out instead of being protected forever by one call
-# from months ago. The floor is enforced separately by
-# ``demote_min_sessions_no_use`` — with fewer sessions *inside the window* than
-# that, demotion never fires. Chronological replay of real sessions set these:
-# a 7-day window holds the carried loadout near its steady state, and the
-# demote floor showed no protective value above 2 (floors 2..20 demote the same
-# tools) while a high floor simply delays the saving.
+# unchanged.
 DEFAULTS = {
+    # Trailing wall-clock recency window: only sessions whose last activity
+    # falls inside it are evidence at all.
     "window_days": 7,
+    # Sessions/calls a tool needs inside the window to be promoted.
     "promote_min_sessions": 1,
     "promote_min_calls": 2,
+    # Sessions inside the window below which demotion never fires.
     "demote_min_sessions_no_use": 2,
     # Economic safety factor k: demote a carried tool only when carrying it
     # costs more than k× what reaching for it on demand would. Token-
@@ -76,12 +70,6 @@ DEFAULTS = {
     # expand_tools when it should).
     "demote_k": 1.5,
 }
-
-#: Retired threshold key. ``session_window`` counted SESSIONS; the recency
-#: window is now wall-clock (``window_days``), so an old value cannot be
-#: translated and is ignored rather than reinterpreted. Still *parsed* — an
-#: old config must not error — and warned about once per resolution.
-DEPRECATED_THRESHOLD_KEYS = ("session_window",)
 
 #: Seconds in the day the ``window_days`` filter counts in.
 _SECONDS_PER_DAY = 86400
@@ -188,19 +176,12 @@ def load_shape_ceiling_defaults(
     policy value, which itself falls through to :data:`DEFAULTS`. Per-scope
     overrides are out of scope for v1 — the whole profile shares one set.
 
-    :data:`DEPRECATED_THRESHOLD_KEYS` (``session_window``) still parse without
-    erroring but never resolve into a threshold: they are warned about once
-    and dropped.
-
     PyYAML is required: :func:`yaml_required.require_yaml` exits loudly when
     it is missing rather than degrading to a second, divergent parser. A
     missing or malformed policy file still falls back to :data:`DEFAULTS` —
-    that is a policy-content question, not a wrong-interpreter one. The
-    ``plugin_config`` argument is optional so every legacy no-arg call site
-    (and any external caller) keeps its exact prior behaviour.
+    that is a policy-content question, not a wrong-interpreter one.
     """
     yaml = require_yaml()
-    policy_shape: dict[str, Any] = {}
     try:
         raw = policy_path.read_text(encoding="utf-8")
     except Exception:
@@ -216,44 +197,19 @@ def load_shape_ceiling_defaults(
             if isinstance(learning, dict):
                 shape = learning.get("shape_ceiling")
                 if isinstance(shape, dict):
-                    policy_shape = shape
                     policy_merged = _merge_shape_defaults(shape)
 
     # User layer (config.yaml) merges over the resolved policy layer: only
     # valid positive values win, so a bad user value degrades to policy.
     user_shape = _config_shape_ceiling(plugin_config)
-    # One warning per resolution, whichever layer still carries a retired key
-    # (the user layer is the one an operator can act on, so it is named first).
-    _warn_deprecated_keys(user_shape or policy_shape)
     if user_shape:
         return _merge_shape_defaults(user_shape, base=policy_merged)
     return policy_merged
 
 
-def _warn_deprecated_keys(overrides: dict[str, Any]) -> None:
-    """Warn once about retired threshold keys still present in a config layer.
-
-    Retired keys are inert — this is the only place their presence is visible,
-    so the message has to name the replacement rather than just complain.
-    """
-    if not isinstance(overrides, dict):
-        return
-    stale = [key for key in DEPRECATED_THRESHOLD_KEYS if key in overrides]
-    if stale:
-        logger.warning(
-            "tool-belt: learning.shape_ceiling %s is deprecated and ignored — "
-            "the shaper's recency window is wall-clock now; set "
-            "learning.shape_ceiling.window_days (days, default %d) instead",
-            ", ".join(stale), DEFAULTS["window_days"],
-        )
-
-
 def _merge_shape_defaults(
     overrides: dict[str, Any], base: dict[str, Any] | None = None
 ) -> dict[str, Any]:
-    # Live positive-int keys only. Retired keys (DEPRECATED_THRESHOLD_KEYS) are
-    # absent from this tuple on purpose: parsing them here would resurrect them
-    # as a threshold nothing reads.
     merged = dict(base if base is not None else DEFAULTS)
     for key in ("window_days", "promote_min_sessions", "promote_min_calls", "demote_min_sessions_no_use"):
         value = overrides.get(key)
@@ -284,8 +240,8 @@ def resolve_primary_detection_entry(
     """The detection entry that defines a scope's effective cache posture.
 
     ``cache_mode_detection.json`` is keyed ``"<scope>|<provider>"`` (one
-    bucket per route the scope has been served on; legacy files carry a bare
-    ``"<scope>"`` key). A scope's posture for shaping is the bucket of its
+    bucket per route the scope has been served on; a session with no provider
+    name writes a bare ``"<scope>"`` key). A scope's posture for shaping is the bucket of its
     PRIMARY provider, resolved in order:
 
       1. ``"<scope>|<primary_provider>"`` when the caller names the configured
@@ -293,7 +249,7 @@ def resolve_primary_detection_entry(
       2. else the ``"<scope>|…"`` bucket with the highest ``sessions_locked``
          (ties → most recent ``locked_at``) — the route the scope actually
          runs on most;
-      3. else the legacy scope-only key.
+      3. else the bare ``"<scope>"`` key.
 
     Returns the whole entry (``mode``, ``hit_rate_at_lock``,
     ``sessions_locked``, ``last_model``, …) so display callers get the full
@@ -323,8 +279,8 @@ def resolve_primary_detection_entry(
             best, best_key = entry, rank
     if best is not None:
         return best
-    legacy = detection_cache.get(scope)
-    return legacy if isinstance(legacy, dict) else {}
+    bare = detection_cache.get(scope)
+    return bare if isinstance(bare, dict) else {}
 
 
 def _profile_primary_provider(state_dir: Path) -> str | None:
@@ -362,8 +318,8 @@ def read_cache_mode(state_dir: Path, scope: str) -> str | None:
     Read from ``cache_mode_detection.json`` (written by the hot path's cache
     detector) through :func:`resolve_primary_detection_entry`: the scope's
     effective posture is the bucket of its PRIMARY provider (configured
-    ``model.provider`` → most-locked ``<scope>|<provider>`` bucket → legacy
-    scope-only key). Under ``"on"`` the plugin carries everything and ships
+    ``model.provider`` → most-locked ``<scope>|<provider>`` bucket → bare
+    ``<scope>`` key). Under ``"on"`` the plugin carries everything and ships
     no ``expand_tools`` (D1), so shaping is moot for the scope; ``"off"``
     shapes on the measured non-caching economics; unknown is treated by the
     economics as cache-on exposures (one per session) — the conservative
@@ -520,7 +476,7 @@ def compute_scope_recommendations(
     Demote evidence: an adaptive ``carry`` resident (partition class C) that went
     unused across the window. Only rows whose residency the normalizer could
     reconstruct (``residency_inferred``) contribute carry candidates — a sparse
-    v1 row cannot drive demotion. always_carry is excluded by construction (it is
+    row cannot drive demotion. always_carry is excluded by construction (it is
     a distinct residency class) and pinned by an assertion below. Only fires when
     the window holds ≥ ``demote_min_sessions_no_use`` sessions — a floor in
     SESSIONS inside a window measured in DAYS, deliberately: the two answer
@@ -541,23 +497,15 @@ def compute_scope_recommendations(
     # not time.time(): the shaper is judged on the telemetry it was handed, so
     # a replay of archived rows and the live run that produced them reach the
     # same verdict. With no parsable timestamps anywhere the window collapses
-    # to "everything" (max of an empty sequence → 0, cutoff ≤ 0) rather than
-    # discarding the data — fail-open, as everywhere else here.
+    # to "everything" (cutoff ≤ 0) rather than discarding the data.
     last_ts_by_session = {
-        sid: max((p.get("ts", 0) or 0) for p in plist) if plist else 0
+        sid: max((p.get("ts", 0) or 0) for p in plist)
         for sid, plist in sessions.items()
     }
     session_ids_ordered = sorted(
         last_ts_by_session, key=lambda sid: -last_ts_by_session[sid]
     )
-    # A non-positive/unparsable window degrades to the default rather than
-    # raising or silently discarding every session (fail-open).
-    try:
-        days = int(window_days)
-    except Exception:
-        days = 0
-    if days <= 0:
-        days = int(DEFAULTS["window_days"])
+    days = int(window_days)
     now_ts = max(last_ts_by_session.values(), default=0)
     cutoff = now_ts - days * _SECONDS_PER_DAY
     recent_session_ids = [
@@ -606,11 +554,9 @@ def compute_scope_recommendations(
         }
 
     def _valid(tool_name: str, kind: str) -> bool:
-        # Assertion: Tool Search bridge tools are pass-through (outside the
-        # partition, see __init__._is_bridge_tool) and must never appear in a
-        # recommendation. Once passed through they never enter the evidence
-        # domains at all — this guard is defensive, for rows written before
-        # the pass-through (or by a foreign writer).
+        # Tool Search bridge tools are pass-through (outside the partition,
+        # see __init__._is_bridge_tool): never eligible for promotion or
+        # demotion, whoever wrote the row.
         if tool_name in _bridge_names():
             logger.warning(
                 "tool-belt: shaper rejecting %s candidate %r for scope %r — "
@@ -681,7 +627,7 @@ def compute_scope_recommendations(
     #     demote when saving > k × penalty;  promote when penalty > saving
     #
     # Token-denominated by design — no price table. Zero uses makes penalty 0,
-    # so the old binary unused-→-demote rule falls out as the limit case.
+    # so an entirely unused carried tool always demotes.
     # ``per_event_cost`` is what one expansion actually costs on THIS scope's
     # non-caching route — the measured expand meta-call input (one extra
     # full-price API call; tens of thousands of tokens on a long session),
@@ -695,8 +641,8 @@ def compute_scope_recommendations(
     # rows are demotable.
     carry_observed: set[str] = set()
     tools_called: set[str] = set()
-    # Sessions where each tool saw a non-trigger call (v1 rows without
-    # activation_source count as such — the conservative direction, biasing
+    # Sessions where each tool saw a non-trigger call (a row without
+    # activation_source counts as such — the conservative direction, biasing
     # toward carrying). ``demand_uses`` keeps raw call counts for reporting.
     demand_use_sessions: dict[str, set[str]] = defaultdict(set)
     demand_uses: Counter[str] = Counter()
@@ -718,10 +664,7 @@ def compute_scope_recommendations(
         for p in plist:
             if p.get("residency_inferred"):
                 residency = p.get("residency") or {}
-                carry_source = residency.get("carry") if isinstance(residency, dict) else None
-                if carry_source is None:
-                    carry_source = p.get("carry_tools") or []
-                for t in carry_source:
+                for t in residency.get("carry") or []:
                     carry_observed.add(str(t))
                     carried_sessions[str(t)].add(sid)
             pid = p.get("prediction_id", "")
@@ -793,13 +736,9 @@ def compute_scope_recommendations(
 
     demote: list[dict[str, Any]] = []
     if len(recent_sessions) >= demote_min_sessions_no_use:
-        # Exclude the immutable always_carry surface by construction. For v2 rows
-        # the normalizer already keeps the ``carry`` residency class disjoint from
-        # always_carry, so this is a no-op. For *complete v1* rows the normalizer
-        # collapses every resident into ``carry`` (v1 had no immutable split), so
-        # an unused always_carry baseline resident would otherwise surface as a
-        # demote candidate. Subtracting the observed always_carry set here makes
-        # the exclusion genuinely by construction for both schema versions.
+        # Exclude the immutable always_carry surface by construction: a row
+        # whose residency collapses every resident into ``carry`` would
+        # otherwise surface a pinned baseline resident as a demote candidate.
         for tool_name in sorted(carry_observed - always_carry_observed):
             use_sessions = demand_use_sessions.get(tool_name, set())
             saving, penalty = _economics(
@@ -849,10 +788,9 @@ def apply_recommendations(
 
     Promotions are applied after demotions so a tool named by both wins toward
     carrying, and any residual overlap is reconciled toward carry. Only the
-    canonical v2 keys (``carry`` / ``expand_only`` / ``shaping``) are written;
-    all v1 spelling stays inside ``learned.py``. Every candidate is validated
-    against the scope's concrete enabled tool names — a category/toolset name
-    is never written into a carrying list.
+    canonical keys (``carry`` / ``expand_only`` / ``shaping``) are written.
+    Every candidate is validated against the scope's concrete enabled tool
+    names — a category/toolset name is never written into a carrying list.
 
     Other scopes and all unrelated metadata (top-level and per-scope) are
     preserved. Returns ``(state, changes)`` where ``changes`` maps each
@@ -868,14 +806,11 @@ def apply_recommendations(
         enabled_names = set(recs.get("enabled_tool_names") or [])
 
         def _accept(tool: str, kind: str) -> bool:
-            # An empty enabled ceiling means no candidate can be proven eligible:
-            # there is no concrete enabled tool set to validate against, so refuse
-            # every candidate (defense-in-depth for hand-built recs that bypass
-            # ``compute``, whose ``_valid`` already drops candidates when the
-            # enabled set is empty). Otherwise a candidate must be a concrete
-            # enabled tool name — a category/toolset name never enters a per-tool
-            # carrying list.
-            if enabled_names and tool and tool in enabled_names:
+            # An empty enabled ceiling means no candidate can be proven
+            # eligible, so refuse every candidate. Otherwise a candidate must
+            # be a concrete enabled tool name — a category/toolset name never
+            # enters a per-tool carrying list.
+            if enabled_names and tool in enabled_names:
                 return True
             logger.warning(
                 "tool-belt: refusing to write %s candidate %r into scope %r "
@@ -884,13 +819,14 @@ def apply_recommendations(
             )
             return False
 
-        # The entry is already normalized to v2 (carry/expand_only/shaping).
         carry_set = {str(t) for t in (entry.get("carry") or []) if str(t).strip()}
         expand_set = {str(t) for t in (entry.get("expand_only") or []) if str(t).strip()}
         prev_carry, prev_expand = set(carry_set), set(expand_set)
 
-        demote_tools = [str(d.get("tool") or "") for d in (recs.get("demote") or [])]
-        promote_tools = [str(p.get("tool") or "") for p in (recs.get("promote") or [])]
+        demote_tools = [t for d in (recs.get("demote") or [])
+                        if (t := str(d.get("tool") or "").strip())]
+        promote_tools = [t for p in (recs.get("promote") or [])
+                         if (t := str(p.get("tool") or "").strip())]
 
         # Demotions first (carry → expand_only) …
         for tool in demote_tools:
@@ -930,7 +866,6 @@ def apply_recommendations(
             "promoted": sorted(carry_set - prev_carry),
             "demoted": sorted(expand_set - prev_expand),
         }
-        # v2 canonical fields only — no v1 mirror; learned.py owns v1 spelling.
         entry["carry"] = new_carry
         entry["expand_only"] = new_expand
         entry["shaping"] = recs
@@ -1832,12 +1767,9 @@ def auto_shape_run(
         summary["reason"] = "learned_schema_too_new"
         return summary
     state = learned.normalize_state(raw_doc)
-    scopes_state = state.get("scopes") or {}
 
     # Debounce stamps live in their own sidecar so a nothing-changed pass
-    # never rewrites learned.json (rewriting widened the cross-process
-    # last-writer-wins window into a routine event). Pre-sidecar installs
-    # fall back to the stamp in the scope's shaping meta once.
+    # never rewrites learned.json.
     stamps = _read_auto_shape_stamps(sd)
 
     eligible: list[str] = []
@@ -1852,11 +1784,7 @@ def auto_shape_run(
             # stamped, so a posture flip re-qualifies the scope at once.
             skipped_carry_all.append(scope)
             continue
-        entry = scopes_state.get(scope) or {}
-        shaping_meta = entry.get("shaping") if isinstance(entry, dict) else {}
         last = _parse_utc_iso(stamps.get(scope))
-        if last is None and isinstance(shaping_meta, dict):
-            last = _parse_utc_iso(shaping_meta.get("last_auto_shape_at"))
         interval_s = auto_shape_interval_hours(plugin_config, scope) * 3600.0
         if last is not None and (now - last) < interval_s:
             continue  # debounced
@@ -1903,15 +1831,6 @@ def auto_shape_run(
 
     state, changes = apply_recommendations(state, per_scope)
 
-    # Explicit assertion of the immunity contract: nothing protected was
-    # written toward expand_only by this run.
-    for scope, delta in changes.items():
-        protected = effective_always_carry(plugin_config, scope)
-        leaked = protected & set(delta.get("demoted") or [])
-        assert not leaked, (
-            f"tool-belt: auto-shape demoted protected always_carry tool(s) "
-            f"{sorted(leaked)} in scope {scope!r}"
-        )
     ts_iso = _utc_iso(now)
 
     # Learned trigger overlay — automatic anticipation. Additive,

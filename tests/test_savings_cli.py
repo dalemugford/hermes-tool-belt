@@ -176,8 +176,7 @@ CEILING = [
 
 # The demoted loadout for replay scenarios. Full-start contract: a fresh scope
 # carries the whole ceiling (zero narrowing, zero savings on day one), so the
-# replay-based projection tests seed learned demotions — the shaped state the
-# old curated policy carry list used to imply.
+# replay-based projection tests seed learned demotions.
 DEMOTED = [
     "delegate_task", "execute_code", "vision_analyze",
     "image_generate", "session_search", "cronjob",
@@ -404,8 +403,11 @@ class RenderLabelTests(_HomeCase):
                        turns=[{"user": "hello"}])
         state = self.home / "state" / "tool-belt"
         state.mkdir(parents=True, exist_ok=True)
+        (state / "predictions.jsonl").write_text(
+            json.dumps({"prediction_id": "p1", "hermes_session_id": "prov"}) + "\n",
+            encoding="utf-8")
         (state / "api_calls.jsonl").write_text(
-            json.dumps({"ts": 1780000000.0, "session_file": "prov",
+            json.dumps({"ts": 1780000000.0, "prediction_id": "p1",
                         "input_tokens": 99999}) + "\n", encoding="utf-8")
         proj = savings.compute_projected(
             savings.discover_agents(self.home)[0], {"enabled": True})
@@ -626,11 +628,14 @@ class DenominatorTests(_HomeCase):
                               turns=[{"user": "hello"}])
         state = self.home / "state" / "tool-belt"
         state.mkdir(parents=True, exist_ok=True)
+        (state / "predictions.jsonl").write_text(
+            json.dumps({"prediction_id": "p1",
+                        "hermes_session_id": path.stem}) + "\n",
+            encoding="utf-8")
         (state / "api_calls.jsonl").write_text(
-            json.dumps({"ts": 1780000000.0, "session_file": path.stem,
+            json.dumps({"ts": 1780000000.0, "prediction_id": "p1",
                         "input_tokens": 99999, "cache_read_tokens": 0}) + "\n",
             encoding="utf-8")
-        loc = savings.discover_agents(self.home)[0]
         loc = savings.discover_agents(self.home)[0]
         proj = savings.compute_projected(loc, {"enabled": True})
         self.assertEqual(proj.denominator_source, "provider_reported")

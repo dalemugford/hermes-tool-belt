@@ -22,9 +22,7 @@ This module is the single home for:
     its thin-data fallback constant (``EXPAND_ROUND_TRIP_TOKENS``);
   * full-definition schema tokenization (``schema_tokens``) built on
     ``logger_io.estimate_tokens`` — the one token estimator in the codebase;
-  * agent/scope discovery for the public ``tool-belt savings`` command;
-  * the observed-cohort math that ``scripts/savings-report.py`` re-exports as a
-    thin backward-compatibility wrapper.
+  * agent/scope discovery for the public ``tool-belt savings`` command.
 
 The engine performs **no writes** — not to config, learned state, telemetry, or
 sessions. It is safe to run against a live Hermes home.
@@ -107,8 +105,8 @@ def price_for(model: str) -> dict[str, float]:
     return PRICE_TABLE.get(model, PRICE_TABLE["generic"])
 
 
-#: Provider-level prompt-caching hints, consulted only for api_calls rows that
-#: predate the per-call ``provider_caches`` field. Keyed by the row's
+#: Provider-level prompt-caching hints, consulted for api_calls rows without
+#: a per-call ``provider_caches`` field. Keyed by the row's
 #: ``provider`` string (lower-cased). ``False`` = the route never serves a
 #: prefix-cache hit, whatever ``cache_mode`` the session was tagged with (the
 #: session posture reflects the provider that locked it, so a fallback route's
@@ -129,7 +127,7 @@ def price_factor_for(model: str, provider_caches: bool | None) -> float:
     cached prefix and billed at the cache_read rate, so each one is worth
     ``1 / miss_premium`` input tokens (~0.1). On a non-caching provider — or
     when the cache status is unknown — every saved token was a full-price
-    input token (factor 1.0, the pre-D4 accounting).
+    input token (factor 1.0).
     """
     if provider_caches is not True:
         return 1.0
@@ -488,7 +486,7 @@ def provider_caches_for_call(
 
     The per-call ``provider_caches`` field (True/False = that call's
     scope|provider detection bucket locked on/off; None while pending) is
-    authoritative. Rows written before the field existed fall back to the
+    authoritative. Rows without it fall back to the
     provider hint table (:data:`PROVIDER_CACHE_HINTS`, or ``hints``); a
     provider with no hint returns None — "unknown", for the caller to resolve
     from the cohort posture. Never guessed from ``cache_mode``: that is the
@@ -545,7 +543,6 @@ def cohort_stats(
     """Compute realized savings for one cache-mode cohort within a scope.
 
     ``mode_filter`` is ``"on"``, ``"off"``, ``"pending"``, or ``"bypass"``.
-    This is the observed-savings math ``scripts/savings-report.py`` re-exports.
 
     Two gross figures are emitted. ``saved_tokens_total`` is the RAW schema
     token reduction (Σ ceiling − narrowed), kept for continuity and as the
@@ -628,10 +625,6 @@ def cohort_stats(
     return out
 
 
-def _count_expand_events(tool_calls: list[dict[str, Any]]) -> int:
-    return sum(1 for t in tool_calls if t.get("tool_name") == "expand_tools")
-
-
 # ─── Measured expand_tools overhead ───────────────────────────────────────────
 #
 # What one explicit expansion actually costs, measured from the same telemetry
@@ -657,7 +650,7 @@ MEASURED_OVERHEAD_MIN_BASELINE_PREDICTIONS = 10
 
 def _call_prompt_tokens(row: dict[str, Any]) -> int:
     """Provider-reported prompt size (cached + uncached); reconstructed from
-    ``input_tokens + cache_read_tokens`` for rows that predate the field."""
+    ``input_tokens + cache_read_tokens`` for rows without the field."""
     prompt = row.get("prompt_tokens")
     if prompt is not None:
         return int(prompt or 0)
@@ -924,16 +917,13 @@ class ObservedCohort:
     # Historical (blended) net: saved_input_equiv_total − expansion_overhead
     # (input-token equivalent). What actually happened over the window.
     net_token_reduction: int = 0
-    # Forward (ongoing) net: the non-caching cohort only. Under D1 a caching
-    # provider carries everything — it narrows nothing and ships no
-    # expand_tools going forward — so its historical figures (below) are a
-    # sunk one-time retrospective, not a pace to project. This is the number
+    # Forward (ongoing) net: the non-caching cohort only — a carry-all caching
+    # provider narrows nothing and ships no expand_tools. This is the number
     # to quote and to annualize.
     net_forward: int = 0
     saved_input_equiv_noncaching: int = 0
     overhead_noncaching: int = 0
-    # The caching cohort's historical net, eliminated by carry-all — kept for
-    # transparency (usually negative: old expand breaks > cache-read savings).
+    # The caching cohort's blended net, reported for transparency.
     net_caching_historical: int = 0
     # Wall-clock span of the measured traffic (epoch seconds; 0 when empty) —
     # lets reports annualize the observed pace.
@@ -1095,20 +1085,16 @@ def compute_observed(
         overhead_basis = "mixed"
     net = saved_input_equiv - overhead
 
-    # Forward (ongoing) view. Under D1 a caching provider carries the whole
-    # ceiling: it narrows nothing (so claims no savings) AND ships no
-    # expand_tools (so pays no break) going forward. The caching cohort's
-    # historical figures are therefore a sunk, one-time retrospective — the
-    # net that describes what Tool Belt will keep saving is the non-caching
-    # cohort alone. ``net_token_reduction`` stays the honest blended history;
-    # ``net_forward`` is what to project.
+    # Forward (ongoing) view: only the non-caching cohort keeps saving, so
+    # ``net_token_reduction`` is the blended history and ``net_forward`` is
+    # what to project.
     saved_input_equiv_noncaching = (on.get("saved_input_equiv_noncaching", 0)
                                     + off.get("saved_input_equiv_noncaching", 0))
     saved_input_equiv_caching = (on.get("saved_input_equiv_caching", 0)
                                  + off.get("saved_input_equiv_caching", 0))
     net_forward = saved_input_equiv_noncaching - overhead_noncaching
-    # The caching cohort's historical net — negative when old expand breaks
-    # outweighed the cache-read-priced schema savings; eliminated by carry-all.
+    # The caching cohort's blended net — negative when expand breaks outweigh
+    # the cache-read-priced schema savings.
     net_caching_historical = saved_input_equiv_caching - overhead_caching
 
     n_pred = on.get("n_predictions", 0) + off.get("n_predictions", 0)
@@ -1900,17 +1886,13 @@ def _api_call_session_keys(
     while historical session files are named by the rotating Hermes session
     UUID. The bridge is ``predictions.jsonl``: its rows carry both
     ``prediction_id`` and ``hermes_session_id``, so each api_call is joined
-    prediction -> Hermes session under that file-stem key. ``session_file`` is
-    a supported external-producer key. The raw chat ``session_id`` is the
-    last-resort fallback when no bridge is available.
+    prediction -> Hermes session under that file-stem key. The raw chat
+    ``session_id`` is the last-resort fallback when no bridge is available.
     """
     keys: list[str] = []
     hermes = pid_to_hermes.get(str(row.get("prediction_id") or ""))
     if hermes:
         keys.append(hermes)
-    session_file = str(row.get("session_file") or "")
-    if session_file:
-        keys.append(session_file)
     if not keys:
         # No bridge available: fall back to the chat key so the denominator
         # still counts (it may aggregate across /new within one long-lived

@@ -309,10 +309,10 @@ class ConfigureModeFlowTests(TempHomeTestCase):
         self.assertNotIn("Nothing selected", out)
 
     def test_declined_confirm_returns_to_the_mode_picker(self):
-        # Dale's "spills back out": answering no at the confirm used to end
-        # the run. It now re-shows the mode picker: shaping → channels 'all'
-        # → learning → n, n (both scopes) → mode picker again → blank ×3
-        # walks back out. Nothing written, and the picker was shown twice.
+        # Answering no at the confirm must not end the run — it re-shows the
+        # mode picker: shaping → channels 'all' → learning → n, n (both
+        # scopes) → mode picker again → blank ×3 walks back out. Nothing
+        # written, and the picker was shown twice.
         self._seed_two_channels()
         rc, out, runner = self._run("2\nall\n1\nn\nn\n\n\n\n")
         self.assertEqual(rc, 0)
@@ -624,14 +624,6 @@ class StateMachineTests(TempHomeTestCase):
             configure.classify_scope(self._info(2), settings, self.thresholds),
             configure.STATE_SHAPED,
         )
-        # Legacy alias normalizes to apply rather than reading as recommend.
-        legacy = configure.scope_settings(
-            "default:telegram", {"channels": {"default:telegram": {"learned_mode": "auto"}}}
-        )
-        self.assertEqual(
-            configure.classify_scope(self._info(2), legacy, self.thresholds),
-            configure.STATE_SHAPED,
-        )
 
     def test_remaining_sessions_counts_down_and_floors_at_zero(self) -> None:
         self.assertEqual(configure.remaining_sessions(self._info(0), self.thresholds), self.needed)
@@ -651,10 +643,10 @@ class StateMachineTests(TempHomeTestCase):
 class ReShapePreviewTests(TempHomeTestCase):
     """The preview of a re-shape must equal what the apply then writes.
 
-    Regression: the summary used to re-implement the move algebra as
-    ``policy carry − demoted + promoted``, ignoring the scope's *existing*
-    learned assignment — so re-shaping an already-shaped scope previewed a
-    different loadout than ``merge_into_learned`` wrote.
+    Regression it catches: a summary that re-implements the move algebra as
+    ``policy carry − demoted + promoted`` ignores the scope's *existing*
+    learned assignment, so re-shaping an already-shaped scope would preview a
+    different loadout than ``merge_into_learned`` writes.
     """
 
     SCOPE = "default:telegram"
@@ -821,9 +813,6 @@ class ApplyFlowTests(TempHomeTestCase):
         entry = learned["scopes"]["default:telegram"]
         self.assertIn("terminal", entry["carry"])
         self.assertEqual(entry["shaping"]["scope"], "default:telegram")
-        # Canonical v2 keys only — the transitional v1 mirror is gone.
-        for stale in ("always_on", "always_off", "cache_aware"):
-            self.assertNotIn(stale, entry)
         # Atomic write leaves no temp file behind.
         self.assertEqual(list(self.root_state.glob("learned*.tmp")), [])
 
@@ -950,22 +939,21 @@ class ResetFlowTests(TempHomeTestCase):
         info = self._shaped_scope()
         path = self.root_state / "learned.json"
         state = json.loads(path.read_text())
-        state["scopes"]["other:cli"] = {"always_on": ["keepme"]}
+        state["scopes"]["other:cli"] = {"carry": ["keepme"]}
         path.write_text(json.dumps(state))
 
         ctx = make_ctx(self.home, FakeRunner(), assume_yes=True, thresholds=self.thresholds)
         configure.flow_reset(ctx, [info])
 
         learned = json.loads(path.read_text())
-        # The untouched scope's assignment survives — normalized to the v2
-        # shape on write (learned.write_state normalizes every persist).
+        # The untouched scope's assignment survives every persist
+        # (learned.write_state normalizes on write).
         other = learned["scopes"]["other:cli"]
         self.assertEqual(other["carry"], ["keepme"])
-        self.assertNotIn("always_on", other)
 
     def test_reset_clears_only_adaptive_keys_and_preserves_scope_metadata(self) -> None:
-        # Regression: reset used to pop the whole scope entry, destroying
-        # unrelated per-scope metadata. The single reset semantic
+        # Regression it catches: a reset that pops the whole scope entry
+        # destroys unrelated per-scope metadata. The single reset semantic
         # (learned.reset_scope) clears ONLY the adaptive carry/expand_only
         # assignments and shaping evidence.
         info = self._shaped_scope()
@@ -984,8 +972,6 @@ class ResetFlowTests(TempHomeTestCase):
         self.assertEqual(entry.get("carry", []), [])
         self.assertEqual(entry.get("expand_only", []), [])
         self.assertEqual(entry.get("shaping", {}), {})
-        for stale in ("always_on", "always_off", "cache_aware"):
-            self.assertNotIn(stale, entry)
         self.assertEqual(entry["notes"], "hand-edited, keep me",
                          "reset must preserve unrelated per-scope metadata")
 
@@ -1235,8 +1221,8 @@ class PromptTests(unittest.TestCase):
 
 class ModeFlagTests(TempHomeTestCase):
     """``--mode learning|history|off`` is the public scripting surface and
-    must mirror the interactive menu; ``--path``/``--reset`` survive only as
-    hidden aliases (absent from --help)."""
+    must mirror the interactive menu; ``--path``/``--reset`` are hidden
+    variants (absent from --help)."""
 
     def _run(self, argv: list[str]):
         runner = FakeRunner()
@@ -1255,7 +1241,7 @@ class ModeFlagTests(TempHomeTestCase):
                        expanded_calls_each=2)
 
     def test_declined_non_interactive_run_exits_zero_not_sentinel(self) -> None:
-        # Review find C1: flow_shape/_apply_mode return the menu's _BACK
+        # flow_shape/_apply_mode return the menu's _BACK
         # sentinel when every scope is declined, and they are also the
         # --mode entry points — main() must translate that to 0, never
         # leak an object() to sys.exit / the Hermes CLI handler.
@@ -1289,8 +1275,8 @@ class ModeFlagTests(TempHomeTestCase):
         self.assertNotIn("Skipped", "\n".join(lines))
 
     def test_channel_filter_waits_for_fresh_install_recovery(self) -> None:
-        # Review find C4: on a profile with no telemetry --channel used to
-        # exit 2 before recovery could ask which platforms exist.
+        # On a profile with no telemetry, --channel must not
+        # exit 2 before recovery has asked which platforms exist.
         runner = FakeRunner()
         lines: list[str] = []
         answers = iter(["telegram", "n"])  # platforms prompt, then decline
@@ -1306,10 +1292,10 @@ class ModeFlagTests(TempHomeTestCase):
         self.assertIn("default:telegram", out)
 
     def test_channel_filters_to_one_of_the_agents_channels(self) -> None:
-        # --platform is only a hint for telemetry-less profiles, so a
-        # non-interactive --mode run used to hit EVERY channel the agent
-        # has. --channel is a real filter: one channel written, and a name
-        # that matches nothing is exit 2 naming what exists.
+        # --platform is only a hint for telemetry-less profiles, so it cannot
+        # scope a non-interactive --mode run to one channel. --channel is the
+        # real filter: one channel written, and a name that matches nothing is
+        # exit 2 naming what exists.
         self._seed()
         seed_telemetry(self.root_state, "default:slack", sessions=self.needed,
                        always_on=["web_search"], append=True)
@@ -1362,13 +1348,13 @@ class ModeFlagTests(TempHomeTestCase):
         self.assertIn("default:telegram", doc["scopes"],
                       "off pauses shaping but keeps the overlay (resumable)")
 
-    def test_old_flags_are_hidden_but_still_parse(self) -> None:
+    def test_hidden_flags_are_absent_from_help_but_still_parse(self) -> None:
         help_text = configure.build_parser().format_help()
         self.assertIn("--mode", help_text)
         self.assertNotIn("--path", help_text)
         self.assertNotIn("--reset", help_text)
-        args = configure.build_parser().parse_args(["--path", "shape"])
-        self.assertEqual(args.path, "shape")
+        args = configure.build_parser().parse_args(["--path", "recommend"])
+        self.assertEqual(args.path, "recommend")
         args = configure.build_parser().parse_args(["--reset", "default"])
         self.assertEqual(args.reset, "default")
 
@@ -1395,10 +1381,10 @@ class HermesHomeContainmentTests(TempHomeTestCase):
         with contextlib.ExitStack() as stack:
             for patch in isolate(spy, "/usr/bin/hermes", []):
                 stack.enter_context(patch)
-            rc = configure.main(["--path", "shape", "--yes",
+            rc = configure.main(["--mode", "history", "--yes",
                                  "--hermes-home", str(self.home)])
         self.assertEqual(rc, 0)
-        self.assertTrue(runner.writes, "the shape path must reach config set")
+        self.assertTrue(runner.writes, "history mode must reach config set")
         self.assertEqual(set(seen), {str(self.home)})
         self.assertEqual(os.environ.get("HERMES_HOME"), prev)
 

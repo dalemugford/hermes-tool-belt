@@ -32,13 +32,10 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Canonical telemetry schema version emitted by the producers below. Bumped to
-# 2 for the Tool Belt 1.0 carrying model: predictions split residency into
-# always_carry/carry, rename allowed/cut to active/expand_only, and drop the
-# retired unknown_kept concept; tool-call rows rename availability/cut flags and
-# add an explicit ``activation_source``. All telemetry consumers read rows
-# through ``normalize_prediction_row`` / ``normalize_tool_call_row``, so v1,
-# v2, and mixed streams present the same canonical fields.
+# Canonical telemetry schema version emitted by the producers below. All
+# telemetry consumers read rows through ``normalize_prediction_row`` /
+# ``normalize_tool_call_row``, so v1, v2, and mixed streams present the same
+# canonical fields.
 SCHEMA_VERSION = 2
 
 # Fallback immutable-resident baseline used by the v1 normalizer to split a
@@ -100,7 +97,6 @@ def api_calls_path() -> Path:
 DEFAULT_PER_TOOL_TOKENS = 388
 
 SCHEMA_SIZES_FILENAME = "schema_sizes.json"
-SCHEMA_SIZES_DOC_VERSION = 1
 #: Refresh at most this often per process — the snapshot is stable between
 #: registry changes, and per-tool tokenization is not free on the hot path.
 SCHEMA_SIZES_REFRESH_SECONDS = 3600.0
@@ -164,7 +160,6 @@ def update_schema_sizes(
             return False
         doc = {
             "schema": "tool-belt/schema-sizes",
-            "version": SCHEMA_SIZES_DOC_VERSION,
             "measured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
             "measured_epoch": now,
             "estimator": token_estimator_name(),

@@ -467,16 +467,8 @@ class BypassCohortTests(unittest.TestCase):
     """
 
     def setUp(self):
-        # Import the savings-report module by file path — it lives under
-        # scripts/ not the importable plugin package, so we load it
-        # explicitly. This mirrors how the script is invoked in practice.
-        scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
-        spec = importlib.util.spec_from_file_location(
-            "savings_report", scripts_dir / "savings-report.py"
-        )
-        assert spec and spec.loader, "could not load savings-report.py"
-        self.report = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(self.report)
+        # The cohort math lives in the plugin's savings engine.
+        self.report = importlib.import_module("tool_belt_plugin.savings")
 
     def _bypass_row(self, prediction_id: str = "bp1") -> dict[str, Any]:
         return {

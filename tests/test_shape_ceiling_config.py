@@ -6,9 +6,7 @@ key, highest first: ``config.yaml`` (the user layer, passed as
 
 These tests lock the precedence contract and its fail-open behaviour (a bad
 user value degrades to the policy layer, never raises), that the shipped
-DEFAULTS are exactly the aggressive-shaping contract, that the retired
-``session_window`` key is parsed-and-ignored rather than resurrected, that
-the legacy no-arg call site keeps working, and — end to end — that a
+DEFAULTS are exactly the aggressive-shaping contract, and — end to end — that a
 ``window_days`` set through ``plugin_config`` actually reaches the shaper's
 analysis and changes how much history it considers.
 
@@ -143,9 +141,8 @@ class PrecedenceTests(unittest.TestCase):
 class DefaultsContractTests(unittest.TestCase):
     """``shaping.DEFAULTS`` is the last-resort layer every other layer falls
     back to, so its exact content is the shipped promise when policy.yaml is
-    unreadable. Fails on any silent re-tune of a threshold, on a stray extra
-    key, and on a resurrected ``session_window`` (which the pre-change code
-    carried at 100)."""
+    unreadable. Fails on any silent re-tune of a threshold or a stray extra
+    key."""
 
     def test_defaults_are_exactly_the_contract(self):
         self.assertEqual(shaping.DEFAULTS, {
@@ -163,77 +160,6 @@ class DefaultsContractTests(unittest.TestCase):
             resolved = shaping.load_shape_ceiling_defaults(policy_path=missing)
         self.assertEqual(resolved["window_days"], shaping.DEFAULTS["window_days"])
         self.assertEqual(resolved, dict(shaping.DEFAULTS))
-
-
-class DeprecatedSessionWindowTests(unittest.TestCase):
-    """``session_window`` counted SESSIONS and cannot be translated into a
-    window of DAYS, so it is parsed, warned about once, and ignored. Fails if
-    a stale config value is either resurrected as a threshold (a 100 would
-    silently become 100 *days* of history) or made fatal — an operator whose
-    config still carries the old key must keep booting."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.policy = _write_policy(Path(self.tmp.name))
-
-    def test_deprecated_key_is_ignored_and_never_becomes_a_threshold(self):
-        resolved = shaping.load_shape_ceiling_defaults(
-            policy_path=self.policy,
-            plugin_config=_cfg({"session_window": 100}),
-        )
-        self.assertNotIn("session_window", resolved,
-                         "the retired key must not survive into the resolved "
-                         "thresholds")
-        self.assertEqual(resolved["window_days"], 77,
-                         "the policy layer's window_days still wins; the "
-                         "retired key contributes nothing")
-
-    def test_deprecated_key_alone_does_not_disturb_the_other_layers(self):
-        # Present alongside a live key: the live key resolves normally.
-        resolved = shaping.load_shape_ceiling_defaults(
-            policy_path=self.policy,
-            plugin_config=_cfg({"session_window": 100, "window_days": 3}),
-        )
-        self.assertEqual(resolved["window_days"], 3)
-        self.assertEqual(resolved["promote_min_sessions"], 4)  # policy layer
-
-    def test_deprecated_key_warns_once_rather_than_raising(self):
-        with self.assertLogs("tool_belt_plugin.shaping", level="WARNING") as logs:
-            resolved = shaping.load_shape_ceiling_defaults(
-                policy_path=self.policy,
-                plugin_config=_cfg({"session_window": 100}),
-            )
-        self.assertEqual(len(logs.output), 1, logs.output)
-        self.assertIn("session_window", logs.output[0])
-        self.assertIn("window_days", logs.output[0],
-                      "the warning must name the replacement key")
-        self.assertEqual(resolved["window_days"], 77)
-
-    def test_defaults_only_path_with_deprecated_key_still_resolves(self):
-        # No policy file at all + a stale user key: fail-open to DEFAULTS.
-        missing = Path(self.tmp.name) / "does-not-exist.yaml"
-        resolved = shaping.load_shape_ceiling_defaults(
-            policy_path=missing, plugin_config=_cfg({"session_window": 100}))
-        self.assertEqual(resolved["window_days"], shaping.DEFAULTS["window_days"])
-
-
-class BackwardCompatTests(unittest.TestCase):
-    def test_noarg_call_matches_shipped_policy(self):
-        # The legacy no-arg signature keeps working: the shipped policy.yaml
-        # thresholds, no user layer.
-        self.assertEqual(shaping.load_shape_ceiling_defaults(), {
-            "window_days": 7, "promote_min_sessions": 1,
-            "promote_min_calls": 2, "demote_min_sessions_no_use": 2,
-            "demote_k": 1.5,
-        })
-
-    def test_policy_path_only_call_still_works(self):
-        # A caller passing only policy_path (the old keyword) is unaffected.
-        with tempfile.TemporaryDirectory() as tmp:
-            policy = _write_policy(Path(tmp))
-            resolved = shaping.load_shape_ceiling_defaults(policy_path=policy)
-        self.assertEqual(resolved["window_days"], 77)
 
 
 def _seed_sessions(state_dir: Path, scope: str, n_sessions: int,

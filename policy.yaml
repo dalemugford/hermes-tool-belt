@@ -3,9 +3,8 @@
 # evidence-driven demotion shapes the loadout down; telemetry records savings.
 
 name: aggressive
-# Documentation only — nothing reads `description`; the loader consumes
-# `name`, `always_carry`, and `triggers` (a legacy `carry` list still loads
-# but the shipped policy no longer carries one).
+# The loader consumes `name`, `always_carry`, and `triggers`; `description`
+# is documentation only.
 description: >
   Full-start: every enabled tool is carried on a fresh scope; evidence-driven
   demotion trims the loadout over time, and demoted tools stay reachable via
@@ -46,11 +45,6 @@ learning:
 # promotion moves a demoted tool back to carry. Trigger definitions never
 # change during either transition. Tool Belt has no disabling semantics:
 # absent/disabled tools are owned by E, not by policy.
-#
-# NOTE — this file no longer ships a `carry` list. The old curated warm-start
-# carry list is retired: runtime resolution never reads a policy carry list
-# (a fresh scope simply carries all of E), and onboarding derives any
-# warm-start prior from historical telemetry analysis instead.
 
 # always_carry — permanent residents. Immutable: the learned/adaptive layer can
 # never demote these. Shipped pins are union-only (users can add via config but
@@ -61,11 +55,12 @@ learning:
 # NOT here on purpose:
 #   send_message — not agent-callable on current Hermes (send_message_tool.py
 #     deliberately registers no model tool; it is CLI/cron/notifier transport
-#     only), so a pin would be permanently inert misinformation. Do not "fix"
-#     it back; if a future Hermes re-registers it, users can pin via config.
-#   todo — evidence-ruled since 1.0: demotion is recoverable via expand_tools
-#     and 20 sessions of no-use is real evidence on a chat-only scope. Users
-#     who want it resident can pin it back via plugins.entries.tool-belt.settings.always_carry.
+#     only), so a pin would be permanently inert misinformation. If a future
+#     Hermes re-registers it, users can pin via config.
+#   todo — evidence-ruled: demotion is recoverable via expand_tools and 20
+#     sessions of no-use is real evidence on a chat-only scope. Users who want
+#     it resident can pin it back via
+#     plugins.entries.tool-belt.settings.always_carry.
 always_carry:
   # Class 2 — asking the user. No alternative expression; demotion is silent
   # and self-confirming (a demoted clarify yields zero clarify calls forever).
@@ -88,10 +83,6 @@ always_carry:
   - tool_search
   - tool_describe
   - tool_call
-
-# NOTE — no always_off key. Tool Belt has no disabling semantics. Any enabled
-# tool outside always_carry is carried until demoted by evidence; disabling is
-# owned by Hermes's ceiling.
 
 # Triggered tool groups. Each group fires when ANY of its signals match.
 # When a group fires, all listed tools are added to the active set.
@@ -223,11 +214,6 @@ triggers:
       # smart-home co-word.
       - '(?-i:\bHA\b).{0,30}\b(entit(y|ies)|state|service|automation|scene|sensor|lights?|switch)\b'
       - '\b(dim|brighten) (the )?lights?\b'
-
-  # Note: tool_search / tool_describe / tool_call (Hermes' native deferred-
-  # loading bridge) are NOT gated here. Tool Search manages its own
-  # activation — it injects the bridge when MCP/plugin tools exist and
-  # stays off when they don't.
 
   # Conversation-history search — pulling up prior sessions/turns.
   - name: history_search

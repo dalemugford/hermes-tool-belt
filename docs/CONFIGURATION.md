@@ -55,7 +55,7 @@ its own:
 |---|---|---|
 | `plugins.entries.tool-belt.settings.channels.<agent>.<platform>.learned_mode` | mode learning / history | `apply` |
 | `plugins.entries.tool-belt.settings.channels.<agent>.<platform>.learned_mode` | mode off, reset | `recommend` |
-| `plugins.entries.tool-belt.settings.channels.<agent>.<platform>.bypass_rate` | observation (legacy recommend path) | `1.0` (full observation) |
+| `plugins.entries.tool-belt.settings.channels.<agent>.<platform>.bypass_rate` | observation (`--path recommend`) | `1.0` (full observation) |
 | `plugins.entries.tool-belt.settings.channels.<agent>.<platform>.bypass_rate` | mode history, on acceptance | `0.0` (narrow immediately) |
 | `plugins.entries.tool-belt.settings.channels.<agent>.<platform>.bypass_rate` | reset | the value observation mode replaced, default `0.0` |
 | `plugins.entries.tool-belt.settings.always_carry` | Protected-tools picker, on confirmation | the selected tool list |
@@ -126,8 +126,6 @@ plugins:
         auto_shape_interval_hours: 24
         always_carry: []
         bypass_rate: 0.0
-        always_on_extra: []   # removed knob — warned about, never applied
-        always_off: []        # removed knob — warned about, never applied
         cache_off:
           sticky:
             enabled: true
@@ -188,7 +186,7 @@ narrowing, so counting them as calls inflated `uses_in_window` in the
 economic demotion engine — a resolved-but-not-dispatched tool looked
 heavily used and was systematically over-carried.
 
-Setting `false` restores legacy logging of every hook emission — the
+Setting `false` logs every hook emission — the
 fail-open escape hatch for a transport that emits primary calls without an
 id. Note the known edge: degraded models at long context can emit primary
 `tool_use` blocks with blank ids (Hermes synthesizes an id only for the
@@ -230,9 +228,6 @@ to the active preset:
   `learned.json`. Recommendations flow through
   `analyze.py --write-recommendations` and the shaper for human review;
   behavior is unchanged.
-
-Legacy values normalize at load: `off` → `recommend`, and `auto` /
-`audit` → `apply`.
 
 May be overridden per scope via `channels.<scope>.learned_mode`.
 
@@ -309,17 +304,6 @@ internally.
 
 Per-scope override: `channels.<scope>.bypass_rate`. See
 [`_bypass_rate_for_scope`](../__init__.py).
-
-### `always_on_extra` / `always_off` (removed)
-
-Type: `list[str]`. Default: `[]`. **No effect.**
-
-Pre-1.0 knobs from before the full-start carrying model. They are still
-parsed so that a value left in an old config produces one warning at
-load naming the replacement, and are never applied. Use `always_carry`
-to pin a tool; there is no disable list — under full-start a tool
-leaves the carried set only through evidence-driven demotion, and
-Hermes' own `platform_toolsets` is where a tool is removed entirely.
 
 ### `cache_off`
 
@@ -420,7 +404,7 @@ A blocklisted route narrows from its **first** dispatch:
 `scope|provider` bucket is still unlocked, so a known-uncached provider or
 model resolves `off` before any API call has run. The `post_api_request`
 path still records a `provider_blocklist` lock for observability (and for
-the cross-session hint), but narrowing no longer waits a session for it.
+the cross-session hint), but narrowing does not wait a session for it.
 
 ### `channels`
 
@@ -445,7 +429,6 @@ Each platform value mirrors the top-level shape and may set any of:
 - `bypass_rate`
 - `always_carry` (additive — union with the global pins, never removes)
 - `auto_shape_interval_hours`
-- `always_on_extra`, `always_off` (removed knobs — warned about, never applied)
 
 ```yaml
 channels:
@@ -514,9 +497,7 @@ triggers:
 - `name` (`string`) — preset identifier; surfaces in `predictions.jsonl`.
 - `description` (`string`) — free text, ignored by the loader.
 - `always_carry` (`list[str]`) — immutable residents: carried on every
-  message and never shaped by the learned layer. (A legacy policy file's
-  `always_on` list — or its `"*"` no-narrowing spelling — still loads,
-  folded in at read time.)
+  message and never shaped by the learned layer.
 - `triggers` (`list[dict]`) — trigger groups, evaluated against each
   inbound message. Multiple groups may fire on one message (additive).
 - `learning.shape_ceiling` (`dict`) — default thresholds for the
@@ -572,21 +553,6 @@ against each other: `window_days` bounds *how far back* evidence is read,
 span. A floor larger than the number of sessions a window happens to contain is
 not a misconfiguration — it just means that window is too thin to demote on,
 which is the intended behavior.
-
-#### Deprecated: `session_window`
-
-The old session-**count** window (`session_window`, formerly defaulting to
-`100`) is deprecated. It is still parsed, logs one warning at load naming
-`window_days` as its replacement, and is then ignored. The day window is the
-only unit the shaper uses. Remove the key from `config.yaml` (or a forked
-`policy.yaml`) to silence the warning.
-
-The replacement is not cosmetic. Measured on 153 real sessions of one live
-scope, varying the session-count window changed demotion timing almost not at
-all, while the day window is what ages out tools whose last use is old: at
-window 100 the scope kept carrying `cronjob` (1,359 tok) and `delegate_task`
-(837 tok) on months-old usage — 2,196 tok/turn, about a quarter of the
-remaining per-turn cost — that a 30-day window demoted.
 
 #### Where the thresholds come from (config precedence)
 
@@ -726,10 +692,7 @@ the configure flows, and inventory reconciliation — all through
 
 - `version` (`int`) — `2` (`LEARNED_VERSION` in
   [`learned.py`](../learned.py)). Documents declaring a NEWER version are
-  refused on read and never rewritten. A v1 document (`always_on` /
-  `always_off` / `cache_aware` keys) is normalized to this shape in
-  memory on read — the file itself is only rewritten on the next real
-  write.
+  refused on read and never rewritten.
 - `updated_at` (`string`, ISO 8601 UTC) — last write timestamp.
 - `scopes` (`dict[str, dict]`) — per-scope overlays, keyed by
   `{agent}:{platform}` (with bare-platform fallback).
@@ -748,16 +711,13 @@ Per scope:
   `sessions_considered` (how many sessions fell inside it),
   `computed_at`, and the apply stamp (`source` `auto|configure`,
   `applied_at`, `last_auto_shape_at`). Human-readable; nothing at runtime
-  branches on it. (Blocks written before the day window landed record
-  `window_requested` — a session count — instead; the field is historical
-  and is not read back.)
+  branches on it.
 
-> **Learned trigger overlay (schema v2, supersedes the above for triggers).**
-> Under the 1.0 carrying model a scope's learned entry may carry a
+> **Learned trigger overlay.** A scope's learned entry may carry a
 > `triggers` list — an additive, auto-learned overlay of trigger groups
 > (`{name, tools, keywords, exclude_keywords, source}`) that UNIONS with the
 > shipped `policy.yaml` triggers at preset resolution; the shipped file is
-> never edited, and v1 `trigger_adjustments` are ignored. Entries are
+> never edited. Entries are
 > written only by the session-end auto pass: keyword mining from expansion
 > evidence auto-applies above a strict bar (support ≥ 4, precision ≥ 0.90),
 > and a demotion with no trigger coverage mints a conservative name-token
@@ -793,8 +753,7 @@ file is for auto-tuned state.
 Path: `$HERMES_HOME/state/tool-belt/cache_mode_detection.json`.
 Owned by the runtime; written on every per-bucket lock event by
 [`_persist_detection_lock`](../__init__.py). Keys are `scope|provider`
-(one bucket per route the scope runs on); a legacy bare-`scope` key from an
-older build is migrated to `scope|<configured primary provider>` on load.
+(one bucket per route the scope runs on).
 
 ```json
 {
@@ -870,8 +829,7 @@ Key fields:
 - `lookback_used`, `lookback_turns_config`
 - `tool_list_hash` — sha256 prefix of the wire-level tool schemas.
 - `provider`, `model`, `schema_version`
-- `frozen_reuse`, `frozen_reuse_count` — vestigial (always `false`/`0`); historical rows had `true` under the removed per-session freeze
-  after the first, with index within the session.
+- `frozen_reuse`, `frozen_reuse_count` — always `false` / `0`.
 
 ### `tool_calls.jsonl`
 
