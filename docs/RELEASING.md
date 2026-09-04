@@ -358,5 +358,20 @@ Announce per project conventions, if any apply.
   `## 🔧 Core changes` (`### Added` / `### Changed` / `### Fixed`). Draft
   the body and apply it with `gh release edit <tag> --notes-file <file>`.
 
-- **Update external pointers.** Community plugin index entry, marketplace
-  listing, or docs-site references, where those are maintained.
+- **Bump the community plugin index `ref`.** The entry in
+  `NousResearch/hermes-agent`'s `hermes_cli/data/plugin_index.json` pins a
+  specific commit SHA, not a branch — so a release the index should serve
+  needs a follow-up PR (or a push to the open one) setting `ref` to the new
+  release commit:
+
+  ```bash
+  git rev-list -n1 <tag>   # the 40-char SHA to pin
+  ```
+
+  Update the entry's `ref`, and the PR body if it cites the SHA. Until this
+  lands, `hermes plugins install tool-belt` (by index name) resolves to the
+  previously pinned commit; installing `dalemugford/hermes-tool-belt` directly
+  still clones `main`.
+
+- **Update any other external pointers.** Marketplace listing or docs-site
+  references, where those are maintained.

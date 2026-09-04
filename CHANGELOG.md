@@ -6,6 +6,13 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ## [Unreleased]
 
+### Documentation
+
+- **RELEASING.md §7 now spells out the community-index `ref` bump.** The index
+  entry pins a commit SHA, so a release the index should serve needs a
+  follow-up PR setting `ref` to the new release commit; the post-release
+  checklist now says so explicitly.
+
 ## [2026.9.5] - 2026-09-04
 
 ### Fixed
