@@ -6,6 +6,13 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ## [Unreleased]
 
+### Documentation
+
+- **RELEASING.md §7 now includes reformatting the published release note.**
+  The release workflow publishes the raw CHANGELOG section; the post-release
+  checklist now calls out editing it into the standing format (summary →
+  `## ✨ Highlights` → `## 🔧 Core changes`).
+
 ## [2026.9.4] - 2026-09-04
 
 ### Added

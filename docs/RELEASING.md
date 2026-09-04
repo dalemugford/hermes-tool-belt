@@ -352,5 +352,11 @@ Announce per project conventions, if any apply.
   against the published tag, confirming the version reported by
   `hermes plugins list` is the one you just cut.
 
+- **Reformat the published release note.** `release.yml` publishes the raw
+  `## [x.y.z]` CHANGELOG section as the note; edit it into the standing
+  format — a 2–3 sentence summary paragraph, then `## ✨ Highlights`, then
+  `## 🔧 Core changes` (`### Added` / `### Changed` / `### Fixed`). Draft
+  the body and apply it with `gh release edit <tag> --notes-file <file>`.
+
 - **Update external pointers.** Community plugin index entry, marketplace
   listing, or docs-site references, where those are maintained.
