@@ -146,18 +146,27 @@ _CONFIG: dict[str, Any] = {
     # narrowing behind it).
     "enabled": True,
     "log": True,
-    # Only log a tool_calls.jsonl row for a *primary* model dispatch — a tool
-    # the model named in its assistant tool_use block. Hermes emits the
+    "require_tool_call_id": True,
+    # ^ Only log a tool_calls.jsonl row for a *primary* model dispatch — a
+    # tool the model named in its assistant tool_use block. Hermes emits the
     # post_tool_call hook for those (carrying the provider ``tool_call_id``)
     # AND for nested/secondary dispatches routed straight through
-    # ``model_tools.handle_function_call`` (code-execution sandboxes, the code
-    # kernel, the MCP tools server, memory/mnemosyne batch fan-out). Those
-    # nested calls never faced per-turn narrowing and arrive with an EMPTY
-    # tool_call_id; logging them inflated ``uses_in_window`` in the economic
-    # demotion engine. True = drop id-less nested dispatches (the contract:
-    # a row means "the model dispatched this tool"). Escape hatch for the
-    # unlikely case a transport emits primary calls without an id.
-    "require_tool_call_id": True,
+    # ``model_tools.handle_function_call`` (code-execution sandboxes, the
+    # code kernel, the MCP tools server, memory/mnemosyne batch fan-out).
+    # Those nested calls never faced per-turn narrowing and arrive with an
+    # EMPTY tool_call_id; logging them inflated ``uses_in_window`` in the
+    # economic demotion engine. True = drop id-less nested dispatches (the
+    # contract: a row means "the model dispatched this tool"). Escape hatch
+    # for the unlikely case a transport emits primary calls without an id.
+    #
+    # KNOWN EDGE (reviewed 2026-09-03): degraded models at long context can
+    # emit primary tool_use blocks with blank ids. Hermes synthesizes an id
+    # only in ``build_assistant_message`` (for the replayable history); the
+    # executor dispatches from the raw SDK message, so the hook receives an
+    # empty id and the gate drops a REAL dispatch. Effect is a rare
+    # under-count — safer for the demotion engine than over-counting (it
+    # can only make a tool demote sooner), and ``require_tool_call_id:
+    # false`` restores full logging if it ever matters in practice.
     "channels": {},
     "agent": "",
     # Zero-config default (full-start contract): evidence-driven shaping

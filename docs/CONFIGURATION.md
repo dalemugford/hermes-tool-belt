@@ -171,6 +171,29 @@ Toggles all JSONL telemetry writers
 (`predictions.jsonl`, `tool_calls.jsonl`, `api_calls.jsonl`). Setting
 `false` keeps the narrowing behavior but disables observation.
 
+### `require_tool_call_id`
+
+Type: `bool`. Default: `true`.
+
+A `tool_calls.jsonl` row is written only for a **primary model dispatch** —
+a tool the model named in its assistant `tool_use` block, identified by the
+provider-assigned `tool_call_id`. Hermes also emits `post_tool_call` for
+nested/secondary dispatches routed straight through
+`model_tools.handle_function_call` (code-execution sandboxes, the code
+kernel, the MCP tools server, memory/mnemosyne batch fan-out); those arrive
+without an id and are **dropped** by this gate. They never faced per-turn
+narrowing, so counting them as calls inflated `uses_in_window` in the
+economic demotion engine — a resolved-but-not-dispatched tool looked
+heavily used and was systematically over-carried.
+
+Setting `false` restores legacy logging of every hook emission — the
+fail-open escape hatch for a transport that emits primary calls without an
+id. Note the known edge: degraded models at long context can emit primary
+`tool_use` blocks with blank ids (Hermes synthesizes an id only for the
+replayable history, not for the executor), so the default gate may
+under-count in that rare case — an under-count is safe for the demotion
+engine, and `false` recovers the data if it ever matters.
+
 ### `cache_mode`
 
 Type: `string`. One of `auto`, `on`, `off`. Default: `auto`.

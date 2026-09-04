@@ -625,6 +625,47 @@ def main() -> int:
                 run_scenario(sc, off_home)
             print(f"  → {sum(1 for f in off_state.iterdir())} state files written")
 
+            # Primary-dispatch gate: a nested/secondary dispatch arrives with
+            # an EMPTY tool_call_id (code-execution sandbox, MCP tools
+            # server, memory/mnemosyne batch fan-out) and must NOT create a
+            # tool_calls.jsonl row. Emit one right into the pipeline's state
+            # dir so the drop contract is smoke-tested end-to-end, then
+            # assert it in run_cache_off_assertions.
+            pre_row_count = len(
+                (off_state / "tool_calls.jsonl").read_text().splitlines()
+            ) if (off_state / "tool_calls.jsonl").exists() else 0
+            plugin._PREDICTION_CV.set({
+                "prediction_id": "smoke-nested-gate",
+                "agent": "assistant-a",
+                "platform": "telegram",
+                "scope": "assistant-a:telegram",
+                "session_id": "smoke-nested-gate-session",
+                "initial_active_tools": ["terminal"],
+                "baseline_active_tools": ["terminal"],
+                "expand_only_tools": ["memory"],
+                "expansions": {"coding", "memory"},
+                "pending_expansion": {
+                    "category": "coding",
+                    "resolved_tools": ["memory", "read_file", "write_file"],
+                    "tools_added": ["memory", "read_file", "write_file"],
+                },
+                "ceiling_tools": ["terminal", "memory"],
+            })
+            plugin._on_post_tool_call(
+                tool_name="memory", args={}, result="ok",
+                task_id="smoke-nested-gate-session", session_id="",
+                tool_call_id="",
+            )
+            plugin._PREDICTION_CV.set(None)
+            post_row_count = len(
+                (off_state / "tool_calls.jsonl").read_text().splitlines()
+            ) if (off_state / "tool_calls.jsonl").exists() else 0
+            check = Check()
+            check.assert_(pre_row_count == post_row_count,
+                f"id-less nested dispatch logged no row "
+                f"({pre_row_count} -> {post_row_count})")
+            check.report()
+
             check = Check()
             run_cache_off_assertions(off_state, check)
             off_rc = check.report()

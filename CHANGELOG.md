@@ -6,6 +6,22 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`tool_calls.jsonl` now logs only primary model dispatches** (behind
+  `require_tool_call_id`, default `true`). Hermes emits `post_tool_call`
+  both for the model's assistant `tool_use` blocks and for nested/secondary
+  dispatches (code-execution sandboxes, the MCP tools server, memory/
+  mnemosyne batch fan-out) that never faced per-turn narrowing; logging the
+  latter inflated `uses_in_window` in the economic demotion engine, so
+  resolved-but-not-dispatched tools looked heavily used and were
+  systematically over-carried (observed: the `memory` tool showed 136
+  telemetry rows vs 5 real dispatches ever). Known edge: degraded models at
+  long context can emit primary calls with blank ids; the default gate
+  under-counts in that rare case (safe for the demotion engine — set
+  `require_tool_call_id: false` to restore legacy logging). Historical
+  inflated rows age out of the shaper window by rotation; no migration.
+
 ## [2026.9.3] - 2026-09-03
 
 ### Added
