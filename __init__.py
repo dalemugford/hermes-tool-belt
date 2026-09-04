@@ -395,9 +395,17 @@ def _load_user_config() -> None:
             "enabled", "log", "require_tool_call_id", "agent", "learned_mode",
             "bypass_rate", "cache_mode",
             "auto_shape", "auto_shape_interval_hours", "always_carry",
+            "learning",
         ):
             if key in plugin_cfg:
                 _CONFIG[key] = plugin_cfg[key]
+        # ``learning`` must survive as a plain dict for
+        # shaping._config_shape_ceiling (and future nested consumers);
+        # never flatten or validate here — resolution is fail-open there.
+        if "learning" in plugin_cfg and not isinstance(
+            plugin_cfg.get("learning"), dict
+        ):
+            _CONFIG.pop("learning", None)
         # "always_on_extra"/"always_off" are REMOVED pre-1.0 knobs: copied
         # only so presets._warn_legacy_disable_inputs can surface a stale
         # value in user config. They are never applied.

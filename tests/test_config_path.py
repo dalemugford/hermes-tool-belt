@@ -174,6 +174,29 @@ class LoaderTests(unittest.TestCase):
         self.assertEqual(cfg["channels"],
                          {"bernard:telegram": {"learned_mode": "recommend"}})
 
+    def test_learning_shape_ceiling_is_copied_into_config(self):
+        """Regression (2026-09-03): the ``learning`` block must survive
+        ``_load_user_config`` — it was missing from the copy allowlist, so a
+        user-configured ``learning.shape_ceiling`` never reached
+        ``_CONFIG`` and the auto-shaper silently ran policy defaults."""
+        cfg, _ = self._load({"plugins": {"entries": {"tool-belt": {"settings": {
+            "agent": "bernard",
+            "learning": {"shape_ceiling": {"session_window": 30,
+                                           "demote_min_sessions_no_use": 8}},
+        }}}}})
+        self.assertEqual(cfg.get("learning"),
+                         {"shape_ceiling": {"session_window": 30,
+                                            "demote_min_sessions_no_use": 8}})
+
+    def test_learning_non_dict_is_dropped_fail_open(self):
+        cfg, _ = self._load({"plugins": {"entries": {"tool-belt": {"settings": {
+            "agent": "bernard",
+            "learning": "tighten everything",
+        }}}}})
+        self.assertNotIn("learning", cfg,
+                         "non-dict learning must not enter _CONFIG; the "
+                         "shaper falls back to the policy layer")
+
     def test_legacy_block_is_ignored_with_a_warning(self):
         cfg, out = self._load({"plugins": {"tool-belt": {"agent": "old"}}})
         self.assertNotEqual(cfg.get("agent"), "old", "legacy block must not be read")
