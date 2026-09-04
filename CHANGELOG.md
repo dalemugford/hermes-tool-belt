@@ -6,6 +6,8 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ## [Unreleased]
 
+## [2026.9.4] - 2026-09-04
+
 ### Added
 
 - **User-configurable shaper thresholds via `config.yaml`.** The five
