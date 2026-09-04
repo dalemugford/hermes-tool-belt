@@ -146,6 +146,18 @@ _CONFIG: dict[str, Any] = {
     # narrowing behind it).
     "enabled": True,
     "log": True,
+    # Only log a tool_calls.jsonl row for a *primary* model dispatch — a tool
+    # the model named in its assistant tool_use block. Hermes emits the
+    # post_tool_call hook for those (carrying the provider ``tool_call_id``)
+    # AND for nested/secondary dispatches routed straight through
+    # ``model_tools.handle_function_call`` (code-execution sandboxes, the code
+    # kernel, the MCP tools server, memory/mnemosyne batch fan-out). Those
+    # nested calls never faced per-turn narrowing and arrive with an EMPTY
+    # tool_call_id; logging them inflated ``uses_in_window`` in the economic
+    # demotion engine. True = drop id-less nested dispatches (the contract:
+    # a row means "the model dispatched this tool"). Escape hatch for the
+    # unlikely case a transport emits primary calls without an id.
+    "require_tool_call_id": True,
     "channels": {},
     "agent": "",
     # Zero-config default (full-start contract): evidence-driven shaping
@@ -361,7 +373,8 @@ def _load_user_config() -> None:
         if not isinstance(plugin_cfg, dict):
             return
         for key in (
-            "enabled", "log", "agent", "learned_mode", "bypass_rate", "cache_mode",
+            "enabled", "log", "require_tool_call_id", "agent", "learned_mode",
+            "bypass_rate", "cache_mode",
             "auto_shape", "auto_shape_interval_hours", "always_carry",
         ):
             if key in plugin_cfg:
@@ -1965,8 +1978,26 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
         state = _PREDICTION_CV.get()
         prediction_id = state.get("prediction_id", "") if state else ""
         session_id = kwargs.get("session_id") or task_id or ""
+        # Provider-assigned id for the model's tool_use request. Present only
+        # on a *primary* dispatch: Hermes' executor emits post_tool_call for
+        # the model's assistant tool_use blocks via
+        # ``tool_executor._emit_terminal_post_tool_call``, threading the real
+        # tool_call_id (and session_id). Nested/secondary dispatches — tools
+        # invoked straight through ``model_tools.handle_function_call`` by
+        # code-execution sandboxes, the code kernel, the MCP tools server, or
+        # memory/mnemosyne batch fan-out — pass neither, so it arrives empty.
+        tool_call_id = str(kwargs.get("tool_call_id") or "")
         if tool_name:
             tool = str(tool_name)
+            # A row in tool_calls.jsonl means "the model dispatched this tool"
+            # — nothing else. Nested dispatches (empty tool_call_id) never
+            # faced per-turn narrowing; counting them as calls inflated
+            # ``uses_in_window`` in the shaper's economic demotion engine
+            # (a resolved-but-not-dispatched tool looked heavily used, so the
+            # penalty side ballooned and the tool was over-carried). Drop them.
+            # ``require_tool_call_id: false`` restores the pre-fix behavior.
+            if _CONFIG.get("require_tool_call_id", True) and not tool_call_id:
+                return None
             initial_allowed = set(state.get("initial_active_tools") or []) if state else set()
             # Baseline = the active set *before* sticky carry-over merged in.
             # Used for credit attribution: a tool only sticky-carries because
@@ -2052,6 +2083,7 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                 "platform": attribution_platform,
                 "scope": attribution_scope,
                 "source": source,
+                "tool_call_id": tool_call_id,
                 "was_initially_active": was_initially_available,
                 "was_expand_only": tool in expand_only,
                 "activated_by_expansion": tool in expanded,

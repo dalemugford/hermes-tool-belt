@@ -29,6 +29,10 @@ config_schema:
     type: bool
     default: true
     description: Write telemetry JSONL under state/tool-belt.
+  require_tool_call_id:
+    type: bool
+    default: true
+    description: Log a tool_calls row only for primary model dispatches (rows carrying the provider tool_call_id). Nested/secondary dispatches (code-execution sandbox, MCP tools server, memory/mnemosyne batch fan-out) arrive id-less and are dropped; false restores legacy logging of every hook emission.
   agent:
     type: str
     description: Display name for this profile's agent in reports.

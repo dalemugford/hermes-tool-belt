@@ -310,6 +310,7 @@ class PostToolCallAttributionRecoveryTests(unittest.TestCase):
             result="ok",
             task_id="t1",
             session_id=REAL_KEY_TELEGRAM,
+            tool_call_id="tc-primary",
         )
         tool_calls_path = Path(self.profile_home) / "state" / "tool-belt" / "tool_calls.jsonl"
         rows = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l]
@@ -785,7 +786,7 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
 
         plugin._on_post_tool_call(
             tool_name="terminal", args={}, result="ok", task_id="t1",
-            session_id=REAL_KEY_TELEGRAM,
+            session_id=REAL_KEY_TELEGRAM, tool_call_id="tc-primary",
         )
         row = self._latest_row()
         self.assertTrue(row.get("was_initially_active"))
@@ -807,7 +808,7 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
 
         plugin._on_post_tool_call(
             tool_name="terminal", args={}, result="ok", task_id="t1",
-            session_id=REAL_KEY_TELEGRAM,
+            session_id=REAL_KEY_TELEGRAM, tool_call_id="tc-primary",
         )
         row = self._latest_row()
         self.assertFalse(row.get("was_initially_active"))
@@ -832,7 +833,7 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
 
         plugin._on_post_tool_call(
             tool_name="terminal", args={}, result="ok", task_id="t1",
-            session_id=REAL_KEY_TELEGRAM,
+            session_id=REAL_KEY_TELEGRAM, tool_call_id="tc-primary",
         )
         row = self._latest_row()
         self.assertFalse(row.get("was_initially_active"),
@@ -858,7 +859,7 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
 
         plugin._on_post_tool_call(
             tool_name="terminal", args={}, result="ok", task_id="t1",
-            session_id=REAL_KEY_TELEGRAM,
+            session_id=REAL_KEY_TELEGRAM, tool_call_id="tc-primary",
         )
         row = self._latest_row()
         self.assertTrue(row.get("was_initially_active"))
@@ -866,6 +867,121 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
             "round-trip happened — should still record after_expand_tools")
         self.assertNotEqual(row.get("expansion_provided_access"), True,
             "round-trip provided nothing new — must not be credited as expansion-driven")
+
+
+class PrimaryDispatchGateTests(unittest.TestCase):
+    """A ``tool_calls.jsonl`` row means "the model dispatched this tool" —
+    nothing else. Hermes emits ``post_tool_call`` both for the model's
+    assistant tool_use blocks (carrying the provider ``tool_call_id``) and
+    for nested/secondary dispatches routed straight through
+    ``model_tools.handle_function_call`` — code-execution sandboxes, the
+    code kernel, the MCP tools server, and memory/mnemosyne batch fan-out.
+    Those nested calls carry an empty ``tool_call_id`` and never faced
+    per-turn narrowing; logging them inflated ``uses_in_window`` in the
+    economic demotion engine (a resolved-but-not-dispatched tool looked
+    heavily used, so it was systematically over-carried).
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.profile_home = _make_profile_dir(self.tmp.name, "assistant-a")
+        self._env_patch = mock.patch.dict(
+            os.environ,
+            {"HERMES_HOME": self.profile_home, "HERMES_SESSION_KEY": ""},
+            clear=False,
+        )
+        self._env_patch.start()
+        self.addCleanup(self._env_patch.stop)
+
+        self._original_config = dict(plugin._CONFIG)
+        plugin._CONFIG["enabled"] = True
+        plugin._CONFIG["log"] = True
+        plugin._CONFIG["require_tool_call_id"] = True
+        plugin._CONFIG["agent"] = "assistant-a"
+        self.addCleanup(self._restore_config)
+
+        plugin._STICKY_BY_KEY.clear()
+        plugin._POLICY_TURN_BY_SCOPE.clear()
+        plugin._PREDICTION_CV.set(None)
+
+    def _restore_config(self) -> None:
+        plugin._CONFIG.clear()
+        plugin._CONFIG.update(self._original_config)
+        plugin._STICKY_BY_KEY.clear()
+        plugin._POLICY_TURN_BY_SCOPE.clear()
+        plugin._PREDICTION_CV.set(None)
+
+    def _rows(self) -> list[dict]:
+        path = Path(self.profile_home) / "state" / "tool-belt" / "tool_calls.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(l) for l in path.read_text().splitlines() if l]
+
+    def _set_post_expansion_state(self) -> None:
+        # Mirror production after the model ran expand_tools(coding): memory
+        # is now in the expansions set and pending_expansion lingers. A later
+        # nested memory write in this context is exactly the polluting case.
+        plugin._PREDICTION_CV.set({
+            "prediction_id": "pred-current",
+            "agent": "assistant-a",
+            "platform": "telegram",
+            "scope": "assistant-a:telegram",
+            "sticky_key": plugin._sticky_key_for_session(REAL_KEY_TELEGRAM),
+            "session_id": REAL_KEY_TELEGRAM,
+            "initial_active_tools": ["terminal"],
+            "baseline_active_tools": ["terminal"],
+            "expand_only_tools": [],
+            "expansions": {"coding", "memory"},
+            "pending_expansion": {
+                "category": "coding",
+                "resolved_tools": ["memory", "read_file", "write_file"],
+                "tools_added": ["memory", "read_file", "write_file"],
+            },
+            "ceiling_tools": ["terminal", "memory"],
+        })
+
+    def test_expansion_resolution_does_not_log_nested_tool(self):
+        # The exact live-file signature: a memory row with
+        # activation_source=expansion / after_expand_tools=true that the
+        # model never dispatched. It reaches the hook as a nested dispatch
+        # (empty tool_call_id) — it must NOT create a row.
+        self._set_post_expansion_state()
+        plugin._on_post_tool_call(
+            tool_name="memory", args={}, result="ok",
+            task_id=REAL_KEY_TELEGRAM, session_id="", tool_call_id="",
+        )
+        rows = self._rows()
+        self.assertEqual(
+            [r for r in rows if r.get("tool_name") == "memory"], [],
+            "a nested (id-less) memory dispatch must not create a call row",
+        )
+
+    def test_primary_dispatch_is_logged_with_tool_call_id(self):
+        # A genuine model dispatch carries the provider tool_call_id and must
+        # still be recorded — including the id, for dedup/debug.
+        self._set_post_expansion_state()
+        plugin._on_post_tool_call(
+            tool_name="memory", args={}, result="ok",
+            task_id="t1", session_id=REAL_KEY_TELEGRAM, tool_call_id="toolu_abc123",
+        )
+        mem = [r for r in self._rows() if r.get("tool_name") == "memory"]
+        self.assertEqual(len(mem), 1, "a real model dispatch must be logged")
+        self.assertEqual(mem[0].get("tool_call_id"), "toolu_abc123")
+
+    def test_escape_hatch_restores_legacy_logging(self):
+        # require_tool_call_id=false is the documented fail-open switch for a
+        # transport that emits primary calls without an id.
+        plugin._CONFIG["require_tool_call_id"] = False
+        self._set_post_expansion_state()
+        plugin._on_post_tool_call(
+            tool_name="memory", args={}, result="ok",
+            task_id=REAL_KEY_TELEGRAM, session_id="", tool_call_id="",
+        )
+        self.assertEqual(
+            len([r for r in self._rows() if r.get("tool_name") == "memory"]), 1,
+            "with the escape hatch off, id-less calls log as before",
+        )
 
 
 class BuildApiKwargsSnapshotTests(unittest.TestCase):
@@ -985,7 +1101,7 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         # Model calls terminal.
         plugin._on_post_tool_call(
             tool_name="terminal", args={}, result="ok",
-            task_id="t1", session_id=REAL_KEY_TELEGRAM,
+            task_id="t1", session_id=REAL_KEY_TELEGRAM, tool_call_id="tc-primary",
         )
 
         tool_calls_path = Path(self.profile_home) / "state" / "tool-belt" / "tool_calls.jsonl"
@@ -1030,7 +1146,7 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         self._run_wrapper_with_tools(["memory", "terminal"])
         plugin._on_post_tool_call(
             tool_name="terminal", args={}, result="ok",
-            task_id="t1", session_id=REAL_KEY_TELEGRAM,
+            task_id="t1", session_id=REAL_KEY_TELEGRAM, tool_call_id="tc-primary",
         )
 
         tool_calls_path = Path(self.profile_home) / "state" / "tool-belt" / "tool_calls.jsonl"

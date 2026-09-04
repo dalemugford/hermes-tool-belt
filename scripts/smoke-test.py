@@ -279,13 +279,16 @@ def run_scenario(scenario: Scenario, profile_home: Path,
                         tools=resolved,
                         policy_scope=state.get("scope", ""),
                     )
-                    # Log the expand_tools call itself
+                    # Log the expand_tools call itself. A primary model
+                    # dispatch carries the provider tool_call_id — synthesize
+                    # one so the plugin's primary-dispatch gate logs the row.
                     plugin._on_post_tool_call(
                         tool_name="expand_tools",
                         args={"category": category},
                         result={"ok": True, "tools": resolved},
                         task_id=f"task-{scenario.chat_id}-{turn_idx}",
                         session_id=canonical,
+                        tool_call_id=f"tc-{scenario.chat_id}-{turn_idx}-expand",
                     )
                 else:
                     plugin._on_post_tool_call(
@@ -294,6 +297,7 @@ def run_scenario(scenario: Scenario, profile_home: Path,
                         result="ok",
                         task_id=f"task-{scenario.chat_id}-{turn_idx}",
                         session_id=canonical,
+                        tool_call_id=f"tc-{scenario.chat_id}-{turn_idx}-{call}",
                     )
 
             plugin._PREDICTION_CV.set(None)
