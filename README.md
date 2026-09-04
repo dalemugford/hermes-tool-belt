@@ -4,44 +4,31 @@
 
 A plugin for [Hermes Agent](https://hermes-agent.nousresearch.com).
 
-Tool definitions are cheap to carry on cached APIs (OpenAI, Anthropic) yet *costly on uncached ones.* Tool Belt shapes tool carry for Agents using uncached APIs (like Ollama Cloud, Opernrouter).
-
-
+Tool definitions are cheap to carry on cached APIs (OpenAI, Anthropic) yet *costly on uncached ones.* Tool Belt shapes tool carry for Agents using uncached APIs (like Ollama Cloud, OpenRouter).
 
 ## Why Tool Belt
 On a **cached API** tool definitions live in the
 prompt prefix the provider caches. You send them once. Every turn reads
-them back at the cache-read rate. Tool-definition cost is cheap.  
+them back at the cache-read rate. Tool-definition cost is cheap.
 
 However on **uncached APIs** there is no prefix to cache, and *every request re-sends every
-tool definition at full input price*... whether an agent uses that tool or not in the session.  
-  
+tool definition at full input price*... whether an agent uses that tool or not in the session.
+
 Which means agents might carry
 8–15k tokens of tool overhead in a session which doesn't use any tools at all. _What if you could significantly save tool overhead tokens while still making tools available to your agents?_
+
 ## What Tool Belt Adds
 
-Tool Belt optimzes Agent tool use in three main ways:
-1. **It shapes tool loadouts based on real usage.** Tool Belt adds and reads agent telemetry. It learns which tools each agent actually reach for, and decides (per tool and per agent) whether carrying that tool is worth the token carry cost.
-2. **If a tool is not worth carrying, it defers the tool in it's own custom tool, `expand_tools`. Tool Belt drops it from the carried loadout, and tucks it behind `expand_tools`. A single call recovers the tool. A tool the agent keeps reaching for is promoted back into the loadout on its own if it's invoked enough.
-3. **It includes a deterministic prediction loader to provide tools just in time.** A deterministic predictor reads each incoming message and pre-loads tools it guesses your agent is about to need, before the agent reaches for them. This further saves tokens Preventing your agent from needing expand_tools at all in many cases. There is no LLM router, no extra API call. Every decision is written to telemetry, and used to shape your agents toolset.  
-  
-
-
-  
-
-
-
-
-
-
-
-
-
+Tool Belt optimizes Agent tool use in three main ways:
+1. **It shapes tool loadouts based on real usage.** Tool Belt adds and reads agent telemetry. It learns which tools each agent actually reaches for, and decides (per tool and per agent) whether carrying that tool is worth the token carry cost.
+2. **It defers tools that aren't worth carrying.** Tool Belt drops such a tool from the carried loadout and tucks it behind its own custom tool, `expand_tools`. A single call recovers it, and a tool the agent keeps reaching for is promoted back into the loadout on its own once it's invoked enough.
+3. **It includes a deterministic prediction loader to provide tools just in time.** A deterministic predictor reads each incoming message and pre-loads tools it guesses your agent is about to need, before the agent reaches for them. This further saves tokens, preventing your agent from needing `expand_tools` at all in many cases. There is no LLM router, no extra API call. Every decision is written to telemetry, and used to shape your agent's toolset.
 
 ## Everything is Automatic
 
-Tool Belt knows when your agent is using an uncached or cached provider  
+Tool Belt knows when your agent is using an uncached or cached provider.
 It picks up when new tools have been added in Hermes. It picks up when tools are removed. And Tool Belt fails open if anything goes wrong.
+
 ## How it works
 
 Tool Belt runs on every message, before your agent runs. It follows the same

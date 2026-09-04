@@ -12,6 +12,9 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
   The release workflow publishes the raw CHANGELOG section; the post-release
   checklist now calls out editing it into the standing format (summary →
   `## ✨ Highlights` → `## 🔧 Core changes`).
+- **README copyedit pass.** Fixed typos (`OpenRouter`, `optimizes`), a broken
+  Markdown bold in the "What Tool Belt Adds" list, a run-on sentence, and
+  stray whitespace — no content changes.
 
 ## [2026.9.4] - 2026-09-04
 
