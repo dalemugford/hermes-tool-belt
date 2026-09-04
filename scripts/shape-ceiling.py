@@ -5,8 +5,8 @@ The principle in one line: usage-aware tool loading at per-tool granularity.
 Adjustments happen at session boundaries (free cache moments), not per turn.
 
 This script reads ``predictions.jsonl`` and ``tool_calls.jsonl`` for the
-last N sessions per scope, then writes per-scope promote/demote
-recommendations into ``learned.json``. The plugin's existing
+sessions active in the last N days per scope, then writes per-scope
+promote/demote recommendations into ``learned.json``. The plugin's existing
 ``apply_to_preset`` machinery picks them up automatically when
 ``learned_mode`` is ``apply``.
 
@@ -22,11 +22,12 @@ For each scope:
     the model can call them immediately without a round-trip.
 
   Demote candidates — adaptive ``carry`` residents that went unused
-    across enough recent sessions. Moving them to ``expand_only`` keeps
-    the carried prefix tighter without losing real capability (they stay
-    reachable via ``expand_tools`` / triggers). The immutable
-    ``always_carry`` surface is never a demote candidate. Conservative
-    thresholds — easy to revert via a single use.
+    across the recency window (``--window-days``) and whose carrying cost
+    beats the on-demand expansion cost by the safety factor ``--demote-k``.
+    Moving them to ``expand_only`` keeps the carried prefix tighter without
+    losing real capability (they stay reachable via ``expand_tools`` /
+    triggers), and a single use inside the window promotes them back. The
+    immutable ``always_carry`` surface is never a demote candidate.
 
 What it does NOT do
 ===================
@@ -47,7 +48,7 @@ Usage
   python3 scripts/shape-ceiling.py
   python3 scripts/shape-ceiling.py --dry-run            # report only
   python3 scripts/shape-ceiling.py --scope assistant-a:telegram
-  python3 scripts/shape-ceiling.py --window 50          # consider last 50 sessions per scope
+  python3 scripts/shape-ceiling.py --window-days 14     # widen the recency window to 14 days
   python3 scripts/shape-ceiling.py --json               # porcelain document on stdout
   python3 scripts/shape-ceiling.py --json-file out.json # porcelain document to a file
 
@@ -93,9 +94,11 @@ logger = logging.getLogger("tool_belt_plugin.shape_ceiling")
 
 #: Porcelain (machine-readable) output identity. ``PORCELAIN_VERSION`` is
 #: bumped whenever a key is removed or its meaning changes; additive keys do
-#: not bump it.
+#: not bump it. v2 replaced the session-count window keys
+#: (``scopes[].window_requested``, ``thresholds.session_window``) with the
+#: day window ``window_days``.
 PORCELAIN_SCHEMA = "tool-belt/shape-ceiling"
-PORCELAIN_VERSION = 1
+PORCELAIN_VERSION = 2
 
 
 def _load_shaping():
@@ -207,7 +210,7 @@ def build_porcelain(
         scopes.append({
             "scope": scope,
             "sessions_considered": considered,
-            "window_requested": int(recs.get("window_requested") or 0),
+            "window_days": int(recs.get("window_days") or 0),
             "computed_at": recs.get("computed_at"),
             # The per-event expansion cost that priced this scope's demote/
             # promote economics — the MEASURED figure (or the fallback on thin
@@ -231,8 +234,9 @@ def build_porcelain(
                 }
                 for d in (recs.get("demote") or [])
             ],
-            # True when the window was too short for the demote half to run at
-            # all — distinct from "ran and found nothing".
+            # True when the window held too FEW SESSIONS for the demote half
+            # to run at all — distinct from "ran and found nothing". (The floor
+            # is in sessions; the window is in days.)
             "demote_skipped_insufficient_sessions": (
                 considered < int(thresholds.get("demote_min_sessions_no_use") or 0)
             ),
@@ -247,7 +251,7 @@ def build_porcelain(
         "changed": bool(changed),
         "wrote_learned_state": bool(changed and not dry_run),
         "thresholds": {
-            "session_window": int(thresholds.get("session_window") or 0),
+            "window_days": int(thresholds.get("window_days") or 0),
             "promote_min_sessions": int(thresholds.get("promote_min_sessions") or 0),
             "promote_min_calls": int(thresholds.get("promote_min_calls") or 0),
             "demote_min_sessions_no_use": int(
@@ -263,10 +267,17 @@ def main() -> int:
     # learning.shape_ceiling over policy.yaml over DEFAULTS); explicit flags
     # below still win for ad-hoc runs.
     defaults = load_shape_ceiling_defaults(plugin_config=_load_plugin_config() or None)
-    ap = argparse.ArgumentParser(description=__doc__)
+    # allow_abbrev=False: the retired ``--window`` (a session COUNT) is a
+    # prefix of ``--window-days``, so abbreviation matching would silently
+    # reinterpret an old invocation's 50 sessions as 50 days. A unit change
+    # has to fail loudly, and no flag here is long enough to be worth
+    # abbreviating.
+    ap = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     ap.add_argument("--state-dir", default=str(default_state_dir()))
     ap.add_argument("--scope", default="", help="filter to a specific scope (default: all)")
-    ap.add_argument("--window", type=int, default=defaults["session_window"])
+    ap.add_argument("--window-days", type=int, default=defaults["window_days"],
+                    help="recency window in days: only sessions whose last "
+                         "activity falls inside it are evidence")
     ap.add_argument("--promote-min-sessions", type=int, default=defaults["promote_min_sessions"])
     ap.add_argument("--promote-min-calls", type=int, default=defaults["promote_min_calls"])
     ap.add_argument("--demote-min-sessions", type=int, default=defaults["demote_min_sessions_no_use"])
@@ -285,7 +296,7 @@ def main() -> int:
 
     state_dir = Path(args.state_dir)
     thresholds = {
-        "session_window": args.window,
+        "window_days": args.window_days,
         "promote_min_sessions": args.promote_min_sessions,
         "promote_min_calls": args.promote_min_calls,
         "demote_min_sessions_no_use": args.demote_min_sessions,
@@ -336,7 +347,7 @@ def main() -> int:
             scope=scope,
             sessions=sessions,
             calls_by_pred=calls_by_pred,
-            window=args.window,
+            window_days=args.window_days,
             promote_min_sessions=args.promote_min_sessions,
             promote_min_calls=args.promote_min_calls,
             demote_min_sessions_no_use=args.demote_min_sessions,

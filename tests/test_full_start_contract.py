@@ -189,7 +189,7 @@ class TestConfigAlwaysCarry(unittest.TestCase):
                 "scope": "agent:cli",
                 "computed_at": "2026-08-30T00:00:00Z",
                 "sessions_considered": 25,
-                "window_requested": 20,
+                "window_days": 7,
                 "promote": [],
                 "demote": [
                     {"tool": "web_search", "sessions_without_use": 25,

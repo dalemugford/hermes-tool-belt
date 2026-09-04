@@ -521,8 +521,8 @@ def required_sessions(thresholds: dict[str, int] | None = None) -> int:
     """
     thresholds = thresholds or shape_thresholds()
     return max(
-        int(thresholds.get("promote_min_sessions", 2)),
-        int(thresholds.get("demote_min_sessions_no_use", 20)),
+        int(thresholds.get("promote_min_sessions", 1)),
+        int(thresholds.get("demote_min_sessions_no_use", 2)),
     )
 
 
@@ -838,10 +838,10 @@ def compute_recommendations(info: ScopeInfo, thresholds: dict[str, int]) -> dict
         scope=info.scope,
         sessions=sessions,
         calls_by_pred=calls_by_pred,
-        window=int(thresholds.get("session_window", 100)),
-        promote_min_sessions=int(thresholds.get("promote_min_sessions", 2)),
-        promote_min_calls=int(thresholds.get("promote_min_calls", 3)),
-        demote_min_sessions_no_use=int(thresholds.get("demote_min_sessions_no_use", 20)),
+        window_days=int(thresholds.get("window_days", 7)),
+        promote_min_sessions=int(thresholds.get("promote_min_sessions", 1)),
+        promote_min_calls=int(thresholds.get("promote_min_calls", 2)),
+        demote_min_sessions_no_use=int(thresholds.get("demote_min_sessions_no_use", 2)),
         demote_k=float(thresholds.get("demote_k", 1.5)),
         schema_sizes=shaper.load_schema_sizes(info.state_dir),
         cache_mode=shaper.read_cache_mode(info.state_dir, info.scope),

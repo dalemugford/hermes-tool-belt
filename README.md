@@ -147,8 +147,10 @@ the tool with `always_carry`. The Protected tools picker in
 `hermes tool-belt configure --status` to see what shaping is active.
 
 **Tools load that I never use.** That is carry cost. Tool Belt demotes those
-tools once it has the evidence — 20 sessions of non-use by default. To shape
-from your recorded sessions now instead of waiting, run
+tools once it has the evidence — by default, a tool goes expand-only when it
+sees no use across at least 2 sessions inside a rolling 7-day window. Anything
+demoted in error costs one `expand_tools` round-trip and promotes itself back.
+To shape from your recorded sessions now instead of waiting, run
 `hermes tool-belt configure --mode history --agent <agent>` and review the diff.
 
 **I want it off right now.** Two switches, per scope or global:
@@ -236,8 +238,16 @@ Every knob — sticky residency, predictor lookback, dampener tuning, the
 in [scripts/README.md](scripts/README.md).
 
 ```bash
-python3 ~/.hermes/plugins/tool-belt/scripts/bootstrap.py   # inspect recommendations, writes nothing
+python3 ~/.hermes/plugins/tool-belt/scripts/bootstrap.py       # inspect recommendations, writes nothing
+python3 ~/.hermes/plugins/tool-belt/scripts/replay-shaping.py  # replay a scope's history through the shaper, writes nothing
 ```
+
+`replay-shaping.py` is how you check the shaping cadence against your own
+traffic before changing it: it replays one scope's telemetry chronologically,
+from an empty learned state through the real shaper, and reports where the
+carried set converges, what the ramp cost, how many `expand_tools` events the
+settings imply, and whether anything flapped. `--window-days` and `--floor`
+take comma-separated lists to sweep several settings in one run.
 
 ## Limitations
 

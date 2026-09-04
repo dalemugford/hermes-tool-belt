@@ -1,7 +1,9 @@
-# Sub-threshold state. Five sessions is below `required_sessions()`
-# (max(promote_min_sessions, demote_min_sessions_no_use) = 20 from
-# policy.yaml), which is the only way to reach `fresh` and `observing` —
-# both states are unreachable from a 20-session script by definition.
+# Sub-threshold state: the short conversation behind `fresh` and `observing`,
+# the two states a scope can only be in while it has fewer sessions than
+# `required_sessions()` (max(promote_min_sessions, demote_min_sessions_no_use)
+# — 2 under the shipped policy.yaml). The count below is the script's natural
+# length; a test that needs to be strictly under the threshold passes
+# `sessions_override` rather than depending on this number.
 name: observing
 agent: testagent
 platform: telegram

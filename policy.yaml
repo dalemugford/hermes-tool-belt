@@ -15,13 +15,16 @@ description: >
 # values unless explicit CLI flags override them for an ad-hoc run.
 learning:
   shape_ceiling:
-    # Ceiling on how much history the shaper reads — it uses ALL available
-    # sessions up to this many. demote_min_sessions_no_use is the floor:
-    # below that, demotion never fires.
-    session_window: 100
-    promote_min_sessions: 2
-    promote_min_calls: 3
-    demote_min_sessions_no_use: 20
+    # Recency window in DAYS: only sessions whose last activity lands inside
+    # the trailing window are evidence, so stale use ages out instead of
+    # protecting a tool forever. demote_min_sessions_no_use is the floor (in
+    # sessions, inside that window): below it, demotion never fires.
+    # Replay of real sessions picked these — a 7-day window holds the loadout
+    # near its steady state, and the floor showed no protective value above 2.
+    window_days: 7
+    promote_min_sessions: 1
+    promote_min_calls: 2
+    demote_min_sessions_no_use: 2
     # Economic safety factor: demote a carried tool only when carrying it
     # costs more than k × what expanding it on demand would (token-
     # denominated — no price table; fewer tokens is always cheaper).

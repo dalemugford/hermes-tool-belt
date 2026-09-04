@@ -15,6 +15,7 @@ labelled `default`; named profiles keep their directory names.
 | [`configure.py`](configure.py) | Mode-setter. Detects every agent scope, sets the shaping mode (learning / history / off) and protected tools, and writes the configuration through `hermes config`. | The first command to run after installing. Re-run any time. |
 | [`bootstrap.py`](bootstrap.py) | Posture-aware first-install warm start for narrowing (non-caching) scopes: live `expand_tools` evidence via the shaper plus session-history replay. Caching scopes are carry-all and are reported as "nothing to bootstrap". | Optional, once after installation. |
 | [`shape-ceiling.py`](shape-ceiling.py) | Builds per-scope promote/demote recommendations from recent sessions and writes the learned overlay. | Run after enough organic sessions; inspect with `--dry-run` first. |
+| [`replay-shaping.py`](replay-shaping.py) | Read-only chronological replay of one scope's telemetry, from an empty learned state through the real shaper. Reports convergence, ramp cost, implied `expand_tools` events, promotions and flap; `--window-days` and `--floor` accept comma lists to sweep. | Check a shaping cadence against your own history before changing the defaults. |
 | [`harvest-replay.py`](harvest-replay.py) | Replays existing Hermes sessions through the per-turn predictor and writes privacy-reduced synthetic telemetry. | Tune trigger coverage for cache-off scopes. |
 | [`cache-stability-replay.py`](cache-stability-replay.py) | Measures per-session tool-list stability against each session's first-call hash and estimates the cache cost of mutations from matched API-call positions. On a caching (carry-all) scope every mutation counter must be zero — a non-zero count is a regression. **Also a hard library dependency of `analyze.py`**, which imports it via `importlib` for the cache-aware savings section; its CLI is an optional focused diagnostic. | Verify carry-all held on a caching scope; investigate cache behavior; verify analyzer savings. |
 | [`savings-report.py`](savings-report.py) | **Deprecated wrapper.** Kept for backward compatibility; delegates to the canonical engine in [`../savings.py`](../savings.py). Resolves each scope's lock from its primary provider's `scope\|provider` bucket. Prefer `tool-belt savings`. | Legacy per-scope cache-on (carry-all) / cache-off view. |
@@ -110,9 +111,12 @@ python3 scripts/shape-ceiling.py --dry-run
 python3 scripts/shape-ceiling.py
 ```
 
-Defaults come from `policy.yaml` under `learning.shape_ceiling`; command-line
-flags override them for an individual run. Applied recommendations are written
-to `$HERMES_HOME/state/tool-belt/learned.json`.
+Defaults come from `policy.yaml` under `learning.shape_ceiling`
+(`window_days: 7`, `demote_min_sessions_no_use: 2`, `promote_min_sessions: 1`,
+`promote_min_calls: 2`, `demote_k: 1.5`); command-line flags override them for
+an individual run. `--window-days N` sets the day window for the run — it
+replaces the old `--window`, which took a session count. Applied
+recommendations are written to `$HERMES_HOME/state/tool-belt/learned.json`.
 
 Every demote/promote decision is priced at the scope's **measured** per-event
 expand cost (`shaping.measured_expand_penalty`) — the same pricing
@@ -122,6 +126,30 @@ interactive review and an automatic pass never disagree on economics. The
 `--json` / `--json-file` porcelain document includes `expand_round_trip_tokens`
 per scope so the priced basis is inspectable, not just the resulting
 recommendation.
+
+### Replay a shaping cadence against your own history
+
+```bash
+python3 scripts/replay-shaping.py --scope default:telegram
+python3 scripts/replay-shaping.py --scope default:telegram --window-days 7,14,30
+python3 scripts/replay-shaping.py --scope default:telegram --floor 2,5,20
+```
+
+Read-only: it starts from an empty learned state and walks one scope's
+telemetry forward in time through the real shaper, session by session, so the
+result is what the shipped engine would actually have done. Per setting it
+reports where the carried set converges and what it costs per turn, the ramp
+cost of getting there, how many `expand_tools` events the cadence implies
+(counting **primary** model dispatches only — nested and secondary dispatches
+are not evidence of the model reaching for a tool), how many promotions fired,
+and whether any tool flapped. Passing comma-separated values to `--window-days`
+or `--floor` sweeps them and prints the settings side by side.
+
+Its blind spot is worth stating: the replay can only score what the recorded
+traffic did, and a carried tool is an invitation — a tool on the wire is
+sometimes used *because* it is visible. A replay cannot show the sessions that
+would have gone differently had a demoted tool still been present, so read it
+as a cost model, not a behavioral one.
 
 ### Analyze cache behavior
 
