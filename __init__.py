@@ -1688,22 +1688,31 @@ def _bucket_mode(scope: str, provider: str, session_key: str = "") -> str:
     return _cached_detection_mode(scope, provider)
 
 
-def _resolve_posture_for_provider(scope: str, provider: str, session_key: str = "") -> str:
+def _resolve_posture_for_provider(
+    scope: str, provider: str, session_key: str = "", model: str = "",
+) -> str:
     """Posture ("on"/"off") for a scope|provider bucket, unpinned.
 
       · Explicit ``cache_mode: off`` → "off" — per-turn narrowing.
       · Explicit ``cache_mode: on`` → "on" — carry-all.
       · ``cache_mode: auto`` (default) → consult the bucket (this
         session's in-process lock, then the cross-session detection
-        cache). If it locked to a definite mode, honor it. Otherwise
-        default to "on": until proven uncached, protect prefix-cache
-        stability.
+        cache). If it locked to a definite mode, honor it. A provider or
+        model named in ``cache_auto.providers_off_models`` resolves "off"
+        here, before any API call — so a known-uncached route narrows
+        from its first session instead of shipping one carry-all session
+        while the post-call blocklist lock lands. Otherwise default to
+        "on": until proven uncached, protect prefix-cache stability.
     """
     mode = str(_CONFIG.get("cache_mode") or "auto").lower()
     if mode in ("on", "off"):
         return mode
     locked = _bucket_mode(scope, provider, session_key)
-    return locked if locked in ("on", "off") else "on"
+    if locked in ("on", "off"):
+        return locked
+    if _provider_or_model_blocklisted(model, provider):
+        return "off"
+    return "on"
 
 
 def _resolve_cache_mode_for_session(
@@ -1734,7 +1743,10 @@ def _resolve_cache_mode_for_session(
         or str(provider or "").strip().lower()
         or str(_HOST_MODEL.get("provider") or "")
     )
-    decision = _resolve_posture_for_provider(scope, resolved_provider, session_key=sid)
+    decision = _resolve_posture_for_provider(
+        scope, resolved_provider, session_key=sid,
+        model=_model_for_provider(resolved_provider),
+    )
     if sid:
         _CACHE_DECISION_BY_SESSION[sid] = {
             "mode": decision, "provider": resolved_provider,
@@ -2187,6 +2199,41 @@ def _cache_auto_cfg() -> dict[str, Any]:
     return cfg if isinstance(cfg, dict) else {}
 
 
+def _provider_or_model_blocklisted(model: str, provider: str) -> bool:
+    """True when ``model`` or ``provider`` is named in
+    ``cache_auto.providers_off_models`` — a config statement that the route
+    never caches. Case-insensitive, matches either the model id or the
+    provider name. Shared by the first-dispatch posture resolver and the
+    post-call detection lock so the two paths agree by construction.
+    """
+    blocklist = _cache_auto_cfg().get("providers_off_models") or []
+    if not isinstance(blocklist, list):
+        return False
+    listed = {str(x).strip().lower() for x in blocklist if x}
+    if not listed:
+        return False
+    m = str(model or "").strip().lower()
+    p = str(provider or "").strip().lower()
+    return (bool(m) and m in listed) or (bool(p) and p in listed)
+
+
+def _model_for_provider(provider: str) -> str:
+    """The configured model that describes ``provider`` for blocklist
+    matching, or "" when none can be attributed.
+
+    ``_HOST_MODEL["model"]`` is the configured PRIMARY model; it describes
+    only the primary provider. For an observed failover provider we have no
+    model to offer, so return "" rather than misattribute the primary's
+    model — which would wrongly narrow (and cache-bust) a caching failover
+    provider whenever the primary model happens to be blocklisted. Every
+    posture-resolution path derives the model through this one helper, so
+    they agree by construction about what model (if any) a provider carries.
+    """
+    p = str(provider or "").strip().lower()
+    host_p = str(_HOST_MODEL.get("provider") or "").strip().lower()
+    return str(_HOST_MODEL.get("model") or "") if (p and p == host_p) else ""
+
+
 def _detection_cache_path():
     """Resolve the persisted detection cache path."""
     home = os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
@@ -2452,15 +2499,14 @@ def _update_cache_mode_detection(
         return state["mode"]
 
     # Provider blocklist: lock "off" the moment we see a known-bad model
-    # or provider.
-    blocklist = _cache_auto_cfg().get("providers_off_models") or []
-    if isinstance(blocklist, list):
-        listed = {str(x).strip().lower() for x in blocklist if x}
-        if (model and str(model).strip().lower() in listed) or (provider and provider in listed):
-            state["mode"] = "off"
-            state["locked_at_call"] = state["calls_observed"]
-            state["lock_reason"] = "provider_blocklist"
-            return state["mode"]  # not persisted — provider blocklist is config, not observation
+    # or provider. Same predicate the first-dispatch resolver uses
+    # (``_resolve_posture_for_provider``), so the two paths can never
+    # disagree about what counts as blocklisted.
+    if _provider_or_model_blocklisted(model, provider):
+        state["mode"] = "off"
+        state["locked_at_call"] = state["calls_observed"]
+        state["lock_reason"] = "provider_blocklist"
+        return state["mode"]  # not persisted — provider blocklist is config, not observation
 
     cfg = _cache_auto_cfg()
     try:
@@ -2537,7 +2583,10 @@ def _maybe_evict_on_provider_change(
     pinned_provider = str(pin.get("provider") or "")
     if not provider or provider == pinned_provider:
         return
-    new_posture = _resolve_posture_for_provider(scope, provider, session_key=session_key)
+    new_posture = _resolve_posture_for_provider(
+        scope, provider, session_key=session_key,
+        model=_model_for_provider(provider),
+    )
     if new_posture == pin.get("mode"):
         # Same posture on the new provider — the pin stays, but record
         # the provider so a later switch compares against reality.

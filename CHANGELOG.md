@@ -6,6 +6,19 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Blocklisted providers/models now narrow from the first session.** A route
+  named in `cache_auto.providers_off_models` used to ship one full carry-all
+  session before the `post_api_request` lock landed, because the session's
+  posture was pinned at first dispatch under the unlocked-bucket default
+  (`on`). `_resolve_posture_for_provider` now consults the blocklist when a
+  `scope|provider` bucket is still unlocked, so a known-uncached provider or
+  model resolves `off` before any API call has run. The detection-lock path
+  and the resolver now share one predicate (`_provider_or_model_blocklisted`),
+  so they can't disagree about what counts as blocklisted. Removes the
+  corresponding KNOWN_ISSUES entry.
+
 ### Documentation
 
 - **RELEASING.md §7 now includes reformatting the published release note.**

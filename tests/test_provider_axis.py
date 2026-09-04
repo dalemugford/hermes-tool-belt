@@ -194,5 +194,74 @@ class CacheAwareSavingsTests(unittest.TestCase):
         self.assertEqual(recs.get("promote"), [])
 
 
+class BlocklistFirstDispatchTests(unittest.TestCase):
+    """A provider/model in ``providers_off_models`` must resolve "off" at the
+    session's FIRST dispatch, before any API call has produced a lock.
+
+    The two ``*_resolves_off_*`` tests are the regression locks: they fail on
+    the pre-fix tree, where ``_resolve_posture_for_provider`` returned "on" for
+    any unlocked bucket, so a known-uncached route shipped one full carry-all
+    session while the post-call lock landed. ``test_unlisted_route_still_defaults_on``
+    and ``test_explicit_locked_bucket_wins_over_blocklist_default`` guard
+    behavior the fix leaves unchanged (they pass on both trees).
+    ``test_blocklisted_primary_model_does_not_narrow_caching_failover`` locks
+    the failover safeguard — it fails on a naive fix that attributes the
+    primary model to every provider.
+    """
+
+    SCOPE = "assistant-a:telegram"
+
+    def setUp(self):
+        _seed_config()
+        _reset()
+
+    def test_blocklisted_provider_name_resolves_off_before_any_call(self):
+        # ollama-cloud is blocklisted by name; no _update_cache_mode_detection
+        # call has run, so the bucket is unlocked.
+        posture = plugin._resolve_posture_for_provider(self.SCOPE, "ollama-cloud")
+        self.assertEqual(posture, "off",
+                         "a blocklisted provider narrows from the first dispatch")
+
+    def test_blocklisted_model_resolves_off_via_session_resolver(self):
+        # Host provider is NOT blocklisted, but the configured model IS.
+        plugin._HOST_MODEL.update(provider="openrouter", model="kimi-k2.6:cloud")
+        posture = plugin._resolve_cache_mode_for_session("sid-new", scope=self.SCOPE)
+        self.assertEqual(posture, "off",
+                         "a blocklisted model narrows the first session even when "
+                         "the provider name is not itself blocklisted")
+
+    def test_unlisted_route_still_defaults_on(self):
+        # The safe default is unchanged for routes we know nothing about.
+        posture = plugin._resolve_posture_for_provider(self.SCOPE, "openrouter")
+        self.assertEqual(posture, "on",
+                         "an unlisted, unlocked route still defaults to carry-all")
+
+    def test_blocklisted_primary_model_does_not_narrow_caching_failover(self):
+        # Finding 1 regression: the primary model is blocklisted, but the
+        # session has failed over to a caching provider that is NOT itself
+        # blocklisted. The stale primary model must not be attributed to the
+        # failover provider — otherwise the caching provider narrows per-turn
+        # and its prefix cache is busted.
+        plugin._HOST_MODEL.update(provider="openai-codex", model="kimi-k2.6:cloud")
+        plugin._CACHE_MODE_BY_SESSION["sid-fo"] = {"observed_provider": "openrouter"}
+        posture = plugin._resolve_cache_mode_for_session("sid-fo", scope=self.SCOPE)
+        self.assertEqual(posture, "on",
+                         "a blocklisted PRIMARY model must not narrow an "
+                         "unrelated caching failover provider")
+
+    def test_explicit_locked_bucket_wins_over_blocklist_default(self):
+        # A bucket already locked "on" by observation is honored; the blocklist
+        # only supplies the UNLOCKED default, it doesn't override a real lock.
+        for _ in range(5):
+            plugin._update_cache_mode_detection(
+                session_key="obs", model="gpt-5.4",
+                cache_read=8000, cache_write=0, input_tokens=2000,
+                scope=self.SCOPE, provider="openrouter",
+            )
+        self.assertEqual(
+            plugin._resolve_posture_for_provider(self.SCOPE, "openrouter", "obs"),
+            "on", "an observed lock is not second-guessed by the blocklist path")
+
+
 if __name__ == "__main__":
     unittest.main()

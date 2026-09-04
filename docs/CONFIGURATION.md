@@ -413,12 +413,12 @@ and lock `off` immediately. Provider-blocklist locks are *not* persisted to the
 cross-session detection cache — they're a config statement, not an
 observation.
 
-The lock is written from `post_api_request`, so it takes effect from the
-*next* session on a fresh `scope|provider` bucket — a scope's very first
-session there still resolves under `_resolve_posture_for_provider`'s
-unlocked-bucket default (`"on"`, carry-all) before any call has run. See
-[KNOWN_ISSUES.md](KNOWN_ISSUES.md) for the detail; it's moot once the
-bucket has locked, which the blocklist forces almost immediately.
+A blocklisted route narrows from its **first** dispatch:
+`_resolve_posture_for_provider` consults the blocklist whenever a
+`scope|provider` bucket is still unlocked, so a known-uncached provider or
+model resolves `off` before any API call has run. The `post_api_request`
+path still records a `provider_blocklist` lock for observability (and for
+the cross-session hint), but narrowing no longer waits a session for it.
 
 ### `channels`
 

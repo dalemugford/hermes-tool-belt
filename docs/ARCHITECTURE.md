@@ -132,9 +132,12 @@ plugins:
   session.
 - `cache_mode: auto` (default) consults the `scope|provider` bucket —
   this session's in-process lock first, then the cross-session detection
-  cache. A locked bucket is reused immediately. Otherwise the plugin
-  defaults to `on` (until proven uncached, protect prefix-cache
-  stability) and starts an observation window.
+  cache. A locked bucket is reused immediately. On an *unlocked* bucket,
+  a provider or model named in `cache_auto.providers_off_models` resolves
+  `off` right there — before any call — so a known-uncached route narrows
+  from its first session; everything else defaults to `on` (until proven
+  uncached, protect prefix-cache stability) and starts an observation
+  window.
 
 The auto path observes `cache_read_tokens` across early API calls,
 accumulating in the bucket of **the call's** provider — a failover call
@@ -180,6 +183,14 @@ from the per-call `provider` Hermes reports, so it follows failover and
 `/model`), (b) the configured primary — Hermes' top-level
 `model.provider`, (c) the bare-scope legacy entry. A detection lock that
 lands mid-session applies to the *next* session, never the current one.
+
+For the blocklist check at this step, the model is attributed to a
+provider through `_model_for_provider`: the configured primary model
+describes only the primary provider, so an *observed failover* provider
+carries no model here (attributing the primary's model to it could
+wrongly narrow — and cache-bust — a caching failover route whose primary
+model happens to be blocklisted). Every resolution path derives the model
+this same way, so they agree by construction.
 
 The one mid-session re-resolution is a provider change whose posture
 differs. When `/model` or a failover moves a session from a caching
