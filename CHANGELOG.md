@@ -6,6 +6,8 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ## [Unreleased]
 
+## [2026.9.5] - 2026-09-04
+
 ### Fixed
 
 - **Blocklisted providers/models now narrow from the first session.** A route
@@ -16,8 +18,10 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
   `scope|provider` bucket is still unlocked, so a known-uncached provider or
   model resolves `off` before any API call has run. The detection-lock path
   and the resolver now share one predicate (`_provider_or_model_blocklisted`),
-  so they can't disagree about what counts as blocklisted. Removes the
-  corresponding KNOWN_ISSUES entry.
+  so they can't disagree about what counts as blocklisted. The configured
+  primary model is attributed only to the primary provider
+  (`_model_for_provider`), so an observed failover provider is never narrowed
+  on a stale primary-model match. Removes the corresponding KNOWN_ISSUES entry.
 
 ### Documentation
 
