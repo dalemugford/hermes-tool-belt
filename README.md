@@ -260,6 +260,14 @@ python3 ~/.hermes/plugins/tool-belt/scripts/bootstrap.py   # inspect recommendat
   predictor does not run again for it.
 - **Cron jobs are not shaped.** Cron sessions get their tools from Hermes
   directly.
+- **The Codex app-server runtime is not shaped.** When an agent runs on the
+  `codex_app_server` runtime, Codex drives the turn and reaches Hermes tools
+  through a fixed MCP tool list in an isolated subprocess. The plugin never
+  sees or controls that toolset, so those sessions are not narrowed, save
+  nothing, and are not recorded in telemetry. This is the runtime, not the
+  provider: Codex used the normal way — as a provider, `api_mode:
+  codex_responses` — runs through Hermes' own tool loop and is shaped like
+  any other provider. Only `codex_app_server` bypasses the plugin.
 - **New tools start carried.** A tool that no policy or learned entry names is
   carried on every call until the evidence demotes it. This is safe for new
   plugins, at some carry cost at first.

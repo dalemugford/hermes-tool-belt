@@ -23,6 +23,16 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
   on busy installs; per-scope overrides are not supported yet. See
   [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 
+### Documentation
+
+- **Documented the `codex_app_server` runtime as not shaped.** That runtime
+  hands the turn to a Codex subprocess and exposes Hermes tools through a
+  fixed MCP tool list the plugin does not control, so those sessions are not
+  narrowed and not recorded in telemetry — the same family of limitation as
+  CLI, subagent, and cron sessions. Added to the README Limitations list,
+  with the distinction that Codex *as a provider* (`api_mode:
+  codex_responses`) runs through the normal tool loop and is shaped as usual.
+
 ### Fixed
 
 - **`tool_calls.jsonl` now logs only primary model dispatches** (behind
