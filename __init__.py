@@ -219,6 +219,16 @@ _CONFIG: dict[str, Any] = {
     #   off  — assume caching is inactive; narrow tools per turn with
     #          expand_tools shipped.
     "cache_mode": "auto",
+    # User-layer shaper thresholds. The five ``shape_ceiling`` keys
+    # (session_window, promote_min_sessions, promote_min_calls,
+    # demote_min_sessions_no_use, demote_k) resolve config.yaml → policy.yaml
+    # → shaping.DEFAULTS via shaping.load_shape_ceiling_defaults(); this dict
+    # is the config.yaml layer, empty by default so shipped policy.yaml
+    # defaults apply unchanged. Nested (like cache_off/cache_auto), so the
+    # five keys are NOT top-level settings and are not declared individually
+    # in plugin.yaml's config_schema. Per-scope overrides are not supported
+    # in v1 — the whole profile shares one threshold set.
+    "learning": {},
     "cache_auto": {
         # Observe at least this many API calls before locking the mode.
         # 5 (not 3) because call 1 of a turn is consistently cache-cold
@@ -413,6 +423,14 @@ def _load_user_config() -> None:
             cache_auto = dict(_CONFIG.get("cache_auto") or {})
             cache_auto.update(plugin_cfg["cache_auto"])
             _CONFIG["cache_auto"] = cache_auto
+        if isinstance(plugin_cfg.get("learning"), dict):
+            learning = dict(_CONFIG.get("learning") or {})
+            user_learning = plugin_cfg["learning"]
+            if isinstance(user_learning.get("shape_ceiling"), dict):
+                shape_ceiling = dict(learning.get("shape_ceiling") or {})
+                shape_ceiling.update(user_learning["shape_ceiling"])
+                learning["shape_ceiling"] = shape_ceiling
+            _CONFIG["learning"] = learning
     except Exception as exc:
         logger.debug("tool-belt: config load failed (using defaults): %s", exc)
 

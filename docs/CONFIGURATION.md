@@ -11,8 +11,8 @@ Configuration is assembled from three files with distinct ownership:
 
 | File | Owner | Purpose |
 |---|---|---|
-| `policy.yaml` (plugin dir) | Plugin | Shipped preset. Always-carry baseline, trigger rules, shaper thresholds. |
-| `config.yaml` (user) | User | Enable the plugin, set mode flags, add per-scope overrides. |
+| `policy.yaml` (plugin dir) | Plugin | Shipped preset. Always-carry baseline, trigger rules, default shaper thresholds. |
+| `config.yaml` (user) | User | Enable the plugin, set mode flags, add per-scope overrides, and tune shaper thresholds (`learning.shape_ceiling`, overriding `policy.yaml`). |
 | `learned.json` (state dir) | shaper / auto-shape / configure | The learned carrying assignment per scope (schema v2). Generally not hand-edited. |
 
 State files (`learned.json`, `cache_mode_detection.json`, JSONL
@@ -551,9 +551,10 @@ skipped — they don't break policy load. See
 
 ### `learning.shape_ceiling`
 
-Default thresholds for [`scripts/shape-ceiling.py`](../scripts/shape-ceiling.py).
-The script reads them via `load_shape_ceiling_defaults`. CLI flags
-override per-run.
+Evidence thresholds for the between-session shaper, shared by
+[`scripts/shape-ceiling.py`](../scripts/shape-ceiling.py) and the in-process
+auto-shape engine. All entrypoints resolve them through
+`load_shape_ceiling_defaults`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -562,6 +563,56 @@ override per-run.
 | `promote_min_calls` | `3` | And this many total calls. Candidates then promote only when their observed expansion spend exceeds what carrying them would have cost. |
 | `demote_min_sessions_no_use` | `20` | Window must contain this many sessions before any carried tool can be demoted. |
 | `demote_k` | `1.5` | Economic safety factor: demote a carried tool only when carrying it costs more than k × what expanding it on demand would (token-denominated — no price table). |
+
+#### Where the thresholds come from (config precedence)
+
+Each key resolves independently, highest layer first:
+
+1. **`config.yaml` user layer** —
+   `plugins.entries.tool-belt.settings.learning.shape_ceiling.<key>`.
+   This is the layer you own. It lets you tune the cadence **without forking
+   the plugin-owned `policy.yaml`** (and so without diverging from upstream
+   policy updates).
+2. **`policy.yaml` shipped defaults** — `learning.shape_ceiling.<key>`, a
+   plugin-owned preset (see the [config-layering table](#config-layering)).
+   Not user-editable in place; fork only as a last resort.
+3. **Hardcoded fallback** — `shaping.DEFAULTS` (the values tabled above).
+
+A user value that is missing or invalid (a non-positive int, a non-numeric
+value, or the wrong type) is ignored and the key falls through to the layer
+below — bad config never raises and never breaks shaping (fail-open). Only
+`demote_k` accepts a positive float; the other four accept positive ints.
+
+CLI flags on `scripts/shape-ceiling.py` (`--window`, `--demote-k`, …) still
+override the resolved value for that one ad-hoc run.
+
+**Scope:** the resolved set applies to the **whole profile** — per-scope
+threshold overrides (e.g. `channels.<scope>.learning.shape_ceiling`) are
+**not** supported yet.
+
+#### Worked example — a tighter rolling cadence
+
+To rotate evidence faster on a busy install (smaller window, quicker
+demotion of tools that stop being used), set the keys you want to change in
+`config.yaml`; unset keys keep their `policy.yaml` / default value:
+
+```yaml
+plugins:
+  entries:
+    tool-belt:
+      settings:
+        learning:
+          shape_ceiling:
+            session_window: 30      # faster evidence rotation (default 100)
+            demote_min_sessions_no_use: 8   # demote after fewer idle sessions (default 20)
+```
+
+**Warning:** a smaller window demotes on thinner evidence — fewer protected
+sessions per tool — and can flap near the promote/demote hysteresis band.
+The anti-flap gates (`promote_min_sessions`, `promote_min_calls`, `demote_k`)
+still bound it, but step down gradually (e.g. 100 → 60 → 30) and watch the
+shaper's promote/demote churn rather than jumping straight to aggressive
+values.
 
 ### Authoring a new preset
 

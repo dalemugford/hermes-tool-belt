@@ -139,37 +139,80 @@ def default_state_dir() -> Path:
     return learned.state_dir()
 
 
-def load_shape_ceiling_defaults(policy_path: Path = _POLICY_PATH) -> dict[str, int]:
-    """Load shaper defaults from ``policy.yaml``'s ``learning.shape_ceiling``.
+def _config_shape_ceiling(plugin_config: dict[str, Any] | None) -> dict[str, Any]:
+    """The user-layer ``learning.shape_ceiling`` override dict, or ``{}``.
+
+    Reads the plugin settings the same way the plugin loads them:
+    ``learning.shape_ceiling.<key>`` under the plugin's settings subtree
+    (already parsed into ``plugin_config``). Never raises — a missing or
+    malformed sub-tree yields ``{}`` so resolution degrades to the policy
+    layer rather than erroring (fail-open).
+    """
+    if not isinstance(plugin_config, dict):
+        return {}
+    learning = plugin_config.get("learning")
+    if not isinstance(learning, dict):
+        return {}
+    shape = learning.get("shape_ceiling")
+    return shape if isinstance(shape, dict) else {}
+
+
+def load_shape_ceiling_defaults(
+    policy_path: Path = _POLICY_PATH,
+    plugin_config: dict[str, Any] | None = None,
+) -> dict[str, int]:
+    """Resolve the shaper's evidence thresholds across the config layers.
+
+    Precedence, highest first:
+
+      1. ``config.yaml`` user settings —
+         ``plugins.entries.tool-belt.settings.learning.shape_ceiling.<key>``
+         (passed in via ``plugin_config``; ``None`` = no user layer).
+      2. ``policy.yaml`` ``learning.shape_ceiling.<key>`` (shipped preset).
+      3. :data:`DEFAULTS` (hardcoded fallback).
+
+    Each key resolves independently: a user override that is absent or
+    invalid (non-positive int, non-numeric, wrong type) falls through to the
+    policy value, which itself falls through to :data:`DEFAULTS`. Per-scope
+    overrides are out of scope for v1 — the whole profile shares one set.
 
     PyYAML is required: :func:`yaml_required.require_yaml` exits loudly when
     it is missing rather than degrading to a second, divergent parser. A
     missing or malformed policy file still falls back to :data:`DEFAULTS` —
-    that is a policy-content question, not a wrong-interpreter one.
+    that is a policy-content question, not a wrong-interpreter one. The
+    ``plugin_config`` argument is optional so every legacy no-arg call site
+    (and any external caller) keeps its exact prior behaviour.
     """
     yaml = require_yaml()
     try:
         raw = policy_path.read_text(encoding="utf-8")
     except Exception:
-        return dict(DEFAULTS)
+        policy_merged = dict(DEFAULTS)
+    else:
+        try:
+            loaded = yaml.safe_load(raw) or {}
+        except Exception:
+            loaded = {}
+        policy_merged = dict(DEFAULTS)
+        if isinstance(loaded, dict):
+            learning = loaded.get("learning")
+            if isinstance(learning, dict):
+                shape = learning.get("shape_ceiling")
+                if isinstance(shape, dict):
+                    policy_merged = _merge_shape_defaults(shape)
 
-    try:
-        loaded = yaml.safe_load(raw) or {}
-    except Exception:
-        return dict(DEFAULTS)
-    if not isinstance(loaded, dict):
-        return dict(DEFAULTS)
-
-    learning = loaded.get("learning")
-    if isinstance(learning, dict):
-        shape = learning.get("shape_ceiling")
-        if isinstance(shape, dict):
-            return _merge_shape_defaults(shape)
-    return dict(DEFAULTS)
+    # User layer (config.yaml) merges over the resolved policy layer: only
+    # valid positive values win, so a bad user value degrades to policy.
+    user_shape = _config_shape_ceiling(plugin_config)
+    if user_shape:
+        return _merge_shape_defaults(user_shape, base=policy_merged)
+    return policy_merged
 
 
-def _merge_shape_defaults(overrides: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(DEFAULTS)
+def _merge_shape_defaults(
+    overrides: dict[str, Any], base: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    merged = dict(base if base is not None else DEFAULTS)
     for key in ("session_window", "promote_min_sessions", "promote_min_calls", "demote_min_sessions_no_use"):
         value = overrides.get(key)
         if value is None:
@@ -1658,9 +1701,11 @@ def auto_shape_run(
     cost (``savings.measure_expand_overhead``), falling back to
     :data:`EXPAND_ROUND_TRIP_TOKENS` on thin data.
 
-    Evidence thresholds are the shaper's own (``policy.yaml`` →
-    ``learning.shape_ceiling``, falling back to :data:`DEFAULTS`) — the auto
-    engine changes *when* shaping runs, never *what* it decides. An attempt
+    Evidence thresholds are the shaper's own, resolved by
+    :func:`load_shape_ceiling_defaults` across the config layers
+    (``config.yaml`` ``learning.shape_ceiling`` over ``policy.yaml`` over
+    :data:`DEFAULTS`) — the auto engine changes *when* shaping runs, never
+    *what* it decides. An attempt
     that finds nothing to change still stamps ``last_auto_shape_at`` (the
     debounce record) and writes nothing else.
 
@@ -1749,7 +1794,7 @@ def auto_shape_run(
         summary["reason"] = "no_eligible_scopes"
         return summary
 
-    thresholds = load_shape_ceiling_defaults()
+    thresholds = load_shape_ceiling_defaults(plugin_config=plugin_config)
     tool_call_rows = load_jsonl(sd / "tool_calls.jsonl")
     calls_by_pred = index_tool_calls_by_prediction(tool_call_rows)
     schema_sizes = load_schema_sizes(sd)

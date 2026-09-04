@@ -6,6 +6,23 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ## [Unreleased]
 
+### Added
+
+- **User-configurable shaper thresholds via `config.yaml`.** The five
+  `learning.shape_ceiling` keys (`session_window`, `promote_min_sessions`,
+  `promote_min_calls`, `demote_min_sessions_no_use`, `demote_k`) can now be
+  tuned under `plugins.entries.tool-belt.settings.learning.shape_ceiling`
+  without forking the plugin-owned `policy.yaml`. Resolution is per-key,
+  highest layer first: `config.yaml` (user) → `policy.yaml` (shipped preset)
+  → `shaping.DEFAULTS`. Every entrypoint threads the layer through
+  `load_shape_ceiling_defaults` — the in-process auto-shape engine,
+  `scripts/shape-ceiling.py` (CLI flags still override per-run), and
+  `scripts/configure.py`. Invalid values (non-positive, non-numeric, wrong
+  type) fall through to the layer below and never raise (fail-open). Enables
+  a tighter rolling demote/promote cadence (smaller window, lower idle floor)
+  on busy installs; per-scope overrides are not supported yet. See
+  [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
 ### Fixed
 
 - **`tool_calls.jsonl` now logs only primary model dispatches** (behind

@@ -71,6 +71,13 @@ config_schema:
   cache_auto:
     type: dict
     description: Cache-mode auto-detection thresholds.
+  learning:
+    type: dict
+    description: >
+      User-layer shaper thresholds. learning.shape_ceiling.<key> overrides the
+      shipped policy.yaml defaults (session_window, promote_min_sessions,
+      promote_min_calls, demote_min_sessions_no_use, demote_k). Whole-profile;
+      per-scope overrides are not supported. See docs/CONFIGURATION.md.
   channels:
     type: dict
     description: Per-channel overrides, nested channels.<agent>.<platform>.

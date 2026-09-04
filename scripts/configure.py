@@ -499,9 +499,17 @@ def scope_settings(
 # ──────────────────────────────── state machine ──────────────────────────────
 
 
-def shape_thresholds() -> dict[str, int]:
-    """Shaper minima, straight from ``policy.yaml`` ``learning.shape_ceiling``."""
-    return load_shaper().load_shape_ceiling_defaults()
+def shape_thresholds(
+    plugin_config: dict[str, Any] | None = None,
+) -> dict[str, int]:
+    """Shaper minima, resolved across the config layers.
+
+    ``config.yaml`` ``learning.shape_ceiling`` (via ``plugin_config``) overrides
+    the shipped ``policy.yaml`` ``learning.shape_ceiling`` defaults, which
+    override the hardcoded fallback — the same precedence the plugin runtime
+    applies. ``plugin_config=None`` resolves the policy layer only (used before
+    the profile's config block has been read)."""
+    return load_shaper().load_shape_ceiling_defaults(plugin_config=plugin_config)
 
 
 def required_sessions(thresholds: dict[str, int] | None = None) -> int:
@@ -1979,11 +1987,15 @@ def _main_with_home(args: argparse.Namespace, hermes_home: Path) -> int:
         hermes_home=hermes_home,
         dry_run=bool(args.dry_run),
         assume_yes=bool(args.yes),
-        thresholds=shape_thresholds(),
         have_hermes=hermes_available(),
     )
+    # Read the profile's plugin config first so shaper thresholds resolve the
+    # user layer (config.yaml learning.shape_ceiling) over the policy defaults,
+    # exactly as the plugin runtime does. Without a live Hermes there is no
+    # config block to read, so thresholds land on the policy layer.
     if ctx.have_hermes:
         ctx.plugin_config = read_plugin_config(ctx.runner)
+    ctx.thresholds = shape_thresholds(ctx.plugin_config or None)
 
     profile_filter = args.reset or args.agent
     args.platform = split_platform_args(args.platform)
