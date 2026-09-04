@@ -1,5 +1,5 @@
-"""Contract tests for the shaper's machine-readable output and the two
-consumers that used to screen-scrape its prose.
+"""Contract tests for the shaper's machine-readable output and its two
+consumers.
 
 What is pinned here:
 
@@ -251,17 +251,17 @@ class BootstrapConsumesPorcelainTests(unittest.TestCase):
     def test_old_human_layout_is_no_longer_parsed(self):
         """The exact pre-porcelain layout must now yield nothing.
 
-        Proof that the screen-scraper is gone: this is byte-for-byte what the
-        old parser mined, and bootstrap no longer sees a single action in it.
+        Prose output carries no actions: bootstrap must read the porcelain
+        document, never the human report.
         """
-        legacy = (
+        prose = (
             "\n=== agent-a:telegram  (sessions_considered=22) ===\n"
             "  Promote:\n"
             "    + grep_files                     sessions= 4  calls=  9  evidence=expansion\n"
             "  Demote:\n"
             "    - stale_tool                     sessions_without_use=22  evidence=carry_unused\n"
         )
-        actions, _ = self._run_with_stdout(legacy)
+        actions, _ = self._run_with_stdout(prose)
         self.assertEqual(actions, [])
 
     def test_unparseable_stdout_warns_and_yields_nothing(self):

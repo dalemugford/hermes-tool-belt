@@ -1,19 +1,16 @@
 # Test suite design
 
-Rebuilt from first principles (2026-08-30) around one rule:
+The suite is built around one rule:
 
 > **A test lives only if it can state, in one sentence: the promise it
 > protects, the plausible regression it catches, and why no other test would
 > catch it.** New tests must meet the same bar at review time — put the
 > sentence in the docstring.
 
-The suite grew organically as per-fix regression locks during release prep,
-and all of them passed while the week's real incidents (a config-default flip
-that left the plugin silently inert; demotable Tool Search bridge tools that
-would have severed all deferred MCP access; `expand_tools` itself deferred
-upstream) were found by audit and field reports instead. Those incidents
-shared one shape: *the deployed system drifted while every test exercised
-functions with explicit fixtures.* The rebuild answers that shape directly.
+The rule exists because a suite of per-fix regression locks can pass in full
+while the deployed system drifts underneath it — every test exercising
+functions with explicit fixtures, none exercising the wiring. The tiers below
+answer that shape directly.
 
 ## Tiers
 
@@ -22,7 +19,7 @@ functions with explicit fixtures.* The rebuild answers that shape directly.
 | 0 — deployed defaults & shipped artifacts | `test_tier0_deployed_defaults.py`, `test_config_path.py` | The in-code defaults and policy.yaml ARE the promise: enabled/apply/auto defaults across their separate homes; the audited pin set exactly; thresholds; regex compile; the config path contract (`plugins.entries.tool-belt.settings`, nested channels ↔ scope keys, `config_schema` defaults == `_CONFIG`). Zero mocking. |
 | 1 — promise wire contracts | `test_promise_wire.py` (crown jewels), plus the promise-graded survivors: `test_economic_demotion.py`, `test_auto_shape.py`, `test_inventory_reconciliation.py`, `test_trigger_overlay.py`, `test_full_start_contract.py`, `test_bridge_passthrough.py`, `test_expand_tools_real_bridge.py`, `test_harvest_privacy.py`, savings-honesty classes in `test_savings_cli.py` | Each shipped promise end-to-end through real wiring: real policy.yaml, real hooks (`_on_pre_gateway_dispatch` → wrapped `_build_api_kwargs`), real JSONL writers, Hermes faked only at import seams (`toolsets`, `tools.tool_search`, `hermes_cli.config`). |
 | 2 — property invariants | `test_properties.py` | The algebra for ANY input, ~200 seeded-random cases per property: partition disjoint/covering, active ⊆ ceiling, full-start supremum, pin immunity under hostile learned states, fail-open at every wrapper seam, never-narrow-to-∅. |
-| 3 — retained locks | everything else in `tests/` | Curated survivors of the original 462: bugs subtle enough that Tiers 0–2 would not re-catch them (session-pricing math, sticky decay, v1→v2 normalization edges, trigger false-positive dampeners, attribution inflation, learned-write durability, `/new` boundary). |
+| 3 — retained locks | everything else in `tests/` | Bugs subtle enough that Tiers 0–2 would not re-catch them (session-pricing math, sticky decay, trigger false-positive dampeners, attribution inflation, learned-write durability, `/new` boundary). |
 | 4 — live-wire walkthrough | NOT pytest — see below | What the suite cannot honestly cover. |
 
 ## Meta-rules

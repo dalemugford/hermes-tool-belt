@@ -12,7 +12,7 @@ Justifications:
     that fails when a refactor moves a default out from under the promise.
   · policy integrity — the shipped policy.yaml IS product behavior: the
     audited pin set exact (an eighth pin sneaking in is also a contract
-    change), thresholds match the documented levers, no legacy keys, every
+    change), thresholds match the documented levers, no unknown keys, every
     trigger regex compiles; the only test that reads the file as a contract
     rather than as fixture input.
 """

@@ -1,7 +1,7 @@
 """Config lives at ``plugins.entries.tool-belt.settings`` — the plugin
 settings subtree Hermes reserves for every plugin — with channels nested as
 ``channels.<agent>.<platform>`` (Hermes forbids ``:`` in a settings key
-segment). Locks the on-disk ↔ internal mapping and the legacy-block warning.
+segment). Locks the on-disk ↔ internal mapping.
 """
 
 from __future__ import annotations
@@ -49,9 +49,7 @@ class FlattenChannelsTests(unittest.TestCase):
 
 
 class MixedAgentBlockTests(unittest.TestCase):
-    """Review find C3: `channels.<agent>.always_carry` next to nested
-    platform entries used to demote the whole agent to a bare-platform key,
-    silently disabling its platform overrides. Agent-level scalars are now
+    """Agent-level scalars sitting next to nested platform entries are
     defaults for every platform; the platform entry wins on conflict."""
 
     def test_agent_level_scalars_default_into_each_platform(self):
@@ -84,9 +82,8 @@ class MixedAgentBlockTests(unittest.TestCase):
 
 
 class HarvestReplayConfigTests(unittest.TestCase):
-    """Review find C2: harvest-replay loaded the raw settings block without
-    flattening channels, so every per-channel override was ignored during
-    replay back-tests."""
+    """harvest-replay flattens nested channels when it loads the settings
+    block, so per-channel overrides apply during replay back-tests."""
 
     def test_replay_config_flattens_nested_channels(self):
         import importlib.util, tempfile
@@ -149,8 +146,7 @@ class _FakeHermesConfig(types.ModuleType):
 
 
 class LoaderTests(unittest.TestCase):
-    """``_load_user_config`` reads only the canonical path and reports a
-    stale legacy block instead of silently ignoring it."""
+    """``_load_user_config`` reads only the canonical path."""
 
     def _load(self, doc):
         fake = _FakeHermesConfig(doc)
@@ -175,10 +171,8 @@ class LoaderTests(unittest.TestCase):
                          {"bernard:telegram": {"learned_mode": "recommend"}})
 
     def test_learning_shape_ceiling_is_copied_into_config(self):
-        """Regression (2026-09-03): the ``learning`` block must survive
-        ``_load_user_config`` — it was missing from the copy allowlist, so a
-        user-configured ``learning.shape_ceiling`` never reached
-        ``_CONFIG`` and the auto-shaper silently ran policy defaults."""
+        """A user-configured ``learning.shape_ceiling`` reaches ``_CONFIG`` so
+        the auto-shaper runs the operator's thresholds, not policy defaults."""
         cfg, _ = self._load({"plugins": {"entries": {"tool-belt": {"settings": {
             "agent": "bernard",
             "learning": {"shape_ceiling": {"window_days": 30,
@@ -193,19 +187,9 @@ class LoaderTests(unittest.TestCase):
             "agent": "bernard",
             "learning": "tighten everything",
         }}}}})
-        self.assertNotIn("learning", cfg,
-                         "non-dict learning must not enter _CONFIG; the "
+        self.assertEqual(cfg.get("learning"), {},
+                         "a non-dict learning value never reaches _CONFIG; the "
                          "shaper falls back to the policy layer")
-
-    def test_legacy_block_is_ignored_with_a_warning(self):
-        cfg, out = self._load({"plugins": {"tool-belt": {"agent": "old"}}})
-        self.assertNotEqual(cfg.get("agent"), "old", "legacy block must not be read")
-        self.assertIn("plugins.entries.tool-belt.settings", out)
-        self.assertIn("WARNING", out)
-
-    def test_no_legacy_block_means_no_warning(self):
-        _, out = self._load({"plugins": {"entries": {"tool-belt": {"settings": {}}}}})
-        self.assertNotIn("WARNING", out)
 
 
 if __name__ == "__main__":

@@ -71,7 +71,7 @@ class TriggerDampenerTests(_TriggerAssertions, unittest.TestCase):
         self.assert_fires("code_execution", "Pull 500 rows out of the export.")
 
     def test_batch_belongs_to_code_execution_only(self):
-        # `batch` used to sit in both groups, so one word loaded execute_code
+        # If `batch` sat in both groups, one word would load execute_code
         # *and* 36 mnemosyne schemas.
         self.assert_fires("code_execution", "Send these in one batch, please.")
         self.assert_quiet("mnemosyne_extended", "Send these in one batch, please.")
@@ -85,14 +85,10 @@ class TriggerDampenerTests(_TriggerAssertions, unittest.TestCase):
             try:
                 state_dir = Path(tmpdir) / "state" / "tool-belt"
                 state_dir.mkdir(parents=True)
-                # A v1 learned file (``always_on``) — exercised through the
-                # v1→v2 read normalization: on load it maps to a ``carry``
-                # promotion for the scope.
                 payload = {
-                    "version": 1,
+                    "version": 2,
                     "updated_at": "2026-01-01T00:00:00Z",
-                    "scopes": {"assistant-a:telegram": {"always_on": ["browser_navigate"]}},
-                    "global": {},
+                    "scopes": {"assistant-a:telegram": {"carry": ["browser_navigate"]}},
                 }
                 (state_dir / "learned.json").write_text(json.dumps(payload), encoding="utf-8")
                 learned.load_state(force=True)
@@ -117,8 +113,8 @@ class TriggerDampenerTests(_TriggerAssertions, unittest.TestCase):
                 self.assertEqual(rec.policy_source, "preset")
                 self.assertNotIn("browser_navigate", rec.preset.carry)
 
-                # apply promotes the learned tool into adaptive carry residency
-                # (v1 always_on → v2 carry), never into the immutable baseline.
+                # apply promotes the learned tool into adaptive carry
+                # residency, never into the immutable baseline.
                 self.assertIn("browser_navigate", result.preset.carry)
                 self.assertNotIn("browser_navigate", result.preset.always_carry)
             finally:
@@ -177,12 +173,7 @@ class TriggerKeywordPrecisionTests(_TriggerAssertions, unittest.TestCase):
 
 
 class LearnedModeNormalizationTests(unittest.TestCase):
-    def test_legacy_values_normalize(self):
-        # Clean migration: old config values map to the two-value model.
-        self.assertEqual(learned.normalize_mode("off"), "recommend")
-        self.assertEqual(learned.normalize_mode("auto"), "apply")
-        self.assertEqual(learned.normalize_mode("audit"), "apply")
-        # Canonical values pass through.
+    def test_canonical_values_pass_through_and_unknowns_default(self):
         self.assertEqual(learned.normalize_mode("recommend"), "recommend")
         self.assertEqual(learned.normalize_mode("apply"), "apply")
         # Blank/unknown fall back to the zero-config default — "apply"
@@ -192,11 +183,12 @@ class LearnedModeNormalizationTests(unittest.TestCase):
         self.assertEqual(learned.normalize_mode(None), "apply")
         self.assertEqual(learned.normalize_mode("bogus"), "apply")
 
-    def test_learned_mode_resolution_uses_aliases(self):
-        self.assertEqual(learned.learned_mode({"learned_mode": "auto"}, "telegram"), "apply")
-        self.assertEqual(learned.learned_mode({"learned_mode": "off"}, "telegram"), "recommend")
-        # Per-scope override with a legacy value normalizes too.
-        cfg = {"learned_mode": "recommend", "channels": {"telegram": {"learned_mode": "audit"}}}
+    def test_per_scope_override_wins_over_the_global_mode(self):
+        self.assertEqual(
+            learned.learned_mode({"learned_mode": "recommend"}, "telegram"),
+            "recommend")
+        cfg = {"learned_mode": "recommend",
+               "channels": {"telegram": {"learned_mode": "apply"}}}
         self.assertEqual(learned.learned_mode(cfg, "telegram"), "apply")
 
 

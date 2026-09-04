@@ -42,7 +42,7 @@ Expected:
 | Command | Expected result |
 | --- | --- |
 | `tests/run_tests.py` | `OK` — 0 failures, 0 errors. Several skips are expected on a clean clone outside the Hermes venv: every case gated on `hermes_cli` or `tools.tool_search` not being importable (about a dozen — the real-bridge tests and `configure.py`'s curses-contract tests), plus a `tiktoken`-gated case when that package isn't installed. Any other `skipped` line means something changed and needs explaining. |
-| `scripts/smoke-test.py` | Two blocks: `9/9 checks passed` (cache-off / narrowing & attribution) and `16/16 checks passed` (cache-on / carry-all contract). |
+| `scripts/smoke-test.py` | Three blocks: `1/1 checks passed` (id-less nested dispatch logs no row), `9/9 checks passed` (cache-off / narrowing & attribution) and `16/16 checks passed` (cache-on / carry-all contract). |
 | `compileall -q .` | No output, exit 0. |
 | `bash -n scripts/rotate-telemetry.sh` | No output, exit 0. |
 
@@ -369,9 +369,9 @@ Announce per project conventions, if any apply.
   ```
 
   Update the entry's `ref`, and the PR body if it cites the SHA. Until this
-  lands, `hermes plugins install tool-belt` (by index name) resolves to the
-  previously pinned commit; installing `dalemugford/hermes-tool-belt` directly
-  still clones `main`.
+  lands, `hermes plugins install tool-belt` (by index name) resolves to
+  whatever commit the index still pins; installing
+  `dalemugford/hermes-tool-belt` directly clones `main`.
 
 - **Update any other external pointers.** Marketplace listing or docs-site
   references, where those are maintained.

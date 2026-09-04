@@ -36,8 +36,8 @@ Usage
 
 ``--mode`` mirrors the interactive menu: learning (shape from future usage),
 history (shape from recorded sessions now), off (observe only; the learned
-overlay is kept but not applied). ``--path shape|recommend`` and ``--reset``
-remain as hidden compatibility aliases (--reset also clears the overlay).
+overlay is kept but not applied). ``--path recommend`` and ``--reset`` are
+hidden variants (--reset also clears the overlay).
 """
 
 from __future__ import annotations
@@ -209,7 +209,7 @@ def load_savings_cli():
 def normalize_mode(value: Any) -> str:
     """Resolve a config value to ``recommend`` / ``apply``.
 
-    Delegates to ``learned.normalize_mode`` so legacy aliases stay in one
+    Delegates to ``learned.normalize_mode`` so mode normalization stays in one
     place; falls back to a minimal equivalent when the package is unavailable.
     """
     learned = load_learned()
@@ -529,16 +529,12 @@ def required_sessions(thresholds: dict[str, int] | None = None) -> int:
 def _has_learned_assignment(info: ScopeInfo) -> bool:
     """True when the scope has an adaptive carrying assignment in learned.json.
 
-    Read-only and fail-open (a read problem means "no assignment"). Checks
-    the v2 keys and their v1 spellings.
+    Read-only and fail-open (a read problem means "no assignment").
     """
     try:
         doc = json.loads((info.state_dir / "learned.json").read_text(encoding="utf-8"))
         entry = (doc.get("scopes") or {}).get(info.scope) or {}
-        return bool(
-            entry.get("carry") or entry.get("expand_only")
-            or entry.get("always_on") or entry.get("always_off")
-        )
+        return bool(entry.get("carry") or entry.get("expand_only"))
     except Exception:
         return False
 
@@ -1848,9 +1844,9 @@ def _ask_platforms(ctx: RunContext) -> list[str]:
 
 def split_platform_args(values: Sequence[str] | None) -> list[str] | None:
     """Comma/space-split --platform values exactly like the interactive
-    prompt that teaches users to type "telegram, slack" (B2: a raw comma
-    value used to silently become one garbage scope named
-    ``agent:telegram,slack`` and could then receive real config writes)."""
+    prompt that teaches users to type "telegram, slack" (B2: an unsplit comma
+    value would become one garbage scope named ``agent:telegram,slack`` and
+    could then receive real config writes)."""
     if not values:
         return None
     return [p.strip().lower()
@@ -1942,10 +1938,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="set the shaping mode non-interactively: learning (shape from "
              "future usage), history (shape from recorded sessions now), "
              "off (observe only)")
-    # Hidden compatibility aliases from the pre-mode-setter vocabulary:
-    # --path shape ≈ --mode history, --path recommend = observation mode with
-    # a full-ceiling baseline, --reset additionally clears the overlay.
-    parser.add_argument("--path", choices=("shape", "recommend"), default=None, help=argparse.SUPPRESS)
+    # Hidden variants: --path recommend = observation mode with a
+    # full-ceiling baseline, --reset additionally clears the overlay.
+    parser.add_argument("--path", choices=("recommend",), default=None, help=argparse.SUPPRESS)
     parser.add_argument("--reset", metavar="AGENT", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--yes", action="store_true", help="apply without the interactive confirmation")
     parser.add_argument("--dry-run", action="store_true", help="show every diff, write nothing")
@@ -2065,7 +2060,7 @@ def _main_with_home(args: argparse.Namespace, hermes_home: Path) -> int:
 
         if args.reset:
             rc = flow_reset(ctx, infos)
-        elif args.mode == "history" or args.path == "shape":
+        elif args.mode == "history":
             rc = flow_shape(ctx, infos)
         elif args.mode in ("learning", "off"):
             rc = _apply_mode(ctx, infos, args.mode)

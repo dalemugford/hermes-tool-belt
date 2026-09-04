@@ -17,22 +17,12 @@ full-start contract it declares the structural
 The adaptive residency default is **full-start**: every enabled tool outside
 ``always_carry`` is carried until an evidence-driven demotion (the learned
 overlay's ``expand_only`` list, carried on ``Preset.demoted``) moves it out.
-The shipped policy no longer ships a curated ``carry`` warm-start list —
-runtime resolution never reads one; a legacy policy file's ``carry`` entries
-still load as explicit residents (they only ever add). ``expand_only``
-(class ``X``) is *derived* — the demoted subset of ``E`` — and is only
-knowable when Hermes supplies ``E`` at request time. Tool Belt has no
+``expand_only`` (class ``X``) is *derived* — the demoted subset of ``E`` — and
+is only knowable when Hermes supplies ``E`` at request time. Tool Belt has no
 disabling semantics: absent/disabled tools are owned by Hermes's ceiling,
 not by policy.
 
-Legacy compatibility lives only in :func:`load_preset_file`, which folds a
-pre-1.0 policy file's single ``always_on`` list (or the ``"*"`` spelling of
-"no narrowing") into the canonical fields at read time. ``Preset`` itself
-carries no v1 vocabulary.
-
-Per-scope narrowing is driven by the learned overlay (``learned.py``). The old
-config-level ``always_on_extra`` / ``always_off`` promote-and-disable knobs are
-gone: a detected legacy value is warned about, never silently applied.
+Per-scope narrowing is driven by the learned overlay (``learned.py``).
 
 To turn shaping off for a scope, use `tool-belt configure` → mode off
 (``learned_mode: recommend`` — full-start carries everything).
@@ -55,9 +45,7 @@ _POLICY_FILE = Path(__file__).parent / "policy.yaml"
 # Runtime "no narrowing — allow everything in the user's ceiling" sentinel.
 # This is the value a *Prediction* (``predictor.py``) stamps onto
 # ``active_tool_names`` on the fail-open / bypass path, and ``__init__.py``
-# compares against it. The ``"*"`` string is also the on-disk spelling a
-# pre-1.0 policy file may use for its ``always_on`` key (handled in
-# ``load_preset_file``). It is NOT part of the Preset domain model — a
+# compares against it. It is NOT part of the Preset domain model — a
 # no-narrowing Preset is expressed by the ``no_narrowing`` flag.
 NO_NARROWING = "*"
 
@@ -106,10 +94,10 @@ class Preset:
       · ``always_carry`` — immutable residents (source of partition class A):
         the shipped structural baseline ∪ config pins. Win every conflict;
         never shaped by the learned/adaptive layer.
-      · ``carry``        — *explicit* adaptive residents: learned promotions
-        (and any legacy policy carry entries). Under full-start these only
-        ever add — the bulk of class C is ``(E − A) − demoted``, computed
-        against the live ceiling in ``carrying.resolve``.
+      · ``carry``        — *explicit* adaptive residents: learned promotions.
+        Under full-start these only ever add — the bulk of class C is
+        ``(E − A) − demoted``, computed against the live ceiling in
+        ``carrying.resolve``.
       · ``demoted``      — evidence-driven expand_only assignments from the
         learned overlay; the only way an enabled tool leaves residency.
       · ``triggers``     — trigger groups (``expand_only`` activation).
@@ -185,8 +173,7 @@ def _parse_triggers(raw: Any) -> list[TriggerGroup]:
 
 
 #: Parsed-preset cache keyed by path, invalidated by (mtime_ns, size). The
-#: savings engine's session replay resolves the preset once per session and
-#: was re-parsing the same policy.yaml hundreds of times per report; the
+#: savings engine's session replay resolves the preset once per session; the
 #: policy file changes rarely and the stat check keeps edits honest. Hits
 #: return a fresh Preset with copied lists so a caller mutating its copy
 #: can never contaminate later loads (compiled trigger groups are shared —
@@ -197,9 +184,7 @@ _PRESET_FILE_CACHE: dict[str, tuple[int, int, Preset]] = {}
 def load_preset_file(path: Path) -> Preset:
     """Read and parse a policy YAML into the 1.0 carrying model.
 
-    Parses the v2 schema (``always_carry`` + ``carry``). A pre-1.0 policy that
-    only has ``always_on`` is folded into ``carry`` so an un-migrated file still
-    loads. Raises on missing file or bad shape. Cached per path by mtime/size.
+    Raises on missing file or bad shape. Cached per path by mtime/size.
     """
     import yaml  # type: ignore[import-untyped]
     key = str(path)
@@ -211,7 +196,6 @@ def load_preset_file(path: Path) -> Preset:
             return Preset(
                 name=p.name,
                 always_carry=list(p.always_carry),
-                carry=list(p.carry),
                 triggers=list(p.triggers),
                 no_narrowing=p.no_narrowing,
             )
@@ -223,29 +207,12 @@ def load_preset_file(path: Path) -> Preset:
         raise ValueError(f"preset {path} is not a YAML mapping")
     name = str(data.get("name") or path.stem)
 
-    no_narrowing = False
-    always_carry = _tool_list(data.get("always_carry"))
-    carry = _tool_list(data.get("carry"))
-
-    if data.get("always_carry") == NO_NARROWING or data.get("carry") == NO_NARROWING:
-        # A "*" carrying baseline means "no narrowing".
-        no_narrowing = True
-        always_carry, carry = [], []
-    elif not always_carry and not carry and "always_on" in data:
-        # Pre-1.0 policy: a single always_on list (or "*") → adaptive carry.
-        legacy = data.get("always_on")
-        if legacy == NO_NARROWING:
-            no_narrowing = True
-        else:
-            carry = _tool_list(legacy)
-
-    # always_carry wins every conflict — a tool named in both is a resident of A.
-    carry = [t for t in carry if t not in set(always_carry)]
+    no_narrowing = data.get("always_carry") == NO_NARROWING
+    always_carry = [] if no_narrowing else _tool_list(data.get("always_carry"))
 
     preset = Preset(
         name=name,
         always_carry=always_carry,
-        carry=carry,
         triggers=_parse_triggers(data.get("triggers")),
         no_narrowing=no_narrowing,
     )
@@ -253,7 +220,7 @@ def load_preset_file(path: Path) -> Preset:
         _PRESET_FILE_CACHE[key] = (
             st.st_mtime_ns, st.st_size,
             Preset(name=preset.name, always_carry=list(preset.always_carry),
-                   carry=list(preset.carry), triggers=list(preset.triggers),
+                   triggers=list(preset.triggers),
                    no_narrowing=preset.no_narrowing),
         )
     return preset
@@ -286,10 +253,6 @@ def resolve_preset(plugin_config: dict[str, Any], channel: str) -> Preset:
          only when ``learned_mode`` is ``apply``) — the centralized
          precedence lives in :func:`learned.apply_to_preset`.
 
-    The pre-1.0 config-level ``always_on_extra`` / ``always_off`` knobs are no
-    longer inputs; a stale value is warned about (see
-    :func:`_warn_legacy_disable_inputs`), never applied.
-
     Returns a fully-resolved :class:`Preset`. Never raises; falls back to a
     no-narrowing preset on any failure so sessions don't break. To turn
     shaping off intentionally, use configure's off mode (``learned_mode:
@@ -307,17 +270,11 @@ def resolve_preset(plugin_config: dict[str, Any], channel: str) -> Preset:
 
 
 def _resolve_preset_inner(plugin_config: dict[str, Any], channel: str) -> Preset:
-    channels_cfg = plugin_config.get("channels") or {}
-    channel_cfg = _channel_config(channels_cfg, channel)
-
     preset = load_base_policy()
 
     if preset.no_narrowing:
         # No-narrowing fallback (e.g. policy.yaml missing) — nothing to layer.
         return preset
-
-    # Surface (never apply) removed pre-1.0 disable/promote config knobs.
-    _warn_legacy_disable_inputs(plugin_config, channel_cfg, channel)
 
     # Learned overlay is imported lazily to avoid a module import cycle.
     try:
@@ -332,51 +289,3 @@ def _resolve_preset_inner(plugin_config: dict[str, Any], channel: str) -> Preset
     except Exception as exc:
         logger.warning("tool-belt: learned state merge failed for %r: %s", channel, exc)
         return preset
-
-
-def _warn_legacy_disable_inputs(
-    plugin_config: dict[str, Any],
-    channel_cfg: dict[str, Any],
-    channel: str,
-) -> None:
-    """Warn (never silently apply) when removed pre-1.0 config knobs are set.
-
-    ``always_on_extra`` (promote-extra) and config-level ``always_off``
-    (disable) are no longer runtime inputs under the 1.0 carrying model: the
-    resident partition comes from policy ``always_carry`` / ``carry`` plus the
-    learned overlay, and disabling is owned by Hermes's ceiling. A stale value
-    in config is surfaced, not consumed.
-    """
-    detected: list[str] = []
-    for label, cfg in (("global", plugin_config), (f"scope {channel!r}", channel_cfg)):
-        if not isinstance(cfg, dict):
-            continue
-        if cfg.get("always_on_extra"):
-            detected.append(f"always_on_extra ({label})")
-        if cfg.get("always_off"):
-            detected.append(f"always_off ({label})")
-    if detected:
-        logger.warning(
-            "tool-belt: ignoring removed pre-1.0 config knob(s) %s — Tool Belt 1.0 "
-            "resident policy is always_carry/carry plus the learned overlay; "
-            "disabling is owned by Hermes's ceiling",
-            ", ".join(detected),
-        )
-
-
-def _channel_config(channels_cfg: Any, channel: str) -> dict[str, Any]:
-    """Return config for a scope, falling back to its platform segment.
-
-    A scope key may be given either fully qualified (``agent:platform``) or as
-    a bare platform segment; the qualified key wins.
-    """
-    if not isinstance(channels_cfg, dict):
-        return {}
-    keys = [str(channel or "").strip().lower()]
-    if keys[0] and ":" in keys[0]:
-        keys.append(keys[0].rsplit(":", 1)[-1])
-    for key in keys:
-        value = channels_cfg.get(key)
-        if isinstance(value, dict):
-            return value
-    return {}

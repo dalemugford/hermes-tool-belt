@@ -32,7 +32,7 @@ config_schema:
   require_tool_call_id:
     type: bool
     default: true
-    description: Log a tool_calls row only for primary model dispatches (rows carrying the provider tool_call_id). Nested/secondary dispatches (code-execution sandbox, MCP tools server, memory/mnemosyne batch fan-out) arrive id-less and are dropped; false restores legacy logging of every hook emission.
+    description: Log a tool_calls row only for primary model dispatches (rows carrying the provider tool_call_id). Nested/secondary dispatches (code-execution sandbox, MCP tools server, memory/mnemosyne batch fan-out) arrive id-less and are dropped; false logs every hook emission.
   agent:
     type: str
     description: Display name for this profile's agent in reports.
@@ -59,12 +59,6 @@ config_schema:
     type: number
     default: 0.0
     description: Internal testing feature — fraction of sessions shipped unnarrowed.
-  always_on_extra:
-    type: list
-    description: Removed pre-1.0 knob; a value is warned about and never applied.
-  always_off:
-    type: list
-    description: Removed pre-1.0 knob; a value is warned about and never applied.
   cache_off:
     type: dict
     description: Cache-off pipeline (sticky residency, predictor lookback).
@@ -77,8 +71,7 @@ config_schema:
       User-layer shaper thresholds. learning.shape_ceiling.<key> overrides the
       shipped policy.yaml defaults: window_days (7 — the recency window, in
       days), promote_min_sessions (1), promote_min_calls (2),
-      demote_min_sessions_no_use (2), demote_k (1.5). session_window is
-      deprecated: it counted sessions, is ignored, and warns once on load.
+      demote_min_sessions_no_use (2), demote_k (1.5).
       Whole-profile; per-scope overrides are not supported.
       See docs/CONFIGURATION.md.
   channels:

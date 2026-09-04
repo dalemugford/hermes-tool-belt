@@ -47,19 +47,3 @@ where tool curation lives, and no in-plugin change can prevent the
 reasoning trace from mutating the prefix. If consistent prefix caching
 matters more than reasoning output, route the scope to an Anthropic
 model instead.
-
----
-
-### Removed: in-memory freeze state (gateway restarts, concurrent `/new`)
-
-Earlier releases kept a per-session frozen tool snapshot in process
-memory, which produced two documented sharp edges: a gateway restart
-re-froze every active session (one cold-cache turn each), and `/new` in
-one chat could evict a sibling chat's snapshot on the same platform. The
-snapshot no longer exists — on a caching provider the plugin ships the
-full ceiling minus `expand_tools` on every call, and the list is stable
-by construction rather than by bookkeeping. A restart or a mis-targeted
-reset now only drops the posture pin, which re-resolves on the next
-dispatch from the on-disk detection cache with no change to the tool
-list. Cache-off sticky residency is still in-memory and is cleared by a
-restart, as before.

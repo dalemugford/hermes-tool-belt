@@ -98,16 +98,7 @@ def _predict_inner(
         )
 
     msg = message or ""
-    # Normalize attachments to a set of strings — be defensive against
-    # callers that pass raw dicts or other shapes.
-    atts: set[str] = set()
-    for a in (attachments or []):
-        if isinstance(a, str):
-            atts.add(a)
-        elif isinstance(a, dict):
-            kind = a.get("type") or a.get("kind") or ""
-            if isinstance(kind, str) and kind:
-                atts.add(kind.lower())
+    atts: set[str] = {a for a in (attachments or []) if isinstance(a, str)}
 
     # Start from the residents (always_carry ∪ carry). The final A/C/X split
     # against the live enabled ceiling happens later in carrying.resolve; here

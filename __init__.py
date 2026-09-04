@@ -156,17 +156,10 @@ _CONFIG: dict[str, Any] = {
     # Those nested calls never faced per-turn narrowing and arrive with an
     # EMPTY tool_call_id; logging them inflated ``uses_in_window`` in the
     # economic demotion engine. True = drop id-less nested dispatches (the
-    # contract: a row means "the model dispatched this tool"). Escape hatch
-    # for the unlikely case a transport emits primary calls without an id.
-    #
-    # KNOWN EDGE (reviewed 2026-09-03): degraded models at long context can
-    # emit primary tool_use blocks with blank ids. Hermes synthesizes an id
-    # only in ``build_assistant_message`` (for the replayable history); the
-    # executor dispatches from the raw SDK message, so the hook receives an
-    # empty id and the gate drops a REAL dispatch. Effect is a rare
-    # under-count — safer for the demotion engine than over-counting (it
-    # can only make a tool demote sooner), and ``require_tool_call_id:
-    # false`` restores full logging if it ever matters in practice.
+    # contract: a row means "the model dispatched this tool"). A primary
+    # tool_use block with a blank id (degraded models at long context) is
+    # dropped too: a rare under-count is safer for the demotion engine than
+    # over-counting. ``require_tool_call_id: false`` restores full logging.
     "channels": {},
     "agent": "",
     # Zero-config default (full-start contract): evidence-driven shaping
@@ -226,8 +219,8 @@ _CONFIG: dict[str, Any] = {
     # is the config.yaml layer, empty by default so shipped policy.yaml
     # defaults apply unchanged. Nested (like cache_off/cache_auto), so the
     # five keys are NOT top-level settings and are not declared individually
-    # in plugin.yaml's config_schema. Per-scope overrides are not supported
-    # in v1 — the whole profile shares one threshold set.
+    # in plugin.yaml's config_schema. The whole profile shares one threshold
+    # set.
     "learning": {},
     "cache_auto": {
         # Observe at least this many API calls before locking the mode.
@@ -291,9 +284,7 @@ _CACHE_DECISION_BY_SESSION: dict[str, dict[str, str]] = {}
 #   {"scope|provider": {"mode": "on"|"off", "locked_at": ts,
 #                       "lock_reason": str, "hit_rate_at_lock": float,
 #                       "sessions_locked": int, "last_model": str}}
-# Pre-1.0 files were keyed by bare scope; _load_detection_cache re-keys
-# them under the configured primary provider. Loaded once on register();
-# written on every lock event.
+# Loaded once on register(); written on every lock event.
 _DETECTION_CACHE: dict[str, dict[str, Any]] = {}
 _DETECTION_CACHE_LOADED = False
 
@@ -363,17 +354,6 @@ def _load_user_config() -> None:
     try:
         from hermes_cli.config import load_config, cfg_get  # type: ignore[import-not-found]
         cfg = load_config()
-        # Canonical: the plugin-settings subtree Hermes reserves for every
-        # plugin. The pre-2026.9 `plugins.tool-belt` block is NOT read —
-        # say so once rather than silently ignore an operator's settings.
-        legacy = cfg_get(cfg, "plugins", "tool-belt", default=None)
-        if isinstance(legacy, dict) and legacy:
-            logger.warning(
-                "tool-belt: ignoring settings at plugins.tool-belt — they now "
-                "live under plugins.entries.tool-belt.settings (channels nest "
-                "as channels.<agent>.<platform>); move them and remove the "
-                "old block"
-            )
         # Configured primary provider/model (Hermes' top-level ``model``
         # block) — the posture-resolution fallback before a session has
         # been observed on any provider. Read before the plugin-settings
@@ -395,22 +375,8 @@ def _load_user_config() -> None:
             "enabled", "log", "require_tool_call_id", "agent", "learned_mode",
             "bypass_rate", "cache_mode",
             "auto_shape", "auto_shape_interval_hours", "always_carry",
-            "learning",
         ):
             if key in plugin_cfg:
-                _CONFIG[key] = plugin_cfg[key]
-        # ``learning`` must survive as a plain dict for
-        # shaping._config_shape_ceiling (and future nested consumers);
-        # never flatten or validate here — resolution is fail-open there.
-        if "learning" in plugin_cfg and not isinstance(
-            plugin_cfg.get("learning"), dict
-        ):
-            _CONFIG.pop("learning", None)
-        # "always_on_extra"/"always_off" are REMOVED pre-1.0 knobs: copied
-        # only so presets._warn_legacy_disable_inputs can surface a stale
-        # value in user config. They are never applied.
-        for key in ("channels", "always_on_extra", "always_off"):
-            if key in plugin_cfg and plugin_cfg[key] is not None:
                 _CONFIG[key] = plugin_cfg[key]
         if "channels" in plugin_cfg:
             from .learned import flatten_channels
@@ -562,8 +528,6 @@ def _wrap_build_api_kwargs(original):
                 demoted=set(state.get("resolved_demoted") or []),
                 triggered=triggered_names,
                 expanded=expanded_names,
-                passthrough=set(),  # passthrough handled directly on the tool list
-                prior_active=set(state.get("prior_active_tools") or []),
             )
             active_set = model.active
 
@@ -1404,12 +1368,6 @@ def _wrap_compress_context(original):
             if session_key and _pinned_posture(session_key) == "on":
                 if _evict_session_cache_state(session_key):
                     evicted_keys.append(session_key)
-            # Defensive: also try the AIAgent's session_id (UUID) in case
-            # the canonical environment key is unavailable.
-            aid = getattr(self, "session_id", "") or ""
-            if aid and aid != session_key and _pinned_posture(aid) == "on":
-                if _evict_session_cache_state(aid):
-                    evicted_keys.append(aid)
             if evicted_keys:
                 logger.info(
                     "tool-belt: compaction evicted posture pin for session(s) "
@@ -1427,25 +1385,13 @@ def _wrap_compress_context(original):
 def _pin_expand_tools_visible() -> None:
     """Keep ``expand_tools`` out of Hermes' native tiered-disclosure bridge.
 
-    Hermes' Tool Search bridge (``model_tools._compute_tool_definitions`` →
-    ``tools.tool_search.assemble_tool_defs``) runs at tool-definition time,
-    *upstream* of our ``_build_api_kwargs`` narrowing. Its classifier,
-    ``tool_search.is_deferrable_tool_name``, treats ``expand_tools`` as
-    deferrable (a non-core, non-MCP plugin tool) and replaces it with the
-    ``tool_search``/``describe``/``call`` bridge tools — hiding the one tool
-    whose whole job is expanding tools. Our narrowing only ever subtracts
-    from the on-the-wire list, so once the bridge has removed ``expand_tools``
-    we can never add it back, and ``always_carry`` (policy.yaml) never gets a
-    chance to protect it (``A = always_carry ∩ E`` is empty when the tool is
-    absent from the enabled ceiling ``E``).
-
-    Fix: wrap the classifier so ``expand_tools`` is never classified
-    deferrable. It then survives into ``E`` and our existing ``always_carry``
-    entry keeps it resident. Every caller of ``is_deferrable_tool_name`` lives
-    inside ``tool_search`` and resolves it via the module global at call time
-    (``classify_tools`` included), so rebinding the module attribute reaches
-    them all. Idempotent (guarded by a marker attribute) and fail-open: any
-    error leaves the bridge untouched and ``expand_tools`` merely deferred.
+    Wraps ``tool_search.is_deferrable_tool_name`` so ``expand_tools`` is never
+    classified deferrable: it survives into the enabled ceiling ``E`` and the
+    shipped ``always_carry`` entry keeps it resident. Every caller of the
+    classifier resolves it via the module global at call time, so rebinding the
+    module attribute reaches them all. Idempotent (guarded by a marker
+    attribute) and fail-open: any error leaves the bridge untouched and
+    ``expand_tools`` merely deferred.
     """
     try:
         import tools.tool_search as _ts  # type: ignore[import-not-found]
@@ -1608,7 +1554,7 @@ def _bypass_rate_for_scope(scope: str) -> float:
 
     Per-scope ``channels.<scope>.bypass_rate`` wins over the global
     ``bypass_rate``. Looks up the full ``{agent}:{platform}`` scope first,
-    then falls back to the bare platform for legacy channel configs.
+    then falls back to the bare platform.
     Values are clamped to [0.0, 1.0]; bad values fall through.
     """
     channels = _CONFIG.get("channels") or {}
@@ -1724,8 +1670,7 @@ def _resolve_cache_mode_for_session(
     resolves against one, in order: (a) the provider this session has
     already been observed on (failover / ``/model`` aware), (b) the
     explicit ``provider`` argument, (c) the configured primary provider,
-    (d) "" — the bare-scope entry ``_cached_detection_mode`` falls back
-    to for pre-1.0 detection files.
+    (d) "" — the bare-key entry.
 
     The decision is PINNED at the session's first dispatch
     (``_CACHE_DECISION_BY_SESSION``) together with the provider it was
@@ -1784,7 +1729,6 @@ def _build_carry_all_state(
         "resolved_demoted": list(getattr(preset, "demoted", []) or []),
         "config_always_carry": list(getattr(preset, "config_always_carry", []) or []),
         "triggered_tools": [],
-        "prior_active_tools": [],
         "expansions": set(),
         "channel": channel,
         "agent": agent,
@@ -1945,7 +1889,6 @@ def _on_pre_gateway_dispatch(event=None, gateway=None, session_store=None, **kwa
             "resolved_demoted": resolved_demoted,
             "config_always_carry": config_pins,
             "triggered_tools": triggered_tool_names,
-            "prior_active_tools": [],
             "expansions": set(),
             "channel": channel,
             "agent": agent,
@@ -2250,12 +2193,6 @@ def _detection_key(scope: str, provider: str = "") -> str:
 def _load_detection_cache() -> None:
     """Read the persisted detection cache into memory exactly once.
 
-    Pre-1.0 files were keyed by bare scope (no ``|``). Those entries are
-    re-keyed under the configured primary provider — the only provider a
-    scope-level lock could have been observing — and persisted in the new
-    format on the next save. When the primary is unknown the bare key is
-    kept as-is; ``_cached_detection_mode`` falls back to it.
-
     Failures are silent — a missing or corrupt file means we fall through
     to the safe-default "on" for every bucket until the first lock writes
     a new entry. No telemetry is lost in either direction.
@@ -2269,25 +2206,9 @@ def _load_detection_cache() -> None:
             data = json.load(f)
         if not isinstance(data, dict):
             return
-        primary = str(_HOST_MODEL.get("provider") or "")
-        migrated = 0
         for key, entry in data.items():
-            if not (isinstance(key, str) and isinstance(entry, dict)):
-                continue
-            if "|" not in key and primary:
-                new_key = _detection_key(key, primary)
-                # A new-format entry for the same bucket is newer evidence.
-                if new_key not in data and new_key not in _DETECTION_CACHE:
-                    _DETECTION_CACHE[new_key] = entry
-                    migrated += 1
-                continue
-            _DETECTION_CACHE[key] = entry
-        if migrated:
-            logger.info(
-                "tool-belt: re-keyed %d scope-only detection entr%s under "
-                "primary provider %r", migrated, "y" if migrated == 1 else "ies",
-                primary,
-            )
+            if isinstance(key, str) and isinstance(entry, dict):
+                _DETECTION_CACHE[key] = entry
     except FileNotFoundError:
         pass
     except Exception as exc:
@@ -2352,14 +2273,11 @@ def _cached_detection_mode(scope: str, provider: str = "") -> str:
 
     Returns "on", "off", or "" (no cache entry). Auto mode at dispatch
     time uses this to resolve the posture without repeating the
-    observation window. A bare-scope entry (pre-1.0 file whose primary
-    provider was unknown at load) is the fallback lookup.
+    observation window.
     """
     if not scope:
         return ""
     entry = _DETECTION_CACHE.get(_detection_key(scope, provider))
-    if not entry and provider:
-        entry = _DETECTION_CACHE.get(scope)
     if not entry:
         return ""
     mode = entry.get("mode")
@@ -2565,16 +2483,15 @@ def _maybe_evict_on_provider_change(
 ) -> None:
     """Re-resolve the session's posture when its provider changes.
 
-    Dale's edge case: ``/model`` in Telegram, or a failover, moves a
-    session from a caching provider to a non-caching one (or back). The
-    pin was resolved against the OLD provider; if the NEW provider's
-    posture differs, keep-pinning would narrow on a caching provider or
-    carry-all on a non-caching one for the rest of the session. The
-    switch already busted the provider's prefix cache, so evicting the
-    pin — through the same path compaction and ``/reset`` use — and
-    letting the next dispatch re-resolve costs nothing. Detection
-    counters for the old provider go with it; the new provider's bucket
-    starts fresh.
+    A ``/model`` switch or a failover moves a session from a caching
+    provider to a non-caching one (or back). The pin was resolved against
+    the OLD provider; if the NEW provider's posture differs, keep-pinning
+    would narrow on a caching provider or carry-all on a non-caching one
+    for the rest of the session. The switch already busted the provider's
+    prefix cache, so evicting the pin — through the same path compaction
+    and ``/reset`` use — and letting the next dispatch re-resolve costs
+    nothing. Detection counters for the old provider go with it; the new
+    provider's bucket starts fresh.
     """
     pin = _CACHE_DECISION_BY_SESSION.get(session_key)
     if not isinstance(pin, dict):
@@ -2728,11 +2645,7 @@ def _on_session_end(session_id=None, **kwargs) -> None:
     (``_decay_sticky``) and the lookback ring self-trims, so neither
     grows unbounded. All per-session memory (posture pin, cache-mode,
     sticky, lookback) is cleared by :func:`_on_session_reset` (true /reset
-    or /new). An earlier revision evicted sticky/lookback here keyed on the
-    ``HERMES_SESSION_KEY`` env var; the deployed gateway migrated session
-    identity to ContextVars and never sets that var, so the eviction was
-    a live no-op — and anywhere the var DID exist it wiped sticky state
-    at the end of the turn that created it, defeating the feature.
+    or /new).
 
     What this hook does: clear the turn's prediction contextvar, then run
     the debounced auto-shape pass.
@@ -2744,9 +2657,8 @@ def _on_session_end(session_id=None, **kwargs) -> None:
     except Exception:
         pass
 
-    # The sanctioned between-session moment
-    # for the in-process auto-shape engine. Fail-open by construction — see
-    # _maybe_auto_shape.
+    # The sanctioned between-session moment for the in-process auto-shape
+    # engine. Fail-open by construction — see _maybe_auto_shape.
     _maybe_auto_shape()
     return None
 
@@ -2870,14 +2782,10 @@ def register(ctx) -> None:
             "no telemetry; expand_tools stays registered but idle"
         )
 
-    # NOTE: registration is unconditional. Hermes' plugin manager already
-    # gates load/no-load via ``plugins.enabled`` in config.yaml, so an
-    # internal ``enabled`` check here would be redundant for load control —
-    # and it blocked Plugin Doctor from validating that the declared tool
-    # and hooks actually register. The plugin stays functionally disable-able
-    # via config: each hook and the narrowing patch guard on
-    # ``_CONFIG["enabled"]`` internally, so with ``enabled: False`` the
-    # registrations exist but do nothing.
+    # Registration is unconditional: Hermes' plugin manager gates load/no-load
+    # via ``plugins.enabled`` in config.yaml, and each hook and the narrowing
+    # patch guard on ``_CONFIG["enabled"]`` internally, so with
+    # ``enabled: False`` the registrations exist but do nothing.
 
     # Pre-load cross-session cache-mode decisions so auto mode need not
     # repeat the observation window for every session.

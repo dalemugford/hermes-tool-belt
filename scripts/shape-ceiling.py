@@ -85,8 +85,8 @@ from typing import Any
 
 # The shaper's compute/merge implementation lives in the shared package module
 # ``shaping.py`` (loaded below via :func:`_load_shaping`); this script owns
-# only the CLI surface. Keeping the plugin dir on ``sys.path`` preserves the
-# historical standalone-import behavior for anything else loaded from here.
+# only the CLI surface. Keeping the plugin dir on ``sys.path`` lets anything
+# else loaded from here be imported standalone.
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PLUGIN_DIR))
 
@@ -94,9 +94,7 @@ logger = logging.getLogger("tool_belt_plugin.shape_ceiling")
 
 #: Porcelain (machine-readable) output identity. ``PORCELAIN_VERSION`` is
 #: bumped whenever a key is removed or its meaning changes; additive keys do
-#: not bump it. v2 replaced the session-count window keys
-#: (``scopes[].window_requested``, ``thresholds.session_window``) with the
-#: day window ``window_days``.
+#: not bump it.
 PORCELAIN_SCHEMA = "tool-belt/shape-ceiling"
 PORCELAIN_VERSION = 2
 
@@ -126,9 +124,8 @@ def _load_shaping():
     return importlib.import_module(f"{name}.shaping")
 
 
-# Shared shaping core, re-exported under the script's historical names so
-# existing importers (configure.py's ``load_shaper()``, the test suite) keep
-# addressing the same single implementation.
+# Shared shaping core, re-exported so importers (configure.py's
+# ``load_shaper()``, the test suite) address the same single implementation.
 _shaping = _load_shaping()
 DEFAULTS = _shaping.DEFAULTS
 default_state_dir = _shaping.default_state_dir
@@ -262,20 +259,24 @@ def build_porcelain(
     }
 
 
+def _positive_int(raw: str) -> int:
+    value = int(raw)
+    if value <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return value
+
+
 def main() -> int:
     # Pre-fill flag defaults from the resolved config layers (config.yaml
     # learning.shape_ceiling over policy.yaml over DEFAULTS); explicit flags
     # below still win for ad-hoc runs.
     defaults = load_shape_ceiling_defaults(plugin_config=_load_plugin_config() or None)
-    # allow_abbrev=False: the retired ``--window`` (a session COUNT) is a
-    # prefix of ``--window-days``, so abbreviation matching would silently
-    # reinterpret an old invocation's 50 sessions as 50 days. A unit change
-    # has to fail loudly, and no flag here is long enough to be worth
-    # abbreviating.
+    # allow_abbrev=False: a mistyped or truncated flag must fail loudly rather
+    # than be silently matched to a different unit (e.g. ``--window`` → days).
     ap = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     ap.add_argument("--state-dir", default=str(default_state_dir()))
     ap.add_argument("--scope", default="", help="filter to a specific scope (default: all)")
-    ap.add_argument("--window-days", type=int, default=defaults["window_days"],
+    ap.add_argument("--window-days", type=_positive_int, default=defaults["window_days"],
                     help="recency window in days: only sessions whose last "
                          "activity falls inside it are evidence")
     ap.add_argument("--promote-min-sessions", type=int, default=defaults["promote_min_sessions"])

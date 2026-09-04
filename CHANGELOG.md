@@ -8,8 +8,8 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ### Changed
 
-- **Shaping defaults are now aggressive and time-windowed.** The evidence
-  window is measured in days, not sessions: the new
+- **Shaping defaults are aggressive and time-windowed.** The evidence
+  window is measured in days:
   `learning.shape_ceiling.window_days` (default `7`; `14` and `30` are the
   other sensible values) keeps only sessions whose last activity falls within
   that many days of "now", where *now* is the most recent activity in the
@@ -22,9 +22,9 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
   demotion needs at least that many sessions *inside* the day window, so a
   quiet week with 0–1 sessions simply doesn't shape — and is deliberately not
   clamped against the window, because the two are different units.
-  `scripts/shape-ceiling.py`'s `--window` becomes `--window-days`; the other
-  flags are unchanged. The shaper's `learned.json` rationale block now records
-  `window_days` in place of `window_requested`.
+  `scripts/shape-ceiling.py` takes `--window-days`; the other flags are
+  unchanged. The shaper's `learned.json` rationale block records
+  `window_days`.
 
   The change is measured, on 153 real sessions of a live scope
   (2026-06-01 → 2026-09-04). Replayed at floor `2` and promote gates `1`/`2`,
@@ -45,16 +45,6 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
   (49 vs 51 demoted). A wrong demotion costs one expansion round-trip and
   corrects itself through promotion, which is why the promote gates drop too.
 
-- **`learning.shape_ceiling.session_window` is deprecated.** The old
-  session-count window is still parsed and logs one warning at load naming
-  `window_days` as its replacement, then is ignored. The day window is the
-  only unit the shaper uses.
-
-- **Named cadence presets were trialled and dropped.** An `aggressive` /
-  `balanced` / `patient` preset trio was built and then falsified by the same
-  replay data: every preset was strictly dominated by a low demote floor plus
-  a short day window, so the defaults above ship instead of a dial.
-
 ### Added
 
 - **`scripts/replay-shaping.py` — read-only shaping replay.** Walks one
@@ -69,6 +59,17 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
   Stated blind spot: it scores recorded traffic only, so it cannot capture the
   "presence is an invitation" effect — sessions that would have gone
   differently had a demoted tool still been on the wire.
+
+### Removed
+
+- **`scripts/savings-report.py`.** Use `tool-belt savings`, which reports the
+  same cohorts from the same engine.
+- **Config keys `always_on_extra` and `always_off`.** They had no effect; a
+  value left in `config.yaml` is now simply ignored. Use `always_carry` to pin
+  a tool.
+- **`learned_mode` values `off`, `auto` and `audit`.** Use `recommend` (carry
+  everything, keep the overlay unapplied) or `apply` (shape).
+- **`configure.py`'s hidden `--path shape` flag.** Use `--mode history`.
 
 ### Documentation
 

@@ -54,15 +54,6 @@ class _RecordingCtx:
         })
 
 
-class _LegacyCtx(_RecordingCtx):
-    """A Hermes too old to support plugin CLI commands."""
-
-    def __getattribute__(self, item):
-        if item == "register_cli_command":
-            raise AttributeError(item)
-        return super().__getattribute__(item)
-
-
 def _register(ctx) -> None:
     """Run register() without touching config, caches or monkey-patches."""
     with mock.patch.object(plugin, "_load_user_config", lambda: None), \
@@ -102,14 +93,6 @@ class RegistrationTest(unittest.TestCase):
         self.assertIs(cli.register_cli, info["setup_fn"])
         self.assertIs(cli.tool_belt_command, info["handler_fn"])
         # The tool and hooks still register alongside it.
-        self.assertIn("expand_tools", ctx.tools)
-        self.assertEqual(5, len(ctx.hooks))
-
-    def test_register_survives_ctx_without_cli_support(self) -> None:
-        ctx = _LegacyCtx()
-        _register(ctx)  # must not raise
-
-        self.assertEqual([], ctx.cli_commands)
         self.assertIn("expand_tools", ctx.tools)
         self.assertEqual(5, len(ctx.hooks))
 

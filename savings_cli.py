@@ -98,8 +98,6 @@ def _basis_tag(basis: str, fallback_per_event: int = _savings.EXPAND_ROUND_TRIP_
     """How the expansion overhead behind a net figure was costed."""
     if basis == "measured":
         return "measured overhead"
-    if basis == "mixed":
-        return f"overhead partly measured, partly fallback {_fmt_int(fallback_per_event)} tok/event"
     return f"fallback: {_fmt_int(fallback_per_event)} tok/event"
 
 
@@ -315,11 +313,8 @@ def launcher_path(hermes_home: Path, *, user_home: Path | None = None) -> Path:
 
     Sandbox containment: when ``hermes_home`` is NOT the user's default
     install home (``~/.hermes``) — a test fixture, a staging copy, a custom
-    ``HERMES_HOME`` — every write stays inside it. The interactivity audit
-    found that a ``HERMES_HOME``-scoped run could still read (and offer to
-    overwrite) the real operator's ``~/.local/bin/tool-belt``; a command
-    whose every other write is scoped to the Hermes home must not be the
-    one exception.
+    ``HERMES_HOME`` — every write stays inside it, never touching the real
+    operator's ``~/.local/bin/tool-belt``.
     """
     home = user_home or Path.home()
     try:

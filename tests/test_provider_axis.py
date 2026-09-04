@@ -100,33 +100,6 @@ class ProviderBucketIsolationTests(unittest.TestCase):
         )
 
 
-class DetectionKeyMigrationTests(unittest.TestCase):
-    """Legacy scope-only detection keys migrate to scope|primary on load."""
-
-    def setUp(self):
-        _seed_config()
-        _reset()
-
-    def test_bare_scope_key_migrates_to_scope_provider(self):
-        import json
-        import os
-        import tempfile
-        from unittest import mock
-        plugin._HOST_MODEL["provider"] = "openai-codex"
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "state" / "tool-belt"
-            path.mkdir(parents=True)
-            (path / "cache_mode_detection.json").write_text(
-                json.dumps({"assistant-a:telegram": {"mode": "on",
-                                                      "sessions_locked": 3}}))
-            with mock.patch.dict(os.environ, {"HERMES_HOME": tmp}, clear=False):
-                plugin._DETECTION_CACHE_LOADED = False
-                plugin._load_detection_cache()
-        self.assertEqual(
-            plugin._cached_detection_mode("assistant-a:telegram", "openai-codex"),
-            "on", "the migrated bucket resolves under scope|primary")
-
-
 class ProviderChangeEvictionTests(unittest.TestCase):
     """A mid-session provider change that flips the posture evicts the pin."""
 
