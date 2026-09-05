@@ -7,16 +7,15 @@ One engine, two separately-labeled cohorts that are **never** summed together:
     Provider-returned usage is authoritative. This is what actually happened.
 
   * **Projected** — a counterfactual replay of historical Hermes sessions
-    through either the *current effective* carrying assignments or a
-    *caller-supplied proposed* per-scope assignment (used by ``tool-belt
-    configure`` before anything is applied). Every projected figure is labeled
-    counterfactual until matched by organic post-apply telemetry.
+    through the *current effective* carrying assignments. Every projected
+    figure is labeled counterfactual until matched by organic post-apply
+    telemetry.
 
 This module is the single home for:
 
   * the per-model USD price table + cost classifier (``PRICE_TABLE`` /
-    ``price_for`` / ``classify_cost``) — ``scripts/cache-stability-replay.py``
-    imports the table from here rather than defining its own;
+    ``price_for`` / ``classify_cost``) — ``cache_replay.py`` imports the
+    table from here rather than defining its own;
   * cache-aware accounting: the priced-gross factor (``price_factor_for``),
     the measured per-cohort expansion cost (``measure_expand_overhead``) and
     its thin-data fallback constant (``EXPAND_ROUND_TRIP_TOKENS``);
@@ -30,8 +29,8 @@ sessions. It is safe to run against a live Hermes home.
 Import styles
 -------------
 Imported as ``tool_belt_plugin.savings`` (the normal path, via the package)
-*and* standalone as ``savings`` (how ``scripts/cache-stability-replay.py`` pulls in
-the price table after inserting the plugin dir on ``sys.path``). The lightweight
+*and* standalone as ``savings`` (how ``cache_replay.py`` pulls in the price
+table after inserting the plugin dir on ``sys.path``). The lightweight
 pricing/estimator surface loads in both contexts; the heavier projection path
 lazily imports ``presets`` / ``predictor`` / ``learned`` only when a projection
 is actually requested, so a standalone ``from savings import price_for`` never
@@ -1306,8 +1305,7 @@ class ProjectedModelRow:
     expansion_overhead: int
     net_token_reduction: int
     estimated_usd_savings: float | None  # only for known variable cost
-    # Priced gross (input-token equivalent) the net is taken from; equals the
-    # raw gross under a cache-off replay.
+    # Priced gross (input-token equivalent) the net is taken from.
     gross_input_equiv_reduction: int = 0
 
     def to_json(self) -> dict[str, Any]:
@@ -1331,18 +1329,16 @@ class ProjectedCohort:
 
     label: str = "projected"
     counterfactual: bool = True
-    cache_mode: str = "on"
     sessions_analyzed: int = 0
     user_turns_analyzed: int = 0
     gross_schema_token_reduction: int = 0
-    # Priced gross: under a cache-on replay each saved schema token is worth
-    # 1/miss_premium input tokens (it would have been a cache read); under
-    # cache-off it equals the raw gross. The net is taken from this.
+    # Priced gross: the input-token-equivalent worth of the saved schema
+    # tokens (see price_factor_for). The net is taken from this.
     gross_input_equiv_reduction: int = 0
     expansion_events: int = 0
     estimated_expansion_overhead: int = 0
-    # Per-event cost charged: the agent's MEASURED figure for the replayed
-    # cache mode (measure_expand_overhead over its observed telemetry), or
+    # Per-event cost charged: the agent's MEASURED figure
+    # (measure_expand_overhead over its observed telemetry), or
     # EXPAND_ROUND_TRIP_TOKENS when that telemetry is too thin.
     overhead_per_event: int = EXPAND_ROUND_TRIP_TOKENS
     overhead_basis: str = "fallback"  # measured | fallback
@@ -1356,19 +1352,16 @@ class ProjectedCohort:
     net_input_reduction_pct: float | None = None
     # Costing.
     models: list[ProjectedModelRow] = field(default_factory=list)
-    estimated_usd_savings: float | None = None  # sum over known rows only
-    usd_coverage: str = "none"  # none | partial | full
+    estimated_usd_savings: float | None = None  # sum over known-cost rows only
+    usd_coverage: str = "none"
     confidence: str = "insufficient"  # high | medium | low | insufficient
     reasons: list[str] = field(default_factory=list)
-    assignment_source: str = "current_effective"  # or "proposed"
     token_estimator: str = ""
 
     def to_json(self) -> dict[str, Any]:
         return {
             "label": self.label,
             "counterfactual": self.counterfactual,
-            "cache_mode": self.cache_mode,
-            "assignment_source": self.assignment_source,
             "sessions_analyzed": self.sessions_analyzed,
             "user_turns_analyzed": self.user_turns_analyzed,
             "gross_schema_token_reduction": self.gross_schema_token_reduction,
@@ -1392,76 +1385,29 @@ class ProjectedCohort:
         }
 
 
-def _resolve_effective_preset(
-    plugin_config: dict[str, Any],
-    scope: str,
-    proposed: dict[str, Any] | None,
-):
-    """Resolve the carrying preset for a scope, read-only.
+def _resolve_effective_preset(plugin_config: dict[str, Any], scope: str):
+    """Resolve the current effective carrying preset for a scope, read-only.
 
-    ``proposed`` (supplied by the configure flow) is a ``{carry: [...],
-    expand_only: [...]}`` mapping to project *before* it is applied. Without
-    it, the *current effective* assignment is used.
-
-    **Both branches resolve through the same pipeline**
-    (:func:`presets.resolve_preset`, which honors the applied learned overlay
-    and per-channel config, read-only). The proposed deltas are layered on top
-    of that resolved preset, so a ``current`` and a ``proposed`` projection of
-    the same scope differ *only* by the proposed assignment — which is exactly
-    the comparison the onboarding flow presents. Resolving the proposed branch
-    against the raw base policy instead would silently drop the learned overlay
-    and channel config and make the two projections non-comparable.
+    :func:`presets.resolve_preset` honors the applied learned overlay and the
+    per-channel config, so the projection replays exactly the assignment the
+    runtime would use.
     """
     presets = _import_sibling("presets")
-    base = presets.resolve_preset(plugin_config, scope)
-    if proposed is None:
-        return base
-
-    if base.no_narrowing:
-        return base
-    always_carry = list(base.always_carry)
-    always_carry_set = set(always_carry)
-    policy_carry = list(base.carry)
-    prop_carry = [str(t) for t in (proposed.get("carry") or [])]
-    prop_expand = set(str(t) for t in (proposed.get("expand_only") or []))
-    effective = [t for t in policy_carry if t not in prop_expand]
-    for t in prop_carry:
-        if t not in effective:
-            effective.append(t)
-    effective = [t for t in effective if t not in always_carry_set]
-    # Full-start precedence: the proposed demotions union the already-applied
-    # ones; an explicit carry entry (promotion) wins over any demotion, and
-    # always_carry is untouchable.
-    demoted = sorted(
-        ((set(getattr(base, "demoted", []) or []) | prop_expand)
-         - set(effective)) - always_carry_set
-    )
-    return presets.Preset(
-        name=f"{base.name}+proposed[{scope}]",
-        always_carry=always_carry,
-        carry=effective,
-        triggers=base.triggers,
-        demoted=demoted,
-    )
+    return presets.resolve_preset(plugin_config, scope)
 
 
 def _replay_active_names(
     session: HistoricalSession,
     preset: presets.Preset,
-    cache_mode: str,
 ) -> tuple[list[list[str]], list[int], int]:
     """Replay the predictor over each user turn.
 
     Returns ``(active_per_turn, user_turn_indices, expansion_events)`` where
     ``active_per_turn[k]`` is the resolved active tool-name list for the k-th
-    user turn.
-
-      * cache-off: the active set is resolved fresh every turn.
-      * cache-on:  the active set is frozen at the first turn, then grows
-        monotonically as triggers activate expand_only tools and as explicit
-        expansions admit called-but-unloaded tools. A trigger activation is not
-        an ``expand_tools`` round trip and carries no overhead; each explicit
-        expansion event is charged once.
+    user turn: the active set is resolved fresh every turn, and a called tool
+    that is neither resident nor trigger-activated is charged as one explicit
+    expansion event. A trigger activation is not an ``expand_tools`` round
+    trip and carries no overhead.
 
     MCP/passthrough tools are never narrowed — they stay active every turn.
     """
@@ -1473,7 +1419,6 @@ def _replay_active_names(
     active_per_turn: list[list[str]] = []
     user_indices: list[int] = []
     expansion_events = 0
-    frozen: set[str] | None = None
 
     for i, row in enumerate(session.turns):
         if row.get("role") != "user":
@@ -1503,27 +1448,12 @@ def _replay_active_names(
             if group.name in set(prediction.triggers_fired):
                 triggered_tools |= {t for t in group.tools if t in ceiling_set}
 
-        if cache_mode == "on":
-            if frozen is None:
-                frozen = set(per_turn)
-            # Monotonic trigger activation: a fired trigger's expand_only tool
-            # joins the frozen set with no round-trip charge.
-            frozen |= (triggered_tools & ceiling_set)
-            # Explicit expansion: a called tool that is neither resident/active
-            # nor trigger-activated must have been expanded. Charge once per
-            # such expansion event; the tool then persists in the frozen set.
-            for name in called:
-                if name in ceiling_set and name not in frozen and name not in mcp_names:
-                    expansion_events += 1
-                    frozen.add(name)
-            active = set(frozen)
-        else:  # cache-off: per-turn resolution
-            active = set(per_turn)
-            for name in called:
-                if (name in ceiling_set and name not in active
-                        and name not in triggered_tools and not _is_mcp(name)):
-                    expansion_events += 1
-                    active.add(name)
+        active = set(per_turn)
+        for name in called:
+            if (name in ceiling_set and name not in active
+                    and name not in triggered_tools and not _is_mcp(name)):
+                expansion_events += 1
+                active.add(name)
 
         active_per_turn.append(sorted(active))
         user_indices.append(i)
@@ -1557,17 +1487,12 @@ def project_sessions(
     sessions: list[HistoricalSession],
     plugin_config: dict[str, Any],
     *,
-    cache_mode: str = "on",
-    proposed_by_scope: dict[str, dict[str, Any]] | None = None,
     provider_input_by_session: dict[str, int] | None = None,
     route_by_session: dict[str, SessionRoute] | None = None,
     expand_overhead: MeasuredExpandOverhead | None = None,
 ) -> ProjectedCohort:
     """Replay a set of historical sessions into one projected cohort.
 
-    ``proposed_by_scope`` (supplied by the configure flow) carries
-    not-yet-applied assignments per scope; when absent the current effective
-    assignment is used.
     ``provider_input_by_session`` maps a session key to provider-reported
     ``input_tokens`` — when present for a session it is the authoritative
     denominator and wins over reconstruction.
@@ -1577,18 +1502,19 @@ def project_sessions(
     Hermes ``session_meta`` records carry neither field. A value recorded in
     ``session_meta`` still wins as an explicit override.
     ``expand_overhead`` is the agent's measured per-event expansion cost
-    (:func:`measure_expand_overhead` over its observed telemetry); the
-    replayed ``cache_mode`` selects the cohort figure. Absent, every event is
-    charged the :data:`EXPAND_ROUND_TRIP_TOKENS` fallback.
+    (:func:`measure_expand_overhead` over its observed telemetry). Absent,
+    every event is charged the :data:`EXPAND_ROUND_TRIP_TOKENS` fallback.
+
+    The replay models cache-off economics throughout: on a caching provider
+    the runtime carries everything and ships no ``expand_tools``, so there is
+    no narrowing to project there.
     """
-    proposed_by_scope = proposed_by_scope or {}
     provider_input_by_session = provider_input_by_session or {}
     route_by_session = route_by_session or {}
-    replay_caches = cache_mode == "on"
     if expand_overhead is None:
         expand_overhead = MeasuredExpandOverhead()
-    per_event = expand_overhead.per_event(replay_caches)
-    overhead_basis = expand_overhead.basis_for(replay_caches)
+    per_event = expand_overhead.per_event(provider_caches=False)
+    overhead_basis = expand_overhead.basis_for(provider_caches=False)
 
     gross = 0
     gross_priced = 0.0
@@ -1608,23 +1534,18 @@ def project_sessions(
     per_model_gross: dict[tuple[str, str, str], int] = defaultdict(int)
     per_model_gross_priced: dict[tuple[str, str, str], float] = defaultdict(float)
     per_model_overhead: dict[tuple[str, str, str], int] = defaultdict(int)
-    assignment_source = "proposed" if proposed_by_scope else "current_effective"
 
     for session in sessions:
         if not session.tool_defs or not session.schemas_complete:
             incomplete_schema = True
             continue
-        scope = session.scope
-        proposed = proposed_by_scope.get(scope)
         try:
-            preset = _resolve_effective_preset(plugin_config, scope, proposed)
+            preset = _resolve_effective_preset(plugin_config, session.scope)
         except Exception:
             incomplete_schema = True
             continue
 
-        active_per_turn, user_indices, exp_events = _replay_active_names(
-            session, preset, cache_mode
-        )
+        active_per_turn, user_indices, exp_events = _replay_active_names(session, preset)
         if not user_indices:
             continue
 
@@ -1637,9 +1558,9 @@ def project_sessions(
             session_gross += max(0, ceiling_tok - narrowed_tok)
 
         overhead = exp_events * per_event
-        # Priced gross: under a cache-on replay the unsent schema tokens
-        # would have been cache reads, worth 1/miss_premium each.
-        session_priced = session_gross * price_factor_for(session.model, replay_caches)
+        session_priced = session_gross * price_factor_for(
+            session.model, provider_caches=False
+        )
         gross += session_gross
         gross_priced += session_priced
         ceiling_total += ceiling_tok * len(user_indices)
@@ -1679,7 +1600,7 @@ def project_sessions(
             denom_reconstructed += _reconstructed_input_denominator(session, user_indices)
             have_reconstructed = True
 
-    cohort = ProjectedCohort(cache_mode=cache_mode, assignment_source=assignment_source)
+    cohort = ProjectedCohort()
     cohort.token_estimator = token_estimator_name()
     cohort.sessions_analyzed = sessions_analyzed
     cohort.user_turns_analyzed = turns_analyzed
@@ -1772,9 +1693,6 @@ def project_sessions(
             "some sessions' API calls disagreed on provider/api_mode; that "
             "route evidence was discarded (conservative) and those rows stay unknown"
         )
-    known_usd_total = 0.0
-    any_known = False
-    any_non_known = False
     for key in sorted(per_model_gross.keys()):
         model, provider, api_mode = key
         cc = classify_cost(model, provider, api_mode)
@@ -1783,14 +1701,9 @@ def project_sessions(
         oh = per_model_overhead[key]
         net = g_priced - oh
         usd: float | None = None
-        if cc.dollars_allowed:
-            any_known = True
-            if not incomplete_schema:
-                prices = price_for(model)
-                usd = round(max(0, net) * prices["input"] / 1_000_000.0, 4)
-                known_usd_total += usd
-        else:
-            any_non_known = True
+        if cc.dollars_allowed and not incomplete_schema:
+            prices = price_for(model)
+            usd = round(max(0, net) * prices["input"] / 1_000_000.0, 4)
         cohort.models.append(ProjectedModelRow(
             model=model, provider=provider, cost_class=cc.cost_class,
             reason=cc.reason, rate_basis=cc.rate_basis,
@@ -1799,20 +1712,12 @@ def project_sessions(
             gross_input_equiv_reduction=g_priced,
         ))
 
-    if incomplete_schema:
-        cohort.usd_coverage = "none"
-        cohort.estimated_usd_savings = None
-    elif any_known and not any_non_known:
-        cohort.usd_coverage = "full"
-        cohort.estimated_usd_savings = round(known_usd_total, 4)
-    elif any_known and any_non_known:
-        cohort.usd_coverage = "partial"
-        cohort.estimated_usd_savings = round(known_usd_total, 4)
-        reasons.append("USD shown only for known-cost rows; token totals are complete")
-    else:
-        cohort.usd_coverage = "none"
-        cohort.estimated_usd_savings = None
-        reasons.append("no known variable-cost route; dollars suppressed")
+    # Hermes producers record a *transport* label in ``api_mode``, never a
+    # billing route, so :func:`classify_cost` holds every row at
+    # subscription/unknown and the cohort carries no dollars.
+    cohort.usd_coverage = "none"
+    cohort.estimated_usd_savings = None
+    reasons.append("no known variable-cost route; dollars suppressed")
 
     cohort.reasons = reasons
     return cohort
@@ -1823,9 +1728,7 @@ def compute_projected(
     plugin_config: dict[str, Any],
     *,
     scopes: Iterable[str] | None = None,
-    cache_mode: str = "on",
     since_ts: float = 0.0,
-    proposed_by_scope: dict[str, dict[str, Any]] | None = None,
 ) -> ProjectedCohort:
     """Load an agent's historical sessions and project savings over them."""
     scope_set = set(scopes) if scopes is not None else None
@@ -1854,8 +1757,6 @@ def compute_projected(
 
     return project_sessions(
         sessions, plugin_config,
-        cache_mode=cache_mode,
-        proposed_by_scope=proposed_by_scope,
         provider_input_by_session=provider_input,
         route_by_session=routes,
         expand_overhead=expand_overhead,
@@ -1992,7 +1893,6 @@ class AgentSavings:
 @dataclass
 class SavingsReport:
     generated_for: str            # "all" or an agent name
-    cache_mode: str
     agents: list[AgentSavings]
     hermes_home: str
     token_estimator: str
@@ -2000,34 +1900,18 @@ class SavingsReport:
     since: str | None = None
 
     def to_json(self) -> dict[str, Any]:
-        # Aggregate token totals are complete across every agent; USD sums only
-        # over known-cost projected rows.
+        # Aggregate token totals are complete across every agent; dollars stay
+        # suppressed for the same reason the per-agent cohorts suppress them
+        # (no provable billing route — see classify_cost).
         agg_observed_realized = sum(a.observed.realized_schema_token_reduction for a in self.agents)
         agg_observed_priced = sum(a.observed.saved_input_equiv_total for a in self.agents)
         agg_observed_net = sum(a.observed.net_token_reduction for a in self.agents)
         agg_proj_gross = sum(a.projected.gross_schema_token_reduction for a in self.agents)
         agg_proj_priced = sum(a.projected.gross_input_equiv_reduction for a in self.agents)
         agg_proj_net = sum(a.projected.net_token_reduction for a in self.agents)
-        known_usd = 0.0
-        any_known = False
-        any_non_known = False
-        for a in self.agents:
-            for m in a.projected.models:
-                if m.cost_class == "known" and m.estimated_usd_savings is not None:
-                    known_usd += m.estimated_usd_savings
-                    any_known = True
-                else:
-                    any_non_known = True
-        coverage = "none"
-        usd: float | None = None
-        if any_known and not any_non_known:
-            coverage, usd = "full", round(known_usd, 4)
-        elif any_known and any_non_known:
-            coverage, usd = "partial", round(known_usd, 4)
         return {
             "schema": "tool-belt/savings/v1",
             "generated_for": self.generated_for,
-            "cache_mode": self.cache_mode,
             "hermes_home": self.hermes_home,
             "token_estimator": self.token_estimator,
             "since": self.since,
@@ -2045,8 +1929,8 @@ class SavingsReport:
                     "gross_schema_token_reduction": agg_proj_gross,
                     "gross_input_equiv_reduction": agg_proj_priced,
                     "net_token_reduction": agg_proj_net,
-                    "estimated_usd_savings": usd,
-                    "usd_coverage": coverage,
+                    "estimated_usd_savings": None,
+                    "usd_coverage": "none",
                 },
             },
         }
@@ -2074,17 +1958,13 @@ def compute(
     agent: str | None = None,
     hermes_home: Path | None = None,
     since: str | None = None,
-    cache_mode: str = "on",
     plugin_config: dict[str, Any] | None = None,
-    proposed_by_scope: dict[str, dict[str, Any]] | None = None,
 ) -> SavingsReport:
     """Build the full savings report — the one entry point the CLI + onboarding
     both call. Strictly read-only.
 
     ``agent`` restricts to a single enabled agent (raising
-    :class:`UnknownAgentError` if it isn't present/enabled). ``proposed_by_scope``
-    lets the configure flow project a not-yet-applied shape without writing any
-    state.
+    :class:`UnknownAgentError` if it isn't present/enabled).
     """
     home = Path(hermes_home or default_hermes_home())
     since_ts = parse_since(since)
@@ -2100,10 +1980,7 @@ def compute(
     for loc in locations:
         scopes = _scopes_for_agent(loc, since_ts)
         observed = compute_observed(loc.state_dir, scopes=None, since_ts=since_ts)
-        projected = compute_projected(
-            loc, plugin_config, cache_mode=cache_mode, since_ts=since_ts,
-            proposed_by_scope=proposed_by_scope,
-        )
+        projected = compute_projected(loc, plugin_config, since_ts=since_ts)
         agents.append(AgentSavings(
             agent=loc.agent,
             platforms=scopes,
@@ -2114,7 +1991,6 @@ def compute(
 
     return SavingsReport(
         generated_for=agent or "all",
-        cache_mode=cache_mode,
         agents=agents,
         hermes_home=str(home),
         token_estimator=token_estimator_name(),

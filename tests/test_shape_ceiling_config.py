@@ -16,12 +16,15 @@ Everything runs against throwaway files; no live state is touched.
 from __future__ import annotations
 
 import importlib
+import importlib.util
+import io
 import json
 import os
 import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -265,6 +268,116 @@ class EndToEndWindowThreadingTests(unittest.TestCase):
         window_tight, considered_tight = self._run_and_capture_window(tightened)
         self.assertEqual(window_tight, 2)
         self.assertEqual(considered_tight, 3)
+
+
+def _seed_unused_carry(state_dir: Path, scope: str, tool: str,
+                       n_sessions: int = 20) -> None:
+    """N sessions carrying ``tool`` adaptively and never calling it — the
+    shape of telemetry that makes it a demote candidate."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    newest = time.time()
+    preds = []
+    for i in range(n_sessions):
+        preds.append({
+            "ts": newest - (n_sessions - 1 - i) * 60.0,
+            "schema_version": 2,
+            "scope": scope,
+            "session_id": "key",
+            "hermes_session_id": f"sess-{i}",
+            "prediction_id": f"pred-{i}",
+            "always_carry_tools": ["read_file"],
+            "carry_tools": [tool],
+            "expand_only_tools": [],
+            "active_tools": ["read_file", tool],
+            "ceiling_tools": ["read_file", tool],
+        })
+    (state_dir / "predictions.jsonl").write_text(
+        "".join(json.dumps(p) + "\n" for p in preds), encoding="utf-8")
+    (state_dir / "tool_calls.jsonl").write_text("", encoding="utf-8")
+
+
+class CliConfigPinTests(unittest.TestCase):
+    """``config.yaml`` ``always_carry`` pins must protect a tool on the CLI
+    path exactly as they do in process.
+
+    The operator scripts run under whichever interpreter started them, so
+    ``hermes_cli.config`` — the runtime's config reader — is usually absent.
+    When the loader gave up there, the user layer resolved to ``{}``: the
+    protected surface collapsed to the shipped policy baseline and a
+    config-pinned tool was reported as demotable.
+    """
+
+    SCOPE = "agent-a:telegram"
+    PINNED = "pinned_tool"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir()
+        (self.home / "config.yaml").write_text(
+            "plugins:\n"
+            "  entries:\n"
+            "    tool-belt:\n"
+            "      settings:\n"
+            "        always_carry:\n"
+            f"          - {self.PINNED}\n"
+            "        channels:\n"
+            "          agent-a:\n"
+            "            telegram:\n"
+            "              learned_mode: apply\n",
+            encoding="utf-8",
+        )
+        # The host package must be unavailable, as it is for any script not
+        # started with the Hermes interpreter: that is the path under test.
+        self._patches = [
+            mock.patch.dict(sys.modules, {"hermes_cli": None}),
+            mock.patch.dict(os.environ, {"HERMES_HOME": str(self.home)}),
+        ]
+        for patch in self._patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_config_pins_reach_the_cli_plugin_config(self):
+        config = shaping.load_cli_plugin_config()
+        self.assertEqual(config.get("always_carry"), [self.PINNED])
+        self.assertIn(self.SCOPE, config.get("channels") or {},
+                      "channels must arrive flattened to agent:platform keys")
+
+    def test_config_pin_is_protected_from_demotion_on_the_cli_path(self):
+        protected = shaping.effective_always_carry(
+            shaping.load_cli_plugin_config(), self.SCOPE)
+        self.assertIn(self.PINNED, protected)
+
+        state_dir = Path(self.tmp.name) / "state" / "tool-belt"
+        _seed_unused_carry(state_dir, self.SCOPE, self.PINNED)
+        argv = ["shape-ceiling.py", "--state-dir", str(state_dir),
+                "--dry-run", "--json"]
+        buf = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), redirect_stdout(buf):
+            rc = _load_shape_ceiling().main()
+        self.assertEqual(rc, 0)
+        doc = json.loads(buf.getvalue())
+        scopes = {s["scope"]: s for s in doc["scopes"]}
+        self.assertIn(self.SCOPE, scopes)
+        demoted = {d["tool"] for d in scopes[self.SCOPE]["demote"]}
+        self.assertNotIn(
+            self.PINNED, demoted,
+            "a config.yaml always_carry pin is undemotable on the CLI path too",
+        )
+
+
+def _load_shape_ceiling():
+    """The ``shape-ceiling.py`` script as an importable module."""
+    name = "tool_belt_shape_ceiling_cli"
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().parent.parent / "scripts" / "shape-ceiling.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 if __name__ == "__main__":

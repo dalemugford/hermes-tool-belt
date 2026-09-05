@@ -10,7 +10,6 @@ thresholds as adjustable defaults rather than permanent policy.
 from __future__ import annotations
 
 import argparse
-import importlib.util
 import json
 import os
 import re
@@ -29,10 +28,12 @@ from typing import Any, Iterable
 # Works both as a script (sibling on sys.path) and as the
 # ``tool_belt_plugin.analyze`` module.
 try:  # package / test import
+    from . import cache_replay as _cache_replay  # type: ignore[import-not-found]
     from . import logger_io  # type: ignore[import-not-found]
     from . import savings as _savings  # type: ignore[import-not-found]
     from .yaml_required import require_yaml  # type: ignore[import-not-found]
 except ImportError:  # script mode
+    import cache_replay as _cache_replay  # type: ignore[no-redef]
     import logger_io  # type: ignore[no-redef]
     import savings as _savings  # type: ignore[no-redef]
     from yaml_required import require_yaml  # type: ignore[no-redef]
@@ -844,7 +845,7 @@ def _stability_payload(stat: "ScopeStats") -> dict[str, Any]:
     schema savings are partially or fully eaten by re-billing the
     history at full input rate. This payload reports the raw frequency;
     the cache-cost analysis uses per-call ``cache_read_tokens`` captured
-    in ``api_calls.jsonl`` and computed by ``scripts/cache-stability-replay.py``,
+    in ``api_calls.jsonl`` and computed by ``cache_replay.py``,
     surfaced in the Cache-Aware Savings section of this report.
 
     Counts exclude turn 1 (always a cold cache by definition) and rows
@@ -1665,26 +1666,6 @@ def scope_payload(stat: ScopeStats, args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-_CACHE_STABILITY_MOD = None
-
-
-def _load_cache_stability_module():
-    """Load scripts/cache-stability-replay.py via importlib (hyphenated filename)."""
-    global _CACHE_STABILITY_MOD
-    if _CACHE_STABILITY_MOD is not None:
-        return _CACHE_STABILITY_MOD
-    script = Path(__file__).resolve().parent / "scripts" / "cache-stability-replay.py"
-    if not script.exists():
-        return None
-    spec = importlib.util.spec_from_file_location("cache_stability_replay", script)
-    if spec is None or spec.loader is None:
-        return None
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    _CACHE_STABILITY_MOD = mod
-    return mod
-
-
 def compute_cache_cost(
     predictions: list[dict[str, Any]],
     api_calls: list[dict[str, Any]],
@@ -1696,15 +1677,16 @@ def compute_cache_cost(
     Each value has:
       - stability: stability_simulation() output
       - counterfactual: matched_counterfactual() output
-    Returns an empty dict if the module or api_calls are unavailable.
+    Returns an empty dict if there are no api_calls to replay.
     """
-    mod = _load_cache_stability_module()
-    if mod is None or not api_calls:
+    if not api_calls:
         return {}
     result: dict[str, dict[str, Any]] = {}
     for scope in scopes:
-        stability = mod.stability_simulation(predictions, api_calls, tool_calls=tool_calls, scope_filter=scope)
-        cf = mod.matched_counterfactual(api_calls, scope_filter=scope)
+        stability = _cache_replay.stability_simulation(
+            predictions, api_calls, tool_calls=tool_calls, scope_filter=scope
+        )
+        cf = _cache_replay.matched_counterfactual(api_calls, scope_filter=scope)
         result[scope] = {"stability": stability, "counterfactual": cf}
     return result
 

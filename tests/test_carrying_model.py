@@ -575,8 +575,8 @@ class ShaperPromotionContract(unittest.TestCase):
 
     def test_validation_domain_is_scope_local_not_global(self):
         # Regression: enabled_tool_names (the candidate-validation domain
-        # merge_into_learned's _accept checks against) was built from the
-        # GLOBAL tool-call index, so another agent's tool names could validate
+        # ``compute_scope_recommendations`` checks candidates against) was built
+        # from the GLOBAL tool-call index, so another agent's names could validate
         # into this scope's carrying lists. It must be built only from this
         # scope's own predictions and their tool calls.
         E = ["clarify", "send_message", "web_extract"]
@@ -758,38 +758,46 @@ class ShaperMergeContract(unittest.TestCase):
             self.assertEqual(out["scopes"]["other:cli"]["carry"], ["keepme"],
                              "an untouched scope's assignment survives")
 
-    def test_category_candidate_is_rejected_not_stored(self):
-        with tempfile.TemporaryDirectory() as t:
-            tmp = Path(t)
-            self._write(tmp, {"version": 2, "scopes": {}})
-            # "web" is a toolset/category, not a concrete enabled tool name.
-            recs = self._recs(promote=["web", "web_extract"],
-                              enabled=["web_extract", "clarify"])
-            with self.assertLogs("tool_belt_plugin.shaping", level="WARNING") as cm:
-                shaper.merge_into_learned(tmp, {self.SCOPE: recs}, False)
-            out = self._read(tmp)["scopes"][self.SCOPE]
-            self.assertIn("web_extract", out["carry"])
-            self.assertNotIn("web", out["carry"], "a category name is never stored")
-            self.assertIn("web", "\n".join(cm.output))
+    def test_category_never_becomes_a_candidate(self):
+        # A toolset/category ("web") is a grouping key the model names in
+        # expand_tools — it is never a concrete tool. Candidates are drawn
+        # only from concrete observed tool names, so the category can reach
+        # neither the validation domain nor a carrying list.
+        E = ["clarify", "send_message", "web_extract"]
+        preds, calls = [], []
+        for i in range(3):
+            pid = f"p{i}"
+            preds.append(_pred_row(
+                self.SCOPE, f"s{i}", pid,
+                ceiling=E, always_carry=["clarify", "send_message"], carry=[],
+                active=["clarify", "send_message"], ts=i,
+            ))
+            # The model expanded the *category*; only the resolved tool is a
+            # dispatch with promotion evidence behind it.
+            calls.append(_expansion_call(pid, "expand_tools"))
+            calls.append(_expansion_call(pid, "web_extract"))
+        recs = _compute(self.SCOPE, preds, calls)
+        promoted = {p["tool"] for p in recs["promote"]}
+        self.assertIn("web_extract", promoted)
+        self.assertNotIn("web", promoted, "a category name is never a candidate")
+        self.assertNotIn("web", recs["enabled_tool_names"],
+                         "a category name never enters the validation domain")
+        self.assertNotIn("expand_tools", promoted,
+                         "the expansion meta-call is never a candidate")
 
-    def test_empty_enabled_ceiling_refuses_all_candidates(self):
-        # Defense-in-depth (O4): an empty enabled ceiling means no candidate can
-        # be proven eligible, so hand-built recs that bypass ``compute`` must not
-        # write anything into a carrying list.
-        with tempfile.TemporaryDirectory() as t:
-            tmp = Path(t)
-            self._write(tmp, {"version": 2, "scopes": {
-                self.SCOPE: {"carry": [], "expand_only": []}}})
-            recs = self._recs(promote=["web_extract"], demote=["read_file"],
-                              enabled=[])  # empty enabled ceiling
-            with self.assertLogs("tool_belt_plugin.shaping", level="WARNING"):
-                shaper.merge_into_learned(tmp, {self.SCOPE: recs}, False)
-            entry = self._read(tmp)["scopes"][self.SCOPE]
-            # No candidate may enter a carrying list when nothing can be validated.
-            self.assertEqual(entry["carry"], [],
-                             "no promote candidate is carried with an empty enabled ceiling")
-            self.assertEqual(entry["expand_only"], [],
-                             "no demote candidate is written with an empty enabled ceiling")
+    def test_empty_enabled_ceiling_yields_no_candidates(self):
+        # Nothing observed means nothing can be proven eligible: sessions with
+        # no tool lists and no calls must produce an empty validation domain
+        # and no candidate on either arm — never an invented one.
+        preds = [
+            _pred_row(self.SCOPE, f"s{i}", f"p{i}",
+                      ceiling=[], always_carry=[], carry=[], active=[], ts=i)
+            for i in range(20)  # ≥ demote_min_sessions_no_use
+        ]
+        recs = _compute(self.SCOPE, preds, [])
+        self.assertEqual(recs["enabled_tool_names"], [])
+        self.assertEqual(recs["promote"], [])
+        self.assertEqual(recs["demote"], [])
 
     def test_dry_run_performs_no_writes(self):
         with tempfile.TemporaryDirectory() as t:

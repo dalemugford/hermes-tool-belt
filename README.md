@@ -89,7 +89,7 @@ Pick an agent, then pick one of two areas:
 To set a mode without the menus:
 
 ```bash
-hermes tool-belt configure --agent <name> --mode learning|history|off
+hermes tool-belt configure --agent <name> --mode learning|history|off|observe|reset
 ```
 
 Add `--channel <platform>` to target one channel. It defaults to all channels.
@@ -341,6 +341,7 @@ Versions use CalVer: `YYYY.M.D`, with an optional prerelease suffix (for example
 ├── analyze.py        # telemetry analyzer
 ├── savings.py        # savings computation
 ├── savings_cli.py    # savings rendering and CLI
+├── cache_replay.py   # analyzer cache-cost library and diagnostic CLI
 ├── cli.py            # `hermes tool-belt` subcommand registration
 ├── yaml_required.py  # PyYAML availability guard for the operator scripts
 ├── tool-belt         # public command launcher (configure, savings, …)

@@ -864,7 +864,6 @@ class PrimaryDispatchGateTests(unittest.TestCase):
         self._original_config = dict(plugin._CONFIG)
         plugin._CONFIG["enabled"] = True
         plugin._CONFIG["log"] = True
-        plugin._CONFIG["require_tool_call_id"] = True
         plugin._CONFIG["agent"] = "assistant-a"
         self.addCleanup(self._restore_config)
 
@@ -935,20 +934,6 @@ class PrimaryDispatchGateTests(unittest.TestCase):
         mem = [r for r in self._rows() if r.get("tool_name") == "memory"]
         self.assertEqual(len(mem), 1, "a real model dispatch must be logged")
         self.assertEqual(mem[0].get("tool_call_id"), "toolu_abc123")
-
-    def test_escape_hatch_restores_legacy_logging(self):
-        # require_tool_call_id=false is the documented fail-open switch for a
-        # transport that emits primary calls without an id.
-        plugin._CONFIG["require_tool_call_id"] = False
-        self._set_post_expansion_state()
-        plugin._on_post_tool_call(
-            tool_name="memory", args={}, result="ok",
-            task_id=REAL_KEY_TELEGRAM, session_id="", tool_call_id="",
-        )
-        self.assertEqual(
-            len([r for r in self._rows() if r.get("tool_name") == "memory"]), 1,
-            "with the escape hatch off, id-less calls log as before",
-        )
 
 
 class BuildApiKwargsSnapshotTests(unittest.TestCase):
