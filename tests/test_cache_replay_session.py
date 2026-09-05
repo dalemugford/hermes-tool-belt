@@ -71,6 +71,8 @@ class FreezeSimulationNewBoundaryTests(unittest.TestCase):
                   tool_list_hash="A", hermes_session_id="H1"),
             _call("P1", shared_transport, ts=2, api_call_idx=1,
                   tool_list_hash="A", hermes_session_id="H1"),
+            _call("P1", shared_transport, ts=3, api_call_idx=2,
+                  tool_list_hash="A", hermes_session_id="H1"),
             # Hermes session H2 (post-/new): different frozen hash "B".
             _call("P2", shared_transport, ts=10, api_call_idx=0,
                   tool_list_hash="B", hermes_session_id="H2"),
@@ -79,9 +81,11 @@ class FreezeSimulationNewBoundaryTests(unittest.TestCase):
         ]
         result = cache_replay.stability_simulation(preds, calls, tool_calls=[])
         # One freeze cohort per Hermes session, each with its own first call.
+        # Every later turn of a session joins that cohort, so H1's two
+        # follow-up calls read as matches rather than breaks.
         self.assertEqual(result["sessions"], 2)
         self.assertEqual(result["first_calls_per_session"], 2)
-        self.assertEqual(result["matches_stable"], 2)
+        self.assertEqual(result["matches_stable"], 3)
         # The post-/new hash change must NOT read as an avoidable freeze break;
         # grouping by transport session_id alone would produce would_break==2.
         self.assertEqual(result["would_break_mutations"], 0)
@@ -117,25 +121,6 @@ class FreezeSimulationNewBoundaryTests(unittest.TestCase):
         # by transport session_id would carry H1's seen trigger tool into H2,
         # demoting H2's mutation to would_break.
         self.assertEqual(result["trigger_driven_mutations"], 2)
-        self.assertEqual(result["would_break_mutations"], 0)
-
-    def test_turns_of_one_hermes_session_share_a_freeze_cohort(self):
-        """Every turn carrying the same hermes_session_id lands in one freeze
-        cohort, so a stable hash reads as repeated matches, not breaks."""
-        sid = "chat-transport-shared"
-        preds = [_pred("P1", sid, ts=1, hermes_session_id="H1")]
-        calls = [
-            _call("P1", sid, ts=1, api_call_idx=0, tool_list_hash="A",
-                  hermes_session_id="H1"),
-            _call("P1", sid, ts=2, api_call_idx=1, tool_list_hash="A",
-                  hermes_session_id="H1"),
-            _call("P1", sid, ts=3, api_call_idx=2, tool_list_hash="A",
-                  hermes_session_id="H1"),
-        ]
-        result = cache_replay.stability_simulation(preds, calls, tool_calls=[])
-        self.assertEqual(result["sessions"], 1)
-        self.assertEqual(result["first_calls_per_session"], 1)
-        self.assertEqual(result["matches_stable"], 2)
         self.assertEqual(result["would_break_mutations"], 0)
 
 

@@ -13,13 +13,13 @@ written to disk.
 """
 from __future__ import annotations
 
+import hashlib
 import importlib
 import json
 import sys
 import time
 import unittest
 from pathlib import Path
-from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 PLUGIN_DIR = HERE.parent
@@ -28,7 +28,6 @@ sys.path.insert(0, str(PLUGIN_DIR))
 sys.path.insert(0, str(PLUGIN_DIR / "tests"))
 import conftest  # noqa: F401
 
-plugin = sys.modules["tool_belt_plugin"]
 presets_mod = importlib.import_module("tool_belt_plugin.presets")
 
 # Load the harvest-replay script as a module so we can call its
@@ -115,10 +114,14 @@ class HarvestPrivacyTests(unittest.TestCase):
         )
 
     def test_full_message_text_never_appears_in_output(self):
-        """No 100+ char substring of the input message can appear in output.
-        Preview is 80 chars, so anything ≥100 chars proves leakage."""
+        """No 81+ char substring of the input message can appear in output.
+
+        The documented redaction window is 80 chars, so the window here is
+        exactly one char wider than the widest legitimate preview. A wider
+        window would leave 81-99 char leaks invisible.
+        """
         output = self._serialized_output()
-        WINDOW = 100
+        WINDOW = 81
         leaks = []
         for i in range(0, len(SECRET_MESSAGE) - WINDOW):
             chunk = SECRET_MESSAGE[i:i + WINDOW]
@@ -146,22 +149,36 @@ class HarvestPrivacyTests(unittest.TestCase):
             "tool argument path leaked to output")
 
     def test_preview_truncated_to_80_chars(self):
-        """Sanity check: the preview that DOES get written is no longer
-        than the documented 80-char window."""
+        """Every derived row's preview is within the documented 80-char
+        window (+1 for the ellipsis the truncator appends)."""
         self.assertTrue(self.predictions, "test setup: replay produced no predictions")
-        preview = self.predictions[0].get("message_preview", "")
-        self.assertLessEqual(len(preview), 81,  # 80 + possible ellipsis char
-            f"preview exceeded 80 chars: {len(preview)} chars")
+        checked = 0
+        for row in list(self.predictions) + list(self.tool_calls):
+            if "message_preview" not in row:
+                continue
+            preview = row["message_preview"] or ""
+            checked += 1
+            self.assertLessEqual(len(preview), 81,
+                f"preview exceeded 80 chars: {len(preview)} chars in {row!r}")
+        self.assertTrue(checked, "test setup: no derived row carried a preview")
 
     def test_message_hash_is_deterministic_but_not_reversible(self):
-        """Hash is a stable identifier; it must not BE the message."""
+        """The hash field is exactly the sha1-16 digest of the message.
+
+        Computed here from the algorithm independently of logger_io, so a
+        change that lets raw text through the hash field fails this test.
+        """
         self.assertTrue(self.predictions)
         hashed = self.predictions[0].get("message_hash", "")
-        self.assertNotIn(SECRET_MESSAGE[:50], hashed,
-            "hash field contained raw message text")
-        # sha1 hex is 40 chars; logger_io.hash_message may shorten it.
-        self.assertLess(len(hashed), 64,
-            "hash field longer than any reasonable hex digest")
+        expected = hashlib.sha1(
+            SECRET_MESSAGE.encode("utf-8", errors="replace")
+        ).hexdigest()[:16]
+        self.assertEqual(hashed, expected,
+            "message_hash is not the deterministic sha1-16 digest")
+        # Belt and braces: no recognisable fragment of the secret survives.
+        for i in range(0, len(SECRET_MESSAGE) - 8):
+            self.assertNotIn(SECRET_MESSAGE[i:i + 8], hashed,
+                "hash field contained raw message text")
 
 
 if __name__ == "__main__":

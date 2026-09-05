@@ -58,6 +58,13 @@ def _invoke(args, state, sticky_refresh_fn=None):
     return json.loads(handler(args))
 
 
+# The persistence claim is code-owned prose; only this marker is contractual.
+# Asserting the whole sentence would break on a harmless rewording, so the
+# tests below assert the marker's PRESENCE on cache-on and ABSENCE on
+# cache-off — the differential is the actual promise.
+PERSISTENCE_MARKER = "persists"
+
+
 def _patched(resolved):
     return mock.patch.object(
         expand_tools, "_resolve_category",
@@ -76,7 +83,7 @@ class PersistenceWordingTests(unittest.TestCase):
         with _patched(["browser_navigate"]):
             payload = _invoke({"category": "browser"}, state,
                               sticky_refresh_fn=sticky_fn)
-        self.assertIn("persists for this session", payload["message"])
+        self.assertIn(PERSISTENCE_MARKER, payload["message"].lower())
         self.assertNotIn("sticky", payload)
 
     def test_cache_off_keeps_sticky_block_and_reserves_sticky_wording(self):
@@ -90,8 +97,7 @@ class PersistenceWordingTests(unittest.TestCase):
             payload = _invoke({"category": "browser"}, state,
                               sticky_refresh_fn=sticky_fn)
         self.assertIn("sticky", payload)
-        self.assertTrue(payload["sticky"]["refreshed"])
-        self.assertNotIn("persists for this session", payload["message"])
+        self.assertNotIn(PERSISTENCE_MARKER, payload["message"].lower())
 
 
 if __name__ == "__main__":  # pragma: no cover

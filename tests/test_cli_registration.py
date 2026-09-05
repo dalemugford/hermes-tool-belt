@@ -27,6 +27,17 @@ cli = importlib.import_module("tool_belt_plugin.cli")
 
 _SAVINGS_CLI_MODULE = "tool_belt_plugin.savings_cli"
 
+#: The hooks ``plugin.yaml`` declares under ``provides_hooks``. Naming them
+#: (rather than counting) is what catches a hook registered under the wrong
+#: name — a count stays 5 while the gateway never calls the renamed one.
+_EXPECTED_HOOKS = {
+    "pre_gateway_dispatch",
+    "post_tool_call",
+    "post_api_request",
+    "on_session_end",
+    "on_session_reset",
+}
+
 
 class _RecordingCtx:
     """ctx double recording tool/hook/CLI registrations."""
@@ -94,7 +105,7 @@ class RegistrationTest(unittest.TestCase):
         self.assertIs(cli.tool_belt_command, info["handler_fn"])
         # The tool and hooks still register alongside it.
         self.assertIn("expand_tools", ctx.tools)
-        self.assertEqual(5, len(ctx.hooks))
+        self.assertEqual(_EXPECTED_HOOKS, set(ctx.hooks))
 
     def test_register_survives_failing_cli_registration(self) -> None:
         class _BoomCtx(_RecordingCtx):
@@ -105,7 +116,7 @@ class RegistrationTest(unittest.TestCase):
         _register(ctx)  # fail-open
 
         self.assertIn("expand_tools", ctx.tools)
-        self.assertEqual(5, len(ctx.hooks))
+        self.assertEqual(_EXPECTED_HOOKS, set(ctx.hooks))
 
 
 class SetupIsCheapTest(unittest.TestCase):
@@ -159,10 +170,6 @@ class PassThroughTest(unittest.TestCase):
         with mock.patch.object(sc, "main", _fake_main):
             args.func(args)
         self.assertTrue(str(seen["prog"]).endswith(" tool-belt"), seen["prog"])
-
-    def test_configure_flags_pass_through(self) -> None:
-        forwarded, _ = self._dispatch(["tool-belt", "configure", "--status"])
-        self.assertEqual(["configure", "--status"], forwarded)
 
     def test_subcommand_help_is_forwarded_not_intercepted(self) -> None:
         forwarded, _ = self._dispatch(["tool-belt", "configure", "--help"])

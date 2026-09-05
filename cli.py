@@ -51,7 +51,8 @@ def register_cli(parser: argparse.ArgumentParser) -> None:
         sub = subs.add_parser(
             verb,
             help=help_text,
-            add_help=False,
+            # ``prefix_chars`` already makes ``-h`` an ordinary positional, so
+            # the subparser never grows a help action to suppress.
             prefix_chars=_PASSTHROUGH_PREFIX,
         )
         sub.add_argument(

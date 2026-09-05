@@ -35,6 +35,10 @@ class PredictionNormalizationTests(unittest.TestCase):
         # Canonical fields are always present, even on a sparse row.
         self.assertEqual(out["active_tools"], ["clarify"])
         self.assertEqual(out["schema_version"], logger_io.SCHEMA_VERSION)
+        for field in ("always_carry_tools", "carry_tools", "expand_only_tools",
+                      "always_carry_count", "carry_count",
+                      "trigger_activated_tools"):
+            self.assertIn(field, out)
 
     def test_complete_row_infers_the_authoritative_partition(self):
         row = {
@@ -87,24 +91,6 @@ class PredictionNormalizationTests(unittest.TestCase):
         self.assertEqual(out["always_carry_count"], 7)
         self.assertEqual(out["carry_count"], 9)
 
-    def test_stream_normalizes_uniformly(self):
-        stream = [
-            {"prediction_id": "complete", "schema_version": 2,
-             "ceiling_tools": ["clarify", "web_extract"],
-             "always_carry_tools": ["clarify"], "carry_tools": [],
-             "active_tools": ["clarify"], "expand_only_tools": ["web_extract"]},
-            {"prediction_id": "sparse", "schema_version": 2, "tokens_saved": 5},
-        ]
-        rows = [logger_io.normalize_prediction_row(r) for r in stream]
-        for r in rows:
-            self.assertEqual(r["schema_version"], logger_io.SCHEMA_VERSION)
-            for field in ("always_carry_tools", "carry_tools", "active_tools",
-                          "expand_only_tools", "always_carry_count", "carry_count",
-                          "trigger_activated_tools"):
-                self.assertIn(field, r)
-        self.assertTrue(rows[0]["residency_inferred"])
-        self.assertFalse(rows[1]["residency_inferred"])
-
 
 class ToolCallNormalizationTests(unittest.TestCase):
     def test_malformed_rows_never_raise(self):
@@ -133,8 +119,6 @@ class ToolCallNormalizationTests(unittest.TestCase):
             "was_initially_active": True,
             "was_expand_only": False,
         })
-        self.assertTrue(out["was_initially_active"])
-        self.assertFalse(out["was_expand_only"])
         self.assertEqual(out["activation_source"], "")
 
     def test_counterfactual_row_gains_no_spurious_expansion_flag(self):

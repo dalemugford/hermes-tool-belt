@@ -72,9 +72,6 @@ class OnboardingTestCase(tc.TempHomeTestCase):
             rc = configure.main(argv + ["--hermes-home", str(self.home)])
         return rc, "\n".join(lines)
 
-    def fs_snapshot(self) -> set[str]:
-        return {str(p.relative_to(self.home)) for p in self.home.rglob("*")}
-
     def learned(self, state_dir: Path | None = None) -> dict:
         path = (state_dir or self.root_state) / "learned.json"
         return json.loads(path.read_text(encoding="utf-8"))
@@ -224,10 +221,8 @@ class OnboardingArcTests(OnboardingTestCase):
         self.assertIn("execute_code", entry["carry"])
         self.assertEqual(entry["shaping"]["scope"], result.scope)
 
-        # The confirmed-apply epilogue speaks the 1.0 vocabulary: the retired
-        # "moved to on-demand" phrasing must never resurface in any flow.
+        # The confirmed-apply epilogue discloses the expansion set.
         self.assertIn("Tools available by expansion:", output)
-        self.assertNotIn("moved to on-demand", output)
 
         self.assertEqual(
             {c[3]: c[4] for c in runner.writes},

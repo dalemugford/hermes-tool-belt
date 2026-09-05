@@ -40,11 +40,6 @@ shaping_mod = importlib.import_module("tool_belt_plugin.shaping")
 
 BRIDGE = ("tool_search", "tool_describe", "tool_call")
 
-AUDITED_SEVEN = frozenset({
-    "expand_tools", "tool_search", "tool_describe", "tool_call",
-    "clarify", "skills_list", "skill_view",
-})
-
 try:
     import tools.tool_search as ts
     from tools.registry import registry
@@ -53,8 +48,6 @@ try:
 except Exception:  # pragma: no cover — env without hermes-agent on the path
     _HAVE_HERMES = False
 
-
-# ─── Lock (c) + (e): the shipped pin set is exactly the audited seven ──────
 
 # ─── Lock (d): todo demotable by ordinary evidence ─────────────────────────
 

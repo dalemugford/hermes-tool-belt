@@ -31,17 +31,22 @@ python3 -m venv .venv
 Full quality gate:
 
 ```bash
-.venv/bin/python tests/run_tests.py
+~/.hermes/hermes-agent/venv/bin/python tests/run_tests.py
 .venv/bin/python scripts/smoke-test.py
 .venv/bin/python -m compileall -q .
 bash -n scripts/rotate-telemetry.sh
 ```
 
+Run the suite under the **Hermes interpreter**, which has the runtime the
+hermes-gated tests need — that is the only run with zero skips, so it is the
+one that verifies a release. Where no Hermes runtime is available, fall back to
+`.venv/bin/python tests/run_tests.py` and accept the skips below.
+
 Expected:
 
 | Command | Expected result |
 | --- | --- |
-| `tests/run_tests.py` | `OK` — 0 failures, 0 errors. Several skips are expected on a clean clone outside the Hermes venv: every case gated on `hermes_cli` or `tools.tool_search` not being importable (about a dozen — the real-bridge tests and `configure.py`'s curses-contract tests), plus a `tiktoken`-gated case when that package isn't installed. Any other `skipped` line means something changed and needs explaining. |
+| `tests/run_tests.py` | `OK` — 0 failures, 0 errors, and under the Hermes interpreter 0 skips. Under the plugin `.venv` instead, about a dozen skips are expected: every case gated on `hermes_cli` or `tools.tool_search` not being importable (the real-bridge tests and `configure.py`'s curses-contract tests), plus a `tiktoken`-gated case when that package isn't installed. Any other `skipped` line means something changed and needs explaining. |
 | `scripts/smoke-test.py` | Three blocks: `1/1 checks passed` (id-less nested dispatch logs no row), `9/9 checks passed` (cache-off / narrowing & attribution) and `16/16 checks passed` (cache-on / carry-all contract). |
 | `compileall -q .` | No output, exit 0. |
 | `bash -n scripts/rotate-telemetry.sh` | No output, exit 0. |

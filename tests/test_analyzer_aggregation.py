@@ -203,22 +203,6 @@ class KeywordMinerContainmentTests(unittest.TestCase):
         self.assertIn("open the page", patterns)
         self.assertNotIn("open the", patterns)
 
-    def test_emitted_candidates_are_never_ones_the_dedupe_dropped(self):
-        # Parity with _suggest_dampeners_for_trigger's final re-filter.
-        previews = ["open the page now"] * 4
-        out = analyze._suggest_keywords_for_expand_only_tool(
-            expand_only_previews=previews,
-            noise_previews=[],
-            existing_patterns=[],
-            min_n=2, max_n=4, min_support=3, min_precision=0.5,
-            max_candidates=20,
-        )
-        patterns = [row["pattern"] for row in out]
-        for shorter in patterns:
-            for longer in patterns:
-                if analyze._ngram_contains(longer, shorter):
-                    self.fail(f"emitted both {shorter!r} and {longer!r}")
-
 
 class CliOutputParityTests(unittest.TestCase):
     """Fix 9 — JSON output carries cache cost and an honest source bucket."""

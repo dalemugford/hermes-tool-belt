@@ -112,44 +112,31 @@ class AlreadyAvailableCategoryTests(unittest.TestCase):
 class CaseInsensitiveCategoryInputTests(unittest.TestCase):
     """The handler should forgive simple case + whitespace differences."""
 
-    def test_uppercase_resolves_to_canonical_name(self):
-        # Live table only knows "browser"; handler should accept "BROWSER".
+    def test_case_and_whitespace_normalize_to_the_canonical_name(self):
+        # Live table only knows "browser"; the handler must accept the shapes a
+        # model actually emits and answer with the canonical name, so the
+        # response the model reads back names a category it can re-use.
         fake_available = ["browser", "file", "terminal"]
+
         def fake_resolve(name):
             return ["browser_navigate"] if name == "browser" else []
 
-        with mock.patch.object(expand_tools, "_available_toolset_names",
-                               return_value=fake_available), \
-             mock.patch("toolsets.resolve_toolset", side_effect=fake_resolve, create=True):
-            state = _make_state()
-            payload = _invoke({"category": "BROWSER"}, state)
+        for raw in ("BROWSER", "  browser  ", "  BrOwSeR\t"):
+            with self.subTest(raw=raw), \
+                 mock.patch.object(expand_tools, "_available_toolset_names",
+                                   return_value=fake_available), \
+                 mock.patch("toolsets.resolve_toolset", side_effect=fake_resolve,
+                            create=True):
+                payload = _invoke({"category": raw}, _make_state())
 
-        self.assertTrue(payload["success"], payload)
-        self.assertEqual(payload["category"], "browser",
-                         "canonical-cased name should be returned in the response")
-        self.assertEqual(payload["resolved_tools"], ["browser_navigate"])
-
-    def test_whitespace_is_stripped(self):
-        fake_available = ["browser"]
-        def fake_resolve(name):
-            return ["browser_navigate"] if name == "browser" else []
-
-        with mock.patch.object(expand_tools, "_available_toolset_names",
-                               return_value=fake_available), \
-             mock.patch("toolsets.resolve_toolset", side_effect=fake_resolve, create=True):
-            payload = _invoke({"category": "  browser  "}, _make_state())
-
-        self.assertTrue(payload["success"], payload)
-        self.assertEqual(payload["category"], "browser")
+            self.assertTrue(payload["success"], payload)
+            self.assertEqual(payload["category"], "browser",
+                             "canonical-cased name should be returned in the response")
+            self.assertEqual(payload["resolved_tools"], ["browser_navigate"])
 
 
 class InvalidCategoryErrorTests(unittest.TestCase):
     """Bad categories should not pretend success; the error should be helpful."""
-
-    def test_missing_category_argument(self):
-        payload = _invoke({}, _make_state())
-        self.assertFalse(payload["success"])
-        self.assertIn("required", payload["error"].lower())
 
     def test_unknown_category_lists_dynamic_available_set(self):
         fake_available = ["browser", "file", "terminal", "cronjob"]
@@ -267,17 +254,16 @@ class ToolNameResolutionTests(unittest.TestCase):
                          sorted(self._TABLE["browser"]))
 
     def test_neither_category_nor_tool_returns_error(self):
-        payload = _invoke({}, _make_state())
-        self.assertFalse(payload["success"])
-        self.assertIn("required", payload["error"].lower())
-        # The error should name both accepted parameters.
-        self.assertIn("category", payload["error"].lower())
-        self.assertIn("tool", payload["error"].lower())
-
-    def test_blank_category_and_tool_returns_error(self):
-        payload = _invoke({"category": "   ", "tool": ""}, _make_state())
-        self.assertFalse(payload["success"])
-        self.assertIn("required", payload["error"].lower())
+        # Absent and blank/whitespace-only arguments are the same failure: the
+        # handler must not treat "   " as a category name.
+        for args in ({}, {"category": "   ", "tool": ""}):
+            with self.subTest(args=args):
+                payload = _invoke(args, _make_state())
+                self.assertFalse(payload["success"])
+                self.assertIn("required", payload["error"].lower())
+                # The error should name both accepted parameters.
+                self.assertIn("category", payload["error"].lower())
+                self.assertIn("tool", payload["error"].lower())
 
 
 class CeilingGateTests(unittest.TestCase):
@@ -363,17 +349,6 @@ class ExpandOnlyManifestBuilderTests(unittest.TestCase):
         # Ungrouped bucket always sorts last, after known categories.
         self.assertLess(text.index("browser:"), text.index("(ungrouped):"))
 
-    def test_ordering_deterministic_across_input_orders(self):
-        a = expand_tools.build_expand_only_manifest(
-            ["web_extract", "browser_exec", "brand_new", "browser_click"],
-            category_index=self._INDEX,
-        )
-        b = expand_tools.build_expand_only_manifest(
-            ["browser_click", "brand_new", "web_extract", "browser_exec"],
-            category_index=self._INDEX,
-        )
-        self.assertEqual(a, b, "manifest text is independent of input ordering")
-
     def test_empty_when_no_expand_only_names(self):
         self.assertEqual(
             expand_tools.build_expand_only_manifest([], category_index=self._INDEX),
@@ -404,14 +379,14 @@ class ExpandOnlyManifestBuilderTests(unittest.TestCase):
         names = sorted(n for members in index.values() for n in members)
         names += ["orphan_alpha", "orphan_beta"]
         text = expand_tools.build_expand_only_manifest(names, category_index=index)
-        budget = 2000  # characters
+        # Budget set just above the measured size (782 chars at the time of
+        # writing) so genuine growth trips it, not a rounding wobble.
+        budget = 1200  # characters
         self.assertLess(
             len(text), budget,
             f"expand-only manifest is {len(text)} chars; budget is {budget}. "
             "Prefer names + category labels over prose.",
         )
-        # Report the size for the delegation record.
-        print(f"[manifest-size] representative_full_ceiling_chars={len(text)}")
 
     def test_augment_clones_schema_without_mutating_original(self):
         import copy

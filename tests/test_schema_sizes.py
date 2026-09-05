@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tests.test_carrying_model import shaper  # noqa: F401  (package bootstrap)
+from tests.shaping_fixtures import shaper  # noqa: F401  (package bootstrap)
 import tool_belt_plugin
 from tool_belt_plugin import logger_io
 

@@ -136,18 +136,17 @@ class CacheAwareSavingsTests(unittest.TestCase):
     """D4: gross priced by provider caching; overhead measured with a
     thin-data fallback."""
 
-    def test_noncaching_call_is_priced_at_full_rate(self):
-        # A call whose route never caches: its saved schema tokens are
-        # full-price, factor 1.0 — not the cache_read discount.
-        row = {"provider": "ollama-cloud", "provider_caches": False}
-        self.assertIs(savings.provider_caches_for_call(row), False)
+    def test_cache_status_comes_off_the_row_never_from_the_provider(self):
+        # The same provider name, two rows. The explicit flag is honoured;
+        # its absence is unknown — for the caller to resolve from the cohort
+        # posture — and never guessed from the provider name.
+        self.assertIs(savings.provider_caches_for_call(
+            {"provider": "ollama-cloud", "provider_caches": False}), False)
+        self.assertIsNone(savings.provider_caches_for_call(
+            {"provider": "ollama-cloud"}))
+        # Both price saved schema tokens at full rate, not the cache_read
+        # discount.
         self.assertEqual(savings.price_factor_for("gpt-5.4", False), 1.0)
-
-    def test_call_without_a_cache_status_is_unknown(self):
-        # No ``provider_caches`` on the row → unknown, for the caller to
-        # resolve from the cohort posture. Never guessed from the provider.
-        row = {"provider": "ollama-cloud"}
-        self.assertIsNone(savings.provider_caches_for_call(row))
         self.assertEqual(savings.price_factor_for("gpt-5.4", None), 1.0)
 
     def test_caching_gross_is_cache_read_discounted(self):

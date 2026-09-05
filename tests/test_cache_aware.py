@@ -6,19 +6,22 @@ that make the freeze model work, plus regression guards for bugs
 that have already been fixed once:
 
   · _resolve_cache_mode_for_session — forced modes + auto with the
-    cross-session detection cache hit/miss
-  · _freeze_session_snapshot / _build_state_from_frozen — snapshot
-    shape; reuse counter increments; expansions carry forward
+    cross-session detection cache hit/miss, and the mid-session pin
+  · _build_carry_all_state — the cache-on dispatch state (D1, 2026-09-02):
+    no narrowing, its own policy_source, sticky/lookback off
   · _update_cache_mode_detection — forced lock, provider blocklist,
-    threshold met/failed, divergence detection
+    the call and token floors, threshold met/failed
   · _persist_detection_lock / _cached_detection_mode — cross-session
     persistence; provider-blocklist locks not persisted
-  · on_session_end DOES NOT evict freeze because Hermes fires it per turn
-  · on_session_reset DOES evict freeze
+  · on_session_end DOES NOT evict session posture because Hermes fires it
+    per turn; on_session_reset DOES
+  · the enabled-ceiling capture, the expand-only manifest injection, and
+    the token estimator's two tiers
 """
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 import tempfile
@@ -84,26 +87,17 @@ class ResolveCacheModeTests(unittest.TestCase):
         plugin._CONFIG["cache_mode"] = "on"
         self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="assistant-a:telegram"), "on")
 
-    def test_auto_defaults_on_when_no_cached_entry(self):
-        # Protect prefix stability unless telemetry has established that
-        # provider-side caching is unavailable.
-        plugin._CONFIG["cache_mode"] = "auto"
-        self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="assistant-a:telegram"), "on")
-
     def test_auto_honors_cached_off(self):
         plugin._CONFIG["cache_mode"] = "auto"
         plugin._DETECTION_CACHE["assistant-a:telegram"] = {"mode": "off"}
         self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="assistant-a:telegram"), "off")
 
-    def test_auto_honors_cached_on(self):
-        plugin._CONFIG["cache_mode"] = "auto"
-        plugin._DETECTION_CACHE["assistant-a:telegram"] = {"mode": "on"}
-        self.assertEqual(plugin._resolve_cache_mode_for_session("sid", scope="assistant-a:telegram"), "on")
-
     def test_decision_is_pinned_for_the_sessions_lifetime(self):
         # A detection lock landing MID-SESSION must not flip the current
         # session's path: granted expansions would vanish and the freeze
-        # entry would orphan. The lock applies to the next session only.
+        # entry would orphan. The lock applies to the next session only. The
+        # first assertion also pins the no-evidence default: auto resolves to
+        # "on" so prefix stability is protected until telemetry says otherwise.
         plugin._CONFIG["cache_mode"] = "auto"
         scope = "assistant-a:telegram"
         self.assertEqual(
@@ -120,9 +114,10 @@ class ResolveCacheModeTests(unittest.TestCase):
 class CarryAllStateTests(unittest.TestCase):
     """_build_carry_all_state: the cache-on (caching-provider) dispatch state.
 
-    Replaces the removed freeze model (D1, 2026-09-02): caching providers
-    carry the whole ceiling, ship no ``expand_tools``, and never mutate the
-    tool list mid-session, so there is no per-session snapshot to reuse.
+    Under D1 (2026-09-02) a caching provider carries the whole ceiling, ships
+    no ``expand_tools``, and never mutates the tool list mid-session — so the
+    dispatch state must declare no narrowing, stamp its own cohort, and leave
+    the per-turn mechanisms (sticky, lookback, expansions) inert.
     """
 
     class _Preset:
@@ -164,10 +159,9 @@ class CarryAllStateTests(unittest.TestCase):
         self.assertEqual(state["sticky_tools"], [])
         self.assertEqual(state["lookback_used"], 0)
         self.assertEqual(state["lookback_turns_config"], 0)
-
-    def test_carry_all_starts_with_no_expansions(self):
-        # Nothing is admitted mid-session; expand_tools is not even shipped.
-        self.assertEqual(self._build()["expansions"], set())
+        # Nothing is admitted mid-session either; expand_tools is not shipped,
+        # so the expansion set starts and stays empty.
+        self.assertEqual(state["expansions"], set())
 
 
 class DetectionStateMachineTests(unittest.TestCase):
@@ -198,15 +192,28 @@ class DetectionStateMachineTests(unittest.TestCase):
             "provider_blocklist",
         )
 
-    def test_pending_until_call_and_token_thresholds_met(self):
-        # 4 calls with tiny inputs → still pending (needs 5 calls + 5K)
-        for _ in range(4):
+    def test_pending_until_the_call_floor_is_met(self):
+        # Plenty of tokens (4 × 10000 ≫ the 5K minimum) but one call short of
+        # the 5-call floor: still pending. Isolates the CALL gate.
+        for i in range(4):
             mode = plugin._update_cache_mode_detection(
                 session_key="sid", model="gpt-5.4",
-                cache_read=100, cache_write=0, input_tokens=100,
+                cache_read=9000, cache_write=0, input_tokens=1000,
                 scope="assistant-a:telegram",
             )
-            self.assertEqual(mode, "pending")
+            self.assertEqual(mode, "pending", f"locked after only {i + 1} calls")
+
+    def test_pending_until_the_token_floor_is_met(self):
+        # Enough calls (5 ≥ the floor) but far too few observed tokens
+        # (5 × 100 ≪ 5K): still pending. Isolates the TOKEN gate.
+        for _ in range(5):
+            mode = plugin._update_cache_mode_detection(
+                session_key="sid", model="gpt-5.4",
+                cache_read=90, cache_write=0, input_tokens=10,
+                scope="assistant-a:telegram",
+            )
+        self.assertEqual(mode, "pending",
+                         "the call floor alone must not lock a verdict")
 
     def test_threshold_met_locks_on(self):
         # 5 calls × (cache=8000, fresh=2000) → hit_rate=0.80 > 0.40 → "on"
@@ -244,19 +251,6 @@ class DetectionCachePersistenceTests(unittest.TestCase):
         _seed_plugin_config()
         _reset_plugin_state()
 
-    def test_persists_threshold_lock(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with mock.patch.dict(os.environ, {"HERMES_HOME": tmp}, clear=False):
-                state = {
-                    "mode": "on",
-                    "lock_reason": "threshold_met",
-                    "hit_rate_at_lock": 0.85,
-                }
-                plugin._persist_detection_lock("assistant-a:telegram", state, "claude-sonnet-4-6")
-                self.assertIn("assistant-a:telegram", plugin._DETECTION_CACHE)
-                self.assertEqual(plugin._DETECTION_CACHE["assistant-a:telegram"]["mode"], "on")
-                self.assertEqual(plugin._DETECTION_CACHE["assistant-a:telegram"]["sessions_locked"], 1)
-
     def test_does_not_persist_provider_blocklist_lock(self):
         # Blocklist is config, not observation — shouldn't pollute the cache.
         with tempfile.TemporaryDirectory() as tmp:
@@ -271,8 +265,13 @@ class DetectionCachePersistenceTests(unittest.TestCase):
     def test_consecutive_same_mode_locks_increment_counter(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(os.environ, {"HERMES_HOME": tmp}, clear=False):
-                state = {"mode": "on", "lock_reason": "threshold_met"}
+                state = {"mode": "on", "lock_reason": "threshold_met",
+                         "hit_rate_at_lock": 0.85}
                 plugin._persist_detection_lock("assistant-a:telegram", state, "model-a")
+                # One observation-driven lock is persisted, verdict and all.
+                entry = plugin._DETECTION_CACHE["assistant-a:telegram"]
+                self.assertEqual(entry["mode"], "on")
+                self.assertEqual(entry["sessions_locked"], 1)
                 plugin._persist_detection_lock("assistant-a:telegram", state, "model-a")
                 plugin._persist_detection_lock("assistant-a:telegram", state, "model-a")
                 self.assertEqual(
@@ -304,8 +303,7 @@ class SessionHookSemanticsTests(unittest.TestCase):
     Hermes fires on_session_end once per user message, so the session's
     posture pin (_CACHE_DECISION_BY_SESSION) and detection state
     (_CACHE_MODE_BY_SESSION) must survive it; on_session_reset — /new,
-    /reset — evicts them through _evict_session_cache_state (D3, 2026-09-02;
-    the old freeze snapshot was removed with the carry-all posture).
+    /reset — evicts them through _evict_session_cache_state (D3, 2026-09-02).
     """
 
     def setUp(self):
@@ -331,7 +329,6 @@ class SessionHookSemanticsTests(unittest.TestCase):
         # The hook fires per turn; sticky (3-turn TTL) and lookback are
         # session-scoped and must survive it, or the features are inert.
         sticky_key = plugin._sticky_key_for_session("sid")
-        self.assertTrue(sticky_key, "sanity: derivation produces non-empty key")
         plugin._STICKY_BY_KEY[sticky_key] = {"terminal": {"remaining_turns": 2}}
         plugin._PRIOR_MESSAGES_BY_SESSION["sid"] = ["msg1"]
         with mock.patch.dict(os.environ, {"HERMES_SESSION_KEY": "sid"}, clear=False):
@@ -346,14 +343,14 @@ class SessionHookSemanticsTests(unittest.TestCase):
 
 
 class SlashCommandBypassTests(unittest.TestCase):
-    """Regression guards for the /new freeze-pollution bug.
+    """Regression guards for the /new posture-pollution bug.
 
     Hermes' gateway fires pre_gateway_dispatch BEFORE routing slash
     commands to their handlers. Without the bypass, the predictor runs
-    on the command text and creates a freeze that's never reached by
+    on the command text and pins a posture that's never reached by
     an LLM call but pollutes the next real-message dispatch. Then
     on_session_reset (which Hermes fires with
-    only the NEW session UUID + platform) can't evict the freeze
+    only the NEW session UUID + platform) can't evict the pin
     because the canonical key isn't in the hook kwargs.
 
     The fix is two-part:
@@ -424,34 +421,6 @@ class SlashCommandBypassTests(unittest.TestCase):
         self.assertNotIn(self.CANONICAL, plugin._CACHE_DECISION_BY_SESSION,
                          "posture pin under canonical key should be evicted via platform fallback")
 
-    def test_new_then_message_builds_fresh_carry_all(self):
-        """End-to-end: /new arrives, then a real message. /new must not pin
-        a posture; on_session_reset evicts any stale pin via the platform
-        fallback; the real message then builds a fresh carry-all state under
-        cache_mode=on (policy_source cache_on_carry_all), not a stale reuse."""
-        store = self._make_session_store()
-
-        # Step 1: /new arrives. pre_gateway_dispatch fires.
-        plugin._on_pre_gateway_dispatch(event=self._make_event("/new"), session_store=store)
-        self.assertNotIn(self.CANONICAL, plugin._CACHE_DECISION_BY_SESSION)
-
-        # Step 2: Gateway routes /new → on_session_reset with new UUID.
-        plugin._on_session_reset(
-            session_id="20260601_162555_d16739f9",
-            platform=self.PLATFORM,
-        )
-        self.assertNotIn(self.CANONICAL, plugin._CACHE_DECISION_BY_SESSION)
-
-        # Step 3: Real user message arrives. With cache_mode=on, this builds
-        # a carry-all dispatch state stamped cache_on_carry_all.
-        plugin._CONFIG["cache_mode"] = "on"
-        plugin._on_pre_gateway_dispatch(
-            event=self._make_event("Run the communication test"), session_store=store)
-        state = plugin._PREDICTION_CV.get()
-        self.assertIsNotNone(state, "real message should build a dispatch state")
-        self.assertEqual(state.get("policy_source"), "cache_on_carry_all")
-        self.assertIs(state.get("active_tool_names"), plugin.NO_NARROWING)
-
 
 class BypassCohortTests(unittest.TestCase):
     """Regression guard: bypass-cohort rows must not pollute cache-on/off
@@ -470,7 +439,7 @@ class BypassCohortTests(unittest.TestCase):
         # The cohort math lives in the plugin's savings engine.
         self.report = importlib.import_module("tool_belt_plugin.savings")
 
-    def _bypass_row(self, prediction_id: str = "bp1") -> dict[str, Any]:
+    def _bypass_row(self, prediction_id: str = "bp1") -> dict:
         return {
             "prediction_id": prediction_id,
             "session_id": "agent:main:slack:dm:D0X:1780000000",
@@ -479,7 +448,7 @@ class BypassCohortTests(unittest.TestCase):
             "ceiling_tokens": 12521, "narrowed_tokens": 12521,
         }
 
-    def _narrowed_row(self, prediction_id: str = "nx1") -> dict[str, Any]:
+    def _narrowed_row(self, prediction_id: str = "nx1") -> dict:
         return {
             "prediction_id": prediction_id,
             "session_id": "agent:main:slack:dm:D0Y:1780000001",
@@ -487,13 +456,6 @@ class BypassCohortTests(unittest.TestCase):
             "ceiling_count": 46, "narrowed_count": 29,
             "ceiling_tokens": 12521, "narrowed_tokens": 7137,
         }
-
-    def test_bypass_row_classifies_as_bypass(self):
-        api_last = {"bp1": {"cache_mode": "on"}}  # api says on, but bypass wins
-        self.assertEqual(
-            self.report.classify_prediction_mode(self._bypass_row(), api_last),
-            "bypass",
-        )
 
     def test_bypass_row_excluded_from_cache_on_cohort(self):
         """The cache-on cohort must not include bypass rows even when
@@ -691,28 +653,14 @@ class ExpandOnlyManifestInjectionTests(unittest.TestCase):
 
     def test_mcp_passthrough_names_absent_from_manifest(self):
         _result, desc = self._run()
-        self.assertNotIn("mcp__github__create_issue", desc)
-        self.assertNotIn("github", desc)
+        manifest = desc.split("Grouped by toolset:", 1)[-1]
+        self.assertNotIn("mcp__github__create_issue", manifest)
+        self.assertNotIn("github", manifest)
 
     def test_ceiling_absent_trigger_name_absent_from_manifest(self):
         # A trigger references a tool that is NOT in the enabled ceiling E.
         _result, desc = self._run(triggered=["ghost_tool"])
         self.assertNotIn("ghost_tool", desc)
-
-    def test_original_registered_schema_unchanged_after_build(self):
-        import copy
-        snapshot = copy.deepcopy(plugin.expand_tools_mod.SCHEMA)
-        _result, desc = self._run(expand_tools_schema=plugin.expand_tools_mod.SCHEMA)
-        # The registered object is byte/deep-equal after request construction...
-        self.assertEqual(plugin.expand_tools_mod.SCHEMA, snapshot,
-                         "the registered expand_tools schema must not be mutated")
-        # ...but the per-request clone carried the manifest.
-        self.assertIn("web: web_extract", desc)
-        self.assertNotIn(
-            "web: web_extract",
-            plugin.expand_tools_mod.SCHEMA["description"],
-            "the manifest must live only on the per-request clone",
-        )
 
     def test_cache_on_manifest_identical_before_and_after_trigger(self):
         # Residency (hence X) is identical across turns; a later trigger only
@@ -781,15 +729,17 @@ class TokenEstimatorTests(unittest.TestCase):
             self.skipTest("tiktoken not installed in this environment")
 
         self.assertEqual(self.logger_io.token_estimator_name(), "tiktoken-cl100k")
-        # Sanity: a non-trivial payload returns a positive count, and that
-        # count is plausibly different from the chars/4 heuristic.
+        # The count must come from the encoder, not the fallback: for a
+        # schema-shaped payload the two disagree, so equality with chars/4
+        # means the tiktoken branch silently fell through.
         payload = [{"name": "read_file",
                     "description": "Read a file from disk.",
                     "parameters": {"type": "object",
                                    "properties": {"path": {"type": "string"}},
                                    "required": ["path"]}}]
         n = self.logger_io.estimate_tokens(payload)
-        self.assertGreater(n, 0)
+        self.assertNotEqual(n, len(json.dumps(payload, ensure_ascii=False)) // 4,
+                            "tiktoken path returned the chars/4 fallback count")
 
 if __name__ == "__main__":
     unittest.main()

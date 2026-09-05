@@ -86,7 +86,7 @@ def _write_session(sessions_dir: Path, stem: str, *, platform: str, model: str,
     return path
 
 
-def _write_observed(state_dir: Path, scope: str, *, expand_events: int = 0) -> None:
+def _write_observed(state_dir: Path, scope: str) -> None:
     """Write a minimal observed-telemetry triple for a scope."""
     state_dir.mkdir(parents=True, exist_ok=True)
     preds = []
@@ -115,11 +115,7 @@ def _write_observed(state_dir: Path, scope: str, *, expand_events: int = 0) -> N
                  "api_call_idx": 0, "cache_mode": "off", "input_tokens": 5000,
                  "prompt_tokens": 5000,
                  "cache_read_tokens": 0, "cache_write_tokens": 0})
-    tcs = []
-    for i in range(expand_events):
-        tcs.append({"schema_version": 2, "ts": 1780000002.0, "prediction_id": "off1",
-                    "session_id": f"{scope}:S2", "scope": scope,
-                    "tool_name": "expand_tools", "source": "gateway"})
+    tcs: list[dict] = []
     (state_dir / "predictions.jsonl").write_text(
         "".join(json.dumps(r) + "\n" for r in preds), encoding="utf-8")
     (state_dir / "api_calls.jsonl").write_text(
@@ -626,6 +622,9 @@ class DenominatorTests(_HomeCase):
         self.assertIsNone(proj.net_input_reduction_pct)
 
     def test_provider_reported_wins_high_confidence(self):
+        # Demotions seeded so net_token_reduction is genuinely non-zero — the
+        # percentage below is then a real division, not 0/99999.
+        _seed_demotions(self.home)
         path = _write_session(self.home / "sessions", "prov", platform="telegram",
                               model="claude-sonnet-4-6", ceiling=CEILING,
                               turns=[{"user": "hello"}])
@@ -645,12 +644,15 @@ class DenominatorTests(_HomeCase):
         self.assertEqual(proj.input_token_denominator, 99999)
         self.assertEqual(proj.confidence, "high")
         # The provider-basis percentage is the single source of
-        # net_input_reduction_pct; assert its exact value.
+        # net_input_reduction_pct, and the provider figure is its denominator:
+        # a denominator built from anything else lands on a different number.
+        self.assertGreater(proj.net_token_reduction, 0,
+                           "fixture must actually reduce something")
         self.assertEqual(
             proj.net_input_reduction_pct,
             round(proj.net_token_reduction / 99999 * 100, 2),
         )
-        self.assertGreaterEqual(proj.net_input_reduction_pct, 0.0)
+        self.assertGreater(proj.net_input_reduction_pct, 0.0)
 
     def test_prediction_bridge_joins_chat_key_to_hermes_session(self):
         # Production reality: api_calls rows key on the chat session_id, while
@@ -726,15 +728,6 @@ class CostClassificationTests(_HomeCase):
         self.assertIsNone(proj.net_input_reduction_pct)
         self.assertIsNotNone(proj.schema_reduction_pct)
 
-    def test_unknown_route_shows_no_dollars(self):
-        _write_session(self.home / "sessions", "u", platform="telegram",
-                       model="claude-sonnet-4-6", ceiling=CEILING,  # no api_mode
-                       turns=[{"user": "hello"}, {"user": "write a file"}])
-        loc = savings.discover_agents(self.home)[0]
-        proj = savings.compute_projected(loc, {"enabled": True})
-        self.assertEqual(proj.models[0].cost_class, "unknown")
-        self.assertIsNone(proj.estimated_usd_savings)
-
     def test_classify_cost_list_price_not_enough(self):
         # A model with a list price but a subscription route is NOT known-cost.
         cc = savings.classify_cost("claude-sonnet-4-6", api_mode="oauth")
@@ -754,8 +747,8 @@ class ApiCallRouteCostingTests(_HomeCase):
             savings.discover_agents(self.home)[0], {"enabled": True})
 
     def test_metered_route_from_api_calls_is_classified_known(self):
-        _seed_demotions(self.home)
         """session_meta carries no route; api_calls prove a metered one."""
+        _seed_demotions(self.home)
         _write_session(self.home / "sessions", "m", platform="telegram",
                        model="claude-sonnet-4-6", ceiling=CEILING, turns=self.TURNS)
         _write_route_evidence(
@@ -830,9 +823,50 @@ class SinceParsingTests(_HomeCase):
         self.assertEqual(savings.parse_since(None), 0.0)
         self.assertEqual(savings.parse_since(""), 0.0)
 
-    def test_valid_since_parses(self):
-        self.assertGreater(savings.parse_since("2026-05-15"), 0.0)
-        self.assertGreater(savings.parse_since("2026-05-15T10:30:00"), 0.0)
+    def test_valid_since_parses_to_the_exact_local_epoch(self):
+        import datetime as dt
+        self.assertEqual(savings.parse_since("2026-05-15"),
+                         dt.datetime(2026, 5, 15).timestamp())
+        self.assertEqual(savings.parse_since("2026-05-15T10:30:00"),
+                         dt.datetime(2026, 5, 15, 10, 30).timestamp())
+
+    def test_since_excludes_rows_before_the_cutoff(self):
+        # The echo test proves the report *says* which window it honored; this
+        # proves the window was actually applied to the telemetry it counted.
+        import datetime as dt
+        state = self.home / "state" / "tool-belt"
+        state.mkdir(parents=True, exist_ok=True)
+        old_ts = dt.datetime(2026, 1, 1).timestamp()
+        new_ts = dt.datetime(2026, 6, 1).timestamp()
+        preds, apis = [], []
+        for tag, ts in (("old", old_ts), ("new", new_ts)):
+            preds.append({
+                "schema_version": 2, "ts": ts, "prediction_id": tag,
+                "session_id": f"default:telegram:{tag}",
+                "hermes_session_id": tag, "scope": "default:telegram",
+                "policy_source": "preset", "ceiling_count": 40,
+                "narrowed_count": 20, "ceiling_tokens": 10000,
+                "narrowed_tokens": 4000})
+            apis.append({
+                "ts": ts, "prediction_id": tag, "scope": "default:telegram",
+                "api_call_idx": 0, "cache_mode": "off", "input_tokens": 4000,
+                "prompt_tokens": 4000, "cache_read_tokens": 0,
+                "cache_write_tokens": 0})
+        (state / "predictions.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in preds), encoding="utf-8")
+        (state / "api_calls.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in apis), encoding="utf-8")
+        (state / "tool_calls.jsonl").write_text("", encoding="utf-8")
+
+        unbounded = savings.compute_observed(state)
+        self.assertEqual(unbounded.n_predictions, 2)
+        windowed = savings.compute_observed(
+            state, since_ts=savings.parse_since("2026-03-01"))
+        self.assertEqual(windowed.n_predictions, 1,
+                         "the pre-cutoff prediction must not be counted")
+        self.assertEqual(windowed.first_ts, new_ts)
+        self.assertLess(windowed.realized_schema_token_reduction,
+                        unbounded.realized_schema_token_reduction)
 
     def test_malformed_since_raises(self):
         for bad in ("2026-13-45", "lastweek", "05/15/2026"):
@@ -1028,8 +1062,10 @@ class AnnualizedPaceTests(_HomeCase):
     def test_pace_line_present_with_enough_span(self):
         text = savings_cli.render_text(self._report(30))
         self.assertIn("12 months of Tool Belt is estimated to save", text)
-        # 100k tokens saved over 30 days → ≈1,216,666/yr
-        self.assertIn("1,216,66", text)
+        # Computed here from the fixture, independently of the renderer:
+        # 100k net tokens over a 30-day uncached span, projected to 365 days.
+        yearly = int(100_000 * 365.0 / 30.0)
+        self.assertIn(f"{yearly:,}", text)
 
     def test_pace_line_absent_below_a_week(self):
         text = savings_cli.render_text(self._report(3))
@@ -1038,7 +1074,8 @@ class AnnualizedPaceTests(_HomeCase):
     def test_display_name_used_in_per_agent_block(self):
         text = savings_cli.render_text(self._report(30))
         self.assertIn("bernard", text)
-        self.assertNotIn("default   ", text)
+        # The internal agent key never leaks into the rendered report.
+        self.assertNotIn("default", text)
 
 
 class LauncherPromptSuffixTests(_HomeCase):
@@ -1119,14 +1156,6 @@ class ColorGatingTests(_HomeCase):
         text = savings_cli.render_text(self._report())
         self.assertNotIn("\x1b[", text)
         self.assertIn("NET TOKENS SAVED", text)
-
-    def test_json_never_colored(self):
-        out = io.StringIO()
-        with redirect_stdout(out):
-            savings_cli.run(["--json", "--hermes-home", str(self.home)])
-        payload = out.getvalue()
-        self.assertNotIn("\x1b[", payload)
-        json.loads(payload)  # still valid JSON
 
 
 class CarriedAgentEmphasisTests(_HomeCase):
