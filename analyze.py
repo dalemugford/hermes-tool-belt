@@ -22,8 +22,8 @@ from pathlib import Path
 from typing import Any, Iterable
 
 # Canonical telemetry adapter. Every prediction/tool-call row is read through
-# ``logger_io.normalize_prediction_row`` / ``normalize_tool_call_row`` so v1, v2,
-# and mixed streams all present the same carrying-model fields. This module
+# ``logger_io.normalize_prediction_row`` / ``normalize_tool_call_row`` so every
+# consumer sees the same carrying-model fields. This module
 # consumes ``carry_tools``, ``expand_only_tools``, and ``was_expand_only``.
 # Works both as a script (sibling on sys.path) and as the
 # ``tool_belt_plugin.analyze`` module.
@@ -266,8 +266,8 @@ def trigger_tools(row: dict[str, Any]) -> dict[str, set[str]]:
 
 
 def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, Any]]) -> dict[str, ScopeStats]:
-    # Read every row through the central adapter so v1, v2, and mixed streams
-    # present the same canonical carrying-model fields. Idempotent, so callers
+    # Read every row through the central adapter so every consumer sees the
+    # same canonical carrying-model fields. Idempotent, so callers
     # that already normalized (e.g. ``main``) pay only a cheap re-pass.
     predictions = [logger_io.normalize_prediction_row(r) for r in predictions]
     tool_calls = [logger_io.normalize_tool_call_row(r) for r in tool_calls]
@@ -290,9 +290,8 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
         scope = normalize_scope(row)
         stat = get(scope)
         stat.predictions += 1
-        # Prefer hermes_session_id (rotates on /new) for accurate per-session
-        # grouping; fall back to session_id (the stable chat key).
-        session_id = str(row.get("hermes_session_id") or row.get("session_id") or "").strip()
+        # hermes_session_id rotates on /new — accurate per-session grouping.
+        session_id = str(row.get("hermes_session_id") or "").strip()
         if session_id:
             stat.sessions.add(session_id)
         policy_source = str(row.get("policy_source") or "").strip().lower() or "preset"
@@ -392,7 +391,7 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
     pred_session: dict[str, str] = {}
     for row in predictions:
         pid = str(row.get("prediction_id") or "").strip()
-        sid = str(row.get("hermes_session_id") or row.get("session_id") or "").strip()
+        sid = str(row.get("hermes_session_id") or "").strip()
         if pid and sid:
             session_ordered_preds[sid].append(pid)
             pred_session[pid] = sid
@@ -2242,18 +2241,13 @@ def main() -> int:
 
     # Break down tool_calls by source so the headline counts don't conflate
     # narrowed gateway calls with cron / subagent calls that bypass narrowing.
-    # A row that carries an unrecognized non-empty `source` (a future writer
-    # value) is bucketed as "other" rather than re-derived — re-deriving would
-    # silently relabel a value the writer actually recorded. Only rows with no
-    # source at all fall through to the session/prediction heuristic.
+    # A row that carries an unrecognized `source` (a future writer value) is
+    # bucketed as "other" rather than re-derived — re-deriving would silently
+    # relabel a value the writer actually recorded.
     source_counts = {"gateway": 0, "cron": 0, "subagent": 0, "other": 0}
     for row in tool_calls:
         src = str(row.get("source") or "").strip()
-        if not src:
-            sid = str(row.get("session_id") or "")
-            pid = str(row.get("prediction_id") or "")
-            src = "cron" if sid.startswith("cron_") else ("gateway" if pid else "subagent")
-        elif src not in source_counts:
+        if src not in source_counts:
             src = "other"
         source_counts[src] += 1
 

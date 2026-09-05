@@ -397,10 +397,10 @@ def group_predictions_by_scope_session(
     """Returns {scope: {session_id: [normalized preds-in-order]}}.
 
     Every row is passed through :func:`normalize_prediction_row` first, so the
-    shaper works exclusively against the canonical v2 shape (``carry_tools``,
+    shaper works exclusively against the canonical shape (``carry_tools``,
     ``expand_only_tools``, ``residency`` / ``residency_inferred``, …). The
     normalizer preserves the scope/session/prediction identity fields the
-    grouping reads, so v1, v2, and mixed streams group identically.
+    grouping reads.
     """
     out: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     for raw in preds:
@@ -408,9 +408,8 @@ def group_predictions_by_scope_session(
         scope = str(p.get("scope") or "")
         # Group by the Hermes internal session UUID, which rotates on /new,
         # so a single long-lived chat yields the distinct-session count the
-        # demote threshold needs. Fall back to session_id (the session key)
-        # for older rows written before hermes_session_id existed.
-        sid = str(p.get("hermes_session_id") or p.get("session_id") or "")
+        # demote threshold needs.
+        sid = str(p.get("hermes_session_id") or "")
         if scope and sid:
             out[scope][sid].append(p)
     for scope, sessions in out.items():
@@ -592,7 +591,7 @@ def compute_scope_recommendations(
     def _valid(tool_name: str, kind: str) -> bool:
         # Tool Search bridge tools are pass-through (outside the partition,
         # see __init__._is_bridge_tool): never eligible for promotion or
-        # demotion, whoever wrote the row.
+        # demotion.
         if tool_name in _bridge_names():
             logger.warning(
                 "tool-belt: shaper rejecting %s candidate %r for scope %r — "

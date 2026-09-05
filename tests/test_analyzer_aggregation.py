@@ -80,7 +80,7 @@ class ReplayNullToleranceTests(unittest.TestCase):
         preds = [
             {"scope": "a:telegram", "hermes_session_id": "s1", "ts": 1,
              "prediction_id": "p1"},
-            # Older/malformed row: no prediction_id at all.
+            # Malformed row: no prediction_id at all.
             {"scope": "a:telegram", "hermes_session_id": "s1", "ts": 2},
             {"scope": "a:telegram", "hermes_session_id": "s1", "ts": 3,
              "prediction_id": ""},
@@ -248,11 +248,11 @@ class CliOutputParityTests(unittest.TestCase):
                 {"scope": "a:telegram", "hermes_session_id": "s1", "ts": 1,
                  "api_call_idx": 0, "tool_list_hash": "h1", "model": "m",
                  "prediction_id": "p1", "cache_read_tokens": 1000,
-                 "input_tokens": 2000},
+                 "input_tokens": 2000, "prompt_tokens": 3000},
                 {"scope": "a:telegram", "hermes_session_id": "s1", "ts": 2,
                  "api_call_idx": 1, "tool_list_hash": "h2", "model": "m",
                  "prediction_id": "p2", "cache_read_tokens": 0,
-                 "input_tokens": 2000},
+                 "input_tokens": 2000, "prompt_tokens": 2000},
             ])
             proc = subprocess.run(
                 [sys.executable, str(PLUGIN_DIR / "analyze.py"),

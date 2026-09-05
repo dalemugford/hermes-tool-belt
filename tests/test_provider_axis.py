@@ -5,8 +5,8 @@ The bug these guard against: cache-mode was keyed per SCOPE, but whether
 narrowing helps or hurts is a property of the PROVIDER, per call. A scope
 that fails over between a caching primary and a non-caching fallback was
 mis-locked in both directions. Each test here fails on the pre-fix tree
-(`_detection_key`, the ``buckets`` sub-structure, ``provider_caches``,
-``measure_expand_overhead`` and the hint table did not exist).
+(`_detection_key`, the ``buckets`` sub-structure, ``provider_caches`` and
+``measure_expand_overhead`` did not exist).
 """
 from __future__ import annotations
 
@@ -136,12 +136,19 @@ class CacheAwareSavingsTests(unittest.TestCase):
     """D4: gross priced by provider caching; overhead measured with a
     thin-data fallback."""
 
-    def test_hint_table_prices_ollama_at_full_rate(self):
-        # ollama-cloud never caches: its saved schema tokens are full-price,
-        # factor 1.0 — not the cache_read discount.
-        row = {"provider": "ollama-cloud"}
+    def test_noncaching_call_is_priced_at_full_rate(self):
+        # A call whose route never caches: its saved schema tokens are
+        # full-price, factor 1.0 — not the cache_read discount.
+        row = {"provider": "ollama-cloud", "provider_caches": False}
         self.assertIs(savings.provider_caches_for_call(row), False)
         self.assertEqual(savings.price_factor_for("gpt-5.4", False), 1.0)
+
+    def test_call_without_a_cache_status_is_unknown(self):
+        # No ``provider_caches`` on the row → unknown, for the caller to
+        # resolve from the cohort posture. Never guessed from the provider.
+        row = {"provider": "ollama-cloud"}
+        self.assertIsNone(savings.provider_caches_for_call(row))
+        self.assertEqual(savings.price_factor_for("gpt-5.4", None), 1.0)
 
     def test_caching_gross_is_cache_read_discounted(self):
         factor = savings.price_factor_for("gpt-5.4", True)

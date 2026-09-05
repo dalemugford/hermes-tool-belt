@@ -94,22 +94,26 @@ def _write_observed(state_dir: Path, scope: str, *, expand_events: int = 0) -> N
     # cache-on narrowed row
     preds.append({
         "schema_version": 2, "ts": 1780000000.0, "prediction_id": "on1",
-        "session_id": f"{scope}:S1", "scope": scope, "policy_source": "preset",
+        "session_id": f"{scope}:S1", "hermes_session_id": "S1",
+        "scope": scope, "policy_source": "preset",
         "ceiling_count": 40, "narrowed_count": 20,
-        "ceiling_tokens": 10000, "narrowed_tokens": 4000, "frozen_reuse": False,
+        "ceiling_tokens": 10000, "narrowed_tokens": 4000,
     })
     apis.append({"ts": 1780000000.0, "prediction_id": "on1", "scope": scope,
                  "api_call_idx": 0, "cache_mode": "on", "input_tokens": 4000,
+                 "prompt_tokens": 10000,
                  "cache_read_tokens": 6000, "cache_write_tokens": 0})
     # cache-off narrowed row
     preds.append({
         "schema_version": 2, "ts": 1780000001.0, "prediction_id": "off1",
-        "session_id": f"{scope}:S2", "scope": scope, "policy_source": "preset",
+        "session_id": f"{scope}:S2", "hermes_session_id": "S2",
+        "scope": scope, "policy_source": "preset",
         "ceiling_count": 40, "narrowed_count": 22,
-        "ceiling_tokens": 10000, "narrowed_tokens": 5000, "frozen_reuse": False,
+        "ceiling_tokens": 10000, "narrowed_tokens": 5000,
     })
     apis.append({"ts": 1780000001.0, "prediction_id": "off1", "scope": scope,
                  "api_call_idx": 0, "cache_mode": "off", "input_tokens": 5000,
+                 "prompt_tokens": 5000,
                  "cache_read_tokens": 0, "cache_write_tokens": 0})
     tcs = []
     for i in range(expand_events):
@@ -143,7 +147,7 @@ def _write_route_evidence(state_dir: Path, session_stem: str, calls: list[dict],
             "hermes_session_id": session_stem, "session_id": f"chat-{session_stem}",
             "scope": scope, "policy_source": "preset",
             "ceiling_count": 40, "narrowed_count": 20,
-            "ceiling_tokens": 10000, "narrowed_tokens": 4000, "frozen_reuse": False,
+            "ceiling_tokens": 10000, "narrowed_tokens": 4000,
         })
         apis.append({
             "ts": base_ts + i, "prediction_id": pid, "session_id": f"chat-{session_stem}",
@@ -152,6 +156,7 @@ def _write_route_evidence(state_dir: Path, session_stem: str, calls: list[dict],
             "provider": call.get("provider", ""),
             "api_mode": call.get("api_mode", ""),
             "input_tokens": int(call.get("input_tokens") or 0),
+            "prompt_tokens": int(call.get("input_tokens") or 0),
             "cache_read_tokens": 0, "cache_write_tokens": 0,
         })
     (state_dir / "predictions.jsonl").write_text(
@@ -457,7 +462,7 @@ class BypassExpansionOverheadTests(_HomeCase):
     def test_bypass_expansion_does_not_reduce_net(self):
         state = self.home / "state" / "tool-belt"
         _write_observed(state, "default:telegram")
-        baseline = savings.compute_observed(state).net_token_reduction
+        baseline = savings.compute_observed(state).net_forward
         # A bypass prediction (never narrowed) with an expansion on it.
         with (state / "predictions.jsonl").open("a", encoding="utf-8") as fh:
             fh.write(json.dumps({
@@ -473,27 +478,28 @@ class BypassExpansionOverheadTests(_HomeCase):
                 "prediction_id": "byp1", "scope": "default:telegram",
                 "tool_name": "expand_tools", "source": "gateway",
             }) + "\n")
-        self.assertEqual(savings.compute_observed(state).net_token_reduction,
+        self.assertEqual(savings.compute_observed(state).net_forward,
                          baseline)
 
 
 class ForwardVsHistoricalNetTests(_HomeCase):
-    """The headline is the ONGOING (non-caching) net. A caching-provider
-    expand break is a one-time cost carry-all eliminated (D1), so it drags
-    the blended history but must NOT reduce the forward figure the report
-    quotes and projects (2026-09-02)."""
+    """The headline is the non-caching net. A caching-provider expand break
+    is a one-time cost carry-all eliminated (D1), so it must NOT reduce the
+    figure the report quotes and projects (2026-09-02)."""
 
     def _seed(self, state):
         state.mkdir(parents=True, exist_ok=True)
         preds = [
             # Caching cohort: narrowed, and its expand broke the prefix cache.
             {"schema_version": 2, "ts": 1.0, "prediction_id": "cach",
-             "session_id": "default:telegram:S1", "scope": "default:telegram",
+             "session_id": "default:telegram:S1", "hermes_session_id": "S1",
+             "scope": "default:telegram",
              "policy_source": "preset", "ceiling_count": 40, "narrowed_count": 20,
              "ceiling_tokens": 10000, "narrowed_tokens": 4000},
             # Non-caching cohort: narrowed, no expand — the ongoing engine.
             {"schema_version": 2, "ts": 2.0, "prediction_id": "ncach",
-             "session_id": "default:telegram:S2", "scope": "default:telegram",
+             "session_id": "default:telegram:S2", "hermes_session_id": "S2",
+             "scope": "default:telegram",
              "policy_source": "preset", "ceiling_count": 40, "narrowed_count": 22,
              "ceiling_tokens": 10000, "narrowed_tokens": 5000},
         ]
@@ -520,15 +526,13 @@ class ForwardVsHistoricalNetTests(_HomeCase):
         state = self.home / "state" / "tool-belt"
         self._seed(state)
         obs = savings.compute_observed(state)
-        # The caching cohort's history is net-negative (tiny cache-read-priced
-        # savings minus the break), and carry-all eliminates it going forward.
-        self.assertLess(obs.net_caching_historical, 0)
-        # The forward net is the non-caching cohort only, and is strictly
-        # higher than the blended history that still carries the break.
+        # The caching cohort's expand break is seen (it is counted as an
+        # event) but charged nowhere: the net is the non-caching cohort only.
+        self.assertEqual(obs.expansion_events, 1)
+        self.assertEqual(obs.overhead_noncaching, 0)
         self.assertEqual(
             obs.net_forward,
             obs.saved_input_equiv_noncaching - obs.overhead_noncaching)
-        self.assertGreater(obs.net_forward, obs.net_token_reduction)
         # The non-caching engine is genuinely positive (full-price schema
         # saved, no expand overhead on it).
         self.assertGreater(obs.net_forward, 0)
@@ -1005,9 +1009,8 @@ class AnnualizedPaceTests(_HomeCase):
         obs = savings.ObservedCohort(
             n_predictions=10, n_sessions=5,
             realized_schema_token_reduction=100_000,
-            net_token_reduction=100_000,
-            # The headline and pace project the ONGOING (non-caching) net, and
-            # the average/pace scope to the uncached sessions/span.
+            # The headline and pace project the non-caching net, and the
+            # average/pace scope to the uncached sessions/span.
             net_forward=100_000,
             saved_input_equiv_noncaching=100_000,
             n_sessions_noncaching=5,

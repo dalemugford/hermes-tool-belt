@@ -1281,8 +1281,6 @@ def _maybe_log_prediction(
             tool_list_hash=_tool_list_hash(narrowed),
             provider=str(state.get("provider", "")),
             model=str(state.get("model", "")),
-            frozen_reuse=bool(state.get("frozen_reuse", False)),
-            frozen_reuse_count=int(state.get("frozen_reuse_count", 0)),
         )
         logger_io.log_prediction(record)
         # Per-tool schema size snapshot for the shaper's token-denominated
@@ -2002,14 +2000,14 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                 attribution_agent, attribution_platform, attribution_scope = (
                     _recover_attribution_without_state(session_id, kwargs)
                 )
-            # was_initially_available reflects the pre-sticky baseline so the
-            # analyzer's "credit only when not initially available" filter
+            # was_initially_active reflects the pre-sticky baseline so the
+            # analyzer's "credit only when not initially active" filter
             # (analyze.py) lines up with the writer's credit decision below.
             base_name = _base_tool_name(tool)
             if baseline_allowed is None:
-                was_initially_available = True
+                was_initially_active = True
             else:
-                was_initially_available = (
+                was_initially_active = (
                     tool in baseline_allowed or base_name in baseline_allowed
                 )
             # Tag the call's source so the analyzer can filter cleanly.
@@ -2062,7 +2060,7 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                 "scope": attribution_scope,
                 "source": source,
                 "tool_call_id": tool_call_id,
-                "was_initially_active": was_initially_available,
+                "was_initially_active": was_initially_active,
                 "was_expand_only": tool in expand_only,
                 "activated_by_expansion": tool in expanded,
                 "activation_source": activation_source,
@@ -2071,7 +2069,7 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                 extra["expand_event"] = pending_expansion
             else:
                 # Only credit a tool call as "expansion-driven" when the
-                # tool was NOT already in the initial allowed set. A tool
+                # tool was NOT already in the initial active set. A tool
                 # the model could have called regardless gives no signal
                 # about whether the expansion was useful — it would
                 # inflate analyzer promotion signal with noise.
@@ -2079,16 +2077,16 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                 # record when an expansion happened, so analyzers can
                 # account for round-trip cost even when the eventual
                 # tool call wasn't expansion-driven.
-                already_available = was_initially_available
+                already_active = was_initially_active
                 expand_use: dict[str, Any] = {}
-                if not already_available:
+                if not already_active:
                     expand_use = _pending_expansion_for_tool(pending_expansion, tool)
                 if pending_expansion:
                     extra["after_expand_tools"] = True
                     extra["expand_category"] = pending_expansion.get("category", "")
                     extra["expand_resolved_tools"] = pending_expansion.get("resolved_tools", [])
                     extra["expand_tools_added"] = pending_expansion.get("tools_added", [])
-                if not expand_use and state and not already_available:
+                if not expand_use and state and not already_active:
                     expand_use = _sticky_expansion_for_tool(
                         str(state.get("sticky_key", "")),
                         str(state.get("scope", "")),
