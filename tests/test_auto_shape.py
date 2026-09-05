@@ -48,7 +48,8 @@ def _shaping_mod():
     return importlib.import_module("tool_belt_plugin.shaping")
 
 
-def seed_state_dir(state_dir: Path, *, scope: str = SCOPE, sessions: int = 3) -> None:
+def seed_state_dir(state_dir: Path, *, scope: str = SCOPE, sessions: int = 3,
+                   policy_source: str = "preset") -> None:
     """Telemetry yielding exactly one promote candidate (``grep_files``)."""
     state_dir.mkdir(parents=True, exist_ok=True)
     now = time.time()
@@ -56,6 +57,7 @@ def seed_state_dir(state_dir: Path, *, scope: str = SCOPE, sessions: int = 3) ->
     for i in range(sessions):
         pid = f"pred-{i}"
         preds.append({
+            "policy_source": policy_source,
             "ts": now + i,
             "schema_version": 2,
             "scope": scope,
@@ -188,6 +190,38 @@ class SessionEndAutoApplyTests(AutoShapeBase):
         self.assertIsNotNone(self.learned_doc())  # the apply really happened
         self.assertIs(plugin._CACHE_DECISION_BY_SESSION["live-key"], pin)
         self.assertEqual(plugin._CACHE_DECISION_BY_SESSION["live-key"], snapshot)
+
+
+class CarryAllTrafficTests(AutoShapeBase):
+    """A scope whose whole window ran carry-all has nothing to learn from:
+    the pass reports it and leaves it UNSTAMPED, so it re-qualifies the
+    moment a session lands on an uncached route."""
+
+    def test_carry_all_only_scope_is_skipped_and_left_unstamped(self):
+        seed_state_dir(self.state_dir, policy_source="cache_on_carry_all")
+        shaping = _shaping_mod()
+        summary = shaping.auto_shape_run(self.config, self.state_dir)
+        self.assertEqual(summary.get("skipped_no_narrowed_sessions"), [SCOPE])
+        self.assertIsNone(self.learned_doc(),
+                          "no evidence — nothing may be written")
+        stamps_path = self.state_dir / shaping.AUTO_SHAPE_STAMP_FILE
+        stamps = (json.loads(stamps_path.read_text(encoding="utf-8"))
+                  if stamps_path.exists() else {})
+        self.assertNotIn(SCOPE, stamps,
+                         "an unshaped scope must not start its debounce clock")
+
+    def test_narrowed_traffic_arriving_later_shapes_at_once(self):
+        # Same scope, now with narrowed sessions: no stale debounce stamp
+        # stands in the way.
+        seed_state_dir(self.state_dir, policy_source="cache_on_carry_all")
+        shaping = _shaping_mod()
+        shaping.auto_shape_run(self.config, self.state_dir)
+        seed_state_dir(self.state_dir)
+        summary = shaping.auto_shape_run(self.config, self.state_dir)
+        self.assertEqual(summary.get("skipped_no_narrowed_sessions"), [])
+        doc = self.learned_doc()
+        self.assertIsNotNone(doc)
+        self.assertIn("grep_files", doc["scopes"][SCOPE]["carry"])
 
 
 class FutureSchemaGuardTests(AutoShapeBase):

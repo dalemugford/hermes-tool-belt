@@ -840,7 +840,6 @@ def compute_recommendations(info: ScopeInfo, thresholds: dict[str, int]) -> dict
         demote_min_sessions_no_use=int(thresholds.get("demote_min_sessions_no_use", 2)),
         demote_k=float(thresholds.get("demote_k", 1.5)),
         schema_sizes=shaper.load_schema_sizes(info.state_dir),
-        cache_mode=shaper.read_cache_mode(info.state_dir, info.scope),
         api_call_counts=shaper.index_api_call_counts(api_calls),
         # Price on-demand expansion at the scope's MEASURED cost — same source
         # as production auto_shape_run — so interactive review never shows a

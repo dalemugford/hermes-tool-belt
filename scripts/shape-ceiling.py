@@ -10,6 +10,12 @@ promote/demote recommendations into ``learned.json``. The plugin's existing
 ``apply_to_preset`` machinery picks them up automatically when
 ``learned_mode`` is ``apply``.
 
+Evidence is the NARROWED traffic. A carry-all turn shipped the full ceiling
+and offered no ``expand_tools``, so it testifies to nothing; such rows are
+dropped and a session left with none of its own is not a session. A scope
+whose window holds no narrowed session reports
+``reason: "no_narrowed_sessions"``.
+
 What it computes
 ================
 
@@ -96,7 +102,7 @@ logger = logging.getLogger("tool_belt_plugin.shape_ceiling")
 #: bumped whenever a key is removed or its meaning changes; additive keys do
 #: not bump it.
 PORCELAIN_SCHEMA = "tool-belt/shape-ceiling"
-PORCELAIN_VERSION = 2
+PORCELAIN_VERSION = 3
 
 
 def _load_shaping():
@@ -136,7 +142,6 @@ index_tool_calls_by_prediction = _shaping.index_tool_calls_by_prediction
 compute_scope_recommendations = _shaping.compute_scope_recommendations
 merge_into_learned = _shaping.merge_into_learned
 load_schema_sizes = _shaping.load_schema_sizes
-read_cache_mode = _shaping.read_cache_mode
 index_api_call_counts = _shaping.index_api_call_counts
 measured_expand_penalty = _shaping.measured_expand_penalty
 filter_protected_demotions = _shaping.filter_protected_demotions
@@ -188,7 +193,13 @@ def build_porcelain(
         considered = int(recs.get("sessions_considered") or 0)
         scopes.append({
             "scope": scope,
+            # NARROWED sessions inside the window: carry-all turns shipped the
+            # full ceiling and are not evidence, so they are not counted.
             "sessions_considered": considered,
+            # "" on a scope that was analysed; "no_narrowed_sessions" when the
+            # window held nothing narrowed, so empty promote/demote lists mean
+            # "no evidence exists", not "the evidence said hold".
+            "reason": str(recs.get("reason") or ""),
             "window_days": int(recs.get("window_days") or 0),
             "computed_at": recs.get("computed_at"),
             # The per-event expansion cost that priced this scope's demote/
@@ -337,7 +348,6 @@ def main() -> int:
             demote_min_sessions_no_use=args.demote_min_sessions,
             demote_k=args.demote_k,
             schema_sizes=schema_sizes,
-            cache_mode=read_cache_mode(state_dir, scope),
             api_call_counts=api_counts,
             expand_round_trip_tokens=measured_expand_penalty(
                 preds, api_calls, tool_calls, scope),

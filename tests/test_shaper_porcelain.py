@@ -63,7 +63,8 @@ bootstrap = _load_script("tool_belt_bootstrap_test", "bootstrap.py")
 harvest_replay = _load_script("tool_belt_harvest_test", "harvest-replay.py")
 
 
-def seed_state_dir(state_dir: Path, *, scope: str = "agent-a:telegram", sessions: int = 3) -> None:
+def seed_state_dir(state_dir: Path, *, scope: str = "agent-a:telegram", sessions: int = 3,
+                   policy_source: str = "preset") -> None:
     """Write telemetry that yields exactly one promote candidate for ``scope``."""
     state_dir.mkdir(parents=True, exist_ok=True)
     now = time.time()
@@ -71,6 +72,7 @@ def seed_state_dir(state_dir: Path, *, scope: str = "agent-a:telegram", sessions
     for i in range(sessions):
         pid = f"pred-{i}"
         preds.append({
+            "policy_source": policy_source,
             "ts": now + i,
             "schema_version": 2,
             "scope": scope,
@@ -119,6 +121,9 @@ class PorcelainDocumentTests(unittest.TestCase):
 
         self.assertEqual(doc["schema"], "tool-belt/shape-ceiling")
         self.assertEqual(doc["version"], shape_ceiling.PORCELAIN_VERSION)
+        # v3: ``sessions_considered`` counts NARROWED sessions only and
+        # ``reason`` carries "no_narrowed_sessions" for a scope with none.
+        self.assertEqual(doc["version"], 3)
         for key in ("generated_at", "state_dir", "learned_path", "dry_run",
                     "changed", "wrote_learned_state", "thresholds", "scopes"):
             self.assertIn(key, doc)
@@ -132,6 +137,8 @@ class PorcelainDocumentTests(unittest.TestCase):
         scope_doc = doc["scopes"][0]
         self.assertEqual(scope_doc["scope"], "agent-a:telegram")
         self.assertEqual(scope_doc["sessions_considered"], 3)
+        self.assertEqual(scope_doc["reason"], "",
+                         "a scope that was analysed reports no skip reason")
         self.assertEqual(
             scope_doc["promote"],
             [{"tool": "grep_files", "sessions": 3, "calls": 3, "evidence": "expansion"}],
@@ -172,6 +179,18 @@ class PorcelainDocumentTests(unittest.TestCase):
         json.loads(result.stdout)  # would raise if prose leaked into stdout
         self.assertIn("=== agent-a:telegram", result.stderr)
 
+    def test_carry_all_only_scope_reports_no_narrowed_sessions(self):
+        carry_all = self.tmp / "carry-all" / "tool-belt"
+        seed_state_dir(carry_all, policy_source="cache_on_carry_all")
+        result = run_shaper(carry_all, "--dry-run", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        scope_doc = json.loads(result.stdout)["scopes"][0]
+        self.assertEqual(scope_doc["reason"], "no_narrowed_sessions")
+        self.assertEqual(scope_doc["sessions_considered"], 0,
+                         "carry-all turns are not sessions the shaper counts")
+        self.assertEqual(scope_doc["promote"], [])
+        self.assertEqual(scope_doc["demote"], [])
+
     def test_empty_state_still_emits_a_parseable_document(self):
         empty = self.tmp / "empty"
         empty.mkdir()
@@ -188,13 +207,14 @@ class BootstrapConsumesPorcelainTests(unittest.TestCase):
 
     PORCELAIN = {
         "schema": "tool-belt/shape-ceiling",
-        "version": 1,
+        "version": 3,
         "dry_run": True,
         "changed": True,
         "wrote_learned_state": False,
         "scopes": [{
             "scope": "agent-a:telegram",
             "sessions_considered": 22,
+            "reason": "",
             "promote": [{"tool": "grep_files", "sessions": 4, "calls": 9,
                          "evidence": "expansion"}],
             "demote": [{"tool": "stale_tool", "sessions_without_use": 22,
@@ -203,7 +223,7 @@ class BootstrapConsumesPorcelainTests(unittest.TestCase):
         }],
     }
 
-    def _run_with_stdout(self, stdout: str):
+    def _run_with_stdout(self, stdout: str, carry_all: list[dict] | None = None):
         captured: list[list[str]] = []
 
         def fake_run(argv, **kwargs):
@@ -212,8 +232,25 @@ class BootstrapConsumesPorcelainTests(unittest.TestCase):
 
         with mock.patch.object(bootstrap.subprocess, "run", fake_run):
             actions = bootstrap._shape_ceiling_actions(
-                [("default", Path("/nonexistent/state"))], sys.executable)
+                [("default", Path("/nonexistent/state"))], sys.executable,
+                carry_all_scopes=carry_all)
         return actions, captured
+
+    def test_no_narrowed_sessions_scope_is_reported_not_mined(self):
+        doc = json.loads(json.dumps(self.PORCELAIN))
+        doc["scopes"].append({
+            "scope": "agent-b:slack",
+            "sessions_considered": 0,
+            "reason": "no_narrowed_sessions",
+            "promote": [],
+            "demote": [],
+            "demote_skipped_insufficient_sessions": True,
+        })
+        carry_all: list[dict] = []
+        actions, _ = self._run_with_stdout(json.dumps(doc), carry_all)
+        self.assertEqual(carry_all, [{"label": "default", "scope": "agent-b:slack"}])
+        self.assertEqual({a["scope"] for a in actions}, {"agent-a:telegram"},
+                         "a scope with no narrowed sessions yields no actions")
 
     def test_consumes_json_and_ignores_prose_wording(self):
         # The document is the whole stdout — exactly what --json produces.

@@ -268,113 +268,6 @@ def load_cli_plugin_config(hermes_home: Path | None = None) -> dict[str, Any]:
     return config
 
 
-def resolve_primary_detection_entry(
-    detection_cache: dict[str, Any],
-    scope: str,
-    primary_provider: str | None = None,
-) -> dict[str, Any]:
-    """The detection entry that defines a scope's effective cache posture.
-
-    ``cache_mode_detection.json`` is keyed ``"<scope>|<provider>"`` (one
-    bucket per route the scope has been served on; a session with no provider
-    name writes a bare ``"<scope>"`` key). A scope's posture for shaping is the bucket of its
-    PRIMARY provider, resolved in order:
-
-      1. ``"<scope>|<primary_provider>"`` when the caller names the configured
-         primary (``model.provider``) and that bucket exists;
-      2. else the ``"<scope>|…"`` bucket with the highest ``sessions_locked``
-         (ties → most recent ``locked_at``) — the route the scope actually
-         runs on most;
-      3. else the bare ``"<scope>"`` key.
-
-    Returns the whole entry (``mode``, ``hit_rate_at_lock``,
-    ``sessions_locked``, ``last_model``, …) so display callers get the full
-    record; ``{}`` when nothing resolves.
-    """
-    if not isinstance(detection_cache, dict):
-        return {}
-    # The hot path writes keys with the provider lowercased/stripped
-    # (``__init__._detection_key``); normalise the lookup the same way so a
-    # mixed-case ``model.provider`` in config still lands on its bucket.
-    primary_provider = str(primary_provider or "").strip().lower()
-    if primary_provider:
-        entry = detection_cache.get(f"{scope}|{primary_provider}")
-        if isinstance(entry, dict):
-            return entry
-    prefix = f"{scope}|"
-    best: dict[str, Any] | None = None
-    best_key: tuple[int, float] | None = None
-    for key, entry in detection_cache.items():
-        if not (isinstance(key, str) and key.startswith(prefix) and isinstance(entry, dict)):
-            continue
-        try:
-            rank = (int(entry.get("sessions_locked") or 0), float(entry.get("locked_at") or 0.0))
-        except (TypeError, ValueError):
-            rank = (0, 0.0)
-        if best_key is None or rank > best_key:
-            best, best_key = entry, rank
-    if best is not None:
-        return best
-    bare = detection_cache.get(scope)
-    return bare if isinstance(bare, dict) else {}
-
-
-def _profile_primary_provider(state_dir: Path) -> str | None:
-    """Best-effort ``model.provider`` for the profile owning ``state_dir``.
-
-    ``state_dir`` is ``<profile_home>/state/tool-belt``, so the profile's own
-    ``config.yaml`` sits two levels up — read that first, which keeps offline
-    CLI runs against another profile's state dir honest. Falls back to the
-    Hermes config loader (the running profile) when the file is absent or
-    unreadable. None when neither resolves.
-    """
-    config_path = Path(state_dir).parent.parent / "config.yaml"
-    try:
-        yaml = require_yaml()
-        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-        model = raw.get("model") if isinstance(raw, dict) else None
-        provider = model.get("provider") if isinstance(model, dict) else None
-        if isinstance(provider, str) and provider.strip():
-            return provider.strip()
-    except Exception:
-        pass
-    try:
-        from hermes_cli.config import load_config, cfg_get  # type: ignore[import-not-found]
-        provider = cfg_get(load_config(), "model", "provider", default=None)
-        if isinstance(provider, str) and provider.strip():
-            return provider.strip()
-    except Exception:
-        pass
-    return None
-
-
-def read_cache_mode(state_dir: Path, scope: str) -> str | None:
-    """The scope's locked prompt-cache mode ('on'/'off'), or None when unknown.
-
-    Read from ``cache_mode_detection.json`` (written by the hot path's cache
-    detector) through :func:`resolve_primary_detection_entry`: the scope's
-    effective posture is the bucket of its PRIMARY provider (configured
-    ``model.provider`` → most-locked ``<scope>|<provider>`` bucket → bare
-    ``<scope>`` key). Under ``"on"`` the plugin carries everything and ships
-    no ``expand_tools`` (D1), so shaping is moot for the scope; ``"off"``
-    shapes on the measured non-caching economics; unknown is treated by the
-    economics as cache-on exposures (one per session) — the conservative
-    direction, biasing toward carrying.
-    """
-    try:
-        with (state_dir / "cache_mode_detection.json").open("r", encoding="utf-8") as fh:
-            doc = json.load(fh)
-        entry = resolve_primary_detection_entry(
-            doc, scope, _profile_primary_provider(state_dir)
-        )
-        mode = entry.get("mode")
-        if mode in ("on", "off"):
-            return str(mode)
-    except Exception:
-        pass
-    return None
-
-
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -480,25 +373,26 @@ def compute_scope_recommendations(
     demote_min_sessions_no_use: int,
     demote_k: float = 1.5,
     schema_sizes: dict[str, int] | None = None,
-    cache_mode: str | None = None,
     api_call_counts: dict[str, int] | None = None,
     expand_round_trip_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Per-scope promote/demote analysis over canonical v2 rows.
 
-    ``cache_mode == "on"`` short-circuits: on a caching provider the plugin
-    carries everything and ships no ``expand_tools`` (decision D1), so there
-    is nothing to demote or promote — the result carries empty lists and
-    ``reason: "caching_provider_carry_all"``. ``expand_round_trip_tokens`` is
-    the per-session expansion penalty for the non-caching economics: the
+    Learning keys on the TRAFFIC, not on a configured provider. Every
+    prediction row records how the runtime actually treated its turn, and a
+    carry-all row (``policy_source == "cache_on_carry_all"``) is not evidence:
+    the full ceiling shipped, no ``expand_tools`` was offered, so nothing was
+    narrowed to demote and nothing was expanded to promote. Such rows are
+    dropped up front and a session left with none of its own is not a session
+    — ``sessions_considered``, the day window and the session floor all
+    operate on NARROWED sessions only. A scope whose window holds no narrowed
+    session returns an explicit no-op with ``reason: "no_narrowed_sessions"``.
+    An agent that mostly runs on a caching provider therefore still learns
+    from every session that lands on an uncached one, just more slowly.
+
+    ``expand_round_trip_tokens`` is the per-session expansion penalty: the
     scope's MEASURED expand meta-call cost (``savings.measure_expand_overhead``),
     falling back to :data:`EXPAND_ROUND_TRIP_TOKENS` when None.
-
-    Carry-all rows (``policy_source == "cache_on_carry_all"``) still count as
-    USAGE evidence here — which tools were actually called — but can never be
-    expansion evidence: they carry no expansion flags and no ``expand_tools``
-    calls, so they feed the demote arm's use/no-use sessions and never the
-    promote arm.
 
     Promote evidence: a tool-call row whose ``activated_by_expansion`` or
     ``expansion_provided_access`` flag is set — direct evidence the model reached
@@ -528,6 +422,19 @@ def compute_scope_recommendations(
     for the scope; a toolset/category-only value can never be stored in a per-tool
     carrying list (it is dropped with a warning).
     """
+    # Narrowing filter, before anything else. A carry-all turn shipped the
+    # full ceiling and offered no expand_tools, so it can testify to neither
+    # arm; a session whose every row is carry-all drops out entirely and never
+    # counts toward the window or the session floor.
+    narrowed_sessions = {
+        sid: rows
+        for sid, plist in sessions.items()
+        if (rows := [
+            p for p in plist
+            if str(p.get("policy_source") or "") != "cache_on_carry_all"
+        ])
+    }
+
     # Recency filter, newest first. "Now" is the newest activity in the data,
     # not time.time(): the shaper is judged on the telemetry it was handed, so
     # a replay of archived rows and the live run that produced them reach the
@@ -535,7 +442,7 @@ def compute_scope_recommendations(
     # to "everything" (cutoff ≤ 0) rather than discarding the data.
     last_ts_by_session = {
         sid: max((p.get("ts", 0) or 0) for p in plist)
-        for sid, plist in sessions.items()
+        for sid, plist in narrowed_sessions.items()
     }
     session_ids_ordered = sorted(
         last_ts_by_session, key=lambda sid: -last_ts_by_session[sid]
@@ -546,7 +453,7 @@ def compute_scope_recommendations(
     recent_session_ids = [
         sid for sid in session_ids_ordered if last_ts_by_session[sid] >= cutoff
     ]
-    recent_sessions = {sid: sessions[sid] for sid in recent_session_ids}
+    recent_sessions = {sid: narrowed_sessions[sid] for sid in recent_session_ids}
 
     # Concrete enabled tool names seen for THIS scope — the validation domain
     # for candidate names. Union of every prediction tool list plus every
@@ -573,19 +480,19 @@ def compute_scope_recommendations(
                 if name:
                     enabled_names.add(name)
 
-    if cache_mode == "on":
-        # Caching provider → carry-all (D1): no expand_tools is ever shipped,
-        # so demotion saves nothing and promotion has nothing to recover
-        # from. Explicit no-op so callers/porcelain can say why.
+    if not recent_sessions:
+        # Nothing narrowed inside the window: no expand_tools was ever
+        # shipped, so demotion saves nothing and promotion has nothing to
+        # recover from. Explicit no-op so callers/porcelain can say why.
         return {
             "scope": scope,
             "computed_at": _utc_iso(),
-            "sessions_considered": len(recent_sessions),
+            "sessions_considered": 0,
             "window_days": days,
             "promote": [],
             "demote": [],
             "enabled_tool_names": sorted(enabled_names),
-            "reason": "caching_provider_carry_all",
+            "reason": "no_narrowed_sessions",
         }
 
     def _valid(tool_name: str, kind: str) -> bool:
@@ -667,10 +574,10 @@ def compute_scope_recommendations(
     # non-caching route — the measured expand meta-call input (one extra
     # full-price API call; tens of thousands of tokens on a long session),
     # not a flat guess; EXPAND_ROUND_TRIP_TOKENS is only the thin-data
-    # fallback. Caching scopes never reach this math (carry-all, above).
-    # Billable exposures per session: cache off pays the manifest on every
-    # API call (counted from api_calls.jsonl per prediction, min 1); an
-    # unknown posture — the conservative read — roughly once per session.
+    # fallback. Billable exposures per session: every remaining session is a
+    # narrowed one by construction, and a narrowed turn re-pays the manifest
+    # on every API call — counted from api_calls.jsonl per prediction, min 1
+    # when a prediction has no api-call rows (logging off, or older data).
     # Trigger activations don't count as use: triggers stay free for a
     # demoted tool. Only adaptive carry residents from residency-inferred
     # rows are demotable.
@@ -689,13 +596,10 @@ def compute_scope_recommendations(
     api_counts = api_call_counts or {}
     session_exposures: dict[str, int] = {}
     for sid, plist in recent_sessions.items():
-        if cache_mode == "off":
-            session_exposures[sid] = sum(
-                max(1, int(api_counts.get(p.get("prediction_id", ""), 1) or 1))
-                for p in plist
-            )
-        else:
-            session_exposures[sid] = 1
+        session_exposures[sid] = sum(
+            max(1, int(api_counts.get(p.get("prediction_id", ""), 1) or 1))
+            for p in plist
+        )
         for p in plist:
             if p.get("residency_inferred"):
                 residency = p.get("residency") or {}
@@ -1716,12 +1620,13 @@ def auto_shape_run(
       · The per-scope debounce interval has elapsed since the scope's
         ``shaping.last_auto_shape_at`` (default 24h,
         ``auto_shape_interval_hours`` to override).
-      · The scope's cache posture (:func:`read_cache_mode`) is not ``"on"``:
-        a caching provider runs carry-all (D1) and ships no ``expand_tools``,
-        so there is nothing to shape — such scopes are listed under
-        ``skipped_carry_all`` and left unstamped.
+    Evidence is keyed to the traffic: ``compute_scope_recommendations`` reads
+    only the scope's NARROWED sessions. A scope whose window holds none comes
+    back as a no-op with ``reason == "no_narrowed_sessions"`` — it is listed
+    under ``skipped_no_narrowed_sessions`` and left unstamped, so it
+    re-qualifies the moment narrowed traffic appears.
 
-    The non-caching demote/promote penalty is the scope's MEASURED expansion
+    The demote/promote penalty is the scope's MEASURED expansion
     cost (``savings.measure_expand_overhead``), falling back to
     :data:`EXPAND_ROUND_TRIP_TOKENS` on thin data.
 
@@ -1789,24 +1694,16 @@ def auto_shape_run(
     stamps = _read_auto_shape_stamps(sd)
 
     eligible: list[str] = []
-    skipped_carry_all: list[str] = []
-    cache_modes: dict[str, str | None] = {}
     for scope in sorted(grouped):
         if learned.learned_mode(plugin_config, scope) != "apply":
             continue  # no standing consent — never auto-write
-        cache_modes[scope] = read_cache_mode(sd, scope)
-        if cache_modes[scope] == "on":
-            # Caching provider → carry-all (D1): nothing to shape. Not
-            # stamped, so a posture flip re-qualifies the scope at once.
-            skipped_carry_all.append(scope)
-            continue
         last = _parse_utc_iso(stamps.get(scope))
         interval_s = auto_shape_interval_hours(plugin_config, scope) * 3600.0
         if last is not None and (now - last) < interval_s:
             continue  # debounced
         eligible.append(scope)
 
-    summary["skipped_carry_all"] = skipped_carry_all
+    summary["skipped_no_narrowed_sessions"] = []
     if not eligible:
         summary["reason"] = "no_eligible_scopes"
         return summary
@@ -1835,12 +1732,26 @@ def auto_shape_run(
             demote_min_sessions_no_use=thresholds["demote_min_sessions_no_use"],
             demote_k=thresholds["demote_k"],
             schema_sizes=schema_sizes,
-            cache_mode=cache_modes.get(scope),
             api_call_counts=api_counts,
             expand_round_trip_tokens=_penalty_per_event(scope),
         )
         for scope in eligible
     }
+
+    # A scope with no narrowed session in the window had nothing to learn
+    # from. Drop it from the pass and leave it unstamped, so it re-qualifies
+    # as soon as a session lands on an uncached route.
+    skipped_no_narrowed_sessions = [
+        scope for scope, recs in per_scope.items()
+        if recs.get("reason") == "no_narrowed_sessions"
+    ]
+    for scope in skipped_no_narrowed_sessions:
+        per_scope.pop(scope, None)
+    eligible = [s for s in eligible if s not in set(skipped_no_narrowed_sessions)]
+    summary["skipped_no_narrowed_sessions"] = skipped_no_narrowed_sessions
+    if not eligible:
+        summary["reason"] = "no_eligible_scopes"
+        return summary
 
     # always_carry (policy ∪ config pins) is undemotable by construction.
     per_scope = filter_protected_demotions(plugin_config, per_scope)

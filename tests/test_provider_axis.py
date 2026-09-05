@@ -156,20 +156,87 @@ class CacheAwareSavingsTests(unittest.TestCase):
                         "on a caching provider saved schema tokens are worth "
                         "the cache_read rate, not full input")
 
-    def test_resolve_primary_detection_entry_is_case_insensitive(self):
-        cache = {"assistant-a:telegram|openrouter": {"mode": "on"}}
-        entry = shaping.resolve_primary_detection_entry(
-            cache, "assistant-a:telegram", "OpenRouter")
-        self.assertEqual(entry.get("mode"), "on",
-                         "a mixed-case configured primary still resolves")
 
-    def test_caching_scope_shaping_is_a_no_op(self):
-        recs = shaping.compute_scope_recommendations(
-            scope="assistant-a:telegram", sessions={}, calls_by_pred={},
+class NarrowedTrafficShapingTests(unittest.TestCase):
+    """Shaping keys on the TRAFFIC, not on the configured primary provider.
+
+    A carry-all turn shipped the full ceiling and offered no ``expand_tools``,
+    so it is evidence for neither arm. These fail on a tree that short-circuits
+    the whole scope on its primary provider's cache posture: there, a mixed
+    scope either learns from carry-all sessions it should ignore, or learns
+    from nothing at all.
+    """
+
+    SCOPE = "assistant-a:telegram"
+    E = ["clarify", "browser_exec", "terminal"]
+
+    def _sessions(self, n, *, carry_all_ids=(), start=0):
+        """n sessions, one prediction each, ``browser_exec`` carried and never
+        used. Sessions named in ``carry_all_ids`` are stamped carry-all."""
+        preds, calls = [], []
+        for i in range(start, start + n):
+            pid = f"p{i}"
+            row = {
+                "schema_version": 2,
+                "scope": self.SCOPE,
+                "hermes_session_id": f"s{i}",
+                "prediction_id": pid,
+                "ts": float(i),
+                "ceiling_tools": list(self.E),
+                "always_carry_tools": ["clarify"],
+                "carry_tools": ["browser_exec", "terminal"],
+                "active_tools": list(self.E),
+                "expand_only_tools": [],
+            }
+            if i in carry_all_ids:
+                row["policy_source"] = "cache_on_carry_all"
+            preds.append(row)
+            calls.append({
+                "schema_version": 2, "prediction_id": pid,
+                "tool_name": "terminal", "was_initially_active": True,
+                "activation_source": "carry",
+            })
+        return preds, calls
+
+    def _compute(self, preds, calls, **overrides):
+        grouped = shaping.group_predictions_by_scope_session(preds)
+        kwargs = dict(
             window_days=7, promote_min_sessions=2, promote_min_calls=3,
-            demote_min_sessions_no_use=20, cache_mode="on",
+            demote_min_sessions_no_use=20,
+            schema_sizes={"browser_exec": 2000},
         )
-        self.assertEqual(recs.get("reason"), "caching_provider_carry_all")
+        kwargs.update(overrides)
+        return shaping.compute_scope_recommendations(
+            scope=self.SCOPE, sessions=grouped.get(self.SCOPE, {}),
+            calls_by_pred=shaping.index_tool_calls_by_prediction(calls),
+            **kwargs,
+        )
+
+    def test_mixed_traffic_shapes_from_the_narrowed_sessions_only(self):
+        # 40 sessions, 20 of them carry-all: only the 20 narrowed ones are
+        # evidence, and the demote saving is priced over those alone.
+        preds, calls = self._sessions(40, carry_all_ids=set(range(20)))
+        recs = self._compute(preds, calls)
+        self.assertEqual(recs.get("sessions_considered"), 20)
+        entry = {d["tool"]: d for d in recs["demote"]}
+        self.assertIn("browser_exec", entry)
+        self.assertEqual(entry["browser_exec"]["sessions_without_use"], 20)
+        self.assertEqual(entry["browser_exec"]["carry_tokens"], 2000 * 20)
+
+    def test_carry_all_sessions_do_not_reach_the_session_floor(self):
+        # 25 sessions, 20 of them carry-all: 5 narrowed sessions is under
+        # demote_min_sessions_no_use=20, so the demote arm must not run.
+        preds, calls = self._sessions(25, carry_all_ids=set(range(20)))
+        recs = self._compute(preds, calls)
+        self.assertEqual(recs.get("sessions_considered"), 5)
+        self.assertEqual(recs["demote"], [],
+                         "carry-all sessions never help clear the session floor")
+
+    def test_scope_with_only_carry_all_sessions_is_a_no_op(self):
+        preds, calls = self._sessions(30, carry_all_ids=set(range(30)))
+        recs = self._compute(preds, calls)
+        self.assertEqual(recs.get("reason"), "no_narrowed_sessions")
+        self.assertEqual(recs.get("sessions_considered"), 0)
         self.assertEqual(recs.get("demote"), [])
         self.assertEqual(recs.get("promote"), [])
 

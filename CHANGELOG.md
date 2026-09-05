@@ -8,6 +8,21 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ### Changed
 
+- **Shaping learns from narrowed traffic, not from the configured primary
+  provider.** A carry-all turn (`policy_source: "cache_on_carry_all"`) shipped
+  the full ceiling and never offered `expand_tools`, so it is evidence for
+  neither arm: those rows are dropped before windowing, and a session left with
+  none of its own is not a session. `sessions_considered`, the day window and
+  the session floor now count NARROWED sessions only, and the session-exposure
+  weighting applies to all of them. A scope whose window holds no narrowed
+  session returns the no-op `reason: "no_narrowed_sessions"`; `auto_shape_run`
+  reports it under `skipped_no_narrowed_sessions` and leaves it unstamped, so it
+  re-qualifies the moment narrowed traffic appears. Previously a scope was
+  skipped wholesale on its primary provider's cache posture, so a mixed-traffic
+  agent never learned from the sessions that landed on an uncached provider.
+  `scripts/shape-ceiling.py` porcelain is version **3**: `sessions_considered`
+  changed meaning and each scope entry carries a `reason`.
+
 - **Shaping defaults are aggressive and time-windowed.** The evidence
   window is measured in days:
   `learning.shape_ceiling.window_days` (default `7`; `14` and `30` are the
