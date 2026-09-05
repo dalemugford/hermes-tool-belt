@@ -396,9 +396,11 @@ class TriggerFpLateBoundTpTests(unittest.TestCase):
 
     def _row_prediction(self, *, pid, sid, trigger, tools_for_trigger, ts):
         return {
+            "schema_version": 2,
             "ts": ts,
             "prediction_id": pid,
             "session_id": sid,
+            "hermes_session_id": sid,
             "scope": "assistant-a:telegram",
             "agent": "assistant-a",
             "platform": "telegram",
@@ -409,12 +411,13 @@ class TriggerFpLateBoundTpTests(unittest.TestCase):
             "tokens_saved": 0,
             "ceiling_tokens": 0,
             "narrowed_tokens": 0,
-            "always_on_tools": [],
-            "cut_tools": [],
+            "carry_tools": [],
+            "expand_only_tools": [],
         }
 
     def _row_call(self, *, pid, tool):
-        return {"prediction_id": pid, "tool_name": tool}
+        return {"schema_version": 2, "prediction_id": pid, "tool_name": tool,
+                "source": "gateway"}
 
     def test_late_bound_call_within_session_window_counts_as_tp(self):
         preds = [
@@ -670,15 +673,15 @@ class RecommendationRowProtectionTests(unittest.TestCase):
             self.assertNotIn("filesystem", scope_patch.get("expand_only", []))
 
 
-class ExpandToolsUsedAttributionTests(unittest.TestCase):
-    """The ``expand_tools_used`` flag must only fire when expansion
+class ExpansionProvidedAccessAttributionTests(unittest.TestCase):
+    """The ``expansion_provided_access`` flag must only fire when expansion
     actually provided the tool — not when the model happens to call a
-    tool that was already in the initial allowed set and is also
+    tool that was already in the initial active set and is also
     coincidentally covered by an active sticky entry.
 
     The bug this guards against: live telemetry showed 94% of
-    ``expand_tools_used`` flags coinciding with ``was_initially_available
-    == True``, inflating analyzer promotion signal ~15×.
+    ``expansion_provided_access`` flags coinciding with
+    ``was_initially_active == True``, inflating analyzer promotion signal ~15×.
     """
 
     def setUp(self):
@@ -787,11 +790,11 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
         # Regression: in production, sticky_tools get merged into the
         # narrowed active set BEFORE filtering, so a sticky-carried tool
         # ends up in initial_active_tools. Without a pre-sticky baseline,
-        # the credit decision saw was_initially_available=True and skipped
-        # the sticky-expansion branch, zeroing out expand_tools_used.
+        # the credit decision saw was_initially_active=True and skipped the
+        # sticky-expansion branch, zeroing out expansion_provided_access.
         sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
         self._seed_sticky(sticky_key, "terminal", ["terminal"])
-        # Terminal IS in initial_allowed (sticky merged in upstream)…
+        # Terminal IS in initial_active (sticky merged in upstream)…
         self._set_prediction_state(initial_allowed=["terminal", "memory"], sticky_key=sticky_key)
         # …but the pre-sticky baseline does NOT include it.
         state = plugin._PREDICTION_CV.get()
@@ -804,16 +807,16 @@ class ExpandToolsUsedAttributionTests(unittest.TestCase):
         )
         row = self._latest_row()
         self.assertFalse(row.get("was_initially_active"),
-            "baseline (pre-sticky) determines was_initially_available")
+            "baseline (pre-sticky) determines was_initially_active")
         self.assertTrue(row.get("expansion_provided_access"),
             "sticky-carried tool must be credited as expansion-driven")
         self.assertEqual(row.get("expand_category"), "terminal")
 
-    def test_pending_expansion_skipped_when_already_available(self):
+    def test_pending_expansion_skipped_when_already_active(self):
         # Same-turn expansion (pending_expansion) for a tool that was
-        # already always-on: the round-trip happened but provided
+        # already resident: the round-trip happened but provided
         # nothing. after_expand_tools still records the round-trip, but
-        # expand_tools_used must stay false.
+        # expansion_provided_access must stay false.
         sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
         self._set_prediction_state(initial_allowed=["terminal"], sticky_key=sticky_key)
         state = plugin._PREDICTION_CV.get()
@@ -973,8 +976,8 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
         wrapped = plugin._wrap_build_api_kwargs(original)
         return wrapped(SimpleNamespace(), [])
 
-    def test_initial_allowed_tools_snapshot_survives_post_expansion_call(self):
-        # Predictor narrowed to {memory, send_message}; terminal was cut.
+    def test_initial_active_tools_snapshot_survives_post_expansion_call(self):
+        # Predictor narrowed to {memory, send_message}; terminal is expand_only.
         plugin._PREDICTION_CV.set({
             "prediction_id": "pred-1",
             "active_tool_names": ["memory", "send_message"],
@@ -1013,7 +1016,7 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
             "initial_active_tools must be a one-time snapshot per prediction",
         )
 
-    def test_end_to_end_recovered_tool_credits_expand_tools_used(self):
+    def test_end_to_end_recovered_tool_credits_expansion_provided_access(self):
         # Full flow: prediction with baseline excluding terminal, sticky
         # carries terminal forward from a prior turn. The model calls
         # terminal. The row must be credited as expansion-driven.

@@ -91,7 +91,7 @@ def seed_telemetry(
     state_dir: Path,
     scope: str,
     sessions: int,
-    always_on: list[str] | None = None,
+    carry: list[str] | None = None,
     expanded_tool: str | None = None,
     expanded_sessions: int = 0,
     expanded_calls_each: int = 0,
@@ -100,24 +100,28 @@ def seed_telemetry(
     """Write synthetic predictions/tool_calls for ``sessions`` distinct sessions."""
     preds: list[dict] = []
     calls: list[dict] = []
+    ceiling = list(carry or []) + ([expanded_tool] if expanded_tool else [])
     for i in range(sessions):
         pid = f"{scope}-p{i}"
         preds.append(
             {
+                "schema_version": 2,
                 "ts": 1000 + i,
                 "scope": scope,
                 "hermes_session_id": f"sess-{i}",
                 "prediction_id": pid,
-                "always_on_tools": list(always_on or []),
+                "ceiling_tools": ceiling,
+                "carry_tools": list(carry or []),
             }
         )
         if expanded_tool and i < expanded_sessions:
             for _ in range(expanded_calls_each):
                 calls.append(
                     {
+                        "schema_version": 2,
                         "prediction_id": pid,
                         "tool_name": expanded_tool,
-                        "was_expanded": True,
+                        "activated_by_expansion": True,
                     }
                 )
     _write_jsonl(state_dir / "predictions.jsonl", preds, append=append)
@@ -240,9 +244,9 @@ class ConfigureModeFlowTests(TempHomeTestCase):
         # always_on tools that never get called → real demotion evidence, so
         # the history path produces a non-empty overlay to write.
         seed_telemetry(self.root_state, f"{agent}:telegram", self.needed,
-                       always_on=["web_search", "read_file"])
+                       carry=["web_search", "read_file"])
         seed_telemetry(self.root_state, f"{agent}:slack", self.needed,
-                       always_on=["web_search", "read_file"], append=True)
+                       carry=["web_search", "read_file"], append=True)
 
     def _run(self, keys: str):
         infos = configure.discover_scopes(self.home)
@@ -339,7 +343,7 @@ class ProtectedToolsFlowTests(TempHomeTestCase):
 
     def _seed(self):
         seed_telemetry(self.root_state, "default:telegram", 3,
-                       always_on=["web_search", "read_file", "terminal"])
+                       carry=["web_search", "read_file", "terminal"])
 
     def _run(self, keys: str):
         infos = configure.discover_scopes(self.home)
@@ -370,7 +374,7 @@ class ProtectedToolsFlowTests(TempHomeTestCase):
             "plugins:\n  entries:\n    tool-belt:\n      settings:\n        agent: bernard\n"
             "        always_carry:\n          - terminal\n", encoding="utf-8")
         seed_telemetry(self.root_state, "bernard:telegram", 3,
-                       always_on=["web_search", "terminal"])
+                       carry=["web_search", "terminal"])
         rc, out, _ = self._run("1\nq\n\n")
         self.assertRegex(out, r"\[x\]\s*\d+\. terminal",
                          "an existing config pin comes pre-checked")
@@ -656,7 +660,7 @@ class ReShapePreviewTests(TempHomeTestCase):
             self.root_state,
             self.SCOPE,
             sessions=self.needed,
-            always_on=["web_search", "read_file"],
+            carry=["web_search", "read_file"],
             expanded_tool="terminal",
             # Expanded in most sessions so the economic test decisively
             # favors carrying (penalty 1500/session-with-use far exceeds
@@ -692,7 +696,7 @@ class WriteDisclosureTests(TempHomeTestCase):
             self.root_state,
             "default:telegram",
             sessions=self.needed,
-            always_on=["web_search", "read_file"],
+            carry=["web_search", "read_file"],
             expanded_tool="terminal",
             # Expanded in most sessions so the economic test decisively
             # favors carrying (penalty 1500/session-with-use far exceeds
@@ -775,7 +779,7 @@ class ApplyFlowTests(TempHomeTestCase):
             self.root_state,
             "default:telegram",
             sessions=self.needed,
-            always_on=["web_search", "read_file"],
+            carry=["web_search", "read_file"],
             expanded_tool="terminal",
             # Expanded in most sessions so the economic test decisively
             # favors carrying (penalty 1500/session-with-use far exceeds
@@ -822,7 +826,7 @@ class ApplyFlowTests(TempHomeTestCase):
             named_state,
             "assistant-a:slack",
             sessions=self.needed,
-            always_on=["web_search"],
+            carry=["web_search"],
             expanded_tool="terminal",
             # Expanded in most sessions so the economic test decisively
             # favors carrying (penalty 1500/session-with-use far exceeds
@@ -888,7 +892,7 @@ class ResetFlowTests(TempHomeTestCase):
             self.root_state,
             "default:telegram",
             sessions=self.needed,
-            always_on=["web_search"],
+            carry=["web_search"],
             expanded_tool="terminal",
             # Expanded in most sessions so the economic test decisively
             # favors carrying (penalty 1500/session-with-use far exceeds
@@ -982,7 +986,7 @@ class DryRunTests(TempHomeTestCase):
             self.root_state,
             "default:telegram",
             sessions=self.needed,
-            always_on=["web_search"],
+            carry=["web_search"],
             expanded_tool="terminal",
             # Expanded in most sessions so the economic test decisively
             # favors carrying (penalty 1500/session-with-use far exceeds
@@ -1124,7 +1128,7 @@ class DegradedModeTests(TempHomeTestCase):
             self.root_state,
             "default:telegram",
             sessions=self.needed,
-            always_on=["web_search"],
+            carry=["web_search"],
             expanded_tool="terminal",
             # Expanded in most sessions so the economic test decisively
             # favors carrying (penalty 1500/session-with-use far exceeds
@@ -1235,7 +1239,7 @@ class ModeFlagTests(TempHomeTestCase):
 
     def _seed(self) -> None:
         seed_telemetry(self.root_state, "default:telegram",
-                       sessions=self.needed, always_on=["web_search"],
+                       sessions=self.needed, carry=["web_search"],
                        expanded_tool="terminal", expanded_sessions=12,
                        expanded_calls_each=2)
 
@@ -1297,7 +1301,7 @@ class ModeFlagTests(TempHomeTestCase):
         # exit 2 naming what exists.
         self._seed()
         seed_telemetry(self.root_state, "default:slack", sessions=self.needed,
-                       always_on=["web_search"], append=True)
+                       carry=["web_search"], append=True)
         rc, _out, runner = self._run(["--mode", "off", "--channel", "slack"])
         self.assertEqual(rc, 0)
         self.assertEqual(
@@ -1364,7 +1368,7 @@ class HermesHomeContainmentTests(TempHomeTestCase):
 
     def test_hermes_calls_see_the_target_home_and_env_is_restored(self) -> None:
         seed_telemetry(self.root_state, "default:telegram",
-                       sessions=self.needed, always_on=["web_search"],
+                       sessions=self.needed, carry=["web_search"],
                        expanded_tool="terminal", expanded_sessions=12,
                        expanded_calls_each=2)
         runner = FakeRunner()
@@ -1393,7 +1397,7 @@ class ResetArgvWiringTests(TempHomeTestCase):
 
     def test_reset_argv_reaches_the_reset_flow(self) -> None:
         seed_telemetry(self.root_state, "default:telegram",
-                       sessions=self.needed, always_on=["web_search"],
+                       sessions=self.needed, carry=["web_search"],
                        expanded_tool="terminal", expanded_sessions=12,
                        expanded_calls_each=2)
         info = configure.discover_scopes(self.home)[0]

@@ -1613,9 +1613,9 @@ def agent_tool_inventory(infos: Sequence[ScopeInfo]) -> list[str]:
         rows = shaper.load_jsonl(info.state_dir / "predictions.jsonl")
         for row in rows[-400:]:
             if str(row.get("scope") or "") in scopes:
-                # ceiling_tools on v2 rows; resident/active fields cover
-                # sparse v1 telemetry so old installs still get a list.
-                for row_key in ("ceiling_tools", "active_tools", "always_on_tools"):
+                # ceiling_tools is the full inventory; active_tools covers
+                # sparse rows so a scope with no ceiling still yields a list.
+                for row_key in ("ceiling_tools", "active_tools"):
                     for t in (row.get(row_key) or []):
                         tools.add(str(t))
     return sorted(tools)

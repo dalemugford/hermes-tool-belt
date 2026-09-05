@@ -28,8 +28,8 @@ Key invariants pinned here (full-start contract, Promise #2 2026-08-30):
     learning, triggers, or explicit expansion.
   * Malformed overlap fails safe toward carrying and warns.
   * Internal failures fail open — the original Hermes ceiling is returned.
-  * v1 telemetry normalizes into v2 in memory (``residency_inferred`` only
-    when membership is complete).
+  * Telemetry normalizes in memory (``residency_inferred`` only when
+    membership is complete).
 
 The contract surface::
 
@@ -482,35 +482,16 @@ def _pred_row(scope, sid, pid, *, ceiling, always_carry, carry, active, ts=0.0):
     }
 
 
-def _sparse_v1_row(scope, sid, pid, *, always_on, ts=0.0):
-    """A sparse v1 prediction row: residents only, no ceiling/active. The
+def _sparse_pred_row(scope, sid, pid, *, carry, ts=0.0):
+    """A sparse prediction row: residents only, no ceiling/active. The
     normalizer cannot reconstruct residency → ``residency_inferred`` is False."""
     return {
+        "schema_version": 2,
         "scope": scope,
         "hermes_session_id": sid,
         "prediction_id": pid,
         "ts": ts,
-        "always_on_tools": list(always_on),
-    }
-
-
-def _complete_v1_row(scope, sid, pid, *, ceiling, residents, active, ts=0.0):
-    """A *complete* v1 prediction row (no schema_version, no always_carry_tools).
-
-    Ceiling + residents + active are all present, so the normalizer can
-    reconstruct residency (``residency_inferred`` True). v1 has no immutable
-    split, so the normalizer collapses every resident into the ``carry``
-    residency class — including any always_carry baseline tool that is resident.
-    This is the exact transitional shape that used to abort the shaper.
-    """
-    return {
-        "scope": scope,
-        "hermes_session_id": sid,
-        "prediction_id": pid,
-        "ts": ts,
-        "ceiling_tools": list(ceiling),
-        "always_on_tools": list(residents),
-        "allowed_tools": list(active),
+        "carry_tools": list(carry),
     }
 
 
@@ -647,40 +628,17 @@ class ShaperDemotionContract(unittest.TestCase):
         self.assertNotIn("clarify", demoted)
         self.assertNotIn("send_message", demoted)
 
-    def test_sparse_v1_row_cannot_drive_demotion(self):
-        # 20 sessions of sparse v1 rows: residents present but no ceiling/active,
+    def test_sparse_row_cannot_drive_demotion(self):
+        # 20 sessions of sparse rows: residents present but no ceiling/active,
         # so residency is not inferable and the tools cannot demote.
         preds = [
-            _sparse_v1_row(self.SCOPE, f"s{i}", f"p{i}",
-                           always_on=["read_file", "web_search"], ts=i)
+            _sparse_pred_row(self.SCOPE, f"s{i}", f"p{i}",
+                             carry=["read_file", "web_search"], ts=i)
             for i in range(20)
         ]
         recs = _compute(self.SCOPE, preds, [])
         self.assertEqual(recs["demote"], [],
                          "a sparse (residency_inferred=False) row cannot demote")
-
-    def test_complete_v1_unused_always_carry_never_demotes_and_no_abort(self):
-        # Regression for the transitional-v1 abort: complete v1 rows normalize
-        # every resident (including the immutable always_carry baseline tool
-        # ``clarify``) into the ``carry`` residency class. With a full window of
-        # such rows where ``clarify`` is resident-but-unused, the shaper must
-        # neither raise nor recommend demoting ``clarify``. The adaptive
-        # (non-baseline) resident ``read_file`` still demotes normally.
-        ceiling = ["clarify", "read_file", "web_extract"]
-        residents = ["clarify", "read_file"]  # clarify is always_carry baseline
-        preds = [
-            _complete_v1_row(self.SCOPE, f"s{i}", f"p{i}",
-                             ceiling=ceiling, residents=residents,
-                             active=residents, ts=i)
-            for i in range(20)  # ≥ demote_min_sessions_no_use
-        ]
-        # Must not raise (the old assert aborted the whole run here).
-        recs = _compute(self.SCOPE, preds, [])
-        demoted = {d["tool"] for d in recs["demote"]}
-        self.assertNotIn("clarify", demoted,
-                         "an unused always_carry resident from a v1 row never demotes")
-        self.assertIn("read_file", demoted,
-                      "a non-baseline carry resident still demotes on a v1 window")
 
 
 class ShaperMergeContract(unittest.TestCase):

@@ -425,7 +425,7 @@ def build_tool_call_row(
 ) -> dict[str, Any]:
     """Build one ``tool_calls.jsonl`` row shaped like ``_on_post_tool_call``.
 
-    ``activated_by_expansion`` / ``expansion_provided_access`` are the two v2
+    ``activated_by_expansion`` / ``expansion_provided_access`` are the two
     flags the shaper accepts as promote evidence (``shape-ceiling.py:286-291``).
     """
     row: dict[str, Any] = {

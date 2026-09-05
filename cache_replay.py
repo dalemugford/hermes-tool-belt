@@ -73,10 +73,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-# Every telemetry row is read through the centralized v1/v2 normalizer so the
-# replay sees one canonical shape (``hermes_session_id`` grouping,
-# ``trigger_activated_tools``, ``activation_source``) regardless of the on-disk
-# schema version. Pricing is single-sourced in the canonical savings engine;
+# Every telemetry row is read through the centralized normalizer so the replay
+# sees one canonical shape (``hermes_session_id`` grouping,
+# ``trigger_activated_tools``, ``activation_source``). Pricing is single-sourced in the canonical savings engine;
 # it is imported rather than copied (see docs/SAVINGS.md — no duplicate price
 # tables). Works both as the ``tool_belt_plugin.cache_replay`` module and as a
 # directly-executed script (sibling on sys.path).
@@ -91,12 +90,11 @@ except ImportError:  # script mode
 def _session_key(row: dict[str, Any]) -> str:
     """Distinct-session key matching the shaper/analyzer semantics.
 
-    Prefer ``hermes_session_id`` (rotates on ``/new``, so pre- and post-reset
-    turns land in *different* cohorts and a stale baseline hash can never
-    pollute a fresh session). Fall back to ``session_id`` — the stable chat key
-    — for normalized historical rows written before the UUID was captured.
+    ``hermes_session_id`` rotates on ``/new``, so pre- and post-reset turns
+    land in *different* cohorts and a stale baseline hash can never pollute a
+    fresh session.
     """
-    return str(row.get("hermes_session_id") or row.get("session_id") or "")
+    return str(row.get("hermes_session_id") or "")
 
 
 def default_state_dir() -> Path:
@@ -136,9 +134,9 @@ def stability_simulation(
     baseline and classify every subsequent call: did the wire-level tool
     list stay identical to that baseline, or mutate?
 
-    Sessions are grouped by :func:`_session_key` (``hermes_session_id`` with a
-    ``session_id`` fallback) so a ``/new`` reset starts a fresh cohort
-    instead of polluting the baseline hash across the reset boundary.
+    Sessions are grouped by :func:`_session_key` (``hermes_session_id``) so a
+    ``/new`` reset starts a fresh cohort instead of polluting the baseline
+    hash across the reset boundary.
 
     Distinguishes four call types:
       · matches_stable    — identical to the baseline: hit the cached prefix
@@ -160,8 +158,7 @@ def stability_simulation(
     cache, and expanded/triggered tools persist for the session, so repeated
     use after the initial mutation does not require repeated mutations.
     """
-    # Canonicalize rows through the central adapter (v1/v2 + hermes_session_id
-    # + trigger_activated_tools).
+    # Canonicalize rows through the central adapter.
     preds = [normalize_prediction_row(p) for p in preds]
     calls = [normalize_tool_call_row(c) for c in calls]
     if tool_calls is not None:
@@ -169,8 +166,8 @@ def stability_simulation(
 
     if scope_filter:
         preds = [p for p in preds if p.get("scope") == scope_filter]
-        # Rows missing ``prediction_id`` are tolerated (older/malformed
-        # telemetry); they simply can't join against calls.
+        # Rows missing ``prediction_id`` are tolerated (malformed telemetry);
+        # they simply can't join against calls.
         pred_ids = {str(p.get("prediction_id") or "") for p in preds}
         pred_ids.discard("")
         calls = [c for c in calls if c.get("prediction_id") in pred_ids]
@@ -313,7 +310,7 @@ def matched_counterfactual(
     if not calls:
         return {"scope_filter": scope_filter or "(all)", "comparable": 0}
 
-    # Group by session key (hermes_session_id with session_id fallback), sort
+    # Group by session key (hermes_session_id), sort
     sess_calls: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for c in calls:
         sess_calls[_session_key(c)].append(c)

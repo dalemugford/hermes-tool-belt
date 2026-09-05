@@ -142,9 +142,7 @@ tail -f "$HERMES_HOME/state/tool-belt/predictions.jsonl" | \
    `policy_source: "cache_on_carry_all"` with `ceiling_count == narrowed_count`
    and `tokens_saved: 0`, and `tool_list_hash` is byte-identical across every
    turn of the session (`expand_tools` is absent from the shipped tool list
-   throughout). Note: the older `frozen_reuse` / `frozen_reuse_count` fields
-   still exist in the schema but are vestigial — carry-all rows never set
-   them, so they stay `false` / `0`; don't use them to judge this check.
+   throughout).
 
 2. **Cache-off: per-turn narrowing and sticky residency.** On a non-caching
    model, `tool_list_hash` changes as intent changes. After an `expand_tools`
