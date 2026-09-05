@@ -139,26 +139,8 @@ load_schema_sizes = _shaping.load_schema_sizes
 read_cache_mode = _shaping.read_cache_mode
 index_api_call_counts = _shaping.index_api_call_counts
 measured_expand_penalty = _shaping.measured_expand_penalty
-
-
-def _load_plugin_config() -> dict[str, Any]:
-    """The profile's plugin settings (the config.yaml layer), for CLI default
-    pre-fill.
-
-    Fail-open: returns ``{}`` when the plugin package or the host config is
-    unreadable (e.g. running outside a live Hermes), so the thresholds fall
-    back to the ``policy.yaml`` layer. Explicit CLI flags override either way —
-    this only sets the pre-filled defaults an ad-hoc run starts from.
-    """
-    try:
-        plugin = sys.modules.get("tool_belt_plugin")
-        if plugin is None:  # pragma: no cover - package loaded at import
-            return {}
-        plugin._load_user_config()
-        cfg = getattr(plugin, "_CONFIG", {})
-        return dict(cfg) if isinstance(cfg, dict) else {}
-    except Exception:
-        return {}
+filter_protected_demotions = _shaping.filter_protected_demotions
+load_cli_plugin_config = _shaping.load_cli_plugin_config
 
 
 def _activation_hint(scopes: list[str]) -> str:
@@ -270,7 +252,8 @@ def main() -> int:
     # Pre-fill flag defaults from the resolved config layers (config.yaml
     # learning.shape_ceiling over policy.yaml over DEFAULTS); explicit flags
     # below still win for ad-hoc runs.
-    defaults = load_shape_ceiling_defaults(plugin_config=_load_plugin_config() or None)
+    plugin_config = load_cli_plugin_config()
+    defaults = load_shape_ceiling_defaults(plugin_config=plugin_config or None)
     # allow_abbrev=False: a mistyped or truncated flag must fail loudly rather
     # than be silently matched to a different unit (e.g. ``--window`` → days).
     ap = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
@@ -364,6 +347,11 @@ def main() -> int:
         print(f"No scopes matched filter {args.scope!r}.", file=sys.stderr)
         emit_porcelain({}, changed=False, error="no_matching_scopes")
         return 1
+
+    # always_carry (policy baseline ∪ config pins) is undemotable by
+    # construction — the same filter ``auto_shape_run`` applies in process, so
+    # a CLI run and the engine agree on the protected surface.
+    per_scope = filter_protected_demotions(plugin_config, per_scope)
 
     state, changed = merge_into_learned(state_dir, per_scope, args.dry_run)
     emit_porcelain(per_scope, changed=changed)

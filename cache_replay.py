@@ -54,10 +54,13 @@ The corrected counterfactual:
     estimate. Signed differences preserve legitimate cache refreshes instead
     of forcing every mutation to look costly.
 
+``analyze.py`` imports this module for its cache-aware savings section; the
+CLI below is an optional focused diagnostic.
+
 Usage:
-  python3 scripts/cache-stability-replay.py
-  python3 scripts/cache-stability-replay.py --scope assistant-a:telegram
-  python3 scripts/cache-stability-replay.py --markdown        # markdown for the report dir
+  python3 cache_replay.py
+  python3 cache_replay.py --scope assistant-a:telegram
+  python3 cache_replay.py --markdown        # markdown for the report dir
 """
 
 from __future__ import annotations
@@ -70,18 +73,19 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-# Read every telemetry row through the centralized v1/v2 normalizer so the
+# Every telemetry row is read through the centralized v1/v2 normalizer so the
 # replay sees one canonical shape (``hermes_session_id`` grouping,
 # ``trigger_activated_tools``, ``activation_source``) regardless of the on-disk
-# schema version. Importing it puts the plugin dir on ``sys.path`` first; the
-# module has no import-time relative deps, so it loads standalone.
-_PLUGIN_DIR = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(_PLUGIN_DIR))
-from logger_io import normalize_prediction_row, normalize_tool_call_row  # noqa: E402
-
-# Pricing is single-sourced in the canonical savings engine; import it rather
-# than defining a second copy (see docs/SAVINGS.md — no duplicate price tables).
-from savings import price_for  # noqa: E402
+# schema version. Pricing is single-sourced in the canonical savings engine;
+# it is imported rather than copied (see docs/SAVINGS.md — no duplicate price
+# tables). Works both as the ``tool_belt_plugin.cache_replay`` module and as a
+# directly-executed script (sibling on sys.path).
+try:  # package / test import
+    from .logger_io import normalize_prediction_row, normalize_tool_call_row  # type: ignore[import-not-found]
+    from .savings import price_for  # type: ignore[import-not-found]
+except ImportError:  # script mode
+    from logger_io import normalize_prediction_row, normalize_tool_call_row  # type: ignore[no-redef]
+    from savings import price_for  # type: ignore[no-redef]
 
 
 def _session_key(row: dict[str, Any]) -> str:

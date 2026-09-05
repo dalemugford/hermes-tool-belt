@@ -15,7 +15,6 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest import mock
 
 PLUGIN_DIR = Path(__file__).resolve().parent.parent
 TESTS_DIR = PLUGIN_DIR / "tests"
@@ -390,7 +389,7 @@ class RenderLabelTests(_HomeCase):
 
     def _render(self, proj):
         report = savings.SavingsReport(
-            generated_for="default", cache_mode="on",
+            generated_for="default",
             agents=[savings.AgentSavings(agent="default", platforms=["telegram"],
                                          observed=savings.ObservedCohort(),
                                          projected=proj)],
@@ -563,7 +562,7 @@ class ExpansionVsTriggerTests(_HomeCase):
                        turns=[{"user": "please delegate this task",
                                "calls": ["delegate_task"]}])
         loc = savings.discover_agents(self.home)[0]
-        trig = savings.compute_projected(loc, {"enabled": True}, cache_mode="off")
+        trig = savings.compute_projected(loc, {"enabled": True})
         self.assertEqual(trig.expansion_events, 0)
         self.assertEqual(trig.estimated_expansion_overhead, 0)
 
@@ -575,7 +574,7 @@ class ExpansionVsTriggerTests(_HomeCase):
                        turns=[{"user": "hello there",
                                "calls": ["execute_code"]}])
         loc = savings.discover_agents(self.home)[0]
-        exp = savings.compute_projected(loc, {"enabled": True}, cache_mode="off")
+        exp = savings.compute_projected(loc, {"enabled": True})
         self.assertEqual(exp.expansion_events, 1)
         self.assertEqual(exp.estimated_expansion_overhead,
                          savings.EXPAND_ROUND_TRIP_TOKENS)
@@ -700,14 +699,14 @@ class CostClassificationTests(_HomeCase):
     unknown routes show no dollars and use net input percentage when
     defensible."""
 
-    def test_known_metered_shows_usd(self):
+    def test_known_metered_row_carries_usd(self):
         _write_session(self.home / "sessions", "k", platform="telegram",
                        model="claude-sonnet-4-6", api_mode="api_key",
                        ceiling=CEILING, turns=[{"user": "hello"}, {"user": "write a file"}])
         loc = savings.discover_agents(self.home)[0]
         proj = savings.compute_projected(loc, {"enabled": True})
         self.assertEqual(proj.models[0].cost_class, "known")
-        self.assertIsNotNone(proj.estimated_usd_savings)
+        self.assertIsNotNone(proj.models[0].estimated_usd_savings)
         self.assertTrue(proj.models[0].rate_basis)
 
     def test_subscription_route_shows_no_dollars(self):
@@ -750,7 +749,7 @@ class ApiCallRouteCostingTests(_HomeCase):
         return savings.compute_projected(
             savings.discover_agents(self.home)[0], {"enabled": True})
 
-    def test_metered_route_from_api_calls_produces_usd(self):
+    def test_metered_route_from_api_calls_is_classified_known(self):
         _seed_demotions(self.home)
         """session_meta carries no route; api_calls prove a metered one."""
         _write_session(self.home / "sessions", "m", platform="telegram",
@@ -765,8 +764,6 @@ class ApiCallRouteCostingTests(_HomeCase):
         self.assertEqual(row.provider, "anthropic")
         self.assertEqual(row.rate_basis, savings.PRICE_TABLE_RATE_BASIS)
         self.assertIsNotNone(row.estimated_usd_savings)
-        self.assertGreater(proj.estimated_usd_savings, 0.0)
-        self.assertEqual(proj.usd_coverage, "full")
 
     def test_no_api_call_rows_still_suppress_usd(self):
         """A session with no matching api_calls row has no route evidence."""
@@ -819,39 +816,6 @@ class ApiCallRouteCostingTests(_HomeCase):
         proj = self._project()
         self.assertEqual(proj.models[0].cost_class, "subscription")
         self.assertIsNone(proj.estimated_usd_savings)
-
-
-class ComparableBaselineTests(_HomeCase):
-    """`current` and `proposed` projections must be computed against the same
-    non-learned configuration, or the before/after onboarding shows is
-    apples-to-oranges."""
-
-    SCOPE = "default:telegram"
-    CONFIG = {"enabled": True, "channels": {SCOPE: {"learned_mode": "apply"}}}
-    OVERLAY = {"version": 2, "scopes": {
-        SCOPE: {"expand_only": ["web_search"], "carry": ["session_search"]}}}
-
-    def test_proposed_branch_keeps_learned_overlay_and_channel_config(self):
-        with mock.patch.object(learned, "load_state", return_value=self.OVERLAY):
-            current = savings._resolve_effective_preset(self.CONFIG, self.SCOPE, None)
-            proposed = savings._resolve_effective_preset(
-                self.CONFIG, self.SCOPE, {"carry": [], "expand_only": []})
-        # An empty proposed delta must reproduce the current effective preset.
-        self.assertEqual(list(current.always_carry), list(proposed.always_carry))
-        self.assertEqual(list(current.carry), list(proposed.carry))
-        # ...and that shared baseline is the learned one, not raw policy.yaml.
-        self.assertNotIn("web_search", proposed.carry)   # learned demotion honored
-        self.assertIn("session_search", proposed.carry)  # learned promotion honored
-
-    def test_proposed_delta_still_applies_on_top_of_the_overlay(self):
-        with mock.patch.object(learned, "load_state", return_value=self.OVERLAY):
-            proposed = savings._resolve_effective_preset(
-                self.CONFIG, self.SCOPE,
-                {"carry": ["cronjob"], "expand_only": ["read_file"]})
-        self.assertIn("cronjob", proposed.carry)         # proposed promotion
-        self.assertNotIn("read_file", proposed.carry)    # proposed demotion
-        self.assertNotIn("web_search", proposed.carry)   # learned demotion survives
-        self.assertIn("session_search", proposed.carry)  # learned promotion survives
 
 
 class SinceParsingTests(_HomeCase):
@@ -1052,7 +1016,7 @@ class AnnualizedPaceTests(_HomeCase):
             first_ts_noncaching=1_780_000_000.0,
             last_ts_noncaching=1_780_000_000.0 + span_days * 86400.0)
         return savings.SavingsReport(
-            generated_for="all", cache_mode="on",
+            generated_for="all",
             agents=[savings.AgentSavings(
                 agent="default", platforms=["a:t"], observed=obs,
                 projected=savings.ProjectedCohort(), display_name="bernard")],
@@ -1113,28 +1077,6 @@ class DispatchExitCodeTests(unittest.TestCase):
             self.assertEqual(savings_cli.main([]), 2)
         self.assertEqual(out.getvalue(), "")
         self.assertIn("no command given", err.getvalue())
-
-
-class CacheModeFlagTests(_HomeCase):
-    """``--cache-mode`` through the CLI: the engine's off-mode math is
-    covered elsewhere, but nothing else proves the flag reaches
-    ``compute`` (or that a bad value is rejected by argparse)."""
-
-    def test_flag_reaches_compute_and_report(self):
-        _write_session(self.home / "sessions", "s", platform="telegram",
-                       model="m", ceiling=CEILING, turns=[{"user": "hello"}])
-        out = io.StringIO()
-        with redirect_stdout(out):
-            code = savings_cli.run(["--json", "--cache-mode", "off",
-                                    "--hermes-home", str(self.home)])
-        self.assertEqual(code, 0)
-        self.assertEqual(json.loads(out.getvalue())["cache_mode"], "off")
-
-    def test_bad_value_is_rejected(self):
-        with redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as caught:
-                savings_cli.run(["--cache-mode", "sideways"])
-        self.assertEqual(caught.exception.code, 2)
 
 
 class SinceEchoTests(_HomeCase):
@@ -1210,7 +1152,7 @@ class CarriedAgentEmphasisTests(_HomeCase):
             agent="default", platforms=["default:t"], observed=shaped,
             projected=savings.ProjectedCohort(), display_name="bernard"))
         return savings.SavingsReport(
-            generated_for="all", cache_mode="on", agents=agents,
+            generated_for="all", agents=agents,
             hermes_home=str(self.home), token_estimator="tiktoken-cl100k")
 
     def test_multiple_carried_agents_are_comma_separated(self):

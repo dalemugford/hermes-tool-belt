@@ -87,13 +87,6 @@ def _fmt_int(n: int) -> str:
     return f"{n:,}"
 
 
-def _rate_basis_label(proj: _savings.ProjectedCohort) -> str:
-    for m in proj.models:
-        if m.cost_class == "known":
-            return m.rate_basis or "n/a"
-    return "n/a"
-
-
 def _basis_tag(basis: str, fallback_per_event: int = _savings.EXPAND_ROUND_TRIP_TOKENS) -> str:
     """How the expansion overhead behind a net figure was costed."""
     if basis == "measured":
@@ -122,7 +115,7 @@ def _render_projection(out: list[str], proj: _savings.ProjectedCohort, indent: s
     if proj.estimated_usd_savings is not None:
         out.append(
             f"{indent}est. USD savings: ${proj.estimated_usd_savings:.4f}"
-            f"  ({proj.usd_coverage} coverage, rate {_rate_basis_label(proj)})"
+            f"  ({proj.usd_coverage} coverage)"
         )
 
 
@@ -440,10 +433,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--since", default=None,
         help="only count telemetry/sessions since this date (YYYY-MM-DD)",
     )
-    parser.add_argument(
-        "--cache-mode", default="on", choices=["on", "off"],
-        help="projection cache model: cache-on freeze (default) or cache-off per-turn",
-    )
     parser.add_argument("--json", action="store_true", help="emit stable machine-readable JSON")
     parser.add_argument(
         "--hermes-home", type=Path, default=None,
@@ -466,7 +455,6 @@ def run(argv: list[str] | None = None, *, out: Callable[[str], None] | None = No
             agent=args.agent,
             hermes_home=args.hermes_home,
             since=args.since,
-            cache_mode=args.cache_mode,
         )
     except (_savings.UnknownAgentError, _savings.InvalidSinceError) as exc:
         print(f"error: {exc}", file=sys.stderr)

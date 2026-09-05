@@ -232,6 +232,42 @@ def _merge_shape_defaults(
     return merged
 
 
+def load_cli_plugin_config(hermes_home: Path | None = None) -> dict[str, Any]:
+    """The profile's plugin settings (``config.yaml``) for an out-of-process run.
+
+    The runtime resolves these through ``hermes_cli.config``, which is only
+    importable from the Hermes interpreter. The operator scripts run under
+    whichever interpreter started them, so this reads ``config.yaml`` itself
+    when the host package is missing — otherwise the user layer silently
+    resolves to ``{}`` and ``effective_always_carry`` sees the shipped policy
+    baseline alone, reporting config-pinned tools as demotable.
+
+    ``channels`` is flattened to the internal ``agent:platform`` keying, the
+    same shape the runtime's ``_CONFIG`` holds. Fail-open: an unreadable or
+    absent config returns ``{}`` (the policy layer then stands alone), which
+    is the right answer outside a Hermes install.
+    """
+    try:
+        from hermes_cli.config import load_config, cfg_get  # type: ignore[import-not-found]
+        settings = cfg_get(load_config(), "plugins", "entries", "tool-belt",
+                           "settings", default={})
+    except Exception:
+        home = hermes_home or Path(
+            os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+        try:
+            raw = (Path(home) / "config.yaml").read_text(encoding="utf-8")
+            loaded = require_yaml().safe_load(raw) or {}
+            settings = loaded["plugins"]["entries"]["tool-belt"]["settings"]
+        except Exception:
+            return {}
+    if not isinstance(settings, dict):
+        return {}
+    config = dict(settings)
+    if "channels" in config:
+        config["channels"] = learned.flatten_channels(config["channels"])
+    return config
+
+
 def resolve_primary_detection_entry(
     detection_cache: dict[str, Any],
     scope: str,
@@ -789,8 +825,8 @@ def apply_recommendations(
     Promotions are applied after demotions so a tool named by both wins toward
     carrying, and any residual overlap is reconciled toward carry. Only the
     canonical keys (``carry`` / ``expand_only`` / ``shaping``) are written.
-    Every candidate is validated against the scope's concrete enabled tool
-    names — a category/toolset name is never written into a carrying list.
+    Candidates arrive already validated against the scope's concrete enabled
+    tool names by ``compute_scope_recommendations``.
 
     Other scopes and all unrelated metadata (top-level and per-scope) are
     preserved. Returns ``(state, changes)`` where ``changes`` maps each
@@ -803,21 +839,6 @@ def apply_recommendations(
     changes: dict[str, dict[str, list[str]]] = {}
     for scope, recs in per_scope.items():
         entry = dict(scopes.get(scope) or {})
-        enabled_names = set(recs.get("enabled_tool_names") or [])
-
-        def _accept(tool: str, kind: str) -> bool:
-            # An empty enabled ceiling means no candidate can be proven
-            # eligible, so refuse every candidate. Otherwise a candidate must
-            # be a concrete enabled tool name — a category/toolset name never
-            # enters a per-tool carrying list.
-            if enabled_names and tool in enabled_names:
-                return True
-            logger.warning(
-                "tool-belt: refusing to write %s candidate %r into scope %r "
-                "carrying list — not a concrete enabled tool name",
-                kind, tool, scope,
-            )
-            return False
 
         carry_set = {str(t) for t in (entry.get("carry") or []) if str(t).strip()}
         expand_set = {str(t) for t in (entry.get("expand_only") or []) if str(t).strip()}
@@ -830,14 +851,10 @@ def apply_recommendations(
 
         # Demotions first (carry → expand_only) …
         for tool in demote_tools:
-            if not _accept(tool, "demote"):
-                continue
             expand_set.add(tool)
             carry_set.discard(tool)
         # … then promotions (expand_only → carry), so carrying wins any tie.
         for tool in promote_tools:
-            if not _accept(tool, "promote"):
-                continue
             carry_set.add(tool)
             expand_set.discard(tool)
         # Reconcile any residual overlap toward carry (belt-and-braces).

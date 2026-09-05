@@ -1,4 +1,4 @@
-"""Regression coverage for cache-stability-replay session grouping across `/new`.
+"""Regression coverage for cache_replay session grouping across `/new`.
 
 The freeze simulation must group calls by the Hermes session id
 (``hermes_session_id``), which rotates on ``/new``, and fall back to the legacy
@@ -9,12 +9,12 @@ session would inherit the first's frozen tool-list hash (its "frozen active
 set") and its accumulated trigger-mutation history, so a fresh `/new` session
 would spuriously "break" the stale frozen prefix.
 
-These tests import the real script functions (``_session_key``,
+These tests import the real module functions (``_session_key``,
 ``stability_simulation``) rather than re-deriving their logic.
 """
 from __future__ import annotations
 
-import importlib.util
+import importlib
 import sys
 import unittest
 from pathlib import Path
@@ -24,19 +24,7 @@ TESTS_DIR = PLUGIN_DIR / "tests"
 sys.path.insert(0, str(TESTS_DIR))
 import conftest  # noqa: F401,E402 — registers tool_belt_plugin, puts plugin on sys.path
 
-
-def _load_script(module_name: str, filename: str):
-    spec = importlib.util.spec_from_file_location(
-        module_name, PLUGIN_DIR / "scripts" / filename
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-cache_replay = _load_script("tool_belt_cache_replay_session", "cache-stability-replay.py")
+cache_replay = importlib.import_module("tool_belt_plugin.cache_replay")
 
 
 def _pred(prediction_id, session_id, ts, *, hermes_session_id=None,

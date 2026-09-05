@@ -21,6 +21,7 @@ analyze = importlib.import_module("tool_belt_plugin.analyze")
 learned = importlib.import_module("tool_belt_plugin.learned")
 logger_io = importlib.import_module("tool_belt_plugin.logger_io")
 savings = importlib.import_module("tool_belt_plugin.savings")
+cache_replay = importlib.import_module("tool_belt_plugin.cache_replay")
 
 
 def _load_script(module_name: str, filename: str):
@@ -36,7 +37,6 @@ def _load_script(module_name: str, filename: str):
 
 bootstrap = _load_script("tool_belt_bootstrap_portability", "bootstrap.py")
 harvest = _load_script("tool_belt_harvest_portability", "harvest-replay.py")
-cache_replay = _load_script("tool_belt_cache_replay_portability", "cache-stability-replay.py")
 shape = _load_script("tool_belt_shape_portability", "shape-ceiling.py")
 
 

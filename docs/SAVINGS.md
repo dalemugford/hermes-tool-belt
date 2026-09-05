@@ -273,14 +273,13 @@ filtered on `source` before any cohort is built.
   logged prediction rows — one row per inbound user message — weighed
   once per row by its route's price factor. Carry-all rows contribute 0.
 - **We don't claim the matched-counterfactual upper bound as the
-  headline.** [scripts/cache-stability-replay.py](../scripts/cache-stability-replay.py)
-  computes a per-call counterfactual against the stable-cohort mean at
-  the same `api_call_idx` — useful for deep analysis, deliberately not
-  the headline number. The headline is the simple, defensible priced
-  `ceiling − narrowed` less measured overhead. Note that `analyze.py`
-  imports this script as a library (via `importlib`) to produce the
-  cache-aware section of its report, so it is a hard analyzer dependency
-  in addition to being a standalone diagnostic CLI.
+  headline.** [cache_replay.py](../cache_replay.py) computes a per-call
+  counterfactual against the stable-cohort mean at the same
+  `api_call_idx` — useful for deep analysis, deliberately not the
+  headline number. The headline is the simple, defensible priced
+  `ceiling − narrowed` less measured overhead. `analyze.py` imports this
+  module to produce the cache-aware section of its report; it is also a
+  standalone diagnostic CLI.
 
 ## Reproducing the numbers from raw telemetry
 
@@ -331,18 +330,18 @@ summed together**:
 - **Observed** — realized savings from organic telemetry (provider-returned
   usage is authoritative). This is what actually happened.
 - **Projected** — a counterfactual replay of historical Hermes sessions through
-  the current effective (or a caller-supplied proposed) carrying assignment.
-  Every projected figure is labeled counterfactual until matched by organic
-  post-apply telemetry, carries a confidence (high/medium/low), and shows a USD
-  estimate only for a **known** metered route — a subscription/OAuth route (even
-  for a model with a public list price) never shows dollars and falls back to a
-  net input-reduction percentage.
+  the current effective carrying assignment. Every projected figure is labeled
+  counterfactual until matched by organic post-apply telemetry and carries a
+  confidence (high/medium/low). Dollars are suppressed: Hermes records a
+  *transport* label rather than a billing route, so `classify_cost` never
+  reaches the `known` metered class and the report falls back to a net
+  input-reduction percentage.
 
 The engine lives in [`savings.py`](../savings.py) and is the single home for the
 price table, the provider cache hints, the token estimator, the overhead
 measurement, and the thin-data fallback constant.
-`scripts/cache-stability-replay.py` imports the price table from it, so there
-is no duplicate table or constant.
+`cache_replay.py` imports the price table from it, so there is no duplicate
+table or constant.
 
 ## Field reference (predictions.jsonl)
 
