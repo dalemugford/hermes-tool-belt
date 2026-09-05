@@ -1,9 +1,8 @@
 """Regression coverage for cache_replay session grouping across `/new`.
 
 The freeze simulation must group calls by the Hermes session id
-(``hermes_session_id``), which rotates on ``/new``, and fall back to the legacy
-transport ``session_id`` only when the Hermes id is absent. If it grouped by the
-stable transport ``session_id`` alone, two Hermes sessions that share the same
+(``hermes_session_id``), which rotates on ``/new``. If it grouped by the stable
+transport ``session_id`` instead, two Hermes sessions that share the same
 underlying chat/transport id would be fused into one freeze cohort: the second
 session would inherit the first's frozen tool-list hash (its "frozen active
 set") and its accumulated trigger-mutation history, so a fresh `/new` session
@@ -27,34 +26,32 @@ import conftest  # noqa: F401,E402 — registers tool_belt_plugin, puts plugin o
 cache_replay = importlib.import_module("tool_belt_plugin.cache_replay")
 
 
-def _pred(prediction_id, session_id, ts, *, hermes_session_id=None,
+def _pred(prediction_id, session_id, ts, *, hermes_session_id,
           scope="assistant-a:telegram", triggers=None):
-    row = {
+    return {
+        "schema_version": 2,
         "prediction_id": prediction_id,
         "session_id": session_id,
+        "hermes_session_id": hermes_session_id,
         "ts": ts,
         "scope": scope,
         "trigger_activated_tools": list(triggers or []),
     }
-    if hermes_session_id is not None:
-        row["hermes_session_id"] = hermes_session_id
-    return row
 
 
 def _call(prediction_id, session_id, ts, api_call_idx, tool_list_hash, *,
-          hermes_session_id=None, scope="assistant-a:telegram", cache_read_tokens=1000):
-    row = {
+          hermes_session_id, scope="assistant-a:telegram", cache_read_tokens=1000):
+    return {
+        "schema_version": 2,
         "prediction_id": prediction_id,
         "session_id": session_id,
+        "hermes_session_id": hermes_session_id,
         "ts": ts,
         "api_call_idx": api_call_idx,
         "tool_list_hash": tool_list_hash,
         "cache_read_tokens": cache_read_tokens,
         "scope": scope,
     }
-    if hermes_session_id is not None:
-        row["hermes_session_id"] = hermes_session_id
-    return row
 
 
 class FreezeSimulationNewBoundaryTests(unittest.TestCase):
@@ -122,15 +119,18 @@ class FreezeSimulationNewBoundaryTests(unittest.TestCase):
         self.assertEqual(result["trigger_driven_mutations"], 2)
         self.assertEqual(result["would_break_mutations"], 0)
 
-    def test_session_id_fallback_groups_turns_without_hermes_id(self):
-        """When rows carry no hermes_session_id, _session_key falls back to
-        session_id, so turns sharing that id land in one freeze cohort."""
-        sid = "legacy-chat"
-        preds = [_pred("P1", sid, ts=1)]  # no hermes_session_id
+    def test_turns_of_one_hermes_session_share_a_freeze_cohort(self):
+        """Every turn carrying the same hermes_session_id lands in one freeze
+        cohort, so a stable hash reads as repeated matches, not breaks."""
+        sid = "chat-transport-shared"
+        preds = [_pred("P1", sid, ts=1, hermes_session_id="H1")]
         calls = [
-            _call("P1", sid, ts=1, api_call_idx=0, tool_list_hash="A"),
-            _call("P1", sid, ts=2, api_call_idx=1, tool_list_hash="A"),
-            _call("P1", sid, ts=3, api_call_idx=2, tool_list_hash="A"),
+            _call("P1", sid, ts=1, api_call_idx=0, tool_list_hash="A",
+                  hermes_session_id="H1"),
+            _call("P1", sid, ts=2, api_call_idx=1, tool_list_hash="A",
+                  hermes_session_id="H1"),
+            _call("P1", sid, ts=3, api_call_idx=2, tool_list_hash="A",
+                  hermes_session_id="H1"),
         ]
         result = cache_replay.stability_simulation(preds, calls, tool_calls=[])
         self.assertEqual(result["sessions"], 1)

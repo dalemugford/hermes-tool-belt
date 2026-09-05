@@ -34,38 +34,9 @@ logger = logging.getLogger(__name__)
 
 # Canonical telemetry schema version emitted by the producers below. All
 # telemetry consumers read rows through ``normalize_prediction_row`` /
-# ``normalize_tool_call_row``, so v1, v2, and mixed streams present the same
-# canonical fields.
+# ``normalize_tool_call_row``, so every stream presents the same canonical
+# fields.
 SCHEMA_VERSION = 2
-
-# Fallback immutable-resident baseline used by the v1 normalizer to split a
-# historical resident set into the v2 always_carry / carry classes. The live
-# baseline is read from policy.yaml (see ``_always_carry_baseline``); this
-# mirror keeps the normalizer working even if that load fails.
-_FALLBACK_ALWAYS_CARRY = frozenset(
-    {"clarify", "skill_view", "skills_list", "expand_tools",
-     "tool_search", "tool_describe", "tool_call"}
-)
-
-
-@functools.lru_cache(maxsize=1)
-def _always_carry_baseline() -> frozenset[str]:
-    """The permanent always_carry tool names, read from policy (cached).
-
-    Lazily imports presets to avoid an import cycle and never raises — on any
-    failure it returns the hardcoded fallback baseline so historical-row
-    normalization stays deterministic.
-    """
-    try:
-        from . import presets as _presets  # local import: avoid import cycle
-        base = _presets.load_base_policy()
-        names = getattr(base, "always_carry", None) or []
-        result = frozenset(str(t) for t in names if isinstance(t, str) and t)
-        if result:
-            return result
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("tool-belt: always_carry baseline load failed: %s", exc)
-    return _FALLBACK_ALWAYS_CARRY
 
 
 def _state_dir() -> Path:
@@ -301,13 +272,6 @@ class PredictionRecord:
     # the kwargs shape doesn't expose them.
     provider: str = ""
     model: str = ""
-    # True when this turn reused a frozen session snapshot rather than
-    # re-running the predictor.
-    # frozen_reuse_count is the index within the session — 1 on the
-    # second dispatch, 2 on the third, etc. Both blank for cache-off
-    # mode and for the first dispatch under cache-on (which freezes).
-    frozen_reuse: bool = False
-    frozen_reuse_count: int = 0
     # Which tokenizer produced ceiling_tokens / narrowed_tokens.
     #   "tiktoken-cl100k": real BPE tokenizer (OpenAI). Exact for
     #     GPT-family, ~5% approximate for Claude (different BPE).
@@ -372,8 +336,6 @@ class PredictionRecord:
             "tool_list_hash": self.tool_list_hash,
             "provider": self.provider,
             "model": self.model,
-            "frozen_reuse": self.frozen_reuse,
-            "frozen_reuse_count": self.frozen_reuse_count,
             "tokens_estimator": self.tokens_estimator,
         }
 
@@ -467,48 +429,25 @@ def _string_list(value: Any) -> list[str] | None:
         return None
 
 
-def _is_mcp_name(name: str) -> bool:
-    """Cheap MCP/plugin tool-name predicate for normalization (no plugin import).
-
-    Mirrors the runtime's ``_is_mcp_tool`` heuristic closely enough for the
-    normalizer's ``unknown_kept_tools`` filter: Hermes MCP tools are prefixed
-    ``mcp__`` (or ``mcp_`` on the Claude Code OAuth path).
-    """
-    return name.startswith("mcp__") or name.startswith("mcp_")
-
-
 def normalize_prediction_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Normalize any prediction telemetry row into the canonical v2 shape.
+    """Normalize a prediction telemetry row into the canonical shape.
 
     Pure, non-mutating, and non-raising: returns a new dict, never rewrites any
     file. This IS the shared choke point every downstream consumer (analyzer,
-    savings engine, shaper, operator scripts) reads through, so v1, v2, and
-    mixed-version streams all present the same canonical fields. Handles
-    malformed input by returning a best-effort dict.
+    savings engine, shaper, operator scripts) reads through, so every consumer
+    sees the same canonical fields. Handles malformed input by returning a
+    best-effort dict.
 
-    Canonical v2 fields (always present on the returned row): ``schema_version``,
+    Canonical fields (always present on the returned row): ``schema_version``,
     ``always_carry_tools``, ``carry_tools``, ``active_tools``,
     ``expand_only_tools``, ``always_carry_count``, ``carry_count``, and
     ``trigger_activated_tools``.
-
-    v1 rows (``always_on_tools`` / ``allowed_tools`` / ``cut_tools``) are mapped
-    forward: the resident set is ``always_on_tools`` plus any non-MCP
-    ``unknown_kept_tools`` (kept-in tools were resident), split against the
-    permanent ``always_carry`` baseline into the v2 always_carry / carry
-    classes; ``cut_tools`` becomes ``expand_only_tools``.
 
     Residency reconstruction (``residency`` mapping + ``residency_inferred``):
     only complete membership — ceiling plus residents plus active — permits it,
     because the A/C/X partition is unknowable from a sparse row. A sparse row
     stays valid for savings/promotion analysis but sets
-    ``residency_inferred: false`` and cannot drive demotion. The v1 residency
-    mapping keeps class A empty (v1 had no immutable split — all residents map
-    to ``carry``); a v2 row's mapping reflects its authoritative A/C/X.
-
-    Legacy v1 field names (``always_on_tools`` / ``allowed_tools`` /
-    ``cut_tools`` / ``unknown_kept_tools``) are consumed here and removed from
-    the returned row: the canonical v2 fields are the only surface a
-    normalized row presents.
+    ``residency_inferred: false`` and cannot drive demotion.
     """
     try:
         out = dict(row or {})
@@ -516,39 +455,14 @@ def normalize_prediction_row(row: dict[str, Any]) -> dict[str, Any]:
         return {"schema_version": SCHEMA_VERSION, "residency_inferred": False,
                 "residency": None}
 
-    is_v2 = out.get("schema_version") == SCHEMA_VERSION or "always_carry_tools" in out
-
     ceiling = _string_list(out.get("ceiling_tools"))
+    always_carry_tools = _string_list(out.get("always_carry_tools")) or []
+    carry_tools = _string_list(out.get("carry_tools")) or []
+    residents = [*always_carry_tools, *carry_tools]
+    active = _string_list(out.get("active_tools"))
+    expand_only = _string_list(out.get("expand_only_tools"))
 
-    if is_v2:
-        always_carry_tools = _string_list(out.get("always_carry_tools")) or []
-        carry_tools = _string_list(out.get("carry_tools")) or []
-        residents = [*always_carry_tools, *carry_tools]
-        active = _string_list(out.get("active_tools"))
-        if active is None:
-            active = _string_list(out.get("allowed_tools"))
-        expand_only = _string_list(out.get("expand_only_tools"))
-        if expand_only is None:
-            expand_only = _string_list(out.get("cut_tools"))
-    else:
-        v1_residents = _string_list(out.get("always_on_tools")) or []
-        # Kept-in unknown tools were resident too; MCP/plugin pass-through is
-        # NOT residency evidence and is filtered out (guarantee: MCP can never
-        # become shaping evidence).
-        unknown_kept = [t for t in (_string_list(out.get("unknown_kept_tools")) or [])
-                        if not _is_mcp_name(t)]
-        baseline = _always_carry_baseline()
-        residents = list(dict.fromkeys([*v1_residents, *unknown_kept]))
-        always_carry_tools = [t for t in residents if t in baseline]
-        carry_tools = [t for t in residents if t not in baseline]
-        active = _string_list(out.get("allowed_tools"))
-        if active is None:
-            active = _string_list(out.get("active_tools"))
-        expand_only = _string_list(out.get("cut_tools"))
-        if expand_only is None:
-            expand_only = _string_list(out.get("expand_only_tools"))
-
-    # ── Canonical v2 fields (always set explicitly). ──────────────────────
+    # ── Canonical fields (always set explicitly). ─────────────────────────
     out["schema_version"] = SCHEMA_VERSION
     out["always_carry_tools"] = always_carry_tools
     out["carry_tools"] = carry_tools
@@ -558,24 +472,13 @@ def normalize_prediction_row(row: dict[str, Any]) -> dict[str, Any]:
     out["carry_count"] = out.get("carry_count", len(carry_tools))
     out.setdefault("trigger_activated_tools",
                    _string_list(out.get("trigger_activated_tools")) or [])
-    # v1 spellings are consumed above — drop them from the canonical row.
-    for legacy_key in ("unknown_kept_tools", "always_on_tools", "allowed_tools",
-                       "cut_tools", "always_on_count"):
-        out.pop(legacy_key, None)
 
     # ── Residency reconstruction (complete membership only). ──────────────
-    residents_known = bool(residents)
-    complete = bool(ceiling) and residents_known and (active is not None)
-    if complete:
+    if bool(ceiling) and bool(residents) and active is not None:
         ceiling_set = [str(t) for t in ceiling]
         ceiling_members = set(ceiling_set)
-        resident_set = set(residents) & ceiling_members
-        if is_v2:
-            a_set = set(always_carry_tools) & ceiling_members
-            c_set = (set(carry_tools) & ceiling_members) - a_set
-        else:
-            a_set = set()
-            c_set = resident_set
+        a_set = set(always_carry_tools) & ceiling_members
+        c_set = (set(carry_tools) & ceiling_members) - a_set
         x_set = [t for t in ceiling_set if t not in (a_set | c_set)]
         out["residency_inferred"] = True
         out["residency"] = {
@@ -590,54 +493,28 @@ def normalize_prediction_row(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_tool_call_row(row: dict[str, Any]) -> dict[str, Any]:
-    """Normalize any tool-call telemetry row into the canonical v2 shape.
+    """Normalize a tool-call telemetry row into the canonical shape.
 
     Pure, non-mutating, non-raising — the tool-call counterpart to
-    :func:`normalize_prediction_row`. v1 rows use ``was_initially_available`` /
-    ``was_cut`` / ``was_expanded`` / ``expand_tools_used``; v2 renames these to
-    ``was_initially_active`` / ``was_expand_only`` / ``activated_by_expansion``
-    / ``expansion_provided_access`` and adds an explicit ``activation_source``.
-
-    v1 spellings are consumed and removed from the returned row: the
-    canonical v2 flags are the only surface a normalized row presents.
-    ``activation_source`` is only set when present (v2) or
-    confidently derivable; a v1 row without it keeps it blank rather than
-    guessing a residency class the old schema never recorded.
+    :func:`normalize_prediction_row`. Coerces the residency flags
+    (``was_initially_active`` / ``was_expand_only`` / ``activated_by_expansion``
+    / ``expansion_provided_access``) to bool and ``activation_source`` to str.
     """
     try:
         out = dict(row or {})
     except (TypeError, ValueError):
         return {"schema_version": SCHEMA_VERSION}
 
-    def _pick(*names, default=None):
-        for n in names:
-            if n in out and out[n] is not None:
-                return out[n]
-        return default
-
-    was_initially_active = _pick("was_initially_active", "was_initially_available")
-    was_expand_only = _pick("was_expand_only", "was_cut")
-    activated_by_expansion = _pick("activated_by_expansion", "was_expanded")
-    expansion_provided_access = _pick("expansion_provided_access", "expand_tools_used")
-    activation_source = _pick("activation_source", default="")
-
     out["schema_version"] = SCHEMA_VERSION
-    # Canonical v2 flags (only set when the row carried the information — a
-    # counterfactual harvest row deliberately omits expansion flags and must
-    # not gain a spurious ``False``).
-    if was_initially_active is not None:
-        out["was_initially_active"] = bool(was_initially_active)
-    if was_expand_only is not None:
-        out["was_expand_only"] = bool(was_expand_only)
-    if activated_by_expansion is not None:
-        out["activated_by_expansion"] = bool(activated_by_expansion)
-    if expansion_provided_access is not None:
-        out["expansion_provided_access"] = bool(expansion_provided_access)
-    out["activation_source"] = str(activation_source or "")
-    # v1 spellings are consumed above — drop them from the canonical row.
-    for legacy_key in ("was_initially_available", "was_cut", "was_expanded",
-                       "expand_tools_used"):
-        out.pop(legacy_key, None)
+    # Only set a flag when the row carried it — a counterfactual harvest row
+    # deliberately omits the expansion flags and must not gain a spurious
+    # ``False``.
+    for flag in ("was_initially_active", "was_expand_only",
+                 "activated_by_expansion", "expansion_provided_access"):
+        value = out.get(flag)
+        if value is not None:
+            out[flag] = bool(value)
+    out["activation_source"] = str(out.get("activation_source") or "")
     return out
 
 

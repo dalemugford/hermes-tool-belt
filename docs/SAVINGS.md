@@ -146,31 +146,20 @@ line.
 
 `prediction_provider_caches` looks at the prediction's API calls:
 
-1. The per-call `provider_caches` field (rows written from this release
-   on) is authoritative — the last call's status wins, then any call with
-   a known status.
-2. Rows that predate the field fall back to `PROVIDER_CACHE_HINTS`, a
-   small table keyed by provider name: `ollama-cloud` and `ollama` are
-   `false` (0% observed cache_read hits). A provider absent from the
-   table has no hint.
-3. Otherwise the cohort the prediction was classified into (`on` →
-   caching, `off` → not). Pending and bypass rows with no per-call facts
-   stay unknown, are priced at full rate, and are excluded from overhead
-   measurement.
-
-`PROVIDER_CACHE_HINTS` covers rows without a per-call cache status: it
-names the routes observed never to cache, so a row whose session-level
-`cache_mode` tag disagrees with its actual route is still priced right.
+1. The per-call `provider_caches` field is authoritative — the last
+   call's status wins, then any call with a known status.
+2. Otherwise the cohort the prediction was classified into (`on` →
+   caching, `off` → not). Rows with no per-call status and no resolvable
+   cohort (pending and bypass) stay unknown, are priced at full rate, and
+   are excluded from overhead measurement.
 
 ## Forward-aware headline, uncached-scoped denominators
 
 The headline `NET TOKENS SAVED` is `net_forward` — the non-caching cohort's
-ongoing net, `saved_input_equiv_noncaching − overhead_noncaching`
-(`ObservedCohort` in [savings.py](../savings.py)). It does **not** blend in
-caching-provider expand breaks (`net_caching_historical`), which are
-one-time costs the carry-all posture does not incur. That figure is kept
-in `--json` for diagnostics only, alongside `net_token_reduction`, the
-blended figure over every cohort. Neither appears in the text report.
+net, `saved_input_equiv_noncaching − overhead_noncaching` (`ObservedCohort`
+in [savings.py](../savings.py)). It is the only observed net: a caching
+provider carries the whole toolset, so it narrows nothing and ships no
+`expand_tools`, and there is nothing on that side to blend in.
 
 Because the headline is scoped to non-caching sessions, the numbers built
 from it are too: the per-session average, the 12-month pace, the headline
@@ -314,14 +303,13 @@ read-only report:
 ```
 
 The text report leads with `NET TOKENS SAVED` (`net_forward`, the
-uncached-only ongoing net, with its overhead basis), then the raw schema
+uncached-only net, with its overhead basis), then the raw schema
 tokens unsent and what they were worth after cache pricing, then the
 `expand_tools` overhead and event count. `--json` exposes `net_forward`,
 `saved_input_equiv_noncaching`, `overhead_noncaching`,
 `n_sessions_noncaching` / `first_ts_noncaching` / `last_ts_noncaching`,
-the blended-history `net_token_reduction` and `net_caching_historical`,
 `saved_input_equiv_total`, `realized_schema_token_reduction`,
-`expansion_overhead`, `overhead_per_event_caching` / `_noncaching`,
+`expansion_events`, `overhead_per_event_caching` / `_noncaching`,
 `overhead_basis`, and `overhead_measurement` per agent.
 
 `tool-belt savings` reports two separately-labeled cohorts that are **never
@@ -362,8 +350,6 @@ The fields most relevant to savings:
 | `narrowed_tokens` | int | Tokenized size of the narrowed toolset |
 | `tokens_saved` | int | `ceiling_tokens − narrowed_tokens` (0 on carry-all rows) |
 | `reduction_pct` | float | `tokens_saved / ceiling_tokens × 100` |
-| `frozen_reuse` | bool | Vestigial — always `false` on current rows. Historical rows with `true` were cache-on reuse dispatches under the removed per-session freeze; the classifier still reads them as cache-on. |
-| `frozen_reuse_count` | int | Vestigial — always `0` on current rows. |
 | `policy_source` | string | `preset`, `learned`, `cache_on_carry_all` (caching provider, nothing narrowed), or `bypass` (A/B control) |
 | `model` | string | Provider model name on this dispatch |
 

@@ -89,8 +89,8 @@ python3 analyze.py --state-dir ~/.hermes/state/tool-belt/harvest \
 The analyzer mines 80-char message previews per (scope, trigger), extracts
 2–4 word n-grams, and surfaces n-grams that show up frequently in
 false-positive messages but rarely in true-positive ones (the inverse flow
-mines `was_cut` previews for keyword candidates that would have covered a
-cut tool). Output includes regex-ready patterns plus sample previews;
+mines `was_expand_only` previews for keyword candidates that would have
+covered an expand-only tool). Output includes regex-ready patterns plus sample previews;
 candidates already covered by an existing pattern are filtered out.
 Tuning flags:
 

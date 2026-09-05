@@ -106,9 +106,7 @@ plugin (`ctx.get_config`, `config_schema` validation and `hermes plugins`
 all key off it). Per-channel entries nest as
 `channels.<agent>.<platform>` because Hermes forbids `:` in a settings
 key segment; the loader flattens them to the `agent:platform` scope
-string every other file (telemetry, `learned.json`) uses. A block left at
-the pre-2026.9 location `plugins.tool-belt` is **not read**; the plugin
-logs one warning at load naming the move. The loader is
+string every other file (telemetry, `learned.json`) uses. The loader is
 [`_load_user_config`](../__init__.py); defaults come from the
 `_CONFIG` dict in the same file.
 
@@ -806,7 +804,6 @@ Key fields:
 - `lookback_used`, `lookback_turns_config`
 - `tool_list_hash` — sha256 prefix of the wire-level tool schemas.
 - `provider`, `model`, `schema_version`
-- `frozen_reuse`, `frozen_reuse_count` — always `false` / `0`.
 
 ### `tool_calls.jsonl`
 
@@ -911,7 +908,7 @@ jq -r '.tool_name' ~/.hermes/state/tool-belt/tool_calls.jsonl | sort | uniq -c |
 **Expansion success rate — when did `expand_tools` lead to a real call?**
 
 ```bash
-jq -c 'select(.expand_tools_used == true) | {scope, category: .expand_category, tool: .expanded_tool, turns_until_used}' \
+jq -c 'select(.expansion_provided_access == true) | {scope, category: .expand_category, tool: .expanded_tool, turns_until_used}' \
   ~/.hermes/state/tool-belt/tool_calls.jsonl | tail -20
 ```
 
@@ -932,7 +929,7 @@ optionally emit `learned_recommendations.json` for review
 | `--unused-carry-turns` | 10 | Always-on tools carried this many turns with zero calls become demotion candidates |
 | `--trigger-min-fires` | 3 | Minimum fires before a trigger gets a precision/recall recommendation |
 | `--expand-round-trip-tokens` | 1500 | Estimated total cost of one `expand_tools` round-trip (model output + result + extra API call). Folded into per-category net-value math and the headline net-savings number. |
-| `--harvest-min-cuts` | 3 | Minimum was_cut count before a tool surfaces as a harvest-driven promotion candidate. |
+| `--harvest-min-cuts` | 3 | Minimum `was_expand_only` call count before a tool surfaces as a harvest-driven promotion candidate. |
 
 Dampener/trigger-keyword suggestion flags (`--suggest-dampeners`,
 `--suggest-trigger-keywords` and their tuning flags) are documented in

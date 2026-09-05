@@ -59,6 +59,16 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
   `shape-ceiling.py` now also applies `filter_protected_demotions`, which it
   never did.
 
+- **Telemetry readers accept only the current schema.** Every consumer
+  (`logger_io` normalizers, analyzer, savings engine, shaper, cache replay,
+  `scripts/`) now requires `predictions.jsonl` rows at `schema_version` 2 with
+  a non-empty `hermes_session_id`, `tool_calls.jsonl` rows carrying `source`,
+  and `api_calls.jsonl` rows carrying `prompt_tokens`. The forward-mapping,
+  alias lookups and identifier fallbacks that stood in for those fields are
+  gone, along with the provider cache-hint table — an `api_calls` row without
+  `provider_caches` is simply unknown and resolves from its cohort posture.
+  Pre-existing telemetry files are rewritten in place by the operator once.
+
 ### Added
 
 - **`scripts/replay-shaping.py` — read-only shaping replay.** Walks one
@@ -91,6 +101,9 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
   economics only, because the runtime carries everything on caching providers
   and ships no `expand_tools` there. The `cache_mode` and `assignment_source`
   keys are gone from the JSON report.
+- **Observed-cohort JSON keys `net_token_reduction`, `net_caching_historical`
+  and `expansion_overhead`** (per agent, plus `aggregate.observed.net_token_reduction`).
+  They described the freeze-era caching expand break; `net_forward` is the net.
 - **`scripts/cache-stability-replay.py`** is now the package module
   `cache_replay.py` at the plugin root (`python3 cache_replay.py` for the
   diagnostic CLI); the analyzer imports it directly.

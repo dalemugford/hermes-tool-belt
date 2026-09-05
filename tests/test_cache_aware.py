@@ -351,8 +351,8 @@ class SlashCommandBypassTests(unittest.TestCase):
     Hermes' gateway fires pre_gateway_dispatch BEFORE routing slash
     commands to their handlers. Without the bypass, the predictor runs
     on the command text and creates a freeze that's never reached by
-    an LLM call but pollutes the next real-message dispatch with
-    frozen_reuse=true. Then on_session_reset (which Hermes fires with
+    an LLM call but pollutes the next real-message dispatch. Then
+    on_session_reset (which Hermes fires with
     only the NEW session UUID + platform) can't evict the freeze
     because the canonical key isn't in the hook kwargs.
 
@@ -486,7 +486,6 @@ class BypassCohortTests(unittest.TestCase):
             "policy_source": "preset",
             "ceiling_count": 46, "narrowed_count": 29,
             "ceiling_tokens": 12521, "narrowed_tokens": 7137,
-            "frozen_reuse": False,
         }
 
     def test_bypass_row_classifies_as_bypass(self):
