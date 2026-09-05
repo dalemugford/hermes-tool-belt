@@ -3,18 +3,21 @@
 Covers:
   1. Prediction ``session_id`` is populated for gateway-dispatched events
      when ``session_store`` is reachable.
-  2. ``_should_bypass`` activates once ``session_id`` exists.
+  2. ``_should_bypass`` — the blank-session guard and the deterministic
+     (scope, session_id) cohort hash.
   3. Real Hermes session-key shape parsing — ``agent:main:{platform}:…``,
      where position 1 is the *literal* string ``"main"``, not the agent
      name. Recovering ``assistant-a:telegram`` from a real gateway key
      requires combining the canonical platform with a profile-derived
      agent.
   4. Blank attribution preserved for genuinely untrackable rows.
-  5. ``_on_session_end`` evicts sticky/lookback state keyed by the
+  5. ``_on_session_reset`` evicts sticky/lookback state keyed by the
      canonical session key, even when Hermes hands us the AIAgent's
      uuid-style ``session_id``.
-  6. Analyzer warns clearly when PyYAML / preset excludes can't be
-     loaded.
+  6. Analyzer degraded modes, trigger TP/FP windowing and keyword mining.
+  7. The tool-call row's credit rules: the primary-dispatch gate, the
+     ``initial_active_tools`` snapshot, and the credit baseline that keeps
+     ``expansion_provided_access`` honest.
 """
 
 from __future__ import annotations
@@ -40,7 +43,6 @@ if "tool_belt_plugin" not in sys.modules:
     from tests import conftest  # noqa: F401 — side-effect: register package
 
 plugin = sys.modules["tool_belt_plugin"]
-logger_io = importlib.import_module("tool_belt_plugin.logger_io")
 analyze = importlib.import_module("tool_belt_plugin.analyze")
 
 
@@ -109,14 +111,26 @@ class SessionKeyParsingTests(unittest.TestCase):
         plugin._CONFIG.clear()
         plugin._CONFIG.update(self._original_config)
 
-    def test_platform_from_real_session_key(self):
-        self.assertEqual(plugin._platform_from_session_key(REAL_KEY_TELEGRAM), "telegram")
-        self.assertEqual(plugin._platform_from_session_key(REAL_KEY_WHATSAPP), "whatsapp")
-
-    def test_platform_from_session_key_ignores_uuid(self):
-        # AIAgent.session_id has no "agent:" prefix; the helper must
-        # return blank rather than guessing.
-        self.assertEqual(plugin._platform_from_session_key("20260516_123456_deadbeef"), "")
+    def test_platform_parsed_only_from_the_canonical_agent_main_shape(self):
+        # Position 1 is the LITERAL "main" in every gateway key. Accepting an
+        # arbitrary second segment would make the helper read position 2 of a
+        # key it does not understand and stamp a bogus platform on the row —
+        # so the "main" check is asserted directly, not just implied by the
+        # happy path.
+        cases = [
+            (REAL_KEY_TELEGRAM, "telegram"),
+            (REAL_KEY_WHATSAPP, "whatsapp"),
+            # AIAgent.session_id has no "agent:" prefix.
+            ("20260516_123456_deadbeef", ""),
+            # An "agent:"-prefixed key whose position 1 is NOT "main": the
+            # shape is not the gateway's, so nothing may be parsed out of it.
+            ("agent:assistant-a:telegram:dm:1", ""),
+            ("agent:sub:whatsapp:dm:1", ""),
+            ("", ""),
+        ]
+        for key, expected in cases:
+            with self.subTest(key=key):
+                self.assertEqual(plugin._platform_from_session_key(key), expected)
 
     def test_profile_agent_from_hermes_home(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -192,16 +206,46 @@ class PreGatewayDispatchSessionIdTests(unittest.TestCase):
 
 
 class BypassEligibilityTests(unittest.TestCase):
-    def test_should_bypass_false_when_session_id_blank(self):
-        self.assertFalse(plugin._should_bypass("assistant-a:telegram", ""))
+    """``_should_bypass`` is the A/B cohort assignment. Two properties make the
+    cohort usable: a session without an id can never be assigned (its turns
+    would flip cohort mid-session and poison both arms), and assignment is a
+    deterministic hash of (scope, session_id) rather than a coin flip."""
 
-    def test_should_bypass_can_fire_with_real_session_id(self):
-        original_rate = plugin._CONFIG.get("bypass_rate")
+    SCOPE = "assistant-a:telegram"
+    # Buckets under the (scope, sid) sha1: 0.369 and 0.828 respectively, so at
+    # rate 0.5 the first is inside the cohort and the second is outside.
+    IN_COHORT = REAL_KEY_TELEGRAM
+    OUT_OF_COHORT = "agent:main:telegram:dm:3"
+
+    def setUp(self):
+        self._original_rate = plugin._CONFIG.get("bypass_rate")
+        self.addCleanup(self._restore_rate)
+
+    def _restore_rate(self):
+        if self._original_rate is None:
+            plugin._CONFIG.pop("bypass_rate", None)
+        else:
+            plugin._CONFIG["bypass_rate"] = self._original_rate
+
+    def test_blank_session_id_never_bypasses_even_at_full_rate(self):
+        # Rate 1.0 so the "rate <= 0" early return cannot be what produces the
+        # False — only the blank-session guard can.
         plugin._CONFIG["bypass_rate"] = 1.0
-        try:
-            self.assertTrue(plugin._should_bypass("assistant-a:telegram", REAL_KEY_TELEGRAM))
-        finally:
-            plugin._CONFIG["bypass_rate"] = original_rate
+        self.assertTrue(plugin._should_bypass(self.SCOPE, REAL_KEY_TELEGRAM),
+                        "PRECONDITION: at rate 1.0 an identified session bypasses")
+        self.assertFalse(plugin._should_bypass(self.SCOPE, ""),
+                         "a session with no id can never join the bypass cohort")
+
+    def test_cohort_assignment_is_a_stable_hash_not_a_coin_flip(self):
+        plugin._CONFIG["bypass_rate"] = 0.5
+        first = plugin._should_bypass(self.SCOPE, self.IN_COHORT)
+        self.assertIs(first, plugin._should_bypass(self.SCOPE, self.IN_COHORT),
+                      "the same session must get the same answer every turn")
+        self.assertTrue(first, "this session's bucket falls inside a 0.5 rate")
+        self.assertFalse(
+            plugin._should_bypass(self.SCOPE, self.OUT_OF_COHORT),
+            "a session whose bucket exceeds the rate stays out of the cohort",
+        )
 
 
 class PostToolCallAttributionRecoveryTests(unittest.TestCase):
@@ -234,20 +278,16 @@ class PostToolCallAttributionRecoveryTests(unittest.TestCase):
 
     def test_recover_from_real_session_key_uses_profile_agent(self):
         # The earlier code would have returned ("main", "telegram", ...).
-        # The fix derives the agent from the HERMES_HOME profile.
-        agent, platform, scope = plugin._recover_attribution_without_state(
-            REAL_KEY_TELEGRAM, kwargs={}
-        )
-        self.assertEqual(agent, "assistant-a")
-        self.assertEqual(platform, "telegram")
-        self.assertEqual(scope, "assistant-a:telegram")
-
-    def test_recover_from_whatsapp_session_key(self):
-        # Confirms the parser works across platforms, not just telegram.
-        agent, platform, scope = plugin._recover_attribution_without_state(
-            REAL_KEY_WHATSAPP, kwargs={}
-        )
-        self.assertEqual((agent, platform, scope), ("assistant-a", "whatsapp", "assistant-a:whatsapp"))
+        # The fix derives the agent from the HERMES_HOME profile, and the
+        # platform from the key — across platforms, not just telegram.
+        for key, platform in ((REAL_KEY_TELEGRAM, "telegram"),
+                              (REAL_KEY_WHATSAPP, "whatsapp")):
+            with self.subTest(platform=platform):
+                recovered = plugin._recover_attribution_without_state(key, kwargs={})
+                self.assertEqual(
+                    recovered,
+                    ("assistant-a", platform, f"assistant-a:{platform}"),
+                )
 
     def test_recover_returns_blanks_for_uuid_style_session_id(self):
         # AIAgent.session_id is a uuid/timestamp string. With no env-var
@@ -320,11 +360,13 @@ class PostToolCallAttributionRecoveryTests(unittest.TestCase):
         self.assertEqual(row["scope"], "assistant-a:telegram")
 
 
-class SessionEndKeepsSessionStateTests(unittest.TestCase):
-    """``on_session_end`` fires PER TURN, so sticky residency and lookback
-    history — session-scoped features with their own decay/trim bounds —
-    must SURVIVE it; evicting them per turn defeated both features. True
-    cleanup belongs to ``_on_session_reset`` only."""
+class SessionResetEvictsSessionStateTests(unittest.TestCase):
+    """True cleanup of sticky residency and lookback history belongs to
+    ``_on_session_reset`` (/new, /reset) alone — and it must find the state
+    even though Hermes hands the hook a fresh AIAgent uuid rather than the
+    canonical key the state is filed under. (The other half of the contract —
+    that the per-turn ``on_session_end`` hook does NOT evict them — is pinned
+    by ``test_cache_aware.SessionHookSemanticsTests``.)"""
 
     AGENT_SESSION_ID = "20260516_123456_deadbeef"
 
@@ -347,16 +389,6 @@ class SessionEndKeepsSessionStateTests(unittest.TestCase):
         }
         plugin._PRIOR_MESSAGES_BY_SESSION[canonical_key] = ["hello"]
         return sticky_key
-
-    def test_sticky_and_lookback_survive_the_per_turn_hook(self):
-        sticky_key = self._seed_state(REAL_KEY_TELEGRAM)
-        with mock.patch.dict(
-            os.environ, {"HERMES_SESSION_KEY": REAL_KEY_TELEGRAM}, clear=False
-        ):
-            plugin._on_session_end(session_id=self.AGENT_SESSION_ID,
-                                   session_key=REAL_KEY_TELEGRAM)
-        self.assertIn(sticky_key, plugin._STICKY_BY_KEY)
-        self.assertIn(REAL_KEY_TELEGRAM, plugin._PRIOR_MESSAGES_BY_SESSION)
 
     def test_session_reset_still_evicts_them(self):
         sticky_key = self._seed_state(REAL_KEY_TELEGRAM)
@@ -434,20 +466,21 @@ class TriggerFpLateBoundTpTests(unittest.TestCase):
         self.assertEqual(scope.trigger_false_positives.get("shell", 0), 0)
 
     def test_call_beyond_window_counts_as_fp(self):
+        # One turn past the shipped lookahead, whatever that is — the fixture
+        # is generated from the constant so a change to the window moves this
+        # test with it instead of silently making it assert nothing.
+        window = analyze.DEFAULT_STICKY_LOOKAHEAD_TURNS
         preds = [
             self._row_prediction(pid="p1", sid="s1", trigger="shell",
                                  tools_for_trigger=["terminal"], ts=1.0),
-            self._row_prediction(pid="p2", sid="s1", trigger=None,
-                                 tools_for_trigger=[], ts=2.0),
-            self._row_prediction(pid="p3", sid="s1", trigger=None,
-                                 tools_for_trigger=[], ts=3.0),
-            self._row_prediction(pid="p4", sid="s1", trigger=None,
-                                 tools_for_trigger=[], ts=4.0),
-            self._row_prediction(pid="p5", sid="s1", trigger=None,
-                                 tools_for_trigger=[], ts=5.0),
         ]
-        # Window is 3 — p5 is 4 turns out, beyond the window.
-        calls = [self._row_call(pid="p5", tool="terminal")]
+        preds += [
+            self._row_prediction(pid=f"p{n}", sid="s1", trigger=None,
+                                 tools_for_trigger=[], ts=float(n))
+            for n in range(2, window + 3)
+        ]
+        beyond = preds[-1]["prediction_id"]
+        calls = [self._row_call(pid=beyond, tool="terminal")]
         stats = analyze.collect_stats(preds, calls)
         scope = stats["assistant-a:telegram"]
         self.assertEqual(scope.trigger_false_positives.get("shell", 0), 1,
@@ -508,7 +541,6 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
 
     def _make_stats(self, *, scope="assistant-a:telegram", expand_only_previews,
                     all_previews, was_expand_only_count):
-        from collections import Counter
         stat = analyze.ScopeStats(scope=scope)
         stat.harvest_predictions = len(all_previews)
         stat.harvest_all_previews = list(all_previews)
@@ -606,15 +638,28 @@ class TriggerKeywordSuggesterTests(unittest.TestCase):
             all_previews=cut_msgs + ["random"] * 10,
             was_expand_only_count={"deploy_tool": 4},
         )
+        # The same fixture WITHOUT the covering pattern must produce
+        # candidates — otherwise "no overlap leaked" would be vacuously true
+        # because the miner found nothing at all.
+        uncovered = {"deploy": {"tools": ["deploy_tool"], "keyword_patterns": []}}
+        with mock.patch.object(analyze, "_load_preset_triggers",
+                               return_value=(uncovered, "ok")):
+            baseline = analyze.trigger_keyword_candidates(stats, self._args())
+        covered = triggers["deploy"]["keyword_patterns"][0]
+        baseline_patterns = [c["pattern"] for r in baseline for c in r["candidates"]]
+        self.assertTrue(any(covered.search(p) for p in baseline_patterns),
+                        "PRECONDITION: without the existing pattern this "
+                        f"fixture mines an overlapping candidate; got "
+                        f"{baseline_patterns}")
+
         with mock.patch.object(analyze, "_load_preset_triggers",
                                return_value=(triggers, "ok")):
             rows = analyze.trigger_keyword_candidates(stats, self._args())
-        # All cut messages contain "deploy the" which is already covered.
-        # Candidates list (if any) must not include "deploy the" or
-        # substrings that the existing pattern matches.
-        if rows:
-            for c in rows[0]["candidates"]:
-                self.assertFalse(triggers["deploy"]["keyword_patterns"][0].search(c["pattern"]),
+        # Every candidate the existing pattern already covers must be gone —
+        # the miner may still offer a narrower, uncovered n-gram.
+        for row in rows:
+            for c in row["candidates"]:
+                self.assertFalse(covered.search(c["pattern"]),
                     f"existing-pattern overlap leaked: {c['pattern']!r}")
 
 
@@ -675,9 +720,11 @@ class RecommendationRowProtectionTests(unittest.TestCase):
 
 class ExpansionProvidedAccessAttributionTests(unittest.TestCase):
     """The ``expansion_provided_access`` flag must only fire when expansion
-    actually provided the tool — not when the model happens to call a
-    tool that was already in the initial active set and is also
-    coincidentally covered by an active sticky entry.
+    actually provided the tool. This class holds the same-turn round-trip
+    half: an ``expand_tools`` call that resolved a tool the model already had
+    still records the round-trip cost but credits nothing. (The sticky /
+    cross-turn half is pinned through the real wrapper in
+    ``BuildApiKwargsSnapshotTests``.)
 
     The bug this guards against: live telemetry showed 94% of
     ``expansion_provided_access`` flags coinciding with
@@ -713,19 +760,6 @@ class ExpansionProvidedAccessAttributionTests(unittest.TestCase):
         plugin._STICKY_BY_KEY.clear()
         plugin._POLICY_TURN_BY_SCOPE.clear()
 
-    def _seed_sticky(self, sticky_key: str, category: str, tools: list[str]) -> None:
-        """Insert a live sticky entry by hand so the test doesn't depend
-        on running a full expand_tools round-trip."""
-        plugin._STICKY_BY_KEY[sticky_key] = {
-            category: {
-                "tools": {str(t) for t in tools},
-                "remaining_turns": 3,
-                "updated_at": 0.0,
-                "expanded_at_turn": 0,
-                "prediction_id": "pred-prior",
-            }
-        }
-
     def _set_prediction_state(self, *, initial_allowed: list[str], sticky_key: str) -> None:
         plugin._PREDICTION_CV.set({
             "prediction_id": "pred-current",
@@ -746,71 +780,6 @@ class ExpansionProvidedAccessAttributionTests(unittest.TestCase):
         rows = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l]
         self.assertTrue(rows, "expected at least one tool-call row")
         return rows[-1]
-
-    def test_already_available_tool_does_not_credit_sticky_expansion(self):
-        # The bug case: terminal is already in the initial allowed set
-        # AND covered by an active sticky entry. The flag must NOT fire.
-        sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
-        self._seed_sticky(sticky_key, "terminal", ["terminal"])
-        self._set_prediction_state(initial_allowed=["terminal", "memory"], sticky_key=sticky_key)
-
-        plugin._on_post_tool_call(
-            tool_name="terminal", args={}, result="ok", task_id="t1",
-            session_id=REAL_KEY_TELEGRAM, tool_call_id="tc-primary",
-        )
-        row = self._latest_row()
-        self.assertTrue(row.get("was_initially_active"))
-        self.assertNotEqual(row.get("expansion_provided_access"), True,
-            "tool already in initial allowed set must not be credited as expansion-driven")
-
-    def test_expand_only_tool_with_active_sticky_credits_expansion(self):
-        # The legitimate case: terminal was expand-only in the initial active
-        # set; sticky residency from a prior expansion is what made it
-        # callable. The flag must fire.
-        sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
-        self._seed_sticky(sticky_key, "terminal", ["terminal"])
-        self._set_prediction_state(initial_allowed=["memory"], sticky_key=sticky_key)
-        # Mark the tool expand-only so the canonical flag reflects reality (the predictor
-        # would have set this when narrowing).
-        state = plugin._PREDICTION_CV.get()
-        state["expand_only_tools"] = ["terminal"]
-        plugin._PREDICTION_CV.set(state)
-
-        plugin._on_post_tool_call(
-            tool_name="terminal", args={}, result="ok", task_id="t1",
-            session_id=REAL_KEY_TELEGRAM, tool_call_id="tc-primary",
-        )
-        row = self._latest_row()
-        self.assertFalse(row.get("was_initially_active"))
-        self.assertTrue(row.get("expansion_provided_access"),
-            "expand-only tool reachable via sticky must be credited")
-        self.assertEqual(row.get("expand_category"), "terminal")
-
-    def test_sticky_carried_tool_in_initial_allowed_still_credits_expansion(self):
-        # Regression: in production, sticky_tools get merged into the
-        # narrowed active set BEFORE filtering, so a sticky-carried tool
-        # ends up in initial_active_tools. Without a pre-sticky baseline,
-        # the credit decision saw was_initially_active=True and skipped the
-        # sticky-expansion branch, zeroing out expansion_provided_access.
-        sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
-        self._seed_sticky(sticky_key, "terminal", ["terminal"])
-        # Terminal IS in initial_active (sticky merged in upstream)…
-        self._set_prediction_state(initial_allowed=["terminal", "memory"], sticky_key=sticky_key)
-        # …but the pre-sticky baseline does NOT include it.
-        state = plugin._PREDICTION_CV.get()
-        state["baseline_active_tools"] = ["memory"]
-        plugin._PREDICTION_CV.set(state)
-
-        plugin._on_post_tool_call(
-            tool_name="terminal", args={}, result="ok", task_id="t1",
-            session_id=REAL_KEY_TELEGRAM, tool_call_id="tc-primary",
-        )
-        row = self._latest_row()
-        self.assertFalse(row.get("was_initially_active"),
-            "baseline (pre-sticky) determines was_initially_active")
-        self.assertTrue(row.get("expansion_provided_access"),
-            "sticky-carried tool must be credited as expansion-driven")
-        self.assertEqual(row.get("expand_category"), "terminal")
 
     def test_pending_expansion_skipped_when_already_active(self):
         # Same-turn expansion (pending_expansion) for a tool that was
@@ -1066,6 +1035,72 @@ class BuildApiKwargsSnapshotTests(unittest.TestCase):
             "baseline excluded terminal — it was only callable via sticky")
         self.assertTrue(row.get("expansion_provided_access"),
             "sticky-recovered tool must be credited as expansion-driven")
+
+    def test_implicit_carry_resident_widens_the_credit_baseline(self):
+        """Class C is mostly IMPLICIT (E − A − demoted), so the predictor's
+        pre-ceiling baseline understates what the model actually saw.
+
+        ``_build_api_kwargs`` widens ``baseline_active_tools`` with the
+        resolved resident classes once the live ceiling is known. Without that
+        widening a tool that was carried anyway looks absent from the
+        baseline, and a coincidental sticky entry then credits
+        ``expansion_provided_access`` to it — the exact 15× promotion-signal
+        inflation the credit rules exist to prevent. No other test drives an
+        implicitly-carried tool (one named in NO resident list) through the
+        real wrapper and then calls it.
+        """
+        sticky_key = plugin._sticky_key_for_session(REAL_KEY_TELEGRAM)
+        plugin._STICKY_BY_KEY[sticky_key] = {
+            "terminal": {
+                "tools": {"terminal"},
+                "remaining_turns": 3,
+                "updated_at": 0.0,
+                "expanded_at_turn": 0,
+                "prediction_id": "pred-prior",
+            }
+        }
+        self.addCleanup(plugin._STICKY_BY_KEY.clear)
+
+        plugin._CONFIG["log"] = True
+        plugin._PREDICTION_CV.set({
+            "prediction_id": "pred-current",
+            "active_tool_names": ["memory"],
+            # The predictor's pre-ceiling baseline: terminal is NOT in it, and
+            # terminal is named in no resident list either — it becomes a
+            # class-C resident only once the ceiling is resolved.
+            "baseline_active_tools": ["memory"],
+            "resolved_always_carry": [],
+            "resolved_carry": ["memory"],
+            "resolved_demoted": [],
+            "triggered_tools": [],
+            "expansions": set(),
+            "agent": "assistant-a", "platform": "telegram",
+            "scope": "assistant-a:telegram",
+            "sticky_key": sticky_key, "session_id": REAL_KEY_TELEGRAM,
+            "sticky_tools": [], "sticky_categories": [],
+            "sticky_remaining_turns": {},
+            "expand_only_tools": [], "pending_expansion": None,
+        })
+
+        self._run_wrapper_with_tools(["memory", "terminal"])
+        state = plugin._PREDICTION_CV.get()
+        self.assertIn("terminal", state["carry_carry"],
+                      "PRECONDITION: terminal resolves to an implicit class-C "
+                      "resident against the live ceiling")
+        self.assertIn("terminal", state["baseline_active_tools"],
+                      "the resolved residents widen the credit baseline")
+
+        plugin._on_post_tool_call(
+            tool_name="terminal", args={}, result="ok",
+            task_id="t1", session_id=REAL_KEY_TELEGRAM, tool_call_id="tc-primary",
+        )
+        tool_calls_path = Path(self.profile_home) / "state" / "tool-belt" / "tool_calls.jsonl"
+        row = [json.loads(l) for l in tool_calls_path.read_text().splitlines() if l][-1]
+        self.assertTrue(row.get("was_initially_active"),
+                        "an implicitly carried tool was available all along")
+        self.assertNotEqual(row.get("expansion_provided_access"), True,
+                            "a tool that was carried anyway must never be "
+                            "credited to expansion, sticky entry or not")
 
     def test_already_available_tool_never_credits_expansion(self):
         # Tool present in baseline (no expansion involved) must not be

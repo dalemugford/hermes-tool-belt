@@ -34,7 +34,6 @@ if str(_TESTS_DIR) not in sys.path:
 
 import conftest  # noqa: F401,E402 — registers the tool_belt_plugin package
 
-plugin = sys.modules["tool_belt_plugin"]
 from tool_belt_plugin import shaping  # noqa: E402
 
 _DAY = 86400
@@ -87,11 +86,6 @@ class PrecedenceTests(unittest.TestCase):
                             shaping.DEFAULTS["window_days"])
         self.assertNotEqual(resolved["promote_min_calls"],
                             shaping.DEFAULTS["promote_min_calls"])
-
-    def test_no_config_resolves_policy_layer(self):
-        resolved = shaping.load_shape_ceiling_defaults(policy_path=self.policy)
-        self.assertEqual(resolved["window_days"], 77)
-        self.assertEqual(resolved["demote_k"], 2.5)
 
     def test_empty_learning_block_is_policy_layer(self):
         for cfg in ({}, {"learning": {}}, {"learning": {"shape_ceiling": {}}}):
@@ -161,7 +155,6 @@ class DefaultsContractTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "no-policy.yaml"
             resolved = shaping.load_shape_ceiling_defaults(policy_path=missing)
-        self.assertEqual(resolved["window_days"], shaping.DEFAULTS["window_days"])
         self.assertEqual(resolved, dict(shaping.DEFAULTS))
 
 

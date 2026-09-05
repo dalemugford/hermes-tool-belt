@@ -8,7 +8,9 @@ import os
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 if "tool_belt_plugin" not in sys.modules:
     here = Path(__file__).resolve().parent
@@ -25,6 +27,26 @@ PLUGIN_DIR = Path(__file__).resolve().parent.parent
 def _trigger(name: str):
     preset = presets.load_preset_file(PLUGIN_DIR / "policy.yaml")
     return next(group for group in preset.triggers if group.name == name)
+
+
+@contextmanager
+def seeded_learned_state(scope: str = "assistant-a:telegram",
+                         carry: list[str] | None = None):
+    """A throwaway HERMES_HOME whose learned.json promotes ``carry``."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with mock.patch.dict(os.environ, {"HERMES_HOME": tmpdir}):
+            state_dir = Path(tmpdir) / "state" / "tool-belt"
+            state_dir.mkdir(parents=True)
+            (state_dir / "learned.json").write_text(json.dumps({
+                "version": 2,
+                "updated_at": "2026-01-01T00:00:00Z",
+                "scopes": {scope: {"carry": carry or ["browser_navigate"]}},
+            }), encoding="utf-8")
+            learned.load_state(force=True)
+            try:
+                yield presets.load_preset_file(PLUGIN_DIR / "policy.yaml")
+            finally:
+                learned.load_state(force=True)
 
 
 class _TriggerAssertions:
@@ -77,52 +99,16 @@ class TriggerDampenerTests(_TriggerAssertions, unittest.TestCase):
         self.assert_quiet("mnemosyne_extended", "Send these in one batch, please.")
 
     def test_learned_merge_preserves_dampeners(self):
-        preset = presets.load_preset_file(PLUGIN_DIR / "policy.yaml")
-        original_home = os.environ.get("HERMES_HOME")
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            os.environ["HERMES_HOME"] = tmpdir
-            try:
-                state_dir = Path(tmpdir) / "state" / "tool-belt"
-                state_dir.mkdir(parents=True)
-                payload = {
-                    "version": 2,
-                    "updated_at": "2026-01-01T00:00:00Z",
-                    "scopes": {"assistant-a:telegram": {"carry": ["browser_navigate"]}},
-                }
-                (state_dir / "learned.json").write_text(json.dumps(payload), encoding="utf-8")
-                learned.load_state(force=True)
-
-                result = learned.apply_to_preset(
-                    preset,
-                    {"learned_mode": "apply"},
-                    "assistant-a:telegram",
-                )
-                self.assertEqual(result.policy_source, "learned")
-                file_write = next(group for group in result.preset.triggers if group.name == "file_write")
-                self.assertTrue(file_write.exclude_patterns)
-                self.assertFalse(file_write.matches("Should we save this as a file later?", []))
-
-                # recommend (default) must NOT merge learned.json.
-                rec = learned.apply_to_preset(
-                    preset,
-                    {"learned_mode": "recommend"},
-                    "assistant-a:telegram",
-                )
-                self.assertEqual(rec.mode, "recommend")
-                self.assertEqual(rec.policy_source, "preset")
-                self.assertNotIn("browser_navigate", rec.preset.carry)
-
-                # apply promotes the learned tool into adaptive carry
-                # residency, never into the immutable baseline.
-                self.assertIn("browser_navigate", result.preset.carry)
-                self.assertNotIn("browser_navigate", result.preset.always_carry)
-            finally:
-                if original_home is None:
-                    os.environ.pop("HERMES_HOME", None)
-                else:
-                    os.environ["HERMES_HOME"] = original_home
-                learned.load_state(force=True)
+        """Merging learned.json must not strip a trigger's exclude patterns."""
+        with seeded_learned_state() as preset:
+            result = learned.apply_to_preset(
+                preset, {"learned_mode": "apply"}, "assistant-a:telegram")
+            self.assertEqual(result.policy_source, "learned")
+            file_write = next(g for g in result.preset.triggers
+                              if g.name == "file_write")
+            self.assertTrue(file_write.exclude_patterns)
+            self.assertFalse(
+                file_write.matches("Should we save this as a file later?", []))
 
 
 class TriggerKeywordPrecisionTests(_TriggerAssertions, unittest.TestCase):
@@ -182,6 +168,22 @@ class LearnedModeNormalizationTests(unittest.TestCase):
         self.assertEqual(learned.normalize_mode(""), "apply")
         self.assertEqual(learned.normalize_mode(None), "apply")
         self.assertEqual(learned.normalize_mode("bogus"), "apply")
+
+    def test_only_apply_merges_learned_state_and_only_into_carry(self):
+        with seeded_learned_state() as preset:
+            # recommend must NOT merge learned.json.
+            rec = learned.apply_to_preset(
+                preset, {"learned_mode": "recommend"}, "assistant-a:telegram")
+            self.assertEqual(rec.mode, "recommend")
+            self.assertEqual(rec.policy_source, "preset")
+            self.assertNotIn("browser_navigate", rec.preset.carry)
+
+            # apply promotes the learned tool into adaptive carry residency,
+            # never into the immutable baseline.
+            applied = learned.apply_to_preset(
+                preset, {"learned_mode": "apply"}, "assistant-a:telegram")
+            self.assertIn("browser_navigate", applied.preset.carry)
+            self.assertNotIn("browser_navigate", applied.preset.always_carry)
 
     def test_per_scope_override_wins_over_the_global_mode(self):
         self.assertEqual(

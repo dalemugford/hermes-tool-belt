@@ -21,8 +21,8 @@ entirely.
 
 import unittest
 
-from tests.test_carrying_model import (
-    _pred_row, _expansion_call, _trigger_call, _compute, shaper,  # noqa: F401
+from tests.shaping_fixtures import (
+    _pred_row, _expansion_call, _trigger_call, _compute,
 )
 from tool_belt_plugin.shaping import EXPAND_ROUND_TRIP_TOKENS
 
@@ -159,6 +159,7 @@ class EconomicDemotion(unittest.TestCase):
         entry = {d["tool"]: d for d in recs["demote"]}
         self.assertIn("browser_exec", entry)
         self.assertEqual(entry["browser_exec"]["sessions_with_use"], 0)
+        self.assertEqual(entry["browser_exec"]["sessions_without_use"], 30)
         self.assertEqual(entry["browser_exec"]["evidence"], "carry_unused")
 
     def test_lean_tool_holds(self):
@@ -168,14 +169,6 @@ class EconomicDemotion(unittest.TestCase):
         recs = _compute(self.SCOPE, preds, calls, window_days=7,
                         schema_sizes={"browser_exec": 150})
         self.assertNotIn("browser_exec", {d["tool"] for d in recs["demote"]})
-
-    def test_zero_use_limit_case_still_demotes_as_unused(self):
-        preds, calls = self._sessions(30)
-        recs = _compute(self.SCOPE, preds, calls, window_days=7)
-        entry = {d["tool"]: d for d in recs["demote"]}
-        self.assertIn("browser_exec", entry)
-        self.assertEqual(entry["browser_exec"]["evidence"], "carry_unused")
-        self.assertEqual(entry["browser_exec"]["sessions_without_use"], 30)
 
     def test_api_call_counts_scale_exposures(self):
         # A narrowed agentic turn pays the manifest on every API call. With
@@ -234,9 +227,6 @@ class EconomicPromotion(unittest.TestCase):
         self.assertEqual(entry["web_extract"]["carry_tokens"], 0)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class PinnedToolsNeverPromote(unittest.TestCase):
     """A pinned (always_carry) tool is carried unconditionally — the shaper
@@ -273,3 +263,7 @@ class PinnedToolsNeverPromote(unittest.TestCase):
         self.assertEqual(out[self.SCOPE]["promote"], [],
                          "a config-pinned tool never promotes (stale pre-pin "
                          "evidence must not re-enter learned carry)")
+
+
+if __name__ == "__main__":
+    unittest.main()

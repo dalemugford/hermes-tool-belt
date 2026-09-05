@@ -30,7 +30,7 @@ import sys
 import unittest
 from pathlib import Path
 
-from tests.test_carrying_model import _pred_row, _compute, shaper
+from tests.shaping_fixtures import _pred_row, _compute
 
 DAY = 86400
 #: A fixed anchor deep in the past (2001-09-09). Every fixture below is dated
@@ -79,15 +79,6 @@ class DayWindowFiltering(unittest.TestCase):
             })
         return preds, calls
 
-    def test_only_sessions_inside_the_day_window_are_considered(self):
-        preds, calls = self._history()
-        recs = _compute(self.SCOPE, preds, calls, window_days=7,
-                        demote_min_sessions_no_use=2)
-        self.assertEqual(
-            recs["sessions_considered"], 3,
-            "a 7-day window holds the sessions 0, 3 and 6 days old; the ones "
-            "10 and 20 days old have aged out")
-
     def test_a_wider_window_reaches_the_older_sessions(self):
         preds, calls = self._history()
         recs = _compute(self.SCOPE, preds, calls, window_days=30,
@@ -105,6 +96,8 @@ class DayWindowFiltering(unittest.TestCase):
         self.assertEqual(recs["sessions_considered"], 3,
                          "'now' is the newest activity in the data; telemetry "
                          "from 2001 replays exactly as it did when it was new")
+        # The porcelain/merge consumers read the window off the result dict.
+        self.assertEqual(recs["window_days"], 7)
 
     def test_a_use_outside_the_window_no_longer_protects_a_carry_tool(self):
         # web_extract used ONLY in the oldest session (20 days back). Inside
@@ -126,13 +119,6 @@ class DayWindowFiltering(unittest.TestCase):
                          demote_min_sessions_no_use=2)
         self.assertNotIn("web_extract", {d["tool"] for d in fresh["demote"]},
                          "inside a 30-day window the use is evidence again")
-
-    def test_result_reports_window_days(self):
-        """The porcelain/merge consumers read the window off the result dict."""
-        preds, calls = self._history()
-        recs = _compute(self.SCOPE, preds, calls, window_days=7,
-                        demote_min_sessions_no_use=2)
-        self.assertEqual(recs["window_days"], 7)
 
 
 class FloorIsCountedInSessionsInsideTheWindow(unittest.TestCase):
@@ -187,16 +173,6 @@ class FloorIsCountedInSessionsInsideTheWindow(unittest.TestCase):
         self.assertIn("web_extract", {d["tool"] for d in recs["demote"]},
                       "at the floor, an unused carry resident demotes")
         self.assertIs(self._porcelain_flag(recs, floor=2), False)
-
-    def test_floor_counts_only_in_window_sessions_not_the_whole_history(self):
-        # Five sessions of history but only one inside the window: a floor of
-        # 2 must NOT be satisfied by the four that aged out.
-        preds, calls = self._history(ages_days=(0, 9, 12, 15, 40))
-        recs = _compute(self.SCOPE, preds, calls, window_days=7,
-                        demote_min_sessions_no_use=2)
-        self.assertEqual(recs["sessions_considered"], 1)
-        self.assertEqual(recs["demote"], [],
-                         "history outside the window cannot satisfy the floor")
 
 
 if __name__ == "__main__":

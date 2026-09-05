@@ -134,20 +134,25 @@ class NameTokenTests(unittest.TestCase):
         kws = shaping.name_token_keywords("get_mnemosyne_list")
         self.assertEqual(kws, [r"\bmnemosyne\b"])
 
-    def test_uncovered_demotion_mints_a_name_token_trigger(self):
-        updates = shaping.compute_overlay_updates(
+    def _mint(self, tool):
+        return shaping.compute_overlay_updates(
             scope=SCOPE,
-            scope_entry={"carry": [], "expand_only": ["mnemosyne_diagnose"],
-                         "shaping": {}},
+            scope_entry={"carry": [], "expand_only": [tool], "shaping": {}},
             sessions={}, calls_by_pred={},
             protected=set(),
-            newly_demoted=["mnemosyne_diagnose"],
+            newly_demoted=[tool],
             policy_preset=presets.Preset(name="t"),
         )
+
+    def test_uncovered_demotion_mints_a_name_token_trigger(self):
+        updates = self._mint("mnemosyne_diagnose")
         minted = [u for u in updates if u["source"] == "name_tokens"]
         self.assertEqual(len(minted), 1)
         self.assertEqual(minted[0]["tools"], ["mnemosyne_diagnose"])
         self.assertIn(r"\bmnemosyne\b", minted[0]["keywords"])
+        # A name with no distinctive token yields nothing to trigger on, so
+        # derivation is skipped entirely rather than minting an empty group.
+        self.assertEqual(self._mint("get_list"), [])
 
     def test_covered_demotion_mints_nothing(self):
         covered_preset = presets.Preset(
@@ -164,17 +169,6 @@ class NameTokenTests(unittest.TestCase):
             protected=set(),
             newly_demoted=["mnemosyne_diagnose"],
             policy_preset=covered_preset,
-        )
-        self.assertEqual(updates, [])
-
-    def test_all_generic_name_skips_derivation_entirely(self):
-        updates = shaping.compute_overlay_updates(
-            scope=SCOPE,
-            scope_entry={"carry": [], "expand_only": ["get_list"], "shaping": {}},
-            sessions={}, calls_by_pred={},
-            protected=set(),
-            newly_demoted=["get_list"],
-            policy_preset=presets.Preset(name="t"),
         )
         self.assertEqual(updates, [])
 

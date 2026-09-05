@@ -98,7 +98,7 @@ class NeverEmpty(unittest.TestCase):
                         demoted=set(), triggered=set(), expanded=set())
             args.update(kw)
             m = carrying.resolve(**args)
-            self.assertTrue(set(m.active) >= e or set(m.active) >= e - {""},
+            self.assertTrue(set(m.active) >= e,
                             f"hostile {list(kw)} must fail OPEN to the "
                             f"readable ceiling, got {sorted(m.active)}")
             self.assertNotEqual(set(m.active), set(),

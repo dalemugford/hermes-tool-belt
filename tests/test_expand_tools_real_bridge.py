@@ -34,7 +34,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import conftest  # noqa: F401
 import unittest
 import types
-from unittest import mock
 
 plugin = sys.modules["tool_belt_plugin"]
 EXPAND_TOOLS_NAME = plugin.expand_tools_mod.SCHEMA["name"]
@@ -172,15 +171,33 @@ class PinFailOpenTest(unittest.TestCase):
         # A non-package ``tools`` with no importable ``tool_search`` submodule
         # makes ``import tools.tool_search`` raise — the pin must swallow it.
         fake_tools = types.ModuleType("tools")  # no __path__ → not a package
-        patcher = mock.patch.dict(sys.modules, {"tools": fake_tools})
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        sys.modules.pop("tools.tool_search", None)
+        saved = {k: v for k, v in sys.modules.items()
+                 if k == "tools" or k.startswith("tools.")}
+        self.addCleanup(sys.modules.update, saved)
+        for name in list(saved):
+            sys.modules.pop(name, None)
+        sys.modules["tools"] = fake_tools
 
         try:
             plugin._pin_expand_tools_visible()
         except Exception as exc:  # pragma: no cover — the point of the test
             self.fail(f"_pin_expand_tools_visible must fail open, raised: {exc!r}")
+        finally:
+            sys.modules.pop("tools", None)
+            sys.modules.update(saved)
+
+        # Failing open means doing NOTHING — "did not raise" alone would also
+        # pass if the pin had attached itself while the import was broken.
+        # Once the real module is reachable again its classifier must still be
+        # unpinned.
+        if _HAVE_HERMES:
+            self.assertFalse(
+                getattr(ts.is_deferrable_tool_name, "_tool_belt_expand_pin", False),
+                "a failed pin attempt must leave the real classifier untouched",
+            )
+        else:
+            self.assertNotIn("tools.tool_search", sys.modules,
+                             "the failed import left no half-pinned module behind")
 
 if __name__ == "__main__":
     unittest.main()

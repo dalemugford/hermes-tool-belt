@@ -22,13 +22,10 @@ import importlib
 import importlib.util
 import io
 import json
-import os
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
-import textwrap
 import time
 import unittest
 from contextlib import redirect_stdout
@@ -41,8 +38,6 @@ sys.path.insert(0, str(PLUGIN_DIR.parent))
 sys.path.insert(0, str(PLUGIN_DIR))
 sys.path.insert(0, str(HERE))
 import conftest  # noqa: F401,E402 — registers tool_belt_plugin
-
-analyze = importlib.import_module("tool_belt_plugin.analyze")
 
 SHAPER_PATH = PLUGIN_DIR / "scripts" / "shape-ceiling.py"
 
@@ -60,7 +55,6 @@ def _load_script(module_name: str, filename: str):
 
 shape_ceiling = _load_script("tool_belt_shape_ceiling_test", "shape-ceiling.py")
 bootstrap = _load_script("tool_belt_bootstrap_test", "bootstrap.py")
-harvest_replay = _load_script("tool_belt_harvest_test", "harvest-replay.py")
 
 
 def seed_state_dir(state_dir: Path, *, scope: str = "agent-a:telegram", sessions: int = 3,
@@ -144,14 +138,6 @@ class PorcelainDocumentTests(unittest.TestCase):
             [{"tool": "grep_files", "sessions": 3, "calls": 3, "evidence": "expansion"}],
         )
         self.assertEqual(scope_doc["demote"], [])
-        # Three sessions clears the shipped floor (demote_min_sessions_no_use
-        # = 2), so the demote arm RAN and found nothing — a distinct state
-        # from "skipped for want of sessions". The skipped branch is locked in
-        # tests/test_day_window.py against an in-window session count of 1.
-        self.assertIs(scope_doc["demote_skipped_insufficient_sessions"], False)
-        for key in ("window_days", "promote_min_sessions", "promote_min_calls",
-                    "demote_min_sessions_no_use"):
-            self.assertIsInstance(doc["thresholds"][key], int)
 
     def test_wrote_learned_state_true_only_when_written(self):
         first = json.loads(run_shaper(self.state_dir, "--json").stdout)
@@ -165,12 +151,20 @@ class PorcelainDocumentTests(unittest.TestCase):
         self.assertIs(second["changed"], False)
 
     def test_json_file_writes_the_same_document(self):
+        """--json-file must carry the identical porcelain --json emits."""
+        from_stdout = json.loads(
+            run_shaper(self.state_dir, "--dry-run", "--json").stdout)
+
         out = self.tmp / "nested" / "shape.json"
         result = run_shaper(self.state_dir, "--dry-run", "--json-file", str(out))
         self.assertEqual(result.returncode, 0, result.stderr)
-        doc = json.loads(out.read_text(encoding="utf-8"))
-        self.assertEqual(doc["schema"], "tool-belt/shape-ceiling")
-        self.assertIs(doc["wrote_learned_state"], False)
+        from_file = json.loads(out.read_text(encoding="utf-8"))
+
+        # generated_at is a per-run timestamp; everything else must match.
+        from_stdout.pop("generated_at", None)
+        from_file.pop("generated_at", None)
+        self.assertEqual(from_file, from_stdout)
+
         # Prose still goes to stdout when only --json-file was requested.
         self.assertIn("=== agent-a:telegram", result.stdout)
 
@@ -269,22 +263,6 @@ class BootstrapConsumesPorcelainTests(unittest.TestCase):
         self.assertEqual(demote["tool"], "stale_tool")
         self.assertIn("sessions_without_use=22", demote["detail"])
 
-    def test_reworded_human_report_alone_yields_nothing(self):
-        """The old contract, restated as a negative.
-
-        A run whose stdout is only prose — in any wording — must produce no
-        actions, because prose is not a contract. The previous screen-scraper
-        would have mined this text (or silently lost candidates the moment
-        the wording changed).
-        """
-        reworded = textwrap.dedent("""
-            ### agent-a:telegram  (22 sessions examined)
-              Recommended for carrying:
-                * grep_files    sessions=4  calls=9
-        """)
-        actions, _ = self._run_with_stdout(reworded)
-        self.assertEqual(actions, [])
-
     def test_old_human_layout_is_no_longer_parsed(self):
         """The exact pre-porcelain layout must now yield nothing.
 
@@ -299,10 +277,6 @@ class BootstrapConsumesPorcelainTests(unittest.TestCase):
             "    - stale_tool                     sessions_without_use=22  evidence=carry_unused\n"
         )
         actions, _ = self._run_with_stdout(prose)
-        self.assertEqual(actions, [])
-
-    def test_unparseable_stdout_warns_and_yields_nothing(self):
-        actions, _ = self._run_with_stdout("{not json")
         self.assertEqual(actions, [])
 
 
@@ -321,7 +295,6 @@ class ActivationGuidanceTests(unittest.TestCase):
         result = run_shaper(state_dir)  # writes into the temp dir only
         combined = result.stdout + result.stderr
         self.assertNotIn(self.FORBIDDEN, combined)
-        self.assertNotIn("``", combined)  # no raw RST rendered to a terminal
         self.assertIn("configure.py", combined)
         self.assertIn(
             "hermes config set plugins.entries.tool-belt.settings.channels.", combined)

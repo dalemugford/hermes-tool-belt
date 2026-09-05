@@ -39,7 +39,7 @@ SCOPE = "agent-x:telegram"
 #: across the 6 non-caching expand predictions below. Deliberately far from the
 #: 1,500 fallback so a fallback regression is unmistakable.
 MEASURED = 20_000
-N_SESSIONS = 22          # ≥ demote_min_sessions_no_use (20) so demotion runs
+N_SESSIONS = 22          # comfortably ≥ demote_min_sessions_no_use so demotion runs
 N_EXPAND = 6             # ≥ measure_expand_overhead's min (5) → a MEASURED cost
 
 

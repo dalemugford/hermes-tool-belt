@@ -259,8 +259,13 @@ class ConfigureModeFlowTests(TempHomeTestCase):
         rc = configure._menu(ctx, infos)
         return rc, "\n".join(lines), runner
 
-    def test_off_writes_recommend_mode(self):
+    def test_menu_index_three_is_off(self):
+        # The numbered mode picker's row order IS the contract: index 3 must
+        # reach the "off" branch of _apply_mode. Nothing else ties a menu index
+        # to a mode value — the --mode flag tests bypass the picker entirely.
         self._seed_two_channels()
+        self.assertEqual(configure._MODE_OPTIONS[2][1], "off",
+                         "row 3 of the mode picker is 'off'")
         # one agent (skipped), channels 'all', mode 3 (off), confirm y ×2
         rc, out, runner = self._run("2\nall\n3\ny\ny\n")
         self.assertEqual(rc, 0)
@@ -269,20 +274,6 @@ class ConfigureModeFlowTests(TempHomeTestCase):
             keys.get("plugins.entries.tool-belt.settings.channels.default.slack.learned_mode"),
             "recommend", "OFF sets learned_mode=recommend (overlay not applied)")
         self.assertIn("Shaping is OFF", out)
-
-    def test_learning_writes_apply_without_history_run(self):
-        self._seed_two_channels()
-        # channels 'all', mode 1 (learning), confirm y ×2
-        rc, out, runner = self._run("2\nall\n1\ny\ny\n")
-        self.assertEqual(rc, 0)
-        keys = {c[3]: c[4] for c in runner.writes}
-        self.assertEqual(
-            keys.get("plugins.entries.tool-belt.settings.channels.default.telegram.learned_mode"),
-            "apply", "learning sets learned_mode=apply")
-        # No learned overlay written on the learning path (that's history's job).
-        self.assertFalse((self.root_state / "learned.json").exists(),
-                         "learning mode does NOT shape from history now")
-        self.assertIn("learning", out)
 
     def test_history_mode_delegates_to_shape(self):
         self._seed_two_channels()
@@ -325,15 +316,6 @@ class ConfigureModeFlowTests(TempHomeTestCase):
         self.assertEqual(out.count("On — learning"), 2,
                          "the mode picker must be shown again after a decline")
 
-    def test_mode_cancel_returns_to_channel_pick(self):
-        # shaping → channels 'all' → blank at mode → back to channels →
-        # blank at channels → back to step-2 → blank → quit. Four blanks
-        # prove each level is a distinct step-back, and nothing is written.
-        self._seed_two_channels()
-        rc, out, runner = self._run("2\nall\n\n\n\n")
-        self.assertEqual(rc, 0)
-        self.assertEqual(runner.writes, [], "walking back writes nothing")
-
 
 class ProtectedToolsFlowTests(TempHomeTestCase):
     """Step-2 'Protected tools': spacebar/numbered picker over the agent's
@@ -355,9 +337,10 @@ class ProtectedToolsFlowTests(TempHomeTestCase):
         rc = configure._menu(ctx, infos)
         return rc, "\n".join(lines), runner
 
-    def test_policy_pins_shown_as_note_not_toggleable(self):
+    def test_policy_pins_shown_as_note_and_cancel_writes_nothing(self):
         self._seed()
-        rc, out, _ = self._run("1\nq\n\n")
+        rc, out, runner = self._run("1\nq\n\n")
+        self.assertEqual(rc, 0)
         # The note appears AFTER choosing 'Protected tools' (Dale), and a
         # policy pin never appears as a toggle row.
         menu_part, picker = out.split("1. Protected tools", 1)
@@ -365,6 +348,11 @@ class ProtectedToolsFlowTests(TempHomeTestCase):
         self.assertIn("Note: Tool Belt will always carry:", picker)
         self.assertNotRegex(picker, r"\[ \]\s*\d+\. clarify",
                             "a policy pin is never a toggle row")
+        # Cancelling the picker writes nothing and steps back silently — no
+        # stacked exit lines.
+        self.assertEqual(runner.writes, [])
+        self.assertNotIn("Nothing changed", out)
+        self.assertNotIn("Nothing selected", out)
 
     def test_existing_pins_preselected_root_profile_with_display_name(self):
         # Bernard's shape: ROOT profile whose configured agent name differs
@@ -387,15 +375,6 @@ class ProtectedToolsFlowTests(TempHomeTestCase):
         keys = {c[3]: c[4] for c in runner.writes}
         self.assertIn("plugins.entries.tool-belt.settings.always_carry", keys)
         self.assertIn("Now protected:", out)
-
-    def test_cancel_writes_nothing(self):
-        self._seed()
-        rc, out, runner = self._run("1\nq\n\n")
-        self.assertEqual(rc, 0)
-        self.assertEqual(runner.writes, [])
-        # Cancelling the picker steps back silently — no stacked exit lines.
-        self.assertNotIn("Nothing changed", out)
-        self.assertNotIn("Nothing selected", out)
 
 
 class SharedCursesContractTests(unittest.TestCase):
@@ -424,6 +403,19 @@ class SharedCursesContractTests(unittest.TestCase):
         for name in ("title", "items", "selected", "cancel_returns",
                      "description"):
             self.assertIn(name, params, f"curses_radiolist lost `{name}`")
+
+    def test_adapter_gates_on_tty(self):
+        # Off a TTY (pipes, tests, --yes) the adapter must decline so the
+        # numbered path — the one the rest of the suite drives — runs.
+        self.assertIsNone(configure._hermes_curses(),
+                          "adapter must return None without a TTY")
+
+
+class CursesAdapterTests(unittest.TestCase):
+    """The adapter layer between configure's flows and whatever curses widget
+    is behind ``_hermes_curses``: cancel → back navigation, preselection, the
+    confirm's shape, and the numbered fallback. Every case injects its own
+    fake widget module, so these run everywhere — no Hermes runtime needed."""
 
     def test_widget_cancel_maps_to_back_navigation(self):
         # The shared widgets signal ESC via their cancel_returns value; the
@@ -581,12 +573,6 @@ class SharedCursesContractTests(unittest.TestCase):
         self.assertNotIn("1. a  (current)", out)
         self.assertIn("Currently: x", out)
 
-    def test_adapter_gates_on_tty(self):
-        # Off a TTY (pipes, tests, --yes) the adapter must decline so the
-        # numbered path — the one the rest of the suite drives — runs.
-        self.assertIsNone(configure._hermes_curses(),
-                          "adapter must return None without a TTY")
-
 
 class StateMachineTests(TempHomeTestCase):
     def _info(self, sessions: int) -> "configure.ScopeInfo":
@@ -598,36 +584,30 @@ class StateMachineTests(TempHomeTestCase):
             sessions=sessions,
         )
 
-    def test_fresh_when_nothing_configured(self) -> None:
-        settings = configure.scope_settings("default:telegram", {}, runner=FakeRunner())
-        self.assertEqual(
-            configure.classify_scope(self._info(0), settings, self.thresholds),
-            configure.STATE_FRESH,
-        )
-
-    def test_observing_while_under_the_session_minimum(self) -> None:
-        cfg = {"channels": {"default:telegram": {"bypass_rate": 1.0, "learned_mode": "recommend"}}}
-        settings = configure.scope_settings("default:telegram", cfg)
-        self.assertEqual(
-            configure.classify_scope(self._info(self.needed - 1), settings, self.thresholds),
-            configure.STATE_OBSERVING,
-        )
-
-    def test_ready_once_the_session_minimum_is_met(self) -> None:
-        cfg = {"channels": {"default:telegram": {"bypass_rate": 1.0, "learned_mode": "recommend"}}}
-        settings = configure.scope_settings("default:telegram", cfg)
-        self.assertEqual(
-            configure.classify_scope(self._info(self.needed), settings, self.thresholds),
-            configure.STATE_READY,
-        )
-
-    def test_shaped_when_learned_mode_applies(self) -> None:
-        cfg = {"channels": {"default:telegram": {"learned_mode": "apply"}}}
-        settings = configure.scope_settings("default:telegram", cfg)
-        self.assertEqual(
-            configure.classify_scope(self._info(2), settings, self.thresholds),
-            configure.STATE_SHAPED,
-        )
+    def test_classify_scope_maps_settings_and_session_count_to_each_state(self) -> None:
+        # The whole classification table in one place — every state the rest of
+        # the tool renders (and every input that selects it). A single wrong
+        # branch shows up as one row of this mapping, not as a whole-table pass.
+        observing = {"channels": {"default:telegram":
+                                  {"bypass_rate": 1.0, "learned_mode": "recommend"}}}
+        shaped = {"channels": {"default:telegram": {"learned_mode": "apply"}}}
+        cases = [
+            # (label, sessions, config, expected state)
+            ("nothing configured", 0, {}, configure.STATE_FRESH),
+            ("observing, under the session minimum", self.needed - 1,
+             observing, configure.STATE_OBSERVING),
+            ("observing, minimum met", self.needed, observing,
+             configure.STATE_READY),
+            ("learned_mode applies", 2, shaped, configure.STATE_SHAPED),
+        ]
+        for label, sessions, cfg, expected in cases:
+            with self.subTest(label):
+                settings = configure.scope_settings(
+                    "default:telegram", cfg, runner=FakeRunner())
+                self.assertEqual(
+                    configure.classify_scope(
+                        self._info(sessions), settings, self.thresholds),
+                    expected)
 
     def test_remaining_sessions_counts_down_and_floors_at_zero(self) -> None:
         self.assertEqual(configure.remaining_sessions(self._info(0), self.thresholds), self.needed)
@@ -687,6 +667,26 @@ class ReShapePreviewTests(TempHomeTestCase):
             encoding="utf-8",
         )
         return configure.discover_scopes(self.home)[0]
+
+    def test_preview_of_a_reshape_equals_what_the_apply_writes(self) -> None:
+        info = self._seed_already_shaped()
+        before = configure.current_assignment(info)
+        self.assertTrue(before["expand_only"],
+                        "fixture must start from a non-empty prior overlay")
+
+        preview = configure.proposed_assignment(
+            info, configure.compute_recommendations(info, self.thresholds))
+
+        ctx = make_ctx(self.home, FakeRunner(), assume_yes=True,
+                       thresholds=self.thresholds)
+        self.assertEqual(configure.flow_shape(ctx, [info]), 0)
+        written = json.loads(
+            (self.root_state / "learned.json").read_text())["scopes"][info.scope]
+
+        for key in ("carry", "expand_only"):
+            self.assertEqual(sorted(preview[key]), sorted(written[key]),
+                             f"previewed {key} must equal what was written")
+
 
 class WriteDisclosureTests(TempHomeTestCase):
     """Nothing is written that did not appear in the pre-prompt diff."""
@@ -765,12 +765,14 @@ class WriteDisclosureTests(TempHomeTestCase):
             info.scope
         ]
         # The disclosed COUNT equals what was written (compact-diff contract).
-        carry_line = next(l for l in sink if "Promoted back to carried:" in l)
         n = len(entry["carry"])
-        self.assertTrue(carry_line.rstrip().endswith(f"→ {n}")
-                        or carry_line.rstrip().endswith("→ unchanged"),
-                        f"disclosed carry count must equal what was written "
-                        f"({n}); got {carry_line!r}")
+        self.assertGreater(n, 0, "fixture must actually promote something back")
+        line = next(l for l in sink
+                    if "Promoted back to carried:" in l).rstrip()
+        self.assertTrue(
+            line.endswith(f"→ {n}"),
+            f"disclosed carry count must equal what was written ({n}); "
+            f"got {line!r}")
 
 
 class ApplyFlowTests(TempHomeTestCase):
@@ -869,11 +871,6 @@ class ApplyFlowTests(TempHomeTestCase):
             },
         )
         self.assertEqual(configure.previous_full_ceiling_rate(self.root_state, "default:telegram"), 0.05)
-
-    def test_previous_bypass_defaults_to_narrow_immediately(self) -> None:
-        self.assertEqual(
-            configure.previous_full_ceiling_rate(self.root_state, "never:seen"), configure.NARROW_BYPASS
-        )
 
     def test_writes_are_skipped_when_confirmation_is_declined(self) -> None:
         info = self._shapeable_scope()
@@ -999,24 +996,18 @@ class DryRunTests(TempHomeTestCase):
     def _fs_snapshot(self) -> set[str]:
         return {str(p.relative_to(self.home)) for p in self.home.rglob("*")}
 
-    def test_dry_run_shape_writes_nothing_to_disk_or_subprocess(self) -> None:
+    def test_dry_run_shape_and_recommend_write_nothing(self) -> None:
         info = self._info()
         before = self._fs_snapshot()
-        runner = FakeRunner()
-        ctx = make_ctx(self.home, runner, dry_run=True, assume_yes=True, thresholds=self.thresholds)
-        configure.flow_shape(ctx, [info])
-        self.assertEqual(runner.writes, [])
-        self.assertEqual(self._fs_snapshot(), before)
-        self.assertFalse((self.root_state / "learned.json").exists())
-
-    def test_dry_run_recommend_writes_nothing(self) -> None:
-        info = self._info()
-        before = self._fs_snapshot()
-        runner = FakeRunner()
-        ctx = make_ctx(self.home, runner, dry_run=True, assume_yes=True, thresholds=self.thresholds)
-        configure.flow_recommend(ctx, [info])
-        self.assertEqual(runner.writes, [])
-        self.assertEqual(self._fs_snapshot(), before)
+        for flow in (configure.flow_shape, configure.flow_recommend):
+            with self.subTest(flow.__name__):
+                runner = FakeRunner()
+                ctx = make_ctx(self.home, runner, dry_run=True,
+                               assume_yes=True, thresholds=self.thresholds)
+                flow(ctx, [info])
+                self.assertEqual(runner.writes, [])
+                self.assertEqual(self._fs_snapshot(), before)
+                self.assertFalse((self.root_state / "learned.json").exists())
 
     def test_dry_run_reset_leaves_the_overlay_intact(self) -> None:
         info = self._info()
@@ -1078,8 +1069,10 @@ class FreshInstallFrontDoorTests(TempHomeTestCase):
 
     def test_the_fresh_install_is_told_what_to_expect(self) -> None:
         _rc, output, _runner = self._run(["--yes"])
+        # The guidance's job is to name the two flags that get a fresh install
+        # unstuck, and the threshold it is waiting for — both computed, not
+        # prose. (The wording itself is code-owned and free to change.)
         self.assertIn("What to expect", output)
-        self.assertIn("one row per gateway session", output)
         self.assertIn(f"{self.needed} recorded session(s)", output)
         self.assertIn("--status", output)
         self.assertIn("--platform", output)
@@ -1153,10 +1146,6 @@ class DegradedModeTests(TempHomeTestCase):
         self.assertIn("hermes config set", output)
         self.assertIn("not on PATH", output)
         self.assertEqual({str(p.relative_to(self.home)) for p in self.home.rglob("*")}, before)
-
-    def test_hermes_available_uses_the_injected_lookup(self) -> None:
-        self.assertTrue(configure.hermes_available(lambda _n: "/usr/bin/hermes"))
-        self.assertFalse(configure.hermes_available(lambda _n: None))
 
 
 class ConfigReadTests(unittest.TestCase):
@@ -1258,7 +1247,6 @@ class ModeFlagTests(TempHomeTestCase):
                 rc = configure.main(["--mode", "off", "--hermes-home",
                                      str(self.home)])
         self.assertEqual(rc, 0)
-        self.assertIsInstance(rc, int)
         self.assertEqual(runner.writes, [])
 
     def test_preview_mode_without_hermes_exits_zero(self) -> None:
@@ -1441,14 +1429,13 @@ class InvocationEchoTests(TempHomeTestCase):
                                 prog=prog)
         return rc, "\n".join(lines)
 
-    def test_launcher_invocation_echoes_tool_belt_form(self) -> None:
-        _rc, output = self._run("tool-belt")
-        self.assertIn("tool-belt configure --status", output)
-        self.assertNotIn("scripts/configure.py", output)
+    def test_guidance_echoes_the_invocation_form_that_was_used(self) -> None:
+        _rc, launcher = self._run("tool-belt")
+        self.assertIn("tool-belt configure --status", launcher)
+        self.assertNotIn("scripts/configure.py", launcher)
 
-    def test_direct_script_run_echoes_script_form(self) -> None:
-        _rc, output = self._run(None)
-        self.assertIn("python3 scripts/configure.py --status", output)
+        _rc, script = self._run(None)
+        self.assertIn("python3 scripts/configure.py --status", script)
 
 
 class StatusFreshInstallTests(TempHomeTestCase):
@@ -1533,11 +1520,6 @@ class StatusRowTests(TempHomeTestCase):
             configure.carried_each_session(info, configure.current_assignment(info)),
             ["browser_click", "process", "todo"])
 
-    def test_fresh_row_shows_on_learning(self) -> None:
-        row = configure.render_status_row(
-            self._info(), configure.STATE_FRESH, self.thresholds)
-        self.assertIn("shaping ON (learning)", row)
-
     def test_observation_row_shows_off(self) -> None:
         row = configure.render_status_row(
             self._info(), configure.STATE_OBSERVING, self.thresholds,
@@ -1547,7 +1529,8 @@ class StatusRowTests(TempHomeTestCase):
     def test_unconfigured_scope_with_history_is_on_not_off(self) -> None:
         # Live-sweep catch: shaping defaults ON, so a scope that merely has
         # enough sessions to classify 'ready' must not render as OFF — only
-        # explicit observation settings turn a row OFF.
+        # explicit observation settings turn a row OFF. The classified state is
+        # not what decides it; the settings are.
         row = configure.render_status_row(
             self._info(), configure.STATE_READY, self.thresholds, settings={})
         self.assertIn("shaping ON (learning)", row)

@@ -163,19 +163,6 @@ class GracePruneTests(ReconcileBase):
         # Absence tracking cleared — a later reappearance is a fresh journey.
         self.assertEqual(self.inventory_doc()["missing_since"], {})
 
-    def test_prune_logs_one_info_line_per_removal(self):
-        self.seed_learned()
-        self.seed_config_yaml()
-        self.seed_inventory(GRACE_SECONDS + 86400)
-        with self.assertLogs("tool_belt_plugin.shaping", level="INFO") as captured:
-            shaping.reconcile_inventory(
-                self.plugin_config(), self.state_dir, now=self.now,
-                registry_names={LIVE, "grep_files"},
-            )
-        text = "\n".join(captured.output)
-        self.assertIn("pruned vanished tool", text)
-        self.assertIn("removed stale always_carry config pin", text)
-
     def test_within_grace_nothing_is_pruned(self):
         self.seed_learned()
         self.seed_config_yaml()

@@ -7,6 +7,16 @@ The suite is built around one rule:
 > catch it.** New tests must meet the same bar at review time — put the
 > sentence in the docstring.
 
+Concretely, a test earns its place when a targeted mutation of the code
+isolates it, when it is the sole or strongest guard of a named invariant, when
+it locks a contract (CLI flags and exit codes, config schema symmetry, file
+formats, porcelain, policy pins, `HERMES_HOME` containment, no-write
+guarantees), or when it is an end-to-end wiring test through real components.
+It does not when it only re-proves what a sibling proves through a bigger
+fixture, when it asserts code-owned prose, or when its assertions cannot fail.
+Between two siblings, the survivor is the one that goes through the real code
+path rather than hand-built state.
+
 The rule exists because a suite of per-fix regression locks can pass in full
 while the deployed system drifts underneath it — every test exercising
 functions with explicit fixtures, none exercising the wiring. The tiers below
@@ -62,14 +72,20 @@ interpreter that does). Bare `pytest tests/` from the plugin root does NOT
 work (the hyphenated plugin dir breaks its import of the package `__init__`)
 — run it from inside `tests/`, or use unittest instead.
 
-Several tests self-skip outside the Hermes runtime: every case gated on
-`hermes_cli` or `tools.tool_search` not being importable (about a dozen,
-covering the real-bridge tests and `configure.py`'s curses-contract tests),
-plus a `tiktoken`-gated case when that package isn't installed. That is
-expected on a clean clone and in the shipped GitHub CI, which builds a bare
-venv with no Hermes runtime — any *other* skip line means something changed
-and needs explaining. For the full-fidelity, zero-skip run, use
-`~/.hermes/hermes-agent/venv/bin/python3`.
+The full suite, including every hermes-dependent case, runs with zero skips
+under the Hermes interpreter:
+
+```bash
+~/.hermes/hermes-agent/venv/bin/python tests/run_tests.py
+```
+
+Under the plugin's own `.venv` — and in the shipped GitHub CI, which builds a
+bare venv with no Hermes runtime — about a dozen cases self-skip: every case
+gated on `hermes_cli` or `tools.tool_search` not being importable (the
+real-bridge tests and `configure.py`'s curses *contract* tests, which pin the
+signatures of an upstream module CI does not have), plus a `tiktoken`-gated
+case when that package isn't installed. Any *other* skip line means something
+changed and needs explaining.
 
 ## Known hygiene debt
 

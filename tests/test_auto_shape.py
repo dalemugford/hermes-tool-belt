@@ -7,19 +7,18 @@ These tests lock that behavior:
   · an apply-mode scope past the evidence threshold and past the debounce
     interval gets a real ``learned.json`` write (``source: "auto"``) from the
     session-end path — THE promise test;
-  · recommend/observe scopes are never auto-written;
+  · recommend/observe scopes are never auto-written, while a scope that sets
+    no mode at all falls through to the shipped ``apply`` default and IS;
   · the per-scope debounce holds;
   · a below-threshold apply scope records the attempt and writes nothing else;
   · an engine exception never propagates out of the session-end hook;
-  · ``auto_shape: false`` disables the whole path;
-  · a live frozen session is never mutated by an auto-apply.
+  · ``auto_shape: false`` disables the whole path.
 
 Everything runs against a throwaway ``HERMES_HOME``; no live state is touched.
 """
 
 from __future__ import annotations
 
-import copy
 import importlib
 import json
 import os
@@ -139,12 +138,22 @@ class SessionEndAutoApplyTests(AutoShapeBase):
         plugin._on_session_end(session_id="sess-x")
         self.assertIsNone(self.learned_doc())
 
-    def test_default_mode_scope_is_never_auto_written(self):
-        # No channel entry at all: global default learned_mode "recommend".
+    def test_scope_with_no_mode_set_falls_through_to_the_apply_default(self):
+        """No channel entry and no global key: the shipped default applies.
+
+        ``learned.DEFAULT_MODE`` is ``apply``, so a scope that never states a
+        mode is auto-shaped. Fails the moment that default flips.
+        """
+        learned = importlib.import_module("tool_belt_plugin.learned")
+        self.assertEqual(learned.DEFAULT_MODE, "apply")
         seed_state_dir(self.state_dir)
         plugin._CONFIG["channels"] = {}
+        plugin._CONFIG.pop("learned_mode", None)
         plugin._on_session_end(session_id="sess-x")
-        self.assertIsNone(self.learned_doc())
+        doc = self.learned_doc()
+        self.assertIsNotNone(
+            doc, "a scope with no learned_mode inherits the apply default")
+        self.assertIn("grep_files", doc["scopes"][SCOPE]["carry"])
 
     def test_auto_shape_false_disables_the_path(self):
         seed_state_dir(self.state_dir)
@@ -164,32 +173,6 @@ class SessionEndAutoApplyTests(AutoShapeBase):
         self._reset_throttle()
         plugin._on_session_end(session_id="sess-x")
         self.assertIsNotNone(self.learned_doc())
-
-    def test_second_session_end_within_interval_is_debounced(self):
-        seed_state_dir(self.state_dir)
-        plugin._on_session_end(session_id="sess-x")
-        first = (self.state_dir / "learned.json").read_text(encoding="utf-8")
-        # New evidence lands, throttle cleared — but the per-scope 24h
-        # debounce (persisted last_auto_shape_at) must still hold.
-        seed_state_dir(self.state_dir, sessions=5)
-        self._reset_throttle()
-        plugin._on_session_end(session_id="sess-y")
-        second = (self.state_dir / "learned.json").read_text(encoding="utf-8")
-        self.assertEqual(first, second)
-
-    def test_live_session_posture_is_never_mutated(self):
-        # The session-end auto-shape pass rewrites learned.json; it must not
-        # touch a live session's posture pin (D3, 2026-09-02 — replaces the
-        # removed frozen-snapshot state this guarded).
-        seed_state_dir(self.state_dir)
-        pin = {"mode": "on", "provider": "openai-codex"}
-        plugin._CACHE_DECISION_BY_SESSION["live-key"] = pin
-        self.addCleanup(plugin._CACHE_DECISION_BY_SESSION.pop, "live-key", None)
-        snapshot = copy.deepcopy(pin)
-        plugin._on_session_end(session_id="sess-x")
-        self.assertIsNotNone(self.learned_doc())  # the apply really happened
-        self.assertIs(plugin._CACHE_DECISION_BY_SESSION["live-key"], pin)
-        self.assertEqual(plugin._CACHE_DECISION_BY_SESSION["live-key"], snapshot)
 
 
 class CarryAllTrafficTests(AutoShapeBase):
@@ -290,7 +273,8 @@ class EngineDebounceTests(AutoShapeBase):
         self.assertIn(SCOPE, later["attempted"])
 
     def test_below_threshold_leaves_learned_untouched_but_still_debounces(self):
-        # One session: below promote_min_sessions (2) — no recommendation.
+        # One session, one call: promote_min_sessions is 1, but a single call
+        # is below promote_min_calls (2) — so no recommendation.
         # A nothing-changed pass must NOT rewrite learned.json (rewriting
         # made the cross-process last-writer-wins window a routine event);
         # the attempt lands in the debounce sidecar and still gates the

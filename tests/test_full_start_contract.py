@@ -57,24 +57,6 @@ POLICY_A = ["clarify", "todo", "expand_tools"]
 class TestFullStartDefault(unittest.TestCase):
     """(a)+(b): fresh scope, zero learned state → active == full ceiling."""
 
-    def test_fresh_scope_active_equals_enabled_ceiling(self):
-        model = carrying_mod.resolve(
-            enabled=CEILING, always_carry=POLICY_A, carry=[],
-        )
-        self.assertEqual(model.active, set(CEILING),
-                         "with no learned state, everything enabled is active")
-        self.assertEqual(model.expand_only, set(),
-                         "nothing is expand_only until demoted by evidence")
-
-    def test_unknown_enabled_tool_is_carried_not_expand_only(self):
-        model = carrying_mod.resolve(
-            enabled=CEILING, always_carry=POLICY_A, carry=[],
-        )
-        self.assertIn("mystery_tool", model.carry,
-                      "an unknown enabled built-in is CARRIED until demoted")
-        self.assertIn("mystery_tool", model.active)
-        self.assertNotIn("mystery_tool", model.expand_only)
-
     def test_only_demoted_tools_leave_residency(self):
         model = carrying_mod.resolve(
             enabled=CEILING, always_carry=POLICY_A, carry=[],
@@ -85,6 +67,11 @@ class TestFullStartDefault(unittest.TestCase):
         # Partition stays a genuine three-way split of E.
         self.assertEqual(model.always_carry | model.carry | model.expand_only,
                          set(CEILING))
+        # ``mystery_tool`` is unknown to every policy list, yet undemoted: the
+        # full-start default puts it in adaptive CARRY, not expand_only.
+        self.assertIn("mystery_tool", model.carry,
+                      "an unknown enabled built-in is CARRIED until demoted")
+        self.assertIn("mystery_tool", model.active)
 
     def test_learned_carry_wins_over_demotion(self):
         model = carrying_mod.resolve(
@@ -125,14 +112,6 @@ class TestConfigAlwaysCarry(unittest.TestCase):
         learned_mod.load_state(force=True)
         return presets_mod.resolve_preset(plugin_config, scope)
 
-    def test_config_pin_joins_effective_always_carry(self):
-        with tempfile.TemporaryDirectory() as home:
-            with mock.patch.dict(os.environ, {"HERMES_HOME": home}):
-                preset = self._preset({"always_carry": ["web_search"]})
-                self.assertIn("web_search", preset.always_carry)
-                # Shipped structural baseline still present.
-                self.assertIn("clarify", preset.always_carry)
-
     def test_scope_pin_unions_never_removes(self):
         cfg = {
             "always_carry": ["web_search"],
@@ -143,8 +122,15 @@ class TestConfigAlwaysCarry(unittest.TestCase):
                 preset = self._preset(cfg, scope="agent:cli")
                 self.assertIn("web_search", preset.always_carry)
                 self.assertIn("terminal", preset.always_carry)
+                # The union is additive on top of the shipped structural
+                # baseline — a pin never replaces it.
+                self.assertIn("clarify", preset.always_carry)
 
     def test_per_profile_configs_resolve_differently(self):
+        # The ONLY guard against cross-scope pin leakage: one profile's global
+        # pin must not resolve into another profile's always_carry. Every other
+        # pin test resolves a single scope, so a resolver that cached or
+        # accumulated pins across calls would pass all of them.
         with tempfile.TemporaryDirectory() as home:
             with mock.patch.dict(os.environ, {"HERMES_HOME": home}):
                 a = self._preset({"always_carry": ["web_search"]}, "bernard:cli")
