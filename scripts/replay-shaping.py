@@ -242,7 +242,6 @@ def replay_scope(
             demote_min_sessions_no_use=demote_min_sessions_no_use,
             demote_k=demote_k,
             schema_sizes=schema_sizes,
-            cache_mode="off",
             api_call_counts=api_call_counts,
             expand_round_trip_tokens=expand_round_trip_tokens,
         )

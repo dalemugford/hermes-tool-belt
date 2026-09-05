@@ -12,9 +12,11 @@ round-trip; demotion only saves in sessions WITHOUT use:
     penalty = EXPAND_ROUND_TRIP_TOKENS × sessions WITH use
     demote when saving > k × penalty; promote when penalty > saving
 
-Billable exposures: cache off = api calls per prediction (min 1); cache
-on/unknown = 1 per session. The burst-use and api-exposure locks fail on the
-call-priced math; the class locks fail on pre-economic code entirely.
+Billable exposures: api calls per prediction (min 1), summed over the
+session — every session the shaper sees is a narrowed one, and a narrowed
+turn re-pays the manifest on every call. The burst-use and api-exposure locks
+fail on the call-priced math; the class locks fail on pre-economic code
+entirely.
 """
 
 import unittest
@@ -57,13 +59,13 @@ class EconomicDemotion(unittest.TestCase):
         return preds, calls
 
     def test_rarely_used_fat_tool_demotes_as_uneconomic(self):
-        # 30 sessions cache-off (1 pred each → 1 exposure each), 2000-token
+        # 30 narrowed sessions (1 pred each → 1 exposure each), 2000-token
         # schema, used in one session: saving = 2000×29 = 58000 >
         # k2 × penalty (1×1500 = 1500) → demote. Pre-economic code never
         # demoted a tool with ANY use.
         preds, calls = self._sessions(30, browser_use_sessions={7})
         recs = _compute(self.SCOPE, preds, calls, window_days=7,
-                        schema_sizes={"browser_exec": 2000}, cache_mode="off")
+                        schema_sizes={"browser_exec": 2000})
         entry = {d["tool"]: d for d in recs["demote"]}
         self.assertIn("browser_exec", entry)
         d = entry["browser_exec"]
@@ -81,7 +83,7 @@ class EconomicDemotion(unittest.TestCase):
         preds, calls = self._sessions(30, browser_use_sessions={3},
                                       calls_per_use_session=25)
         recs = _compute(self.SCOPE, preds, calls, window_days=7,
-                        schema_sizes={"browser_exec": 2000}, cache_mode="off")
+                        schema_sizes={"browser_exec": 2000})
         entry = {d["tool"]: d for d in recs["demote"]}
         self.assertIn("browser_exec", entry)
         self.assertEqual(entry["browser_exec"]["uses_in_window"], 25)
@@ -94,15 +96,13 @@ class EconomicDemotion(unittest.TestCase):
         # k2 × penalty (25×1500 = 37500) → carrying is cheaper, hold.
         preds, calls = self._sessions(30, browser_use_sessions=set(range(25)))
         recs = _compute(self.SCOPE, preds, calls, window_days=7,
-                        schema_sizes={"browser_exec": 2000}, cache_mode="off")
+                        schema_sizes={"browser_exec": 2000})
         self.assertNotIn("browser_exec", {d["tool"] for d in recs["demote"]})
 
     def test_saving_counted_only_where_the_tool_was_carried(self):
         # browser_exec carried in 10 of 30 sessions (zero use): demotion can
         # only save schema where the schema was actually shipped — 2000×10,
-        # not 2000×30. Fails on the union-of-carries math. Non-caching
-        # ("off") scope — the only posture that shapes (D1: caching carries
-        # everything and never demotes).
+        # not 2000×30. Fails on the union-of-carries math.
         preds, calls = [], []
         for i in range(30):
             pid = f"p{i}"
@@ -114,7 +114,7 @@ class EconomicDemotion(unittest.TestCase):
             ))
             calls.append(_use_call(pid, "terminal"))
         recs = _compute(self.SCOPE, preds, calls, window_days=7,
-                        schema_sizes={"browser_exec": 2000}, cache_mode="off")
+                        schema_sizes={"browser_exec": 2000})
         entry = {d["tool"]: d for d in recs["demote"]}
         self.assertIn("browser_exec", entry)
         self.assertEqual(entry["browser_exec"]["carry_tokens"], 2000 * 10)
@@ -138,23 +138,13 @@ class EconomicDemotion(unittest.TestCase):
                 calls.append(_use_call(pid, "terminal"))
         return preds, calls
 
-    def test_late_trigger_fires_defend_carry_under_caching(self):
-        # 15 of 30 cache-on sessions have a mid-session trigger activation:
-        # post-demotion each would bust the prefix cache, so the demote arm
-        # charges a round-trip per such session — penalty 15×1500 = 22500,
-        # saving 1000×30 = 30000 ≤ 1.5×22500 → hold. Fails on the
-        # trigger-is-always-free math (penalty 0 → demote).
+    def test_late_trigger_fires_are_free(self):
+        # A mid-session trigger activation costs a demoted tool nothing —
+        # there is no charge to defend the carry slot, and the unused carry
+        # demotes.
         preds, calls = self._late_trigger_sessions(30, set(range(15)))
         recs = _compute(self.SCOPE, preds, calls, window_days=7,
-                        schema_sizes={"browser_exec": 1000}, cache_mode="on")
-        self.assertNotIn("browser_exec", {d["tool"] for d in recs["demote"]})
-
-    def test_late_trigger_fires_are_free_without_caching(self):
-        # Same shape, cache OFF: no frozen list to mutate, no cache to bust —
-        # the trigger charge must not apply, and the unused carry demotes.
-        preds, calls = self._late_trigger_sessions(30, set(range(15)))
-        recs = _compute(self.SCOPE, preds, calls, window_days=7,
-                        schema_sizes={"browser_exec": 1000}, cache_mode="off")
+                        schema_sizes={"browser_exec": 1000})
         entry = {d["tool"]: d for d in recs["demote"]}
         self.assertIn("browser_exec", entry)
         self.assertNotIn("late_trigger_sessions", entry["browser_exec"])
@@ -165,18 +155,18 @@ class EconomicDemotion(unittest.TestCase):
         preds, calls = self._sessions(30, browser_use_sessions=set(range(5)),
                                       calls_factory=_trigger_call)
         recs = _compute(self.SCOPE, preds, calls, window_days=7,
-                        schema_sizes={"browser_exec": 2000}, cache_mode="off")
+                        schema_sizes={"browser_exec": 2000})
         entry = {d["tool"]: d for d in recs["demote"]}
         self.assertIn("browser_exec", entry)
         self.assertEqual(entry["browser_exec"]["sessions_with_use"], 0)
         self.assertEqual(entry["browser_exec"]["evidence"], "carry_unused")
 
-    def test_cache_on_lean_tool_holds(self):
-        # Cache on (1 exposure/session), 150-token schema, used in 2
-        # sessions: saving = 150×28 = 4200 ≤ k2×(2×1500) = 6000 → hold.
+    def test_lean_tool_holds(self):
+        # One exposure per session, 150-token schema, used in 2 sessions:
+        # saving = 150×28 = 4200 ≤ k1.5×(2×1500) = 4500 → hold.
         preds, calls = self._sessions(30, browser_use_sessions={0, 1})
         recs = _compute(self.SCOPE, preds, calls, window_days=7,
-                        schema_sizes={"browser_exec": 150}, cache_mode="on")
+                        schema_sizes={"browser_exec": 150})
         self.assertNotIn("browser_exec", {d["tool"] for d in recs["demote"]})
 
     def test_zero_use_limit_case_still_demotes_as_unused(self):
@@ -187,14 +177,14 @@ class EconomicDemotion(unittest.TestCase):
         self.assertEqual(entry["browser_exec"]["evidence"], "carry_unused")
         self.assertEqual(entry["browser_exec"]["sessions_without_use"], 30)
 
-    def test_api_call_counts_scale_cache_off_exposures(self):
-        # A cache-off agentic turn pays the manifest on every API call. With
+    def test_api_call_counts_scale_exposures(self):
+        # A narrowed agentic turn pays the manifest on every API call. With
         # 10 api calls per prediction the zero-use saving is 10× the
         # prediction count. Fails before api_call_counts existed.
         preds, calls = self._sessions(30)
         api_counts = {f"p{i}": 10 for i in range(30)}
         recs = _compute(self.SCOPE, preds, calls, window_days=7,
-                        schema_sizes={"browser_exec": 2000}, cache_mode="off",
+                        schema_sizes={"browser_exec": 2000},
                         api_call_counts=api_counts)
         entry = {d["tool"]: d for d in recs["demote"]}
         self.assertEqual(entry["browser_exec"]["carry_tokens"], 2000 * 300)
@@ -221,22 +211,22 @@ class EconomicPromotion(unittest.TestCase):
         return preds, calls
 
     def test_promotion_vetoed_when_carrying_would_cost_more(self):
-        # Expanded in 2 of 30 cache-off sessions (5 predictions each, 3
+        # Expanded in 2 of 30 narrowed sessions (5 predictions each, 3
         # calls total → meets the anti-flap gates): penalty = 2×1500 = 3000
         # vs marginal carry 388×(150−10) = 54320 → expanding stays cheaper.
         preds, calls = self._expansion_history(
             30, use_sessions={0, 1}, preds_per_session=5,
             calls_in_use_session=2)
-        recs = _compute(self.SCOPE, preds, calls, window_days=7, cache_mode="off")
+        recs = _compute(self.SCOPE, preds, calls, window_days=7)
         self.assertNotIn("web_extract", {p["tool"] for p in recs["promote"]})
 
     def test_promotion_granted_when_expansion_spend_exceeds_carry(self):
-        # Expanded in every one of 3 non-caching sessions: no unused
+        # Expanded in every one of 3 narrowed sessions: no unused
         # sessions, marginal carry cost 0 vs penalty 3×1500 → promote,
         # economics stamped on the entry. 3 expand events is below the
         # measure threshold, so the per-event cost is the 1500 fallback.
         preds, calls = self._expansion_history(3, use_sessions={0, 1, 2})
-        recs = _compute(self.SCOPE, preds, calls, cache_mode="off")
+        recs = _compute(self.SCOPE, preds, calls)
         entry = {p["tool"]: p for p in recs["promote"]}
         self.assertIn("web_extract", entry)
         self.assertEqual(entry["web_extract"]["expansion_tokens"],
@@ -268,7 +258,7 @@ class PinnedToolsNeverPromote(unittest.TestCase):
                 active=E, ts=float(i),
             ))
             calls.append(_expansion_call(pid, "skills_list"))
-        recs = _compute(self.SCOPE, preds, calls, cache_mode="on")
+        recs = _compute(self.SCOPE, preds, calls)
         self.assertNotIn("skills_list", {p["tool"] for p in recs["promote"]},
                          "an observed always_carry tool never promotes")
 

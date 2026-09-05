@@ -514,6 +514,11 @@ Evidence thresholds for the between-session shaper, shared by
 auto-shape engine. All entrypoints resolve them through
 `load_shape_ceiling_defaults`.
 
+Everywhere below, "session" means a **narrowed** session. A carry-all turn
+(`policy_source: "cache_on_carry_all"`) shipped the full ceiling and offered no
+`expand_tools`, so it is not evidence; such rows are dropped before the window
+is applied, and a session left with none of its own is not counted at all.
+
 | Key | Default | Meaning |
 |---|---|---|
 | `window_days` | `7` | The evidence window, in **days**. The shaper considers only sessions whose last activity falls within this many days of "now" — where *now* is the most recent activity in the telemetry, not wall-clock time (a replay of an old archive windows against that archive's own end, so results are reproducible). `14` and `30` are the other sensible values; larger windows carry stale-use tools for longer. |

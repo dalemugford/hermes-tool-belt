@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Day-one warm start for the tool-belt plugin — posture-aware.
 
-The plugin runs one of two postures per scope, keyed by the scope's
-primary provider (see ``__init__.py``):
+The plugin runs one of two postures per session, decided per scope *and*
+provider at dispatch (see ``__init__.py``):
 
   · Caching provider → **carry-all**. The full ceiling ships on every
     call, ``expand_tools`` is not shipped, and the tool list never
     changes mid-session. There is nothing to narrow, nothing to expand,
-    and therefore nothing to bootstrap: no expansion evidence is ever
-    produced and the shaper returns a no-op for the scope. This script
-    reports those scopes as "carry-all: nothing to bootstrap" and moves
-    on. That is the correct outcome, not a thin-data one.
+    and therefore nothing to bootstrap from such a session: it produces
+    no expansion evidence and the shaper does not count it. A scope whose
+    whole window ran that way comes back from the shaper as
+    ``reason: "no_narrowed_sessions"``; this script reports it as
+    "carry-all: nothing to bootstrap" and moves on. That is the correct
+    outcome, not a thin-data one.
 
   · Non-caching provider → **narrowing** (cache-off). This is the real
     bootstrap. Two sources feed it:
@@ -50,27 +52,6 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PLUGIN_DIR = HERE.parent
-
-# The posture resolver lives in the plugin's shaping module. It is the same
-# call ``shape-ceiling.py`` uses to decide whether a scope is carry-all, so
-# bootstrap and the shaper can never disagree about a scope's posture.
-sys.path.insert(0, str(PLUGIN_DIR))
-try:
-    from shaping import read_cache_mode as _read_cache_mode  # noqa: E402
-except Exception:  # pragma: no cover — shaping needs PyYAML; degrade to "unknown"
-    _read_cache_mode = None
-
-
-def _scope_posture(state_dir: Path, scope: str) -> str:
-    """``"carry_all"`` when the scope's primary provider is locked as caching,
-    ``"narrowing"`` when locked non-caching, ``"unknown"`` otherwise."""
-    if _read_cache_mode is None:
-        return "unknown"
-    try:
-        mode = _read_cache_mode(state_dir, scope)
-    except Exception:
-        return "unknown"
-    return {"on": "carry_all", "off": "narrowing"}.get(str(mode or ""), "unknown")
 
 
 def _default_python() -> str:
@@ -125,11 +106,11 @@ def _shape_ceiling_actions(state_dirs: list[tuple[str, Path]], python: str,
     bootstrap surfaces. ``--dry-run`` is passed because bootstrap only
     reports; it never rewrites ``learned.json``.
 
-    Carry-all scopes (caching primary provider) come back from the shaper
-    as an empty no-op by construction — they produce no expansion evidence
-    because nothing is ever narrowed. They are recorded into
-    ``carry_all_scopes`` (``{"label", "scope", "sessions"}``) so the caller
-    can say so, rather than misreporting them as "no candidates yet".
+    A scope with no narrowed session in the window comes back from the shaper
+    as an empty no-op carrying ``reason: "no_narrowed_sessions"`` — it
+    produced no expansion evidence because nothing was ever narrowed. Those
+    are recorded into ``carry_all_scopes`` (``{"label", "scope"}``) so the
+    caller can say so, rather than misreporting them as "no candidates yet".
     """
     actions: list[dict] = []
     for label, sdir in state_dirs:
@@ -147,16 +128,11 @@ def _shape_ceiling_actions(state_dirs: list[tuple[str, Path]], python: str,
             payload = json.loads(result.stdout)
             for scope_doc in payload.get("scopes") or []:
                 scope = str(scope_doc.get("scope") or "")
-                if _scope_posture(sdir, scope) == "carry_all":
-                    # Nothing narrowed → nothing to promote or demote. Any
-                    # candidate the shaper did emit for a carry-all scope
-                    # would be a shaper bug, so don't surface one.
+                if str(scope_doc.get("reason") or "") == "no_narrowed_sessions":
+                    # Nothing narrowed → nothing to promote or demote, and
+                    # the shaper emits no candidates for such a scope.
                     if carry_all_scopes is not None:
-                        carry_all_scopes.append({
-                            "label": label,
-                            "scope": scope,
-                            "sessions": int(scope_doc.get("sessions_considered") or 0),
-                        })
+                        carry_all_scopes.append({"label": label, "scope": scope})
                     continue
                 for row in scope_doc.get("promote") or []:
                     actions.append({
@@ -284,8 +260,8 @@ def main() -> int:
         shape_actions = _shape_ceiling_actions(state_dirs, args.python,
                                                carry_all_scopes=carry_all_scopes)
         for row in carry_all_scopes:
-            info(f"  {row['label']}/{row['scope']}: carry-all (caching provider) — "
-                 f"nothing to bootstrap ({row['sessions']} session(s) seen)")
+            info(f"  {row['label']}/{row['scope']}: carry-all throughout — "
+                 f"nothing to bootstrap (no narrowed sessions in the window)")
         if not shape_actions:
             if carry_all_scopes:
                 info("  No narrowing-scope candidates yet (narrowing scopes need ≥2 sessions "
@@ -325,13 +301,13 @@ def main() -> int:
     # Carry-all scopes first: state the outcome plainly so nobody waits for
     # evidence that will never arrive.
     if carry_all_scopes:
-        print("\n  Carry-all scopes (caching provider — full ceiling shipped, no expand_tools):")
+        print("\n  Carry-all scopes (full ceiling shipped throughout, no expand_tools):")
         for row in carry_all_scopes:
             print(f"    · {row['label']}/{row['scope']:<22} nothing to bootstrap")
 
     if not shape_actions and not harvest_actions:
         print("\n  No actionable recommendations surfaced today. Reasons:")
-        print("    · carry-all scopes never produce expand_tools evidence (by design)")
+        print("    · carry-all sessions never produce expand_tools evidence (by design)")
         print("    · narrowing scopes need ≥2 sessions of real expand_tools evidence")
         print("    · the harvest path needs sessions/*.jsonl content to replay")
         print("    · or your current policy already covers your usage")

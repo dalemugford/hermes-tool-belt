@@ -329,20 +329,25 @@ debounced per scope via `auto_shape_stamp.json`, apply-mode scopes only),
 and [scripts/shape-ceiling.py](../scripts/shape-ceiling.py) (the CLI
 wrapper for on-demand or scripted runs).
 
-Shaping is **moot under carry-all**. A scope whose primary provider is
-locked `on` ships no `expand_tools`, so demotion saves nothing and
-promotion has nothing to recover from: `compute_scope_recommendations`
-returns an explicit no-op (`reason: "caching_provider_carry_all"`) and
-`auto_shape_run` lists the scope under `skipped_carry_all`, unstamped, so
-a posture flip re-qualifies it at once. A scope's effective posture for
-shaping is its primary provider's bucket (`read_cache_mode` →
-`resolve_primary_detection_entry`): the profile's own `config.yaml`
-`model.provider` first, then the Hermes config loader, then the
-most-locked `scope|provider` bucket. Carry-all
-prediction rows still count as *usage* evidence (which tools were called)
-but can never be expansion evidence.
+Shaping keys on the **traffic**, not on a configured provider. Every
+prediction row records how the runtime actually treated its turn, and a
+carry-all row (`policy_source: "cache_on_carry_all"`) shipped the full
+ceiling with no `expand_tools` — nothing was narrowed to demote and
+nothing was expanded to promote, so it is evidence for neither arm.
+`compute_scope_recommendations` drops those rows before windowing, and a
+session left with none of its own is not a session:
+`sessions_considered`, the day window and the session floor all count
+NARROWED sessions only.
 
-Promote evidence (cache-off scopes):
+A scope whose window holds no narrowed session returns an explicit no-op
+(`reason: "no_narrowed_sessions"`); `auto_shape_run` lists it under
+`skipped_no_narrowed_sessions` and leaves it unstamped, so it
+re-qualifies the moment narrowed traffic appears. An agent whose primary
+provider caches therefore still learns from every session that lands on
+an uncached provider — just more slowly, in proportion to how much of its
+traffic is narrowed.
+
+Promote evidence (from narrowed sessions):
 
 - A tool call tagged `activated_by_expansion: true` (the in-turn
   expansion path) or `expansion_provided_access: true` (the sticky-carry
@@ -378,11 +383,10 @@ promote when penalty > saving                     (after the anti-flap gates)
 - Per-tool schema sizes come from the `schema_sizes.json` sidecar
   (snapshotted in-process, since only the live gateway sees real tool
   definitions); unmeasured tools fall back to a 388-token average.
-- Billable exposures: a cache-off scope pays the manifest on every API
-  call (counted per prediction from `api_calls.jsonl`, min 1). A scope
-  whose posture is *unknown* is charged one exposure per session — the
-  conservative direction, biasing toward carrying. (A scope locked `on`
-  never reaches the arithmetic.)
+- Billable exposures: every session the shaper sees is a narrowed one,
+  and a narrowed turn re-pays the manifest on every API call — counted
+  per prediction from `api_calls.jsonl`, min 1 for a prediction with no
+  api-call rows (logging off, or older data).
 - Trigger-activated uses don't defend a carry slot: they stay free for a
   demoted tool.
 - A tool with zero uses is the limit case (`demote_tokens = 0`) — it

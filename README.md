@@ -75,13 +75,13 @@ call:
    disk, so the first message after switching back behaves the way it did
    before.
 
-Learning follows your primary provider. Shaping (promotion and demotion) is
-computed against the provider set in `model.provider`. A stint on a caching
-provider neither adds nor removes demotions, and its turns are reported as
-carry-all in `tool-belt savings`, where the plugin claims no savings. If your
-primary is a caching provider, the learned loadout is still applied whenever a
-session lands on an uncached provider, but it stops evolving until an uncached
-provider is the primary again.
+Learning follows narrowed sessions. A carry-all session shipped the full
+ceiling and never offered `expand_tools`, so it contributes nothing and counts
+for nothing: not toward the evidence, not toward the session floor, and its
+turns are reported as carry-all in `tool-belt savings`, where the plugin claims
+no savings. An agent whose primary provider caches still learns from every
+session that lands on an uncached provider — just more slowly, in proportion to
+how much of its traffic is narrowed.
 
 ## How to use it
 

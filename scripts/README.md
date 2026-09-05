@@ -13,7 +13,7 @@ labelled `default`; named profiles keep their directory names.
 | Script | Purpose | Typical use |
 |---|---|---|
 | [`configure.py`](configure.py) | Mode-setter. Detects every agent scope, sets the shaping mode (learning / history / off / observe / reset) and protected tools, and writes the configuration through `hermes config`. | The first command to run after installing. Re-run any time. |
-| [`bootstrap.py`](bootstrap.py) | Posture-aware first-install warm start for narrowing (non-caching) scopes: live `expand_tools` evidence via the shaper plus session-history replay. Caching scopes are carry-all and are reported as "nothing to bootstrap". | Optional, once after installation. |
+| [`bootstrap.py`](bootstrap.py) | Posture-aware first-install warm start from narrowed traffic: live `expand_tools` evidence via the shaper plus session-history replay. A scope with no narrowed sessions is reported as "nothing to bootstrap". | Optional, once after installation. |
 | [`shape-ceiling.py`](shape-ceiling.py) | Builds per-scope promote/demote recommendations from recent sessions and writes the learned overlay. | Run after enough organic sessions; inspect with `--dry-run` first. |
 | [`replay-shaping.py`](replay-shaping.py) | Read-only chronological replay of one scope's telemetry, from an empty learned state through the real shaper. Reports convergence, ramp cost, implied `expand_tools` events, promotions and flap; `--window-days` and `--floor` accept comma lists to sweep. | Check a shaping cadence against your own history before changing the defaults. |
 | [`harvest-replay.py`](harvest-replay.py) | Replays existing Hermes sessions through the per-turn predictor and writes privacy-reduced synthetic telemetry. | Tune trigger coverage for cache-off scopes. |
@@ -182,9 +182,9 @@ python3 scripts/bootstrap.py --profile assistant-a
 
 The bootstrap command discovers the root Hermes profile and named profiles
 under `$HERMES_HOME/profiles/`. It does not modify plugin policy; the shaper
-writes only the learned overlay. Scopes whose primary provider prompt-caches
-are carry-all and produce no expansion evidence by design; bootstrap reports
-them as "nothing to bootstrap" rather than waiting for data that never comes.
+writes only the learned overlay. A scope whose window holds no narrowed
+session produced no expansion evidence by design; bootstrap reports it as
+"nothing to bootstrap" rather than waiting for data that never comes.
 
 ### Validate behavior
 
