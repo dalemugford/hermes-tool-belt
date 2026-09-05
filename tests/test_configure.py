@@ -1083,7 +1083,7 @@ class FreshInstallFrontDoorTests(TempHomeTestCase):
     def test_the_platform_prompt_is_reachable_without_agent(self) -> None:
         # No --agent, no --platform: the recovery must still be offered, and
         # naming a platform must produce a configurable scope.
-        rc, output, runner = self._run(["--path", "recommend"], answers=["telegram", "y"])
+        rc, output, runner = self._run(["--mode", "observe"], answers=["telegram", "y"])
         self.assertEqual(rc, 0)
         self.assertNotIn(self.ABSENT, output)
         self.assertIn("default:telegram", output)
@@ -1096,7 +1096,7 @@ class FreshInstallFrontDoorTests(TempHomeTestCase):
         )
 
     def test_an_empty_answer_falls_through_to_the_same_guidance(self) -> None:
-        rc, output, runner = self._run(["--path", "recommend"], answers=[""])
+        rc, output, runner = self._run(["--mode", "observe"], answers=[""])
         self.assertEqual(rc, 0)
         self.assertNotIn(self.ABSENT, output)
         self.assertIn("What to expect", output)
@@ -1141,7 +1141,7 @@ class DegradedModeTests(TempHomeTestCase):
             for patch in isolate(runner, None, lines):
                 stack.enter_context(patch)
             rc = configure.main(
-                ["--agent", "default", "--path", "recommend", "--yes", "--hermes-home", str(self.home)]
+                ["--agent", "default", "--mode", "observe", "--yes", "--hermes-home", str(self.home)]
             )
         output = "\n".join(lines)
         self.assertEqual(rc, 0)
@@ -1220,9 +1220,8 @@ class PromptTests(unittest.TestCase):
 
 
 class ModeFlagTests(TempHomeTestCase):
-    """``--mode learning|history|off`` is the public scripting surface and
-    must mirror the interactive menu; ``--path``/``--reset`` are hidden
-    variants (absent from --help)."""
+    """``--mode`` is the public scripting surface and must mirror the
+    interactive menu — every branch of it reachable from --help."""
 
     def _run(self, argv: list[str]):
         runner = FakeRunner()
@@ -1348,15 +1347,13 @@ class ModeFlagTests(TempHomeTestCase):
         self.assertIn("default:telegram", doc["scopes"],
                       "off pauses shaping but keeps the overlay (resumable)")
 
-    def test_hidden_flags_are_absent_from_help_but_still_parse(self) -> None:
+    def test_every_mode_is_documented_in_help(self) -> None:
         help_text = configure.build_parser().format_help()
-        self.assertIn("--mode", help_text)
-        self.assertNotIn("--path", help_text)
-        self.assertNotIn("--reset", help_text)
-        args = configure.build_parser().parse_args(["--path", "recommend"])
-        self.assertEqual(args.path, "recommend")
-        args = configure.build_parser().parse_args(["--reset", "default"])
-        self.assertEqual(args.reset, "default")
+        for mode in ("learning", "history", "off", "observe", "reset"):
+            self.assertIn(mode, help_text)
+        for mode in ("observe", "reset"):
+            args = configure.build_parser().parse_args(["--mode", mode])
+            self.assertEqual(args.mode, mode)
 
 
 class HermesHomeContainmentTests(TempHomeTestCase):
@@ -1390,7 +1387,7 @@ class HermesHomeContainmentTests(TempHomeTestCase):
 
 
 class ResetArgvWiringTests(TempHomeTestCase):
-    """``--reset AGENT`` through ``main()``: the flow itself is covered by
+    """``--mode reset`` through ``main()``: the flow itself is covered by
     ResetFlowTests, but nothing else proves the argv actually reaches
     ``flow_reset`` (a dispatch typo would no-op with exit 0)."""
 
@@ -1412,7 +1409,7 @@ class ResetArgvWiringTests(TempHomeTestCase):
         with contextlib.ExitStack() as stack:
             for patch in isolate(runner, "/usr/bin/hermes", lines):
                 stack.enter_context(patch)
-            rc = configure.main(["--reset", "default", "--yes",
+            rc = configure.main(["--mode", "reset", "--agent", "default", "--yes",
                                  "--hermes-home", str(self.home)])
         self.assertEqual(rc, 0)
         self.assertNotIn("default:telegram",

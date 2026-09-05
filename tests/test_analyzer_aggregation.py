@@ -28,7 +28,6 @@ code:
 from __future__ import annotations
 
 import importlib
-import importlib.util
 import json
 import subprocess
 import sys
@@ -54,23 +53,11 @@ def _args(*extra: str):
         return analyze.parse_args()
 
 
-def _load_replay_module():
-    """Load ``scripts/cache-stability-replay.py`` (hyphenated, not importable)."""
-    spec = importlib.util.spec_from_file_location(
-        "cache_stability_replay_test",
-        PLUGIN_DIR / "scripts" / "cache-stability-replay.py",
-    )
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 class ReplayNullToleranceTests(unittest.TestCase):
-    """Fix 1 + 2 — crash bugs in scripts/cache-stability-replay.py."""
+    """Fix 1 + 2 — crash bugs in cache_replay.py."""
 
     def setUp(self):
-        self.replay = _load_replay_module()
+        self.replay = importlib.import_module("tool_belt_plugin.cache_replay")
 
     def test_matched_counterfactual_tolerates_explicit_nulls(self):
         # A provider that reports no cache usage writes an explicit null;

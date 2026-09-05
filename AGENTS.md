@@ -35,8 +35,8 @@ the same change.
 - Learned overlay: `learned.py`
 - Telemetry writes: `logger_io.py`
 - Telemetry analysis: `analyze.py`
-- Analyzer cache-cost library: `scripts/cache-stability-replay.py` (imported by
-  `analyze.py`; also a standalone CLI)
+- Analyzer cache-cost library: `cache_replay.py` (imported by `analyze.py`;
+  also a standalone CLI)
 - Savings engine and CLI: `savings.py`, `savings_cli.py`, `tool-belt` launcher
 - Supported operator commands: `scripts/`
 - Tests: `tests/`

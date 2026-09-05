@@ -36,8 +36,8 @@ Usage
 
 ``--mode`` mirrors the interactive menu: learning (shape from future usage),
 history (shape from recorded sessions now), off (observe only; the learned
-overlay is kept but not applied). ``--path recommend`` and ``--reset`` are
-hidden variants (--reset also clears the overlay).
+overlay is kept but not applied), observe (off plus a full-ceiling baseline),
+reset (off plus clearing the agent's learned overlay).
 """
 
 from __future__ import annotations
@@ -270,7 +270,7 @@ def configured_agent_name(profile_home: Path) -> str:
 
 def _filter_hits(profile_filter: str | None, dir_name: str,
                  profile_home: Path) -> bool:
-    """``--agent``/``--reset`` match by profile directory name OR by the
+    """``--agent`` matches by profile directory name OR by the
     configured agent name the UI displays for that profile."""
     if not profile_filter:
         return True
@@ -1934,14 +1934,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--status", action="store_true", help="print per-scope state and telemetry counts, write nothing")
     parser.add_argument("--agent", default=None, help="restrict to one agent/profile (skips selection)")
     parser.add_argument(
-        "--mode", choices=("learning", "history", "off"), default=None,
+        "--mode", choices=("learning", "history", "off", "observe", "reset"),
+        default=None,
         help="set the shaping mode non-interactively: learning (shape from "
              "future usage), history (shape from recorded sessions now), "
-             "off (observe only)")
-    # Hidden variants: --path recommend = observation mode with a
-    # full-ceiling baseline, --reset additionally clears the overlay.
-    parser.add_argument("--path", choices=("recommend",), default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--reset", metavar="AGENT", default=None, help=argparse.SUPPRESS)
+             "off (observe only), observe (off plus a full-ceiling baseline), "
+             "reset (off plus clearing the learned overlay)")
     parser.add_argument("--yes", action="store_true", help="apply without the interactive confirmation")
     parser.add_argument("--dry-run", action="store_true", help="show every diff, write nothing")
     parser.add_argument("--channel", action="append", default=None, help="restrict to these channels of the chosen agent, e.g. telegram (repeatable; comma-separated ok)")
@@ -1992,7 +1990,7 @@ def _main_with_home(args: argparse.Namespace, hermes_home: Path) -> int:
         ctx.plugin_config = read_plugin_config(ctx.runner)
     ctx.thresholds = shape_thresholds(ctx.plugin_config or None)
 
-    profile_filter = args.reset or args.agent
+    profile_filter = args.agent
     args.platform = split_platform_args(args.platform)
     infos = discover_scopes(hermes_home, profile_filter, args.platform)
     channels = split_platform_args(args.channel)
@@ -2058,13 +2056,13 @@ def _main_with_home(args: argparse.Namespace, hermes_home: Path) -> int:
             if infos is None:
                 return 2
 
-        if args.reset:
+        if args.mode == "reset":
             rc = flow_reset(ctx, infos)
         elif args.mode == "history":
             rc = flow_shape(ctx, infos)
         elif args.mode in ("learning", "off"):
             rc = _apply_mode(ctx, infos, args.mode)
-        elif args.path == "recommend":
+        elif args.mode == "observe":
             rc = flow_recommend(ctx, infos)
         else:
             rc = _menu(ctx, infos)
@@ -2072,7 +2070,7 @@ def _main_with_home(args: argparse.Namespace, hermes_home: Path) -> int:
         ctx.out("\n\n  Stopped. No changes were written.")
         return 0
     if rc is _BACK:
-        # A non-interactive --mode/--path run declined at its confirm: the
+        # A non-interactive --mode run declined at its confirm: the
         # menu's walk-back sentinel has no menu to return to — it is a
         # clean "nothing written" exit, never a non-int exit code.
         rc = 0

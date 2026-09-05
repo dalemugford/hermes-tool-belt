@@ -45,6 +45,20 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
   (49 vs 51 demoted). A wrong demotion costs one expansion round-trip and
   corrects itself through promotion, which is why the promote gates drop too.
 
+- **`configure.py`'s hidden flags are part of `--mode`.** The observation
+  path is `--mode observe` (was `--path recommend`) and the deeper rollback
+  is `--mode reset --agent <agent>` (was `--reset <agent>`); both now appear
+  in `--help` alongside `learning`, `history` and `off`.
+
+- **`scripts/shape-ceiling.py` and `scripts/replay-shaping.py` see the
+  `config.yaml` layer.** Both read the plugin settings themselves when
+  `hermes_cli` is not importable — which it is not under any interpreter but
+  the Hermes one. Their `always_carry` protection previously collapsed to the
+  shipped policy baseline, so a config-pinned tool was reported as demotable
+  and a run's protected set disagreed with the in-process auto-shaper's.
+  `shape-ceiling.py` now also applies `filter_protected_demotions`, which it
+  never did.
+
 ### Added
 
 - **`scripts/replay-shaping.py` — read-only shaping replay.** Walks one
@@ -70,6 +84,16 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 - **`learned_mode` values `off`, `auto` and `audit`.** Use `recommend` (carry
   everything, keep the overlay unapplied) or `apply` (shape).
 - **`configure.py`'s hidden `--path shape` flag.** Use `--mode history`.
+- **Config key `require_tool_call_id`.** The gate it toggled is now
+  unconditional: a `tool_calls.jsonl` row is written only for a primary model
+  dispatch (one carrying the provider `tool_call_id`).
+- **`tool-belt savings --cache-mode`.** The projection replays cache-off
+  economics only, because the runtime carries everything on caching providers
+  and ships no `expand_tools` there. The `cache_mode` and `assignment_source`
+  keys are gone from the JSON report.
+- **`scripts/cache-stability-replay.py`** is now the package module
+  `cache_replay.py` at the plugin root (`python3 cache_replay.py` for the
+  diagnostic CLI); the analyzer imports it directly.
 
 ### Documentation
 

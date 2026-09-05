@@ -171,7 +171,7 @@ class OnboardingArcTests(OnboardingTestCase):
         self.assertLess(result.sessions, self.needed)
 
         runner = tc.FakeRunner()
-        rc, _out = self.run_main(["--path", "recommend", "--yes"], runner)
+        rc, _out = self.run_main(["--mode", "observe", "--yes"], runner)
         self.assertEqual(rc, 0)
         emitted = {c[3]: c[4] for c in runner.writes}
         self.assertEqual(

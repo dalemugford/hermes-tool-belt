@@ -106,25 +106,6 @@ DEFAULT_WINDOW_DAYS = "7,14,30"
 DEFAULT_FLOOR = "2"
 
 
-def _load_plugin_config() -> dict[str, Any]:
-    """The profile's plugin settings (the config.yaml layer).
-
-    Same resolution ``scripts/shape-ceiling.py`` uses, and fail-open for the
-    same reason: outside a live Hermes there is no user layer, and the replay
-    should still run against whatever telemetry it was pointed at. Only the
-    ``always_carry`` pins are read from it here.
-    """
-    try:
-        plugin = sys.modules.get("tool_belt_plugin")
-        if plugin is None:  # pragma: no cover - package loaded at import
-            return {}
-        plugin._load_user_config()
-        cfg = getattr(plugin, "_CONFIG", {})
-        return dict(cfg) if isinstance(cfg, dict) else {}
-    except Exception:
-        return {}
-
-
 def _int_list(raw: str, flag: str) -> list[int]:
     """Parse a ``7,14,30``-style flag value into positive ints, in order."""
     values: list[int] = []
@@ -483,7 +464,7 @@ def main() -> int:
         promote_min_sessions=args.promote_min_sessions,
         promote_min_calls=args.promote_min_calls,
         demote_k=args.demote_k,
-        plugin_config=_load_plugin_config(),
+        plugin_config=shaping.load_cli_plugin_config(),
     )
 
     if not doc["scopes"]:

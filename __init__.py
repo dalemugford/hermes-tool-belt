@@ -146,20 +146,6 @@ _CONFIG: dict[str, Any] = {
     # narrowing behind it).
     "enabled": True,
     "log": True,
-    "require_tool_call_id": True,
-    # ^ Only log a tool_calls.jsonl row for a *primary* model dispatch — a
-    # tool the model named in its assistant tool_use block. Hermes emits the
-    # post_tool_call hook for those (carrying the provider ``tool_call_id``)
-    # AND for nested/secondary dispatches routed straight through
-    # ``model_tools.handle_function_call`` (code-execution sandboxes, the
-    # code kernel, the MCP tools server, memory/mnemosyne batch fan-out).
-    # Those nested calls never faced per-turn narrowing and arrive with an
-    # EMPTY tool_call_id; logging them inflated ``uses_in_window`` in the
-    # economic demotion engine. True = drop id-less nested dispatches (the
-    # contract: a row means "the model dispatched this tool"). A primary
-    # tool_use block with a blank id (degraded models at long context) is
-    # dropped too: a rare under-count is safer for the demotion engine than
-    # over-counting. ``require_tool_call_id: false`` restores full logging.
     "channels": {},
     "agent": "",
     # Zero-config default (full-start contract): evidence-driven shaping
@@ -372,7 +358,7 @@ def _load_user_config() -> None:
         if not isinstance(plugin_cfg, dict):
             return
         for key in (
-            "enabled", "log", "require_tool_call_id", "agent", "learned_mode",
+            "enabled", "log", "agent", "learned_mode",
             "bypass_rate", "cache_mode",
             "auto_shape", "auto_shape_interval_hours", "always_carry",
         ):
@@ -1985,8 +1971,10 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
             # ``uses_in_window`` in the shaper's economic demotion engine
             # (a resolved-but-not-dispatched tool looked heavily used, so the
             # penalty side ballooned and the tool was over-carried). Drop them.
-            # ``require_tool_call_id: false`` restores the pre-fix behavior.
-            if _CONFIG.get("require_tool_call_id", True) and not tool_call_id:
+            # A primary tool_use block with a blank id (degraded models at long
+            # context) is dropped too: a rare under-count is safer for the
+            # demotion engine than over-counting.
+            if not tool_call_id:
                 return None
             initial_allowed = set(state.get("initial_active_tools") or []) if state else set()
             # Baseline = the active set *before* sticky carry-over merged in.
