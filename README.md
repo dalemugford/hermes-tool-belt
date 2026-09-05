@@ -53,6 +53,36 @@ normal.
 The full lifecycle — hooks, the carry-all posture, compaction handling,
 telemetry joins — is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+### Switching providers mid-session
+
+The cache decision is made per scope *and* provider, and it follows the
+provider, not the session. If you switch models mid-session (`/model`, or a
+failover) and the new provider is different, Tool Belt notices on the next
+call:
+
+1. **The session's posture is dropped.** It was decided against the old
+   provider. The switch already broke that provider's prefix cache, so
+   dropping it costs nothing.
+2. **The next message resolves against the new provider.** If Tool Belt has
+   already watched this scope on that provider, it uses what it learned: a
+   provider locked as caching gets every tool, a provider locked as uncached
+   gets a narrowed loadout straight away. A provider it has never seen on this
+   scope starts as carry-all, the safe default, and is locked from the cache
+   hits it observes over the session. A provider or model named in
+   `cache_auto.providers_off_models` skips the observation and narrows from
+   the first message.
+3. **Switching back is instant.** The old provider's decision is still on
+   disk, so the first message after switching back behaves the way it did
+   before.
+
+Learning follows your primary provider. Shaping (promotion and demotion) is
+computed against the provider set in `model.provider`. A stint on a caching
+provider neither adds nor removes demotions, and its turns are reported as
+carry-all in `tool-belt savings`, where the plugin claims no savings. If your
+primary is a caching provider, the learned loadout is still applied whenever a
+session lands on an uncached provider, but it stops evolving until an uncached
+provider is the primary again.
+
 ## How to use it
 
 Install the plugin, restart the gateway, and configure it:
