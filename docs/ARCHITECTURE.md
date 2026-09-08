@@ -487,6 +487,26 @@ In addition to the patches, the plugin registers:
 - `post_tool_call` — log each actual tool call linked by
   `prediction_id`, with attribution (`source`, `was_initially_active`,
   `was_expand_only`, `activated_by_expansion`, `activation_source`).
+  Also runs the **shell-bypass detector**
+  ([`_maybe_log_shell_bypass`](../__init__.py)): for a `terminal` call on
+  a narrowed gateway turn, it matches the command against the
+  `bypass_patterns` table ([`bypass_map.py`](../bypass_map.py)) and, when
+  the matched native tool was latent that turn (in the ceiling but not
+  active), writes a `bypass_events.jsonl` row. This captures the tool the
+  model *should* have used but reached around via the shell — signal the
+  expand-only harvest path (which only sees tools the model recovered via
+  `expand_tools`) never observes. The command text is inspected in memory
+  and never written (see [PRIVACY.md](PRIVACY.md)); the row is a separate
+  stream so the `terminal` call's own `tool_calls` row keeps its single
+  meaning.
+
+  > **Naming note — two unrelated "bypasses".** A *shell bypass event*
+  > (this detector) is the model routing around a latent tool via the
+  > shell. The *bypass cohort* (`bypass_rate`, below) is the internal A/B
+  > control that deterministically disables narrowing for a fraction of
+  > sessions to measure the baseline. They share a word and nothing else:
+  > the shell-bypass detector never touches narrowing, and the bypass
+  > cohort emits no `bypass_events.jsonl` rows.
 - `post_api_request` — capture per-call cache_read / cache_write
   tokens, run the cache-mode detection state machine in the call's
   `scope|provider` bucket, stamp `provider_caches`, evict the pin on a
@@ -527,6 +547,7 @@ never widen past it.
 ├── predictions.jsonl              # one row per inbound dispatch
 ├── tool_calls.jsonl               # one row per tool call, linked by prediction_id
 ├── api_calls.jsonl                # one row per outbound API call, with cache + hash data + provider_caches
+├── bypass_events.jsonl            # one row per shell-bypass of a latent tool, linked by prediction_id
 ├── cache_mode_detection.json      # per scope|provider locked mode (cross-session)
 ├── schema_sizes.json              # measured per-tool schema token sizes
 ├── auto_shape_stamp.json          # per-scope auto-shape debounce stamps

@@ -863,6 +863,41 @@ Key fields:
 Joining `tool_calls.jsonl` and `api_calls.jsonl` to `predictions.jsonl`
 on `prediction_id` is the supported analysis path.
 
+### `bypass_events.jsonl`
+
+One row per shell-bypass of a *latent* native tool: the model ran a
+shell command (via the `terminal` tool) whose content maps to a native
+Tool Belt tool that was in the ceiling but not made active that turn, so
+it reached around the tool instead of using it. This is promotion signal
+the expand-only harvest path never sees — that path only observes tools
+the model *recovered* via `expand_tools`. Written by
+[`_maybe_log_shell_bypass`](../__init__.py) from inside the
+`post_tool_call` hook; the pattern table is data in `policy.yaml` under
+`bypass_patterns`, compiled by [`bypass_map.py`](../bypass_map.py).
+
+This is a **separate stream, not a `tool_calls.jsonl` row**: the shell
+command already occupies one `tool_calls` row, and the bypass is a
+derived signal about a different (latent) tool. Deduped per
+`prediction_id`+`matched_tool`, so failed retries of the same shell
+command count as one bypass decision.
+
+Key fields:
+
+- `schema_version`, `ts`, `prediction_id`, `session_id`, `scope`
+- `shell_tool` — the shell tool that carried the command (v1: `terminal`).
+- `matched_tool` — the latent native tool the command shadowed
+  (e.g. `cronjob`).
+- `pattern_id` — the `bypass_patterns` entry id that matched
+  (e.g. `hermes_cron_subcommand`).
+- `tool_in_ceiling` — always `true` (the row is only written for a tool
+  in the ceiling); recorded explicitly for join clarity.
+- `tool_was_initially_active` — always `false` (an initially-active tool
+  driven from the shell is operator preference, not a learning signal, so
+  no row is written).
+- `message_preview` — the prediction's already-derived user-message
+  preview, reused. **The command text is never recorded** (see
+  [PRIVACY.md](PRIVACY.md)).
+
 ## Analyzing telemetry with `jq`
 
 Quick recipes for spot-checks. For proper per-scope precision/recall and
@@ -920,8 +955,9 @@ jq -c 'select(.expansion_provided_access == true) | {scope, category: .expand_ca
 ## Analyzer thresholds (`analyze.py`)
 
 All thresholds are CLI flags, not hard-coded policy. The deterministic
-telemetry pass reads `predictions.jsonl` + `tool_calls.jsonl`, prints a
-summary, writes a dated markdown report under `reports/`, and can
+telemetry pass reads `predictions.jsonl` + `tool_calls.jsonl` +
+`bypass_events.jsonl`, prints a summary, writes a dated markdown report
+under `reports/`, and can
 optionally emit `learned_recommendations.json` for review
 ([`scripts/README.md`](../scripts/README.md) has the workflow).
 
@@ -935,6 +971,7 @@ optionally emit `learned_recommendations.json` for review
 | `--trigger-min-fires` | 3 | Minimum fires before a trigger gets a precision/recall recommendation |
 | `--expand-round-trip-tokens` | 1500 | Estimated total cost of one `expand_tools` round-trip (model output + result + extra API call). Folded into per-category net-value math and the headline net-savings number. |
 | `--harvest-min-cuts` | 3 | Minimum `was_expand_only` call count before a tool surfaces as a harvest-driven promotion candidate. |
+| `--harvest-min-bypass-calls` | 3 | Minimum shell-bypass event count before a latent tool surfaces as a bypass-driven promote-to-carry candidate (`shell_bypass_promotion`). Independent of the expand-only floor: expand-only harvesting is *recovered-late* evidence, a bypass is *never-recovered*. |
 
 Dampener/trigger-keyword suggestion flags (`--suggest-dampeners`,
 `--suggest-trigger-keywords` and their tuning flags) are documented in

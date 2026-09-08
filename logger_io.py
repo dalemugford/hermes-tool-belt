@@ -10,7 +10,17 @@ Two log files at ``~/.hermes/state/tool-belt/``:
     One row per actual tool call during a session:
       {ts, prediction_id, session_id, tool_name}
 
-Both are opened in append mode (``"a"``) and written one JSON line at a
+  bypass_events.jsonl
+    One row per shell-bypass of a latent native tool. A separate stream from
+    tool_calls.jsonl on purpose: the shell call itself (``terminal``) already
+    occupies one tool_calls row under the "one row per tool call" contract, so
+    the bypass — a *derived* signal about a different, latent tool — cannot
+    share that row without giving ``tool_name`` two meanings. See
+    ``docs/PRIVACY.md``. Privacy: only the matched tool name and pattern id are
+    recorded, never the command text; the preview reuses the prediction's
+    ``message_preview``.
+
+These are opened in append mode (``"a"``) and written one JSON line at a
 time, which on POSIX is effectively atomic for short writes. Files
 self-heal — a corrupt row never breaks the next write. Privacy: full
 message text is never logged; only a sha1 hash and a short preview
@@ -54,6 +64,10 @@ def tool_calls_path() -> Path:
 
 def api_calls_path() -> Path:
     return _state_dir() / "api_calls.jsonl"
+
+
+def bypass_events_path() -> Path:
+    return _state_dir() / "bypass_events.jsonl"
 
 
 # ── Per-tool schema size sidecar ─────────────────────────────────────────────
@@ -518,6 +532,27 @@ def normalize_tool_call_row(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def normalize_bypass_event_row(row: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a shell-bypass telemetry row into the canonical shape.
+
+    Pure, non-mutating, non-raising. Coerces the two residency flags to bool
+    and the identifier fields to str, and never manufactures a command field —
+    a bypass row that somehow carried one (it should not) is left as-is for the
+    caller's privacy assertions to catch, not silently normalized away.
+    """
+    try:
+        out = dict(row or {})
+    except (TypeError, ValueError):
+        return {"schema_version": SCHEMA_VERSION}
+    out["schema_version"] = SCHEMA_VERSION
+    for flag in ("tool_in_ceiling", "tool_was_initially_active"):
+        if out.get(flag) is not None:
+            out[flag] = bool(out[flag])
+    for key in ("matched_tool", "pattern_id", "shell_tool", "scope"):
+        out[key] = str(out.get(key) or "")
+    return out
+
+
 def _append_jsonl(path: Path, row: dict[str, Any], what: str) -> None:
     """Append one JSON line to ``path``, creating its directory. Never raises."""
     try:
@@ -576,3 +611,38 @@ def log_tool_call(
                 pass
         row["result"] = result
     _append_jsonl(tool_calls_path(), row, "log_tool_call")
+
+
+def log_bypass_event(
+    prediction_id: str,
+    session_id: str,
+    scope: str,
+    shell_tool: str,
+    matched_tool: str,
+    pattern_id: str,
+    tool_in_ceiling: bool,
+    tool_was_initially_active: bool,
+    message_preview: str = "",
+) -> None:
+    """Append one shell-bypass event. Errors are swallowed.
+
+    Privacy: the caller must pass only the matched tool name and pattern id —
+    never the command string or a preview of it. ``message_preview`` is the
+    prediction's already-derived preview (see ``PredictionRecord``), reused
+    here as the accepted disclosure; the command text is never a source for it.
+    """
+    row: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "ts": time.time(),
+        "prediction_id": prediction_id,
+        "session_id": session_id,
+        "scope": scope,
+        "shell_tool": shell_tool,
+        "matched_tool": matched_tool,
+        "pattern_id": pattern_id,
+        "tool_in_ceiling": bool(tool_in_ceiling),
+        "tool_was_initially_active": bool(tool_was_initially_active),
+    }
+    if message_preview:
+        row["message_preview"] = message_preview
+    _append_jsonl(bypass_events_path(), row, "log_bypass_event")

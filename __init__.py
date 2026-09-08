@@ -116,6 +116,7 @@ import threading
 import time
 from typing import Any
 
+from . import bypass_map as bypass_map_mod
 from . import carrying as carrying_mod
 from . import expand_tools as expand_tools_mod
 from . import logger_io
@@ -1945,6 +1946,92 @@ def _recover_attribution_without_state(
     return "", "", ""
 
 
+#: Shell tools whose command content is inspected for latent-tool bypasses.
+#: v1 is deliberately terminal-only; execute_code needs deeper code-content
+#: inspection (see docs/KNOWN_ISSUES.md) and is a follow-up.
+_BYPASS_SHELL_TOOLS = frozenset({"terminal"})
+
+
+def _command_text_from_args(args: Any) -> str:
+    """Best-effort ``command`` string from a terminal tool-call payload.
+
+    Accepts the dict form (``{"command": ...}``) and the attribute form.
+    Returns "" for anything else so the caller can bail cleanly. The returned
+    string is used only to run the regex table and is never logged.
+    """
+    if isinstance(args, dict):
+        value = args.get("command")
+    else:
+        value = getattr(args, "command", None)
+    return value if isinstance(value, str) else ""
+
+
+def _maybe_log_shell_bypass(
+    tool: str,
+    args: Any,
+    state: dict[str, Any] | None,
+    session_id: Any,
+    source: str,
+) -> None:
+    """Record a bypass event when a shell command shadows a latent native tool.
+
+    Fires only for a real narrowed gateway turn (``source == "gateway"`` with
+    prediction state): a matched tool must have been *latent* this turn — in
+    the ceiling but not initially active — for the bypass to be a learning
+    signal. An active tool driven from the shell is operator preference, not a
+    signal, and is skipped. Deduped per prediction+tool so retries of the same
+    failed shell invocation count as one bypass decision, not several.
+
+    Privacy: only the matched tool name and pattern id reach disk; the command
+    text is inspected in-memory and discarded.
+    """
+    if tool not in _BYPASS_SHELL_TOOLS or source != "gateway" or not state:
+        return
+    command = _command_text_from_args(args)
+    if not command:
+        return
+    match = bypass_map_mod.detect_bypass(command)
+    if match is None:
+        return
+    pattern_id, matched_tool = match
+    ceiling = set(state.get("ceiling_tools") or [])
+    if not ceiling:
+        # Without a resolved ceiling we can't tell latent from active — the
+        # whole point of the signal — so record nothing rather than guess.
+        return
+    base = _base_tool_name(matched_tool)
+    if matched_tool not in ceiling and base not in ceiling:
+        # Not a tool this scope carries at all; nothing to promote.
+        return
+    baseline_raw = state.get("baseline_active_tools")
+    if baseline_raw == NO_NARROWING:
+        was_active = True
+    else:
+        baseline = set(baseline_raw) if baseline_raw else set(
+            state.get("initial_active_tools") or []
+        )
+        was_active = matched_tool in baseline or base in baseline
+    if was_active:
+        return
+    # One bypass event per prediction+tool: two failed `hermes cron create`
+    # retries plus a success are one bypass decision, not three.
+    logged = state.setdefault("bypass_events_logged", set())
+    if matched_tool in logged:
+        return
+    logged.add(matched_tool)
+    logger_io.log_bypass_event(
+        prediction_id=str(state.get("prediction_id", "")),
+        session_id=str(session_id or ""),
+        scope=str(state.get("scope", "")),
+        shell_tool=tool,
+        matched_tool=matched_tool,
+        pattern_id=pattern_id,
+        tool_in_ceiling=True,
+        tool_was_initially_active=False,
+        message_preview=str(state.get("message_preview", "")),
+    )
+
+
 def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **kwargs) -> None:
     if not _CONFIG["enabled"] or not _CONFIG.get("log", True):
         return None
@@ -2030,6 +2117,11 @@ def _on_post_tool_call(tool_name=None, args=None, result=None, task_id=None, **k
                 source = "gateway"
             else:
                 source = "subagent"
+            # Shell-bypass detection: a shell command shadowing a latent native
+            # tool is promotion signal the expand-only harvest path never sees.
+            # Written to its own stream (bypass_events.jsonl); does not touch
+            # the tool_calls row for this terminal call.
+            _maybe_log_shell_bypass(tool, args, state, session_id, source)
             # ``activation_source`` — the carrying class that made this tool
             # active this turn (v2). Derived from the resolved A/C/X partition
             # captured in state; refined to expansion/sticky_expansion below

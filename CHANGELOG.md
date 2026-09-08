@@ -6,6 +6,33 @@ project uses CalVer (`YYYY.M.D` with an optional prerelease suffix).
 
 ## [Unreleased]
 
+### Added
+
+- **Shell-bypass detection for latent tools.** When the model runs a shell
+  command via the `terminal` tool that shadows a native Tool Belt tool which
+  was latent that turn — in the ceiling but not made active — Tool Belt now
+  records a bypass event. This closes a blind spot in the promotion machinery:
+  the expand-only harvest path only ever saw tools the model *recovered* via
+  `expand_tools`, so a tool the model bypassed by shelling out (because it
+  never thought to expand it) was invisible to the learning loop — exactly the
+  tool it most needed to surface. The detector lives in the `post_tool_call`
+  hook ([`_maybe_log_shell_bypass`](__init__.py)); the pattern table is data in
+  `policy.yaml` under `bypass_patterns` (compiled by [`bypass_map.py`](bypass_map.py)),
+  extendable without touching plugin logic, and ships one entry mapping
+  `hermes cron create|list|remove|run|pause|resume` → `cronjob`. Events land in
+  a new fourth telemetry file, `bypass_events.jsonl`, deduped per
+  prediction+tool so failed retries count once. `analyze.py` joins them on
+  `prediction_id` and surfaces per-scope bypass counts and a
+  `shell_bypass_promotion` promote-to-carry candidate list, driven by the new
+  `--harvest-min-bypass-calls` floor (default 3) and kept as a counter separate
+  from expand-only harvesting so an operator can see which path — never-recovered
+  (bypass) vs recovered-late (expand-only) — drove a recommendation.
+  **Privacy:** only the matched tool name and pattern id are logged, never the
+  command text; the row's only preview is the prediction's reused
+  `message_preview`. Detection-only in v1 — no runtime intervention, and
+  `execute_code` inspection is out of scope (see
+  [KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md)).
+
 ### Changed
 
 - **Shaping learns from narrowed traffic, not from the configured primary

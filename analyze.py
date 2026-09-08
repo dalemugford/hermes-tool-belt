@@ -62,6 +62,13 @@ DEFAULT_DAMPENER_MAX_CANDIDATES = 10
 # Minimum was_expand_only call count before a tool surfaces as a harvest-driven
 # promote-to-carry candidate.
 DEFAULT_HARVEST_MIN_EXPAND_ONLY_CALLS = 3
+# Minimum shell-bypass event count before a latent tool surfaces as a
+# bypass-driven promote-to-carry candidate. The same thin-signal dampener
+# discipline as the expand-only harvest path, but a separate constant and a
+# separate counter: expand-only harvesting is "recovered-late" evidence (the
+# model reached the tool via expand_tools), whereas a bypass is
+# "never-recovered" (the model shelled around the latent tool entirely).
+DEFAULT_HARVEST_MIN_BYPASS_CALLS = 3
 # Session-bounded lookahead window for trigger true-positive attribution. This
 # is an analysis-time approximation of the runtime ``sticky_ttl_turns`` (default
 # 3), which is config-overridable — the two can diverge on a tuned install.
@@ -129,6 +136,17 @@ class ScopeStats:
     harvest_expand_only_predictions: dict[str, set[str]] = field(
         default_factory=lambda: defaultdict(set))
     harvest_predictions: int = 0
+    # Shell-bypass signal: per-tool count of bypass events (a shell command
+    # shadowing a latent native tool). A separate counter from the expand-only
+    # harvest above so the operator can see which path drives a recommendation:
+    # bypass = the model never recovered the tool (shelled around it);
+    # expand-only = the model recovered it late via expand_tools. One event is
+    # already deduped per prediction+tool by the writer.
+    shell_bypass_events: Counter[str] = field(default_factory=Counter)
+    # Distinct predictions with at least one bypass event for the tool — the
+    # denominator-safe count, mirroring harvest_expand_only_predictions.
+    shell_bypass_predictions: dict[str, set[str]] = field(
+        default_factory=lambda: defaultdict(set))
     # Per-tool sample of message previews that led to a was_expand_only call.
     # Used by the trigger-keyword suggester to mine candidate keywords for
     # broadening the trigger groups that would activate those expand_only tools.
@@ -265,12 +283,19 @@ def trigger_tools(row: dict[str, Any]) -> dict[str, set[str]]:
     return parsed
 
 
-def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, Any]]) -> dict[str, ScopeStats]:
+def collect_stats(
+    predictions: list[dict[str, Any]],
+    tool_calls: list[dict[str, Any]],
+    bypass_events: list[dict[str, Any]] | None = None,
+) -> dict[str, ScopeStats]:
     # Read every row through the central adapter so every consumer sees the
     # same canonical carrying-model fields. Idempotent, so callers
     # that already normalized (e.g. ``main``) pay only a cheap re-pass.
     predictions = [logger_io.normalize_prediction_row(r) for r in predictions]
     tool_calls = [logger_io.normalize_tool_call_row(r) for r in tool_calls]
+    bypass_events = [
+        logger_io.normalize_bypass_event_row(r) for r in (bypass_events or [])
+    ]
 
     stats: dict[str, ScopeStats] = {}
 
@@ -376,6 +401,23 @@ def collect_stats(predictions: list[dict[str, Any]], tool_calls: list[dict[str, 
                 stat.used_expansion_event_ids_by_category[category].add(f"{event_prediction_id}:{category}")
             stat.expanded_uses_by_category[category] += 1
             stat.turns_until_used.append(max(0, safe_int(row.get("turns_until_used"))))
+
+    # Shell-bypass events. Join to the prediction for scope backfill exactly
+    # as tool_calls do, so a row that only carries a prediction_id still lands
+    # in the right scope. Count per matched tool; track distinct predictions
+    # for a denominator-safe rate.
+    for row in bypass_events:
+        prediction_id = str(row.get("prediction_id") or "").strip()
+        scope = normalize_scope(row)
+        if scope == "unknown" and prediction_id in prediction_scope:
+            scope = prediction_scope[prediction_id]
+        matched_tool = str(row.get("matched_tool") or "").strip()
+        if not matched_tool:
+            continue
+        stat = get(scope)
+        stat.shell_bypass_events[matched_tool] += 1
+        if prediction_id:
+            stat.shell_bypass_predictions[matched_tool].add(prediction_id)
 
     # Build a session-bounded lookahead window so that sticky-carried
     # tool calls in subsequent turns count as TPs for the trigger that
@@ -1341,6 +1383,87 @@ def harvest_recommendation_rows(
     return rows
 
 
+def bypass_recommendation_rows(
+    stats: dict[str, ScopeStats],
+    args: argparse.Namespace,
+    immutable_always_carry: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Per-tool promote-to-carry candidates driven by shell-bypass events.
+
+    A bypass event means the model shelled around a latent native tool it
+    could have reached — strictly-worse behavior the expand-only harvest path
+    never observes (that path only sees tools the model *did* recover via
+    ``expand_tools``). Because a bypass is a correctness signal, not merely a
+    token trade, promotion is driven by bypass support once it clears
+    ``--harvest-min-bypass-calls`` — the same thin-signal dampener discipline
+    as the expand-only path, but a separate counter and a separate candidate
+    kind (``shell_bypass_promotion``) so the operator can see which path drove
+    the recommendation. The token net is carried as an advisory metric only.
+
+    Emits nothing when no bypass events are present, so it is safe to call
+    unconditionally.
+    """
+    rows: list[dict[str, Any]] = []
+    immutable = set(immutable_always_carry if immutable_always_carry is not None
+                    else preset_always_carry())
+    min_calls = max(1, args.harvest_min_bypass_calls)
+    for scope, stat in sorted(stats.items()):
+        if not stat.shell_bypass_events:
+            continue
+        denom = max(stat.predictions, 1)
+        per_event = expand_round_trip_tokens_for(args, scope)
+        per_event_basis = expand_round_trip_basis_for(args, scope)
+        for tool, bypass_calls in stat.shell_bypass_events.most_common():
+            if tool in immutable:
+                continue
+            if bypass_calls < min_calls:
+                continue
+            bypass_predictions = len(stat.shell_bypass_predictions.get(tool, ()))
+            if bypass_predictions:
+                bypass_rate = bypass_predictions / denom
+            else:
+                bypass_rate = min(1.0, bypass_calls / denom)
+            # Advisory only: a carried tool would have avoided at least the
+            # expand round-trip. The true cost of a bypass (wrong path, failed
+            # retries) is larger, so this understates the case for promotion —
+            # which is why the action is driven by support, not by this net.
+            recovered_value = bypass_calls * per_event
+            carry_cost = denom * args.per_tool_tokens
+            net = recovered_value - carry_cost
+            confidence = "medium" if bypass_calls >= min_calls * 2 else "low"
+            rows.append({
+                "scope": scope,
+                "kind": "shell_bypass_promotion",
+                "item": tool,
+                "action": "promote_to_carry",
+                "status": "review",
+                "confidence": confidence,
+                "metrics": {
+                    "predictions": stat.predictions,
+                    "shell_bypass_events": bypass_calls,
+                    "shell_bypass_predictions": bypass_predictions,
+                    "bypass_rate": round(bypass_rate, 4),
+                    "advisory_recovered_value_tokens": recovered_value,
+                    "advisory_carry_cost_tokens": carry_cost,
+                    "advisory_net_tokens": net,
+                },
+                "defaults": {
+                    "expand_round_trip_tokens": per_event,
+                    "expand_round_trip_basis": per_event_basis,
+                    "per_tool_tokens": args.per_tool_tokens,
+                    "harvest_min_bypass_calls": min_calls,
+                },
+                "proposed_learned_patch": {"scopes": {scope: {"carry": [tool]}}},
+                "reason": (
+                    f"model shelled around latent {tool} {bypass_calls} time(s) "
+                    f"(in {bypass_rate:.1%} of predictions) instead of using the "
+                    f"native tool; a bypass is never-recovered evidence, stronger "
+                    f"than expand-only recovery → promote_to_carry"
+                ),
+            })
+    return rows
+
+
 def recommendation_rows(
     stats: dict[str, ScopeStats],
     args: argparse.Namespace,
@@ -1527,6 +1650,8 @@ def summary_payload(
         for stat in stats.values()
     )
     total_saved = sum(stat.total_tokens_saved for stat in stats.values())
+    total_bypass_events = sum(
+        sum(stat.shell_bypass_events.values()) for stat in stats.values())
     # Each scope's events at that scope's measured per-event cost.
     total_expand_cost = sum(
         stat.expansion_events * expand_round_trip_tokens_for(args, scope)
@@ -1565,6 +1690,7 @@ def summary_payload(
             "estimated_expand_round_trip_cost_tokens": total_expand_cost,
             "estimated_net_savings_tokens": total_saved - total_expand_cost,
             "recommendation_candidates": len(recs),
+            "shell_bypass_events": total_bypass_events,
             "first_turns": total_first_turns,
             "comparable_turns": total_comparable,
             "mutation_turns": total_mutation_turns,
@@ -1662,6 +1788,11 @@ def scope_payload(stat: ScopeStats, args: argparse.Namespace) -> dict[str, Any]:
             for trigger, fires in stat.trigger_fires.items()
         },
         "learned_modes": dict(stat.learned_modes),
+        "shell_bypass_events": dict(stat.shell_bypass_events),
+        "shell_bypass_predictions": {
+            tool: len(preds)
+            for tool, preds in stat.shell_bypass_predictions.items()
+        },
     }
 
 
@@ -2086,6 +2217,29 @@ def markdown_report(
             lines.append(f"- {r['reason']}")
             lines.append("")
 
+    bypass_recs = [r for r in (recs or []) if r.get("kind") == "shell_bypass_promotion"]
+    if bypass_recs:
+        lines.extend(["", "## Shell-Bypass Promote-to-Carry Candidates", ""])
+        lines.append(
+            "Derived from `bypass_events.jsonl`: the model ran a shell command "
+            "(via `terminal`) that shadowed a latent native tool — in the "
+            "ceiling but not made active that turn — instead of using the tool. "
+            "This is *never-recovered* evidence, distinct from the harvest "
+            "expand-only path above (*recovered-late*): the model reached the "
+            "tool via `expand_tools` there, but never reached it here."
+        )
+        lines.append("")
+        for r in bypass_recs:
+            m = r["metrics"]
+            lines.append(
+                f"### {r['scope']} / `{r['item']}` — **{r['action']}** "
+                f"(bypass_events={m['shell_bypass_events']}, "
+                f"bypass_rate={m['bypass_rate']:.1%})"
+            )
+            lines.append("")
+            lines.append(f"- {r['reason']}")
+            lines.append("")
+
     if trigger_keywords:
         lines.extend(["", "## Suggested Trigger-Keyword Candidates", ""])
         lines.append(
@@ -2201,6 +2355,12 @@ def parse_args() -> argparse.Namespace:
         help="Minimum was_expand_only call count before a tool surfaces as a "
              "harvest-driven promote-to-carry candidate. Filters thin-signal "
              "noise. (default: 3)")
+    parser.add_argument("--harvest-min-bypass-calls", type=int,
+        default=DEFAULT_HARVEST_MIN_BYPASS_CALLS,
+        help="Minimum shell-bypass event count before a latent tool surfaces "
+             "as a bypass-driven promote-to-carry candidate. Filters thin-"
+             "signal noise, independent of --harvest-min-expand-only-calls. "
+             "(default: 3)")
     parser.add_argument("--suggest-trigger-keywords", action="store_true",
         help="Mine expand_only-tool message previews for candidate trigger "
              "keywords. Symmetric inverse of --suggest-dampeners. Requires "
@@ -2215,9 +2375,11 @@ def main() -> int:
     # Read every row through the central adapter so all downstream consumers
     # (collect_stats, cache-cost, source counts) see canonical carrying-model
     # fields regardless of the on-disk schema version.
+    bypass_events_paths = telemetry_paths(args.state_dir, "bypass_events.jsonl", args.include_archives)
     predictions = [logger_io.normalize_prediction_row(r) for r in load_rows(predictions_paths)]
     tool_calls = [logger_io.normalize_tool_call_row(r) for r in load_rows(tool_calls_paths)]
-    stats = collect_stats(predictions, tool_calls)
+    bypass_events = [logger_io.normalize_bypass_event_row(r) for r in load_rows(bypass_events_paths)]
+    stats = collect_stats(predictions, tool_calls, bypass_events)
 
     # Load api_calls.jsonl for cache-cost analysis (cache_read_tokens per call)
     # and for the per-scope MEASURED expand_tools cost every net-value figure
@@ -2233,7 +2395,11 @@ def main() -> int:
     }
 
     immutable_always_carry = preset_always_carry(Path(__file__).resolve().parent)
-    recs = recommendation_rows(stats, args, immutable_always_carry) + harvest_recommendation_rows(stats, args, immutable_always_carry)
+    recs = (
+        recommendation_rows(stats, args, immutable_always_carry)
+        + harvest_recommendation_rows(stats, args, immutable_always_carry)
+        + bypass_recommendation_rows(stats, args, immutable_always_carry)
+    )
     dampeners = dampener_candidates(stats, args)
     trigger_keywords = trigger_keyword_candidates(stats, args)
 

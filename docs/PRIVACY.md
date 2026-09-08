@@ -12,7 +12,7 @@ is never transmitted anywhere, and nothing is phoned home.
 
 ## What is collected
 
-When `log: true` (the default), the plugin appends to three JSONL files
+When `log: true` (the default), the plugin appends to four JSONL files
 under `$HERMES_HOME/state/tool-belt/` — `~/.hermes/state/tool-belt/`
 when `HERMES_HOME` is unset ([`logger_io.py:_state_dir`](../logger_io.py)):
 
@@ -21,10 +21,21 @@ when `HERMES_HOME` is unset ([`logger_io.py:_state_dir`](../logger_io.py)):
 | `predictions.jsonl` | inbound gateway message | which preset and triggers fired, the tool names before and after narrowing, estimated token counts, the message hash and preview |
 | `tool_calls.jsonl` | tool call in a session | the tool name and attribution flags (was it cut, was it expanded, was it available already) |
 | `api_calls.jsonl` | outbound API call | token and cache-hit counters, model/provider identifiers, the detected cache posture (`cache_mode`, `provider_caches`), and fingerprint hashes of the tool block and system message |
+| `bypass_events.jsonl` | shell-bypass of a latent tool | the matched native tool name and pattern id, the shell tool used, whether the tool was in the ceiling / initially active, and the reused message preview — **never the command text** |
 
-The purpose is measurement: the analyzer joins the three files on
+The purpose is measurement: the analyzer joins the files on
 `prediction_id` to answer whether narrowing predicted the tools the
 model actually reached for, and what it cost or saved.
+
+A `bypass_events.jsonl` row is a *separate* stream, not a `tool_calls`
+row: the shell command that triggered it (a `terminal` call) already
+occupies one `tool_calls` row under the "one row per tool call"
+contract. The bypass is a derived signal about a *different* tool — the
+latent native tool the shell command shadowed — so it cannot share that
+row without giving `tool_name` two meanings. It is written only when the
+shadowed tool was latent that turn (in the ceiling but not made active);
+see [`bypass_map.py`](../bypass_map.py) and
+[`__init__.py:_maybe_log_shell_bypass`](../__init__.py).
 
 The full field-by-field schema is in
 [CONFIGURATION.md § Telemetry outputs](CONFIGURATION.md#telemetry-outputs).
@@ -62,6 +73,19 @@ properties, `category` and `tool`
 ([`expand_tools.py`](../expand_tools.py)); its result is the plugin's
 own expansion outcome. No other tool's arguments or results reach
 disk.
+
+**The shell-bypass detector inspects command text but never writes it.**
+When a `terminal` call runs, the detector matches its `command` string
+against the pattern table ([`bypass_map.py`](../bypass_map.py)) purely
+in memory. On a match it records *only* the matched tool name and the
+pattern id ([`logger_io.py:log_bypass_event`](../logger_io.py)); the
+command string is discarded and never reaches disk, not even as a
+truncated preview. The one preview a `bypass_events.jsonl` row carries
+is `message_preview` — the same derived value the prediction row already
+holds (the first 80 characters of the *user's* message, an
+already-accepted disclosure), reused verbatim, never derived from the
+command. This is a hard contract, asserted by
+`tests/test_shell_bypass.py`.
 
 **Also not written:** API keys, auth tokens, message attachments,
 assistant output text, or system-prompt contents.
@@ -111,8 +135,8 @@ Two caveats:
 
 - Rotation **archives, it does not delete**. Rotated data stays on disk
   under `archive/` until removed by hand.
-- The script rotates all three files — `predictions.jsonl`,
-  `tool_calls.jsonl`, and `api_calls.jsonl`.
+- The script rotates all four files — `predictions.jsonl`,
+  `tool_calls.jsonl`, `api_calls.jsonl`, and `bypass_events.jsonl`.
 
 ## Turning collection off
 
@@ -144,7 +168,8 @@ There is no "forget me" command. Erasure is manual file deletion:
 
 That removes:
 
-- `predictions.jsonl`, `tool_calls.jsonl`, `api_calls.jsonl`
+- `predictions.jsonl`, `tool_calls.jsonl`, `api_calls.jsonl`,
+  `bypass_events.jsonl`
 - `archive/` — every rotated snapshot
 - `harvest/` — synthetic rows written by
   [`scripts/harvest-replay.py`](../scripts/harvest-replay.py), which

@@ -289,3 +289,30 @@ triggers:
       - '\b(export|import)\s+(the\s+)?memor(y|ies)\b'
       - '\bmemor(y|ies)\b.{0,30}\b(sync|synced|syncing|graph|batch|export|import|diagnose|diagnostics?|canonical|triples?|stats|validate|sleep)\b'
       - '\b(sync|syncing|graph|batch|export|import|diagnose|diagnostics?|canonical|triples?)\b.{0,30}\bmemor(y|ies)\b'
+
+# ── Shell-bypass detection ───────────────────────────────────────────────────
+# CLI shadows of latent native tools. When the model runs one of these via the
+# `terminal` tool while the mapped native tool is latent this turn (in the
+# ceiling but not made active), Tool Belt records a bypass event — the
+# promotion signal for a tool the model should have used but reached around via
+# the shell instead. Loaded and compiled by `bypass_map.py`.
+#
+# Data, not code: add an entry per latent tool with a CLI shadow; no plugin
+# logic changes. Each entry is {id, tool, pattern}; `pattern` is a regex
+# matched (case-insensitive) against the shell command string.
+#
+# PRIVACY (hard, see docs/PRIVACY.md): only the matched `id` and `tool` are
+# ever logged. The command text is never written or previewed — the bypass
+# event reuses the prediction's message_preview, not the command.
+#
+# An entry whose `tool` is not in a scope's ceiling simply never fires, so it
+# is safe to ship a pattern for a tool a given install does not carry.
+bypass_patterns:
+  - id: hermes_cron_subcommand
+    tool: cronjob
+    pattern: '\bhermes\s+cron\s+(create|list|remove|run|pause|resume)\b'
+  # Example extension (no `config` model tool exists on current Hermes, so this
+  # is left commented — uncomment if/when a config toolset is carried):
+  # - id: hermes_config_subcommand
+  #   tool: config
+  #   pattern: '\bhermes\s+config\s+(get|set|show)\b'

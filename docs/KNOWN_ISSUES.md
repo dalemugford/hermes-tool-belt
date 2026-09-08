@@ -47,3 +47,32 @@ where tool curation lives, and no in-plugin change can prevent the
 reasoning trace from mutating the prefix. If consistent prefix caching
 matters more than reasoning output, route the scope to an Anthropic
 model instead.
+
+---
+
+### Shell-bypass detection: terminal-only, and detection-only (v1)
+
+**Symptom.** The model runs code in an `execute_code` sandbox — or a
+subprocess spawned from one — that shells out to a native tool's CLI
+shadow, and no `bypass_events.jsonl` row appears. Or: a bypass is
+detected and recorded, but nothing at the time of the call nudges the
+model toward the native tool; the shell path still runs.
+
+**Why.** The v1 detector inspects only the `terminal` tool's `command`
+string ([`bypass_map.py`](../bypass_map.py),
+[`_maybe_log_shell_bypass`](../__init__.py)). `execute_code` carries a
+code body, not a single command line, so catching a CLI shadow inside it
+needs deeper code-content inspection (import graphs, subprocess-argv
+reconstruction) that is deliberately out of scope for v1 — a narrow,
+high-precision terminal matcher earns trust before a fuzzier one is
+added. The detector is also **detection-only**: it produces a promotion
+signal for the offline shaper, and does not intervene at call time.
+
+**Workaround / future direction.** None owed today — a missed
+`execute_code` bypass is a lost learning signal, not a correctness or
+privacy problem, and the promotion path still learns from every
+`terminal` bypass and from the expand-only harvest path. Two natural v2
+extensions, both opt-in: (1) extend the pattern table to inspect
+`execute_code` bodies; (2) a runtime intervention that, on a detected
+bypass, prefers the native tool — behind a config flag, off by default,
+since intervention changes behavior rather than just observing it.
